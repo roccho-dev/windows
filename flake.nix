@@ -88,7 +88,7 @@
         port=$(jq -r .sshPort <<<"$spec"); mount=$(jq -r .stateMount <<<"$spec")
         jq -e --arg p "$port/tcp" --arg m "$mount" \
           '(.ExposedPorts | has($p)) and (.Volumes | has($m)) and (.Env | index("HOME=" + $m))' <<<"$config"
-        grep -qx "    Port $port" ${own.sshConfig}
+        grep -qx "Port $port" ${own.sshConfig}
         grep -qF "HostKey $mount/.ssh/" ${own.sshConfig}
         grep -qF "$(jq -r .authorizedKeyEnv <<<"$spec")" ${own.start}/bin/own-start
         grep -qF "$mount/.ssh/authorized_keys" ${own.start}/bin/own-start
