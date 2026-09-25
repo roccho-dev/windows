@@ -1,0 +1,12 @@
+{
+  "role": "dev",
+  "site": "G6I3",
+  "expectHost": "G6I3",
+  "nixVolume": "nix",
+  "workVolume": "work",
+  "repoRoot": "C:\\Users\\resta\\Codex\\repos\\windows",
+  "importRef": "refs/heads/codex/own-iac-derivative",
+  "importSha": "6c0b3489cf5fc1c8ece2b2a75a34f48a4acda20f",
+  "baseSha": "0b9ffa24749b416fd39bfa49c0682b1f32711f02",
+  "gitNixpkgs": "35d3407a3816f3b341d8cf1d60abaf2b7b8166ac"
+}
