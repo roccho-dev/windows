@@ -9,7 +9,8 @@ param(
 
     [switch] $Apply,
 
-    # Run only: the container command and its arguments (default: the image's shell).
+    # Run only: the container command and its arguments. Call the script with & and put them after --, e.g.
+    # & .\win.ps1 -Step Run -Binding <file> -Apply -- nix --version (pwsh -File does not pass them).
     [Parameter(ValueFromRemainingArguments)]
     [string[]] $Command
 )
@@ -78,6 +79,9 @@ $DevProfile = '/nix/var/nix/profiles/windows-dev'
 $ImagePath = '/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/nix/var/nix/profiles/default/sbin'
 $Tools = $Seeded + 'set -f; p=$1 r=$2 d=$3; ' +
     'nix --extra-experimental-features ''nix-command flakes'' build --profile $d git+file://$r?rev=$p#dev-profile && readlink $d'
+# Run checks the seed marker, then execs the command. With IFS empty and globbing off,
+# unquoted $@ keeps each argument as exactly one field (empty arguments are dropped).
+$RunScript = $Seeded + 'set -f; IFS=; exec $@'
 # Every run is ephemeral, never pulls, and uses the pinned image.
 function New-Run([string[]] $Mounts, [string] $Script, [string[]] $Values) {
     $Argv = @('run', '--rm', '--pull', 'never')
@@ -103,7 +107,8 @@ $Plan = [ordered]@{
     Tools = New-Run @($NixAt, $WorkAt) $Tools @($Spec.image, $Site.toolsRev, $Spec.repoPath, $DevProfile)
     # Run: the profile's tools first on PATH, then the image's own PATH; no ports and no /repo.
     Run = @('run', '--rm', '--pull', 'never', '--volume', $NixAt, '--volume', $WorkAt,
-        '--env', "PATH=$DevProfile/bin:$ImagePath", $Spec.image) + @($Command | Where-Object { $_ })
+        '--env', "PATH=$DevProfile/bin:$ImagePath", $Spec.image, 'sh', '-c', $RunScript, 'sh', $Spec.image) +
+        @($Command | Where-Object { $_ })
 }
 
 function Invoke-Wslc([string] $What, [string[]] $Argv) {
