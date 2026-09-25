@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Pull', 'Create', 'Serve')]
+    [ValidateSet('Pull', 'Create', 'Serve', 'LogonTask')]
     [string] $Step,
 
     [Parameter(Mandatory)]
@@ -53,6 +53,18 @@ if ($Step -eq 'Pull') {
 if ($Step -eq 'Create') {
     & $Wslc run --name $Container --detach --publish "127.0.0.1:${Port}:2222" --volume "${Volume}:/home/dev" --env "RENT_AUTHORIZED_KEY=$Key" $Image
     if ($LASTEXITCODE -ne 0) { throw "WSLC run failed: $LASTEXITCODE" }
+    exit 0
+}
+
+if ($Step -eq 'LogonTask') {
+    $Actor = whoami
+    $Action = New-ScheduledTaskAction -Execute $Wslc -Argument "start $Container"
+    $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $Actor
+    $Trigger.Delay = 'PT30S'
+    $Principal = New-ScheduledTaskPrincipal -UserId $Actor -LogonType Interactive -RunLevel Limited
+    $Settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    Register-ScheduledTask -TaskName "$Container-oci-logon" -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Force | Out-Null
+    Get-ScheduledTask -TaskName "$Container-oci-logon" | Select-Object TaskName, State
     exit 0
 }
 
