@@ -1,13 +1,17 @@
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Plan', 'Init', 'Clone', 'Import')]
+    [ValidateSet('Plan', 'Init', 'Clone', 'Import', 'Tools', 'Run')]
     [string] $Step,
 
     # Binding(dev, site): site values only. Spec(dev) is read from spec.json beside this script.
     [Parameter(Mandatory)]
     [string] $Binding,
 
-    [switch] $Apply
+    [switch] $Apply,
+
+    # Run only: the container command and its arguments (default: the image's shell).
+    [Parameter(ValueFromRemainingArguments)]
+    [string[]] $Command
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,7 +34,7 @@ function Assert-Match([string] $Name, $Value, [string] $Pattern) {
 $Spec = Read-Exact (Join-Path $PSScriptRoot 'spec.json') @(
     'role', 'image', 'labelKey', 'nixMount', 'workMount', 'repoPath', 'repoMount', 'cloneUrl')
 $Site = Read-Exact $Binding @(
-    'role', 'site', 'expectHost', 'nixVolume', 'workVolume', 'repoRoot', 'importRef', 'importSha', 'baseSha', 'gitNixpkgs')
+    'role', 'site', 'expectHost', 'nixVolume', 'workVolume', 'repoRoot', 'importRef', 'importSha', 'baseSha', 'gitNixpkgs', 'toolsRev')
 
 if ($Site.role -cne $Spec.role) { throw "Binding role $($Site.role) does not match Spec role $($Spec.role)" }
 Assert-Match 'image' $Spec.image '^nixos/nix@sha256:[a-f0-9]{64}$'
@@ -44,7 +48,7 @@ foreach ($Name in 'nixVolume', 'workVolume') { Assert-Match $Name $Site.$Name '^
 if ($Site.nixVolume -ceq $Site.workVolume) { throw 'nixVolume and workVolume must differ.' }
 Assert-Match 'repoRoot' $Site.repoRoot '^[A-Za-z]:\\[A-Za-z0-9\\._-]+$'
 Assert-Match 'importRef' $Site.importRef '^refs/heads/[A-Za-z0-9._/-]+$'
-foreach ($Name in 'importSha', 'baseSha', 'gitNixpkgs') { Assert-Match $Name $Site.$Name '^[a-f0-9]{40}$' }
+foreach ($Name in 'importSha', 'baseSha', 'gitNixpkgs', 'toolsRev') { Assert-Match $Name $Site.$Name '^[a-f0-9]{40}$' }
 if ($env:COMPUTERNAME -ine $Site.expectHost) {
     throw "expected Windows host $($Site.expectHost), found $env:COMPUTERNAME"
 }
@@ -60,7 +64,7 @@ $Wslc = Join-Path $ProgramFiles 'WSL\wslc.exe'
 $Git = 'g() { nix --extra-experimental-features ''nix-command flakes'' shell github:NixOS/nixpkgs/$p#git -c git $@; }; '
 $Seed = 'm=/seed/var/windows-seed-image; if [ -e $m ]; then read v < $m; test $v = $1; exit; fi; ' +
     'test $(ls -A /seed | wc -l) -eq 0 || exit 3; cp -a /nix/. /seed/ && echo $1 > $m'
-# Clone and Import run only on the volume Init seeded; the image is their first argument.
+# Clone, Import and Tools run only on the volume Init seeded; the image is their first argument.
 $Seeded = 'read v < /nix/var/windows-seed-image && test $v = $1 || exit 4; shift; '
 $Verify = 'read v < /nix/var/windows-seed-image && echo $v && test $v = $1 && nix --version && nix-store --verify --check-contents'
 $Clone = $Seeded + 'p=$1 u=$2 r=$3 b=$4; ' + $Git +
@@ -68,7 +72,12 @@ $Clone = $Seeded + 'p=$1 u=$2 r=$3 b=$4; ' + $Git +
 $Import = $Seeded + 'p=$1 r=$2 f=$3 s=$4 b=$5 d=$6; o=; while read -r x x x x t y x; do case $t in $d) o=$y;; esac; done < /proc/self/mountinfo; ' +
     'case ,$o, in *,ro,*) ;; *) exit 5;; esac; ' + $Git +
     'cd $r && g -c safe.directory=$d/.bare fetch --no-tags $d/.bare $f:$f && test $(g rev-parse $f) = $s && g merge-base --is-ancestor $b $s && g rev-parse $f'
-
+# Tools builds the flake's dev-profile at the committed toolsRev into $DevProfile, which is also its GC root.
+# set -f keeps ? literal in the flake URL.
+$DevProfile = '/nix/var/nix/profiles/windows-dev'
+$ImagePath = '/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/nix/var/nix/profiles/default/sbin'
+$Tools = $Seeded + 'set -f; p=$1 r=$2 d=$3; ' +
+    'nix --extra-experimental-features ''nix-command flakes'' build --profile $d git+file://$r?rev=$p#dev-profile && readlink $d'
 # Every run is ephemeral, never pulls, and uses the pinned image.
 function New-Run([string[]] $Mounts, [string] $Script, [string[]] $Values) {
     $Argv = @('run', '--rm', '--pull', 'never')
@@ -91,6 +100,10 @@ $Plan = [ordered]@{
     Clone = New-Run @($NixAt, $WorkAt) $Clone @($Spec.image, $Site.gitNixpkgs, $Spec.cloneUrl, $Spec.repoPath, $Site.baseSha)
     Import = New-Run @($NixAt, $WorkAt, "$($Site.repoRoot):$($Spec.repoMount):ro") $Import @(
         $Spec.image, $Site.gitNixpkgs, $Spec.repoPath, $Site.importRef, $Site.importSha, $Site.baseSha, $Spec.repoMount)
+    Tools = New-Run @($NixAt, $WorkAt) $Tools @($Spec.image, $Site.toolsRev, $Spec.repoPath, $DevProfile)
+    # Run: the profile's tools first on PATH, then the image's own PATH; no ports and no /repo.
+    Run = @('run', '--rm', '--pull', 'never', '--volume', $NixAt, '--volume', $WorkAt,
+        '--env', "PATH=$DevProfile/bin:$ImagePath", $Spec.image) + @($Command | Where-Object { $_ })
 }
 
 function Invoke-Wslc([string] $What, [string[]] $Argv) {
@@ -132,6 +145,9 @@ if ($Step -eq 'Plan') {
 if (-not (Test-Path -LiteralPath $Wslc)) { throw "WSLC is missing: $Wslc" }
 if ($Step -eq 'Import' -and -not (Test-Path -LiteralPath (Join-Path $Site.repoRoot '.bare\HEAD'))) {
     throw "No bare repository at $($Site.repoRoot)\.bare"
+}
+if ($Step -eq 'Tools' -and $Site.toolsRev -ceq ('0' * 40)) {
+    throw 'toolsRev unset: commit the Binding with the reviewed revision before Tools.'
 }
 Write-Host "$Step on $env:COMPUTERNAME / $($Site.site)"
 if (-not $Apply) {
