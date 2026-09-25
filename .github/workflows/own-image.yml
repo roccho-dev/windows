@@ -1,0 +1,124 @@
+name: own trial image
+
+on:
+  push:
+    branches: [main, feat/rent-ci]
+    paths: ["flake.nix", "flake.lock", "hosts/own/**", ".github/workflows/own-image.yml"]
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Build actual own OCI image
+        run: nix build .#own-image --no-write-lock-file --print-build-logs
+      - name: Test synthetic trial mode, restart, and volume reuse (no real logins)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker load < result
+          key_dir="$(mktemp -d)"
+          trap 'kill "${tunnel_pid:-}" 2>/dev/null || true; docker rm -f own-smoke >/dev/null 2>&1 || true; docker volume rm own-smoke-home >/dev/null 2>&1 || true; rm -rf "$key_dir"' EXIT
+          ssh-keygen -q -t ed25519 -N '' -f "$key_dir/key"
+          docker volume create own-smoke-home
+          docker run -d --name own-smoke --shm-size 1g -p 127.0.0.1:2223:2223 \
+            -v own-smoke-home:/home/dev \
+            -e "OWN_AUTHORIZED_KEY=$(cat "$key_dir/key.pub")" \
+            -e OWN_TRIAL_UNSANDBOXED=1 \
+            ghcr.io/roccho-dev/windows-own:nix
+          ssh_cmd=(ssh -F /dev/null -p 2223 -i "$key_dir/key" -o IdentitiesOnly=yes \
+            -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+            -o "UserKnownHostsFile=$key_dir/known_hosts" dev@127.0.0.1)
+          for attempt in {1..60}; do
+            if "${ssh_cmd[@]}" id -un > "$key_dir/answer" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          test "$(cat "$key_dir/answer")" = dev
+          for attempt in {1..60}; do
+            if docker exec own-smoke /bin/curl -fsS http://127.0.0.1:9222/json/version > "$key_dir/cdp" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          grep -q '"Browser": "Chrome/' "$key_dir/cdp"
+          for attempt in {1..30}; do
+            docker exec own-smoke /bin/curl -fsS http://127.0.0.1:9222/json/list > "$key_dir/pages"
+            if grep -q '"title": "own agent B"' "$key_dir/pages"; then break; fi
+            sleep 1
+          done
+          grep -q '"title": "own human"' "$key_dir/pages"
+          grep -q '"title": "own agent A"' "$key_dir/pages"
+          grep -q '"title": "own agent B"' "$key_dir/pages"
+          "${ssh_cmd[@]}" 'test -s /home/dev/chromium/Local\ State; test -d /home/dev/chromium/Default; test -d "/home/dev/chromium/Profile 1"; test -d "/home/dev/chromium/Profile 2"'
+          ssh -F /dev/null -N -p 2223 -i "$key_dir/key" -o IdentitiesOnly=yes \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o "UserKnownHostsFile=$key_dir/known_hosts" \
+            -o ExitOnForwardFailure=yes \
+            -L 127.0.0.1:14500:127.0.0.1:14500 dev@127.0.0.1 &
+          tunnel_pid=$!
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:14500/ > "$key_dir/index" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          grep -Eqi 'xpra|html5' "$key_dir/index"
+          python3 - <<'PY'
+          import socket
+          request = (
+              "GET / HTTP/1.1\r\n"
+              "Host: 127.0.0.1:14500\r\n"
+              "Upgrade: websocket\r\n"
+              "Connection: Upgrade\r\n"
+              "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+              "Sec-WebSocket-Version: 13\r\n"
+              "Sec-WebSocket-Protocol: binary\r\n"
+              "Origin: http://127.0.0.1:14500\r\n\r\n"
+          )
+          with socket.create_connection(("127.0.0.1", 14500), timeout=5) as conn:
+              conn.sendall(request.encode())
+              response = conn.recv(4096)
+          assert response.startswith(b"HTTP/1.1 101 "), response[:300]
+          PY
+          kill "$tunnel_pid"
+          wait "$tunnel_pid" || true
+          unset tunnel_pid
+          docker restart own-smoke
+          for attempt in {1..60}; do
+            if "${ssh_cmd[@]}" 'test -d /home/dev/chromium/Default && test -d "/home/dev/chromium/Profile 1" && test -d "/home/dev/chromium/Profile 2"' 2>/dev/null; then break; fi
+            sleep 1
+          done
+          "${ssh_cmd[@]}" 'test -d /home/dev/chromium/Default && test -d "/home/dev/chromium/Profile 1" && test -d "/home/dev/chromium/Profile 2"'
+          old_id="$(docker inspect --format '{{.Id}}' own-smoke)"
+          docker rm -f own-smoke
+          docker run -d --name own-smoke --shm-size 1g -p 127.0.0.1:2223:2223 \
+            -v own-smoke-home:/home/dev \
+            -e "OWN_AUTHORIZED_KEY=$(cat "$key_dir/key.pub")" \
+            -e OWN_TRIAL_UNSANDBOXED=1 \
+            ghcr.io/roccho-dev/windows-own:nix
+          test "$(docker inspect --format '{{.Id}}' own-smoke)" != "$old_id"
+          for attempt in {1..60}; do
+            if docker exec own-smoke /bin/curl -fsS http://127.0.0.1:9222/json/version > "$key_dir/cdp" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          grep -q '"Browser": "Chrome/' "$key_dir/cdp"
+          for attempt in {1..30}; do
+            docker exec own-smoke /bin/curl -fsS http://127.0.0.1:9222/json/list > "$key_dir/pages"
+            if grep -q '"title": "own agent B"' "$key_dir/pages"; then break; fi
+            sleep 1
+          done
+          grep -q '"title": "own human"' "$key_dir/pages"
+          grep -q '"title": "own agent A"' "$key_dir/pages"
+          grep -q '"title": "own agent B"' "$key_dir/pages"
+          "${ssh_cmd[@]}" 'test -d /home/dev/chromium/Default && test -d "/home/dev/chromium/Profile 1" && test -d "/home/dev/chromium/Profile 2"'
+      - name: Publish tested image by commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          image="ghcr.io/roccho-dev/windows-own:sha-${GITHUB_SHA}"
+          docker tag ghcr.io/roccho-dev/windows-own:nix "$image"
+          docker push "$image"
+          docker image inspect "$image" --format '{{index .RepoDigests 0}}' >> "$GITHUB_STEP_SUMMARY"
