@@ -7,7 +7,8 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
-      own = import ./hosts/own/nix.nix { inherit pkgs; };
+      ownSpec = builtins.fromJSON (builtins.readFile ./hosts/own/spec.json);
+      own = import ./hosts/own/nix.nix { inherit pkgs; spec = ownSpec; };
       devTools = pkgs.buildEnv {
         name = "rent-dev-tools";
         paths = with pkgs; [ coreutils git openssh ];
@@ -39,7 +40,7 @@
     in {
       packages.${system} = {
         own-image = pkgs.dockerTools.buildLayeredImage {
-          name = "ghcr.io/roccho-dev/windows-own";
+          name = ownSpec.imageRepository;
           tag = "nix";
           contents = [ pkgs.bash pkgs.cacert own.tools own.start ];
           extraCommands = ''
@@ -52,8 +53,8 @@
           config = {
             Cmd = [ "${own.start}/bin/own-start" ];
             Env = [ "HOME=/home/dev" "PATH=/bin:/usr/bin" ];
-            ExposedPorts."2223/tcp" = {};
-            Volumes."/home/dev" = {};
+            ExposedPorts."${toString ownSpec.sshPort}/tcp" = {};
+            Volumes.${ownSpec.stateMount} = {};
             Labels."org.opencontainers.image.source" = "https://github.com/roccho-dev/windows";
           };
         };

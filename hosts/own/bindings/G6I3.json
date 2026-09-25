@@ -1,0 +1,11 @@
+{
+  "role": "own",
+  "site": "G6I3",
+  "expectHost": "G6I3",
+  "wslc": "C:\\Program Files\\WSL\\wslc.exe",
+  "container": "windows-own",
+  "hostPort": 2223,
+  "volume": "windows-own-home",
+  "publicKeyFile": "%USERPROFILE%\\.ssh\\id_ed25519_windows_own.pub",
+  "image": "ghcr.io/roccho-dev/windows-own@sha256:3a475335c3075a3a2ca131ebffd19790513da82d547396bbafa6a3be0de1dc23"
+}

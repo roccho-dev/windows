@@ -1,0 +1,9 @@
+{
+  "role": "own",
+  "sshPort": 2223,
+  "stateMount": "/home/dev",
+  "shmSize": "1G",
+  "authorizedKeyEnv": "OWN_AUTHORIZED_KEY",
+  "syntheticTrialEnv": "OWN_TRIAL_UNSANDBOXED",
+  "imageRepository": "ghcr.io/roccho-dev/windows-own"
+}

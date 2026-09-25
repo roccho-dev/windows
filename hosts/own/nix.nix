@@ -1,11 +1,11 @@
-{ pkgs }:
+{ pkgs, spec }:
 
 let
   fontConfig = pkgs.makeFontsConf {
     fontDirectories = [ pkgs.dejavu_fonts pkgs.noto-fonts-cjk-sans ];
   };
   sshConfig = pkgs.writeText "own-sshd-config" ''
-    Port 2223
+    Port ${toString spec.sshPort}
     ListenAddress 0.0.0.0
     HostKey /home/dev/.ssh/ssh_host_ed25519_key
     AuthorizedKeysFile .ssh/authorized_keys
