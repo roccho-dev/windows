@@ -1,13 +1,14 @@
 { pkgs, spec }:
 
 let
+  home = spec.stateMount;
   fontConfig = pkgs.makeFontsConf {
     fontDirectories = [ pkgs.dejavu_fonts pkgs.noto-fonts-cjk-sans ];
   };
   sshConfig = pkgs.writeText "own-sshd-config" ''
     Port ${toString spec.sshPort}
     ListenAddress 0.0.0.0
-    HostKey /home/dev/.ssh/ssh_host_ed25519_key
+    HostKey ${home}/.ssh/ssh_host_ed25519_key
     AuthorizedKeysFile .ssh/authorized_keys
     PubkeyAuthentication yes
     PasswordAuthentication no
@@ -25,11 +26,11 @@ let
   };
   browser = pkgs.writeShellScript "own-browser" ''
     set -eu
-    export HOME=/home/dev
+    export HOME=${home}
     export DISPLAY=:100
     export XDG_RUNTIME_DIR=/tmp/own-runtime
     export FONTCONFIG_FILE=${fontConfig}
-    profile=/home/dev/chromium
+    profile=${home}/chromium
     exec 9>"$profile/.own-instance.lock"
     ${pkgs.util-linux}/bin/flock -n 9 || {
       echo 'Chromium profile is already in use' >&2
@@ -37,19 +38,19 @@ let
     }
     ${pkgs.coreutils}/bin/rm -f "$profile"/SingletonLock "$profile"/SingletonSocket "$profile"/SingletonCookie
     browser_args=()
-    if [ "''${OWN_TRIAL_UNSANDBOXED:-0}" = 1 ]; then
+    if [ "''${${spec.syntheticTrialEnv}:-0}" = 1 ]; then
       echo 'Synthetic trial only: Chromium sandbox disabled; do not use real logins' >&2
       browser_args+=(--no-sandbox)
     fi
     ${pkgs.chromium}/bin/chromium "''${browser_args[@]}" --no-first-run --no-default-browser-check \
       --window-size=1100,700 \
       --user-data-dir="$profile" --remote-debugging-address=127.0.0.1 \
-      --remote-debugging-port=9222 --profile-directory=Default \
+      --remote-debugging-port=${toString spec.cdpPort} --profile-directory=Default \
       --new-window file://${pages.human} &
     browser_pid=$!
     ready=0
     for attempt in $(seq 1 60); do
-      if ${pkgs.curl}/bin/curl --fail --silent http://127.0.0.1:9222/json/version >/dev/null; then
+      if ${pkgs.curl}/bin/curl --fail --silent http://127.0.0.1:${toString spec.cdpPort}/json/version >/dev/null; then
         ready=1
         break
       fi
@@ -68,28 +69,28 @@ let
   start = pkgs.writeShellScriptBin "own-start" ''
     set -eu
     export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.util-linux pkgs.openssh pkgs.xpra ]}:$PATH
-    chown 1000:1000 /home/dev
-    install -d -m 700 -o 1000 -g 1000 /home/dev/.ssh /home/dev/chromium /tmp/own-runtime
-    if [ ! -s /home/dev/.ssh/authorized_keys ]; then
-      if [ -z "''${OWN_AUTHORIZED_KEY:-}" ]; then
-        echo 'Set OWN_AUTHORIZED_KEY on first creation' >&2
+    chown 1000:1000 ${home}
+    install -d -m 700 -o 1000 -g 1000 ${home}/.ssh ${home}/chromium /tmp/own-runtime
+    if [ ! -s ${home}/.ssh/authorized_keys ]; then
+      if [ -z "''${${spec.authorizedKeyEnv}:-}" ]; then
+        echo 'Set ${spec.authorizedKeyEnv} on first creation' >&2
         exit 1
       fi
-      printf '%s\n' "$OWN_AUTHORIZED_KEY" > /home/dev/.ssh/authorized_keys
+      printf '%s\n' "''${${spec.authorizedKeyEnv}}" > ${home}/.ssh/authorized_keys
     fi
-    chown 1000:1000 /home/dev/.ssh/authorized_keys /home/dev/chromium
-    chmod 600 /home/dev/.ssh/authorized_keys
-    if [ ! -s /home/dev/.ssh/ssh_host_ed25519_key ]; then
-      ${pkgs.openssh}/bin/ssh-keygen -q -t ed25519 -N "" -f /home/dev/.ssh/ssh_host_ed25519_key
+    chown 1000:1000 ${home}/.ssh/authorized_keys ${home}/chromium
+    chmod 600 ${home}/.ssh/authorized_keys
+    if [ ! -s ${home}/.ssh/ssh_host_ed25519_key ]; then
+      ${pkgs.openssh}/bin/ssh-keygen -q -t ed25519 -N "" -f ${home}/.ssh/ssh_host_ed25519_key
     fi
-    chmod 600 /home/dev/.ssh/ssh_host_ed25519_key
+    chmod 600 ${home}/.ssh/ssh_host_ed25519_key
     ${pkgs.openssh}/bin/sshd -D -e -f ${sshConfig} &
     ssh_pid=$!
     ${pkgs.util-linux}/bin/setpriv --reuid=1000 --regid=1000 --clear-groups \
-      ${pkgs.coreutils}/bin/env HOME=/home/dev XDG_RUNTIME_DIR=/tmp/own-runtime \
+      ${pkgs.coreutils}/bin/env HOME=${home} XDG_RUNTIME_DIR=/tmp/own-runtime \
       FONTCONFIG_FILE=${fontConfig} \
       ${pkgs.xpra}/bin/xpra seamless :100 \
-      --bind-tcp=127.0.0.1:14500 --html=on --websocket-upgrade=on \
+      --bind-tcp=127.0.0.1:${toString spec.xpraPort} --html=on --websocket-upgrade=on \
       --daemon=no --exit-with-client=no --exit-with-children=no \
       --mdns=no --pulseaudio=no --dbus-launch=no --dbus-control=no \
       --printing=no --notifications=no --webcam=no \
@@ -100,7 +101,7 @@ let
   '';
 in
 {
-  inherit start;
+  inherit start sshConfig browser;
   tools = pkgs.buildEnv {
     name = "own-tools";
     paths = with pkgs; [

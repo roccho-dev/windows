@@ -2,10 +2,13 @@
   "role": "own",
   "site": "G6I3",
   "expectHost": "G6I3",
-  "wslc": "C:\\Program Files\\WSL\\wslc.exe",
   "container": "windows-own",
   "hostPort": 2223,
+  "tunnelPort": 14500,
   "volume": "windows-own-home",
   "publicKeyFile": "%USERPROFILE%\\.ssh\\id_ed25519_windows_own.pub",
-  "image": "ghcr.io/roccho-dev/windows-own@sha256:3a475335c3075a3a2ca131ebffd19790513da82d547396bbafa6a3be0de1dc23"
+  "privateKeyFile": "%USERPROFILE%\\.ssh\\id_ed25519_windows_own",
+  "knownHostsFile": "%USERPROFILE%\\.ssh\\known_hosts_windows_own",
+  "image": "ghcr.io/roccho-dev/windows-own@sha256:3a475335c3075a3a2ca131ebffd19790513da82d547396bbafa6a3be0de1dc23",
+  "imageFrom": "roccho-dev/windows run 36095012862 at cc0a405aa6304c79fb520a3bf16d1dffa5acee08; not rebuilt from this branch"
 }
