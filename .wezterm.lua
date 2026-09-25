@@ -1,1 +1,0 @@
-//wsl.localhost/nix/home/nixos/.config/wezterm/wezterm.lua
