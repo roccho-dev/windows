@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Plan', 'Pull', 'Create')]
+    [ValidateSet('Plan', 'Pull', 'Create', 'Replace')]
     [string] $Step,
 
     # Binding(own, site): site values only. Spec(own) is read from spec.json beside this script.
@@ -29,6 +29,16 @@ function Assert-Port([string] $Name, $Value, [int] $Min) {
     if (-not ($Value -is [int] -or $Value -is [long]) -or $Value -lt $Min -or $Value -gt 65535) {
         throw "Invalid ${Name}: $Value"
     }
+}
+
+# True only when the container inspect object has exactly one mount at $Target, and it is the named volume $Volume.
+function Test-OwnMount($Inspect, [string] $Volume, [string] $Target) {
+    $items = @($Inspect)
+    if ($items.Count -ne 1 -or -not ($items[0].PSObject.Properties.Name -ccontains 'Mounts')) { return $false }
+    $atTarget = @(@($items[0].Mounts) | Where-Object { $_ -and ([string] $_.Destination) -ceq $Target })
+    if ($atTarget.Count -ne 1) { return $false }
+    $m = $atTarget[0]
+    return (([string] $m.Type) -ceq 'volume') -and (([string] $m.Name) -ceq $Volume)
 }
 
 function Assert-Name([string] $Name, $Value) {
@@ -65,7 +75,7 @@ $KnownHosts = [Environment]::ExpandEnvironmentVariables($Site.knownHostsFile)
 
 $Key = "<contents of $PublicKey>"
 if ($Step -ne 'Plan' -and -not (Test-Path -LiteralPath $Wslc)) { throw "WSLC is missing: $Wslc" }
-if ($Step -eq 'Create') {
+if ($Step -in 'Create', 'Replace') {
     $Key = (Get-Content -LiteralPath $PublicKey -Raw).Trim()
     if ($Key -notmatch '^ssh-ed25519 [A-Za-z0-9+/=]+(?: .*)?$') { throw 'Expected one ed25519 public key.' }
 }
@@ -93,6 +103,9 @@ if ($Step -eq 'Plan') {
         volumeCreateOnce = @($Wslc, 'volume', 'create', $Site.volume)
         pull = @($Wslc, 'pull', $Site.image)
         create = @($Wslc) + $RunArgs
+        # Replace: stop and remove the container only (no -f, no -v); the named volume is kept, then create again.
+        replaceStop = @($Wslc, 'stop', $Site.container)
+        replaceRemove = @($Wslc, 'remove', $Site.container)
         # Pin the host key through WSLC, not over the network: write "[addr]:port <key>" to knownHostsFile.
         hostKeyRead = @($Wslc, 'exec', $Site.container, '/bin/cat', "$($Spec.stateMount)/.ssh/ssh_host_ed25519_key.pub")
         knownHostsEntryPrefix = "[$($Spec.publishAddress)]:$($Site.hostPort)"
@@ -119,5 +132,21 @@ if ($Step -eq 'Pull') {
 
 & $Wslc volume inspect $Site.volume
 if ($LASTEXITCODE -ne 0) { throw "Named volume is missing: $($Site.volume)" }
+
+if ($Step -eq 'Replace') {
+    # Only replace the container this Binding created: it must exist and reference the Binding's volume and state mount.
+    $Current = (& $Wslc container inspect -f json $Site.container) -join "`n"
+    if ($LASTEXITCODE -ne 0) { throw "Container to replace is missing: $($Site.container)" }
+    if (-not (Test-OwnMount ($Current | ConvertFrom-Json) $Site.volume $Spec.stateMount)) {
+        throw "Container $($Site.container) does not mount exactly volume $($Site.volume) at $($Spec.stateMount); not replacing."
+    }
+    & $Wslc stop $Site.container
+    if ($LASTEXITCODE -ne 0) { throw "WSLC stop failed: $LASTEXITCODE" }
+    & $Wslc remove $Site.container
+    if ($LASTEXITCODE -ne 0) { throw "WSLC remove failed: $LASTEXITCODE" }
+    & $Wslc volume inspect $Site.volume
+    if ($LASTEXITCODE -ne 0) { throw "Named volume lost after remove: $($Site.volume)" }
+}
+
 & $Wslc @RunArgs
 if ($LASTEXITCODE -ne 0) { throw "WSLC run failed: $LASTEXITCODE" }
