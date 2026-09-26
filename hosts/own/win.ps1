@@ -95,23 +95,32 @@ $RunArgs += $Site.image
 
 if ($Step -eq 'Plan') {
     # Runtime = instantiate(Spec, Binding) for the whole runbook, as exact argv; touches nothing.
-    $Ssh = @('ssh', '-F', 'NUL', '-p', "$($Site.hostPort)", '-i', $PrivateKey, '-o', 'IdentitiesOnly=yes')
+    # keygenOnce, identity and tunnel run inside the bound Nix-defined WSLC dev runtime, with its OpenSSH client and
+    # the key generated there; no Windows SSH. The client reaches sshd at the container's WSLC address (addressRead)
+    # and first writes "[<address>]:<sshPort> <pinned key from knownHostsFile>" to its /tmp/known_hosts.
+    $Ssh = @('ssh', '-F', '/dev/null', '-p', "$($Spec.sshPort)", '-i', $PrivateKey, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes',
+        '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=/tmp/known_hosts', '-o', 'GlobalKnownHostsFile=/dev/null')
+    $Target = "dev@<WSLC address of $($Site.container)>"
     $Plan = [ordered]@{
         site = $Site.site
         imageFrom = $Site.imageFrom
-        keygenOnce = @('ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', $PrivateKey, '-C', "windows-$($Spec.role)")
+        # Inside the dev runtime; only the .pub is exported to publicKeyFile.
+        keygenOnce = @('ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', $PrivateKey, '-C', "windows-$($Spec.role)-wslc")
         volumeCreateOnce = @($Wslc, 'volume', 'create', $Site.volume)
         pull = @($Wslc, 'pull', $Site.image)
         create = @($Wslc) + $RunArgs
         # Replace: stop and remove the container only (no -f, no -v); the named volume is kept, then create again.
         replaceStop = @($Wslc, 'stop', $Site.container)
         replaceRemove = @($Wslc, 'remove', $Site.container)
-        # Pin the host key through WSLC, not over the network: write "[addr]:port <key>" to knownHostsFile.
+        # Pin the host key through WSLC, not over the network: store "[addr]:port <key>" in knownHostsFile.
         hostKeyRead = @($Wslc, 'exec', $Site.container, '/bin/cat', "$($Spec.stateMount)/.ssh/ssh_host_ed25519_key.pub")
+        knownHostsFile = $KnownHosts
         knownHostsEntryPrefix = "[$($Spec.publishAddress)]:$($Site.hostPort)"
-        identity = $Ssh + @('-o', 'StrictHostKeyChecking=yes', '-o', "UserKnownHostsFile=$KnownHosts", "dev@$($Spec.publishAddress)", 'id', '-un')
-        tunnel = $Ssh + @('-N', '-o', 'StrictHostKeyChecking=yes', '-o', "UserKnownHostsFile=$KnownHosts", '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=30',
-            '-L', "$($Spec.publishAddress):$($Site.tunnelPort):127.0.0.1:$($Spec.xpraPort)", "dev@$($Spec.publishAddress)")
+        addressRead = @($Wslc, 'container', 'inspect', '-f', 'json', $Site.container)
+        identity = $Ssh + @($Target, 'id', '-un')
+        # B2 (held): this reaches a Windows browser only if that client Run also publishes publishAddress:tunnelPort.
+        tunnel = $Ssh + @('-N', '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=30',
+            '-L', "0.0.0.0:$($Site.tunnelPort):127.0.0.1:$($Spec.xpraPort)", $Target)
         browserUrl = "http://$($Spec.publishAddress):$($Site.tunnelPort)/"
     }
     $Plan | ConvertTo-Json -Depth 3
