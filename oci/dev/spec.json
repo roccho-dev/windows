@@ -5,6 +5,5 @@
   "nixMount": "/nix",
   "workMount": "/work/repos",
   "repoPath": "/work/repos/windows",
-  "repoMount": "/repo",
   "cloneUrl": "https://github.com/roccho-dev/windows"
 }
