@@ -1,0 +1,12 @@
+{
+  "role": "own",
+  "imageRepository": "ghcr.io/roccho-dev/windows-own",
+  "sshPort": 2223,
+  "xpraPort": 14500,
+  "cdpPort": 9222,
+  "publishAddress": "127.0.0.1",
+  "stateMount": "/home/dev",
+  "shmSize": "1G",
+  "authorizedKeyEnv": "OWN_AUTHORIZED_KEY",
+  "syntheticTrialEnv": "OWN_TRIAL_UNSANDBOXED"
+}

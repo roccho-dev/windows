@@ -7,7 +7,15 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
-      own = import ./hosts/own/nix.nix { inherit pkgs; };
+      ownSpec = builtins.fromJSON (builtins.readFile ./hosts/own/spec.json);
+      own = import ./hosts/own/nix.nix { inherit pkgs; spec = ownSpec; };
+      ownConfig = {
+        Cmd = [ "${own.start}/bin/own-start" ];
+        Env = [ "HOME=${ownSpec.stateMount}" "PATH=/bin:/usr/bin" ];
+        ExposedPorts."${toString ownSpec.sshPort}/tcp" = {};
+        Volumes.${ownSpec.stateMount} = {};
+        Labels."org.opencontainers.image.source" = "https://github.com/roccho-dev/windows";
+      };
       devTools = pkgs.buildEnv {
         name = "rent-dev-tools";
         paths = with pkgs; [ coreutils git openssh ];
@@ -39,23 +47,17 @@
     in {
       packages.${system} = {
         own-image = pkgs.dockerTools.buildLayeredImage {
-          name = "ghcr.io/roccho-dev/windows-own";
+          name = ownSpec.imageRepository;
           tag = "nix";
           contents = [ pkgs.bash pkgs.cacert own.tools own.start ];
           extraCommands = ''
-            mkdir -p etc home/dev tmp var/empty
-            printf 'root:x:0:0:root:/root:/bin/sh\nsshd:x:74:74:sshd:/var/empty:/bin/sh\ndev:x:1000:1000:Development user:/home/dev:/bin/sh\n' > etc/passwd
+            mkdir -p etc .${ownSpec.stateMount} tmp var/empty
+            printf 'root:x:0:0:root:/root:/bin/sh\nsshd:x:74:74:sshd:/var/empty:/bin/sh\ndev:x:1000:1000:Development user:${ownSpec.stateMount}:/bin/sh\n' > etc/passwd
             printf 'root:x:0:\nsshd:x:74:\ndev:x:1000:\n' > etc/group
             touch etc/profile
             chmod 1777 tmp
           '';
-          config = {
-            Cmd = [ "${own.start}/bin/own-start" ];
-            Env = [ "HOME=/home/dev" "PATH=/bin:/usr/bin" ];
-            ExposedPorts."2223/tcp" = {};
-            Volumes."/home/dev" = {};
-            Labels."org.opencontainers.image.source" = "https://github.com/roccho-dev/windows";
-          };
+          config = ownConfig;
         };
         rent-image = pkgs.dockerTools.buildLayeredImage {
           name = "ghcr.io/roccho-dev/windows-rent";
@@ -76,5 +78,24 @@
           };
         };
       };
+      # Fails when the own image or its scripts disagree with hosts/own/spec.json.
+      checks.${system}.own-spec = pkgs.runCommand "own-spec-check" {
+        nativeBuildInputs = [ pkgs.jq ];
+        config = builtins.toJSON ownConfig;
+        spec = builtins.toJSON ownSpec;
+      } ''
+        set -eu
+        port=$(jq -r .sshPort <<<"$spec"); mount=$(jq -r .stateMount <<<"$spec")
+        jq -e --arg p "$port/tcp" --arg m "$mount" \
+          '(.ExposedPorts | has($p)) and (.Volumes | has($m)) and (.Env | index("HOME=" + $m))' <<<"$config"
+        grep -qx "Port $port" ${own.sshConfig}
+        grep -qF "HostKey $mount/.ssh/" ${own.sshConfig}
+        grep -qF "$(jq -r .authorizedKeyEnv <<<"$spec")" ${own.start}/bin/own-start
+        grep -qF "$mount/.ssh/authorized_keys" ${own.start}/bin/own-start
+        grep -qF "127.0.0.1:$(jq -r .xpraPort <<<"$spec")" ${own.start}/bin/own-start
+        grep -qF "$(jq -r .syntheticTrialEnv <<<"$spec")" ${own.browser}
+        grep -qF "remote-debugging-port=$(jq -r .cdpPort <<<"$spec")" ${own.browser}
+        touch $out
+      '';
     };
 }
