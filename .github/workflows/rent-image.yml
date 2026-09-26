@@ -4,6 +4,8 @@ on:
   push:
     branches: [main, feat/rent-ci]
     paths: ["flake.nix", "flake.lock", "hosts/rent/**", ".github/workflows/rent-image.yml"]
+  pull_request:
+    paths: ["flake.nix", "flake.lock", "hosts/rent/**", ".github/workflows/rent-image.yml"]
 
 jobs:
   build-test-publish:
@@ -38,7 +40,7 @@ jobs:
           done
           test "$(cat "$key_dir/answer")" = dev
           "${ssh_cmd[@]}" 'set -eu
-            if command -v nix-instantiate >/dev/null; then exit 1; fi
+            node --version >/dev/null; python3 --version >/dev/null
             command -v git >/dev/null
             test -r "$SSL_CERT_FILE"
             git --version >/dev/null
@@ -53,6 +55,7 @@ jobs:
           done
           test "$(cat "$key_dir/answer")" = persisted
       - name: Publish exact image from this repository
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
