@@ -2,6 +2,7 @@
 
 let
   home = spec.stateMount;
+  codex = import ./codex.nix { inherit pkgs; };
   fontConfig = pkgs.makeFontsConf {
     fontDirectories = [ pkgs.dejavu_fonts pkgs.noto-fonts-cjk-sans ];
   };
@@ -16,6 +17,7 @@ let
     PermitRootLogin no
     AllowUsers dev
     UsePAM no
+    SetEnv SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
     PidFile /tmp/own-sshd.pid
     Subsystem sftp internal-sftp
   '';
@@ -104,16 +106,20 @@ in
   inherit start sshConfig browser;
   tools = pkgs.buildEnv {
     name = "own-tools";
-    paths = with pkgs; [
+    paths = (with pkgs; [
       bash
+      bubblewrap
       chromium
       coreutils
       curl
       fontconfig
+      gh
+      git
       openssh
+      ripgrep
       util-linux
       xpra
-    ];
+    ]) ++ [ codex ];
     pathsToLink = [ "/bin" ];
   };
 }

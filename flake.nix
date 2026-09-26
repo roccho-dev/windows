@@ -11,7 +11,11 @@
       own = import ./hosts/own/nix.nix { inherit pkgs; spec = ownSpec; };
       ownConfig = {
         Cmd = [ "${own.start}/bin/own-start" ];
-        Env = [ "HOME=${ownSpec.stateMount}" "PATH=/bin:/usr/bin" ];
+        Env = [
+          "HOME=${ownSpec.stateMount}"
+          "PATH=/bin:/usr/bin"
+          "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+        ];
         ExposedPorts."${toString ownSpec.sshPort}/tcp" = {};
         Volumes.${ownSpec.stateMount} = {};
         Labels."org.opencontainers.image.source" = "https://github.com/roccho-dev/windows";
