@@ -2,7 +2,7 @@ name: own trial image
 
 on:
   push:
-    branches: [main, feat/rent-ci, codex/own-iac-derivative]
+    branches: [main, feat/rent-ci, codex/own-iac-derivative, codex/remote-ssh-codex]
     paths: ["flake.nix", "flake.lock", "hosts/own/**", ".github/workflows/own-image.yml"]
   pull_request:
     paths: ["flake.nix", "flake.lock", "hosts/own/**", ".github/workflows/own-image.yml"]
@@ -58,6 +58,8 @@ jobs:
             sleep 1
           done
           test "$(cat "$key_dir/answer")" = dev
+          "${ssh_cmd[@]}" 'test "$(command -v codex)" = /bin/codex && codex --version | grep -F "codex-cli 0.157.1"'
+          "${ssh_cmd[@]}" 'gh --version | grep -F "gh version 2.96.0"'
           for attempt in {1..60}; do
             if docker exec own-smoke /bin/curl -fsS http://127.0.0.1:9222/json/version > "$key_dir/cdp" 2>/dev/null; then break; fi
             sleep 1
