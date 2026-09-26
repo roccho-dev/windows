@@ -2,6 +2,7 @@
 
 let
   home = spec.stateMount;
+  codex = import ./codex.nix { inherit pkgs; };
   fontConfig = pkgs.makeFontsConf {
     fontDirectories = [ pkgs.dejavu_fonts pkgs.noto-fonts-cjk-sans ];
   };
@@ -104,16 +105,20 @@ in
   inherit start sshConfig browser;
   tools = pkgs.buildEnv {
     name = "own-tools";
-    paths = with pkgs; [
+    paths = (with pkgs; [
       bash
+      bubblewrap
       chromium
       coreutils
       curl
       fontconfig
+      gh
+      git
       openssh
+      ripgrep
       util-linux
       xpra
-    ];
+    ]) ++ [ codex ];
     pathsToLink = [ "/bin" ];
   };
 }
