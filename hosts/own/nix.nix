@@ -3,7 +3,7 @@
 let
   home = spec.stateMount;
   codex = import ./codex.nix { inherit pkgs; };
-  # ops PR #426 squash commit on roccho-dev/ops `proposals`: a pinned proposal candidate, not adopted SSOT.
+  # Squash-merge commit of ops PR #426 (merged 2026-09-26T05:36:11Z into default branch `proposals`; not in `main`).
   opsSrc = pkgs.fetchFromGitHub {
     owner = "roccho-dev";
     repo = "ops";
