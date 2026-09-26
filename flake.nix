@@ -10,7 +10,7 @@
       own = import ./hosts/own/nix.nix { inherit pkgs; };
       devTools = pkgs.buildEnv {
         name = "rent-dev-tools";
-        paths = with pkgs; [ coreutils git openssh ];
+        paths = with pkgs; [ coreutils git nodejs openssh python3 ];
         pathsToLink = [ "/bin" ];
       };
       sshConfig = pkgs.writeText "rent-sshd-config" (import ./hosts/rent/nix.nix {
