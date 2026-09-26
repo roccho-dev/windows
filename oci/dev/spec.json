@@ -1,0 +1,9 @@
+{
+  "role": "dev",
+  "image": "nixos/nix@sha256:617d914dba5384bf75adf17081583b69371031ec7defce36c34c5fa14fc819b0",
+  "labelKey": "roccho-dev.windows/role",
+  "nixMount": "/nix",
+  "workMount": "/work/repos",
+  "repoPath": "/work/repos/windows",
+  "cloneUrl": "https://github.com/roccho-dev/windows"
+}

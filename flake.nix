@@ -9,6 +9,7 @@
       pkgs = import nixpkgs { inherit system; };
       ownSpec = builtins.fromJSON (builtins.readFile ./hosts/own/spec.json);
       own = import ./hosts/own/nix.nix { inherit pkgs; spec = ownSpec; };
+      dev = import ./oci/dev/nix.nix { inherit pkgs; };
       ownConfig = {
         Cmd = [ "${own.start}/bin/own-start" ];
         Env = [ "HOME=${ownSpec.stateMount}" "PATH=/bin:/usr/bin" ];
@@ -77,6 +78,7 @@
             Labels."org.opencontainers.image.source" = "https://github.com/roccho-dev/windows";
           };
         };
+        dev-profile = dev.profile;
       };
       # Fails when the own image or its scripts disagree with hosts/own/spec.json.
       checks.${system}.own-spec = pkgs.runCommand "own-spec-check" {
