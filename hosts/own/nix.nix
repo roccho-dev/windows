@@ -17,6 +17,7 @@ let
     PermitRootLogin no
     AllowUsers dev
     UsePAM no
+    SetEnv SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
     PidFile /tmp/own-sshd.pid
     Subsystem sftp internal-sftp
   '';
