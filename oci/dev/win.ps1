@@ -38,8 +38,7 @@ function Assert-Match([string] $Name, $Value, [string] $Pattern) {
 $Spec = Read-Exact (Join-Path $PSScriptRoot 'spec.json') @(
     'role', 'image', 'labelKey', 'nixMount', 'workMount', 'repoPath', 'repoMount', 'cloneUrl')
 $Site = Read-Exact $Binding @(
-    'role', 'site', 'expectHost', 'nixVolume', 'workVolume', 'repoRoot', 'importRef', 'importSha', 'baseSha', 'gitNixpkgs', 'toolsRev',
-    'ghOwner', 'ghRepos')
+    'role', 'site', 'expectHost', 'nixVolume', 'workVolume', 'repoRoot', 'importRef', 'importSha', 'baseSha', 'gitNixpkgs', 'toolsRev')
 
 if ($Site.role -cne $Spec.role) { throw "Binding role $($Site.role) does not match Spec role $($Spec.role)" }
 Assert-Match 'image' $Spec.image '^nixos/nix@sha256:[a-f0-9]{64}$'
@@ -48,20 +47,13 @@ Assert-Match 'labelKey' $Spec.labelKey '^[a-z0-9.-]+/[a-z0-9-]+$'
 Assert-Match 'nixMount' $Spec.nixMount '^/nix$'
 foreach ($Name in 'workMount', 'repoMount') { Assert-Match $Name $Spec.$Name '^/[a-z0-9/_-]+$' }
 Assert-Match 'repoPath' $Spec.repoPath ('^' + [regex]::Escape($Spec.workMount) + '/[a-z0-9_-]+$')
-Assert-Match 'cloneUrl' $Spec.cloneUrl '^https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9._-]+$'
+# cloneUrl is the exact canonical https://github.com/<owner>/<repo> (no .git, no trailing slash); Tools derives the owner from it.
+Assert-Match 'cloneUrl' $Spec.cloneUrl '^https://github\.com/[A-Za-z0-9-]+/(?!.*\.git$)[A-Za-z0-9._-]+$'
 foreach ($Name in 'nixVolume', 'workVolume') { Assert-Match $Name $Site.$Name '^[a-z0-9][a-z0-9-]+$' }
 if ($Site.nixVolume -ceq $Site.workVolume) { throw 'nixVolume and workVolume must differ.' }
 Assert-Match 'repoRoot' $Site.repoRoot '^[A-Za-z]:\\[A-Za-z0-9\\._-]+$'
 Assert-Match 'importRef' $Site.importRef '^refs/heads/[A-Za-z0-9._/-]+$'
 foreach ($Name in 'importSha', 'baseSha', 'gitNixpkgs', 'toolsRev') { Assert-Match $Name $Site.$Name '^[a-f0-9]{40}$' }
-Assert-Match 'ghOwner' $Site.ghOwner '^[A-Za-z0-9-]+$'
-# ghRepos maps each clone under workMount to its canonical repository name under ghOwner.
-$GhRepos = @(foreach ($Entry in $Site.ghRepos.PSObject.Properties) {
-    Assert-Match 'ghRepos clone' $Entry.Name '^[a-z0-9][a-z0-9_-]*$'
-    Assert-Match 'ghRepos repository' $Entry.Value '^[A-Za-z0-9._-]+$'
-    $Entry.Name; $Entry.Value
-})
-if ($GhRepos.Count -eq 0) { throw 'ghRepos must name at least one clone.' }
 if ($Interactive -and $Step -ne 'Run') { throw '-Interactive applies to Run only.' }
 if ($env:COMPUTERNAME -ine $Site.expectHost) {
     throw "expected Windows host $($Site.expectHost), found $env:COMPUTERNAME"
@@ -87,20 +79,21 @@ $Import = $Seeded + 'p=$1 r=$2 f=$3 s=$4 b=$5 d=$6; o=; while read -r x x x x t 
     'case ,$o, in *,ro,*) ;; *) exit 5;; esac; ' + $Git +
     'cd $r && g -c safe.directory=$d/.bare fetch --no-tags $d/.bare $f:$f && test $(g rev-parse $f) = $s && g merge-base --is-ancestor $b $s && g rev-parse $f'
 # Tools builds the flake's dev-profile at the committed toolsRev into $DevProfile, which is also its GC root,
-# then creates the owner credential root (mode 0700) and binds each listed clone's own Git config to the
-# profile's owner helper: helper reset, <repo> and <repo>.git keys, useHttpPath, no redirects, canonical
-# origin and pushurl. No network and no credential content. Exit 6: the profile's owner helper or gh root does
-# not match ghOwner. set -f keeps ? literal in the flake URL.
+# then creates the owner credential root (mode 0700) and binds only the Spec clone (repoPath, cloneUrl), never
+# a PREPARE support clone: helper reset, <repo> and <repo>.git keys naming the profile's owner helper,
+# useHttpPath, no redirects, canonical origin and pushurl. No network and no credential content. Exit 6: the
+# profile's helper or gh root does not match the cloneUrl owner, or the clone's origin is not cloneUrl.
+# set -f keeps ? literal in the flake URL.
 $DevProfile = '/nix/var/nix/profiles/windows-dev'
 $ImagePath = '/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/nix/var/nix/profiles/default/sbin'
-$Bind = 'o=$1; shift; a=/work/repos/.auth; h=$d/bin/git-credential-github-$o; G=$d/bin/git; ' +
+$Bind = 'u=$1; o=${u#https://github.com/}; o=${o%%/*}; a=/work/repos/.auth; h=$d/bin/git-credential-github-$o; G=$d/bin/git; ' +
     'test -x $h && test -x $G || exit 6; case $(cat $d/bin/gh) in *GH_CONFIG_DIR=$a/$o/gh*) ;; *) exit 6;; esac; ' +
+    'case $($G -C $r config --get remote.origin.url) in $u|$u.git) ;; *) exit 6;; esac; ' +
     'install -d -m 700 $a $a/$o $a/$o/gh || exit 1; ' +
-    'while [ $# -ge 2 ]; do c=/work/repos/$1 u=https://github.com/$o/$2; shift 2; ' +
-    '$G -C $c config --replace-all credential.helper '''' || exit 1; ' +
-    'for k in $u $u.git; do $G -C $c config --replace-all credential.$k.helper $h || exit 1; done; ' +
-    '$G -C $c config credential.useHttpPath true && $G -C $c config http.followRedirects false && ' +
-    '$G -C $c config remote.origin.url $u && $G -C $c config --replace-all remote.origin.pushurl $u || exit 1; echo bound $c $u; done'
+    '$G -C $r config --replace-all credential.helper '''' || exit 1; ' +
+    'for k in $u $u.git; do $G -C $r config --replace-all credential.$k.helper $h || exit 1; done; ' +
+    '$G -C $r config credential.useHttpPath true && $G -C $r config http.followRedirects false && ' +
+    '$G -C $r config remote.origin.url $u && $G -C $r config --replace-all remote.origin.pushurl $u || exit 1; echo bound $r $u'
 $Tools = $Seeded + 'set -f; p=$1 r=$2 d=$3; shift 3; ' +
     'nix --extra-experimental-features ''nix-command flakes'' build --profile $d git+file://$r?rev=$p#dev-profile && readlink $d || exit 1; ' + $Bind
 # Run checks the seed marker, then execs the command. With IFS empty and globbing off,
@@ -128,7 +121,7 @@ $Plan = [ordered]@{
     Clone = New-Run @($NixAt, $WorkAt) $Clone @($Spec.image, $Site.gitNixpkgs, $Spec.cloneUrl, $Spec.repoPath, $Site.baseSha)
     Import = New-Run @($NixAt, $WorkAt, "$($Site.repoRoot):$($Spec.repoMount):ro") $Import @(
         $Spec.image, $Site.gitNixpkgs, $Spec.repoPath, $Site.importRef, $Site.importSha, $Site.baseSha, $Spec.repoMount)
-    Tools = New-Run @($NixAt, $WorkAt) $Tools (@($Spec.image, $Site.toolsRev, $Spec.repoPath, $DevProfile, $Site.ghOwner) + $GhRepos)
+    Tools = New-Run @($NixAt, $WorkAt) $Tools @($Spec.image, $Site.toolsRev, $Spec.repoPath, $DevProfile, $Spec.cloneUrl)
     # Run: the profile's tools first on PATH, then the image's own PATH; Git reads no system or global
     # config and never prompts; no ports and no /repo.
     Run = @('run', '--rm', '--pull', 'never') + @(if ($Interactive) { '--interactive'; '--tty' }) +
