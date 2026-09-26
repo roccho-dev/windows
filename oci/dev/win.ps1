@@ -9,6 +9,9 @@ param(
 
     [switch] $Apply,
 
+    # Run only: attach a terminal (wslc --interactive --tty), e.g. for gh auth login.
+    [switch] $Interactive,
+
     # Run only: the container command and its arguments. Call the script with & and put them after --, e.g.
     # & .\win.ps1 -Step Run -Binding <file> -Apply -- nix --version (pwsh -File does not pass them).
     [Parameter(ValueFromRemainingArguments)]
@@ -35,7 +38,8 @@ function Assert-Match([string] $Name, $Value, [string] $Pattern) {
 $Spec = Read-Exact (Join-Path $PSScriptRoot 'spec.json') @(
     'role', 'image', 'labelKey', 'nixMount', 'workMount', 'repoPath', 'repoMount', 'cloneUrl')
 $Site = Read-Exact $Binding @(
-    'role', 'site', 'expectHost', 'nixVolume', 'workVolume', 'repoRoot', 'importRef', 'importSha', 'baseSha', 'gitNixpkgs', 'toolsRev')
+    'role', 'site', 'expectHost', 'nixVolume', 'workVolume', 'repoRoot', 'importRef', 'importSha', 'baseSha', 'gitNixpkgs', 'toolsRev',
+    'ghOwner', 'ghRepos')
 
 if ($Site.role -cne $Spec.role) { throw "Binding role $($Site.role) does not match Spec role $($Spec.role)" }
 Assert-Match 'image' $Spec.image '^nixos/nix@sha256:[a-f0-9]{64}$'
@@ -50,6 +54,15 @@ if ($Site.nixVolume -ceq $Site.workVolume) { throw 'nixVolume and workVolume mus
 Assert-Match 'repoRoot' $Site.repoRoot '^[A-Za-z]:\\[A-Za-z0-9\\._-]+$'
 Assert-Match 'importRef' $Site.importRef '^refs/heads/[A-Za-z0-9._/-]+$'
 foreach ($Name in 'importSha', 'baseSha', 'gitNixpkgs', 'toolsRev') { Assert-Match $Name $Site.$Name '^[a-f0-9]{40}$' }
+Assert-Match 'ghOwner' $Site.ghOwner '^[A-Za-z0-9-]+$'
+# ghRepos maps each clone under workMount to its canonical repository name under ghOwner.
+$GhRepos = @(foreach ($Entry in $Site.ghRepos.PSObject.Properties) {
+    Assert-Match 'ghRepos clone' $Entry.Name '^[a-z0-9][a-z0-9_-]*$'
+    Assert-Match 'ghRepos repository' $Entry.Value '^[A-Za-z0-9._-]+$'
+    $Entry.Name; $Entry.Value
+})
+if ($GhRepos.Count -eq 0) { throw 'ghRepos must name at least one clone.' }
+if ($Interactive -and $Step -ne 'Run') { throw '-Interactive applies to Run only.' }
 if ($env:COMPUTERNAME -ine $Site.expectHost) {
     throw "expected Windows host $($Site.expectHost), found $env:COMPUTERNAME"
 }
@@ -73,12 +86,23 @@ $Clone = $Seeded + 'p=$1 u=$2 r=$3 b=$4; ' + $Git +
 $Import = $Seeded + 'p=$1 r=$2 f=$3 s=$4 b=$5 d=$6; o=; while read -r x x x x t y x; do case $t in $d) o=$y;; esac; done < /proc/self/mountinfo; ' +
     'case ,$o, in *,ro,*) ;; *) exit 5;; esac; ' + $Git +
     'cd $r && g -c safe.directory=$d/.bare fetch --no-tags $d/.bare $f:$f && test $(g rev-parse $f) = $s && g merge-base --is-ancestor $b $s && g rev-parse $f'
-# Tools builds the flake's dev-profile at the committed toolsRev into $DevProfile, which is also its GC root.
-# set -f keeps ? literal in the flake URL.
+# Tools builds the flake's dev-profile at the committed toolsRev into $DevProfile, which is also its GC root,
+# then creates the owner credential root (mode 0700) and binds each listed clone's own Git config to the
+# profile's owner helper: helper reset, <repo> and <repo>.git keys, useHttpPath, no redirects, canonical
+# origin and pushurl. No network and no credential content. Exit 6: the profile's owner helper or gh root does
+# not match ghOwner. set -f keeps ? literal in the flake URL.
 $DevProfile = '/nix/var/nix/profiles/windows-dev'
 $ImagePath = '/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/nix/var/nix/profiles/default/sbin'
-$Tools = $Seeded + 'set -f; p=$1 r=$2 d=$3; ' +
-    'nix --extra-experimental-features ''nix-command flakes'' build --profile $d git+file://$r?rev=$p#dev-profile && readlink $d'
+$Bind = 'o=$1; shift; a=/work/repos/.auth; h=$d/bin/git-credential-github-$o; G=$d/bin/git; ' +
+    'test -x $h && test -x $G || exit 6; case $(cat $d/bin/gh) in *GH_CONFIG_DIR=$a/$o/gh*) ;; *) exit 6;; esac; ' +
+    'install -d -m 700 $a $a/$o $a/$o/gh || exit 1; ' +
+    'while [ $# -ge 2 ]; do c=/work/repos/$1 u=https://github.com/$o/$2; shift 2; ' +
+    '$G -C $c config --replace-all credential.helper '''' || exit 1; ' +
+    'for k in $u $u.git; do $G -C $c config --replace-all credential.$k.helper $h || exit 1; done; ' +
+    '$G -C $c config credential.useHttpPath true && $G -C $c config http.followRedirects false && ' +
+    '$G -C $c config remote.origin.url $u && $G -C $c config --replace-all remote.origin.pushurl $u || exit 1; echo bound $c $u; done'
+$Tools = $Seeded + 'set -f; p=$1 r=$2 d=$3; shift 3; ' +
+    'nix --extra-experimental-features ''nix-command flakes'' build --profile $d git+file://$r?rev=$p#dev-profile && readlink $d || exit 1; ' + $Bind
 # Run checks the seed marker, then execs the command. With IFS empty and globbing off,
 # unquoted $@ keeps each argument as exactly one field (empty arguments are dropped).
 $RunScript = $Seeded + 'set -f; IFS=; exec $@'
@@ -104,16 +128,19 @@ $Plan = [ordered]@{
     Clone = New-Run @($NixAt, $WorkAt) $Clone @($Spec.image, $Site.gitNixpkgs, $Spec.cloneUrl, $Spec.repoPath, $Site.baseSha)
     Import = New-Run @($NixAt, $WorkAt, "$($Site.repoRoot):$($Spec.repoMount):ro") $Import @(
         $Spec.image, $Site.gitNixpkgs, $Spec.repoPath, $Site.importRef, $Site.importSha, $Site.baseSha, $Spec.repoMount)
-    Tools = New-Run @($NixAt, $WorkAt) $Tools @($Spec.image, $Site.toolsRev, $Spec.repoPath, $DevProfile)
-    # Run: the profile's tools first on PATH, then the image's own PATH; no ports and no /repo.
-    Run = @('run', '--rm', '--pull', 'never', '--volume', $NixAt, '--volume', $WorkAt,
-        '--env', "PATH=$DevProfile/bin:$ImagePath", $Spec.image, 'sh', '-c', $RunScript, 'sh', $Spec.image) +
+    Tools = New-Run @($NixAt, $WorkAt) $Tools (@($Spec.image, $Site.toolsRev, $Spec.repoPath, $DevProfile, $Site.ghOwner) + $GhRepos)
+    # Run: the profile's tools first on PATH, then the image's own PATH; Git reads no system or global
+    # config and never prompts; no ports and no /repo.
+    Run = @('run', '--rm', '--pull', 'never') + @(if ($Interactive) { '--interactive'; '--tty' }) +
+        @('--volume', $NixAt, '--volume', $WorkAt, '--env', "PATH=$DevProfile/bin:$ImagePath",
+        '--env', 'GIT_CONFIG_NOSYSTEM=1', '--env', 'GIT_CONFIG_GLOBAL=/dev/null', '--env', 'GIT_TERMINAL_PROMPT=0',
+        $Spec.image, 'sh', '-c', $RunScript, 'sh', $Spec.image) +
         @($Command | Where-Object { $_ })
 }
 
 function Invoke-Wslc([string] $What, [string[]] $Argv) {
     Write-Host "> $What $(ConvertTo-Json -Compress -InputObject $Argv)"
-    & $Wslc @Argv | Write-Host
+    if ($Interactive) { & $Wslc @Argv } else { & $Wslc @Argv | Write-Host }
     $Code = $LASTEXITCODE
     Write-Host "< $What exit $Code $((Get-Date).ToUniversalTime().ToString('o'))"
     if ($Code -ne 0) { throw "$What failed: wslc exit $Code" }
