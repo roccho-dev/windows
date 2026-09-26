@@ -80,6 +80,7 @@
         };
         dev-profile = dev.profile;
         dev-image-draft = dev.imageDraft;
+        dev-auth-candidate = dev.authCandidate;
       };
       # Fails when the own image or its scripts disagree with hosts/own/spec.json.
       checks.${system}.own-spec = pkgs.runCommand "own-spec-check" {
