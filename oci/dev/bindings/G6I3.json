@@ -9,7 +9,7 @@
   "importSha": "6c0b3489cf5fc1c8ece2b2a75a34f48a4acda20f",
   "baseSha": "0b9ffa24749b416fd39bfa49c0682b1f32711f02",
   "gitNixpkgs": "35d3407a3816f3b341d8cf1d60abaf2b7b8166ac",
-  "toolsRev": "e54e40f1f08aa8fe76ef3b99b48f7543e05ea657",
+  "toolsRev": "f65d5b4a9636963dd71376f60b06dd6cdb220175",
   "ghOwner": "roccho-dev",
   "ghRepos": { "windows": "windows", "adrs-g6i3": "adrs" }
 }
