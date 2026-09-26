@@ -6,9 +6,9 @@
   "hostPort": 2223,
   "tunnelPort": 14500,
   "volume": "windows-own-home",
-  "publicKeyFile": "%USERPROFILE%\\.ssh\\id_ed25519_windows_own.pub",
-  "privateKeyFile": "%USERPROFILE%\\.ssh\\id_ed25519_windows_own",
+  "publicKeyFile": "%USERPROFILE%\\.ssh\\id_ed25519_windows_own_wslc.pub",
+  "privateKeyFile": "/work/repos/.auth/ssh/windows-own/id_ed25519",
   "knownHostsFile": "%USERPROFILE%\\.ssh\\known_hosts_windows_own",
-  "image": "ghcr.io/roccho-dev/windows-own@sha256:3a475335c3075a3a2ca131ebffd19790513da82d547396bbafa6a3be0de1dc23",
-  "imageFrom": "roccho-dev/windows run 36095012862 at cc0a405aa6304c79fb520a3bf16d1dffa5acee08; not rebuilt from this branch"
+  "image": "ghcr.io/roccho-dev/windows-own@sha256:7be5c46770dc25227992387cd5ead59f47951bb0b962d49b1c4e907323395586",
+  "imageFrom": "roccho-dev/windows run 36220998798 at 6c0b3489cf5fc1c8ece2b2a75a34f48a4acda20f"
 }
