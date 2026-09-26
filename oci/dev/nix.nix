@@ -17,7 +17,7 @@
   # The tools that the Tools step realizes into /nix/var/nix/profiles/windows-dev.
   profile = pkgs.buildEnv {
     name = "windows-dev";
-    paths = (with pkgs; [ bash coreutils git cacert ]) ++ [ ghWrapper ghCredential ];
+    paths = (with pkgs; [ bash coreutils git cacert openssh ]) ++ [ ghWrapper ghCredential ];
     pathsToLink = [ "/bin" "/etc/ssl" ];
   };
 }
