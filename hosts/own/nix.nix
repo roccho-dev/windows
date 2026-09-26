@@ -42,6 +42,7 @@ let
     <button onclick="show()">show marker</button> marker: <b id="m"></b><br>
     <a href="file://${nav}">navigate</a>
     <script>function show() { document.getElementById('m').textContent = localStorage.getItem('own-marker') || '(none)'; }</script>
+    <div style="height:2400px"></div><p>bottom of own p${n}</p>
     </body>
   '';
   pages = {
