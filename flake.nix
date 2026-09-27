@@ -58,6 +58,7 @@
         mount_opts ${rentState} > /dev/null || fail '${rentState} must be the state volume'
         s=${rentState}/dev
         p=projects/-home-dev
+        same() { if [ -d "$1" ]; then diff -r -q --no-dereference "$1" "$2" > /dev/null 2>&1; else cmp -s "$1" "$2"; fi; }
         pairs=(
           "/old/.claude/.credentials.json|$s/claude/.credentials.json|f"
           "/old/.claude.json|$s/claude.json|f"
@@ -72,22 +73,28 @@
             f) [ -f "$src" ] && [ "$(stat -c '%u %a' "$src")" = '1000 600' ] || fail "$src must be a UID 1000 mode 600 file" ;;
             d) [ -d "$src" ] && [ "$(stat -c %u "$src")" = 1000 ] || fail "$src must be a UID 1000 directory" ;;
           esac
-          # Only rent-start's placeholder may be replaced.
+          # Only rent-start's placeholder, or an identical copy from an interrupted run, may already exist.
           if [ -e "$dst" ] || [ -L "$dst" ]; then
-            [ "$dst" = "$s/claude.json" ] && [ ! -L "$dst" ] && [ "$(cat "$dst")" = '{}' ] || fail "$dst already exists"
+            if [ "$dst" = "$s/claude.json" ] && [ ! -L "$dst" ] && [ "$(cat "$dst")" = '{}' ]; then :
+            elif [ ! -L "$dst" ] && same "$src" "$dst"; then :
+            else fail "$dst already exists and differs from its source"; fi
           fi
         done
         install -d -m 755 -o 0 -g 0 "$s"
         install -d -m 700 -o 1000 -g 1000 "$s/codex" "$s/claude" "$s/claude/projects" "$s/claude/$p"
+        # Each target appears only complete: copy to a .partial name, check it, then rename into place.
         for e in "''${pairs[@]}"; do
           IFS='|' read -r src dst kind <<< "$e"
-          case $kind in
-            f) install -m 600 -o 1000 -g 1000 "$src" "$dst"
-               cmp -s "$src" "$dst" || fail "$dst differs from its source" ;;
-            d) cp -R --no-dereference --preserve=mode,timestamps "$src" "$dst"
-               chown -R -h 1000:1000 "$dst"
-               diff -r -q --no-dereference "$src" "$dst" > /dev/null || fail "$dst differs from its source" ;;
-          esac
+          if ! { [ -e "$dst" ] && same "$src" "$dst"; }; then
+            rm -rf "$dst.partial"
+            case $kind in
+              f) install -m 600 -o 1000 -g 1000 "$src" "$dst.partial" ;;
+              d) cp -R --no-dereference --preserve=mode,timestamps "$src" "$dst.partial"
+                 chown -R -h 1000:1000 "$dst.partial" ;;
+            esac
+            same "$src" "$dst.partial" || fail "$dst.partial differs from its source"
+            mv -T "$dst.partial" "$dst"
+          fi
           echo "imported $dst ($(du -sb "$dst" | cut -f1) bytes)"
         done
       '';

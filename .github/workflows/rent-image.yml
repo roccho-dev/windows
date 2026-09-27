@@ -117,7 +117,11 @@ jobs:
           grep -qF '/old must be mounted read-only' "$key_dir/import"
           state_import :ro > "$key_dir/import"
           if grep -q synthetic "$key_dir/import"; then echo 'import printed file contents' >&2; exit 1; fi
-          if state_import :ro > /dev/null 2>&1; then echo 'import ran twice' >&2; exit 1; fi
+          # An identical rerun (as after an interruption) is a no-op; a differing target is never overwritten.
+          state_import :ro > /dev/null
+          docker run --rm -v rent-smoke-old:/o "$image" /bin/bash -c 'echo changed >> /o/.codex/auth.json'
+          if state_import :ro > "$key_dir/import" 2>&1; then echo 'overwrote a differing target' >&2; exit 1; fi
+          grep -qF 'already exists and differs from its source' "$key_dir/import"
           docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c \
             'shopt -s globstar dotglob; cd /s; for f in **; do stat -c "%a %u %n" "$f"; done' | LC_ALL=C sort > "$key_dir/imported"
           printf '%s\n' '755 0 dev' '700 1000 dev/codex' '600 1000 dev/codex/auth.json' '700 1000 dev/claude' '600 1000 dev/claude.json' '600 1000 dev/claude/.credentials.json' \
