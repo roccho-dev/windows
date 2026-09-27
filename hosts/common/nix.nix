@@ -14,13 +14,22 @@ let
       family = "PlemolJP Console NF";
       package = pkgs.plemoljp-nf;
       directory = "share/fonts/truetype/plemoljp-nf-console";
+      # The font-only NF release omits a standalone license. Retain the
+      # upstream license from the same version; do not weaken the packer gate.
+      licenseSource = pkgs.runCommand "plemoljp-license" {} ''
+        mkdir -p "$out"
+        cp ${pkgs.fetchurl {
+          url = "https://raw.githubusercontent.com/yuru7/PlemolJP/v${pkgs.plemoljp-nf.version}/LICENSE";
+          sha256 = "52bbb5e729acc62435831d20641ece6a919e610100285ba183ef4d7233fb1e9a";
+        }} "$out/LICENSE"
+      '';
     }
   ];
   policy = pkgs.writeText "font-selection.json" (builtins.toJSON (map (choice: {
     inherit (choice) role family;
     inherit (choice.package) version;
     directory = "${choice.package}/${choice.directory}";
-    licenseSource = toString choice.package.src;
+    licenseSource = toString (choice.licenseSource or choice.package.src);
   }) choices));
   python = pkgs.python3.withPackages (ps: [ ps.fonttools ]);
   backend = pkgs.fetchurl {

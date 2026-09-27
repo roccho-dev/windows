@@ -40,6 +40,14 @@ $repair = Run 'Apply'
 if ($repair.copied -ne 1) { throw 'Expected one repaired file.' }
 $null = Run 'Test'
 
+# Registry drift must also fail the native DSC test (exit code alone is not enough).
+$resource = $config.resources[0].properties
+$key = 'Registry::' + ($resource.keyPath -replace '^HKCU\\', 'HKEY_CURRENT_USER\')
+Set-ItemProperty -LiteralPath $key -Name $resource.valueName -Value 'negative-control'
+MustReject { Run 'Test' }
+$null = Run 'Apply'
+$null = Run 'Test'
+
 # Valid JSON with altered bytes still fails the package inventory before effects.
 $path = Join-Path $PSScriptRoot 'configuration.dsc.json'
 $original = [IO.File]::ReadAllBytes($path)
@@ -50,5 +58,5 @@ try {
 finally { [IO.File]::WriteAllBytes($path, $original) }
 $null = Run 'Test'
 [ordered]@{ source = $ExpectedSource; proof = 'PASS'; fonts = $first.fonts;
-    secondApplyChanges = 0; installedDriftRejected = $true; corruptionRejected = $true;
+    secondApplyChanges = 0; installedDriftRejected = $true; registryDriftRejected = $true; corruptionRejected = $true;
     scope = 'current-user file and registry convergence; not rendering or real-host UX' } | ConvertTo-Json
