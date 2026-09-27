@@ -35,12 +35,13 @@ jobs:
             migrate = @($W, 'run', '--rm', '--volume', 'dev-home:/old:ro', '--volume', 'windows-rent-state:/var/lib/rent',
               $Image, '/bin/rent-state-import', '4eba321e-6ade-4815-930d-dfa58b6fc960')
             stateVolumeCreateOnce = @($W, 'volume', 'create', 'windows-rent-state')
+            migrateSourceInspect = @($W, 'container', 'inspect', '-f', 'json', 'envs-dev-mutable')
           }
           foreach ($K in $Want.Keys) {
             if ((@($Plan.$K) -join "`n") -cne ($Want[$K] -join "`n")) { "$K differs: $(@($Plan.$K) -join ' ')"; exit 1 }
           }
           # Refusals before any WSLC call.
-          foreach ($Bad in @(@{ OldHomeVolume = 'repos' }, @{ OldHomeVolume = 'windows-rent-state' }, @{ SessionId = 'not-a-session' },
+          foreach ($Bad in @(@{ OldHomeVolume = 'repos' }, @{ OldHomeVolume = 'windows-rent-state' }, @{ SessionId = 'not-a-session' }, @{ OldContainer = 'windows-rent' },
               @{ Image = 'ghcr.io/roccho-dev/windows-rent:latest' })) {
             $Refused = $false
             $Args2 = $Base.Clone(); foreach ($K in $Bad.Keys) { $Args2[$K] = $Bad[$K] }
@@ -48,9 +49,9 @@ jobs:
             if (-not $Refused) { "not refused: $($Bad | ConvertTo-Json -Compress)"; exit 1 }
           }
           # Replace/Migrate shape guards, taken from the script itself, on synthetic inspect objects.
-          $ReposVolume = 'repos'; $StateVolume = 'windows-rent-state'
+          $ReposVolume = 'repos'; $StateVolume = 'windows-rent-state'; $OldContainer = 'envs-dev-mutable'; $OldHomeVolume = 'dev-home'
           foreach ($N in $Ast.FindAll({ param($n)
-              ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Test-OldShape', 'Test-NewShape') -or
+              ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Test-OldShape', 'Test-NewShape', 'Get-OldSourceProblem') -or
               ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in '$OldImage', '$Mounts') }, $true)) {
             . ([scriptblock]::Create($N.Extent.Text))
           }
@@ -67,6 +68,25 @@ jobs:
           )
           foreach ($C in $Cases) {
             if ((Test-OldShape $C.Item) -ne $C.Old -or (Test-NewShape $C.Item) -ne $C.New) { $C.Item | ConvertTo-Json -Depth 4; exit 1 }
+          }
+          # Migrate source guard on synthetic inspect JSON: only an existing, stopped envs-dev-mutable with dev-home at /home/dev.
+          $HomeMount = '{"Type":"volume","Name":"dev-home","Destination":"/home/dev"}'
+          $Sources = [ordered]@{
+            'stopped valid' = @{ Ok = $true; Json = '{"Name":"/envs-dev-mutable","State":{"Running":false,"Status":"exited"},"Mounts":[' + $HomeMount + ',{"Type":"volume","Name":"repos","Destination":"/work/repos"}]}' }
+            'missing' = @{ Ok = $false; Json = $null }
+            'running' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":true,"Status":"running"},"Mounts":[' + $HomeMount + ']}' }
+            'status running' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":false,"Status":"running"},"Mounts":[' + $HomeMount + ']}' }
+            'no state' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","Mounts":[' + $HomeMount + ']}' }
+            'string state' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":"false"},"Mounts":[' + $HomeMount + ']}' }
+            'wrong container' = @{ Ok = $false; Json = '{"Name":"windows-rent","State":{"Running":false},"Mounts":[' + $HomeMount + ']}' }
+            'no mounts' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":false},"Mounts":[]}' }
+            'other home volume' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":false},"Mounts":[{"Type":"volume","Name":"other","Destination":"/home/dev"}]}' }
+            'bind home' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":false},"Mounts":[{"Type":"bind","Name":"dev-home","Destination":"/home/dev"}]}' }
+          }
+          foreach ($K in $Sources.Keys) {
+            $Item = if ($Sources[$K].Json) { $Sources[$K].Json | ConvertFrom-Json } else { $null }
+            $Problem = Get-OldSourceProblem $Item
+            if ([bool] (-not $Problem) -ne $Sources[$K].Ok) { "source guard wrong for '$K': $Problem"; exit 1 }
           }
       - uses: cachix/install-nix-action@v31
       - name: Build from locked Nix inputs

@@ -25,6 +25,9 @@ param(
     # Migrate only: the old home is mounted read-only into a one-shot --rm helper, never into the rent container.
     [ValidatePattern('^[a-z0-9][a-z0-9-]+$')]
     [string] $OldHomeVolume = 'dev-home',
+    # Migrate only: the old runtime that owns the old home; it must exist, be stopped, and mount it at /home/dev.
+    [ValidatePattern('^[a-z0-9][a-z0-9-]+$')]
+    [string] $OldContainer = 'envs-dev-mutable',
     [ValidatePattern('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')]
     [string] $SessionId = '4eba321e-6ade-4815-930d-dfa58b6fc960',
     [switch] $Apply
@@ -42,6 +45,7 @@ $OldImage = 'ghcr.io/roccho-dev/windows-rent@sha256:da1393586b2e847c7508038675be
 # Exactly these two named volumes; never the old home volume.
 $Mounts = [ordered]@{ '/work/repos' = $ReposVolume; '/var/lib/rent' = $StateVolume }
 if (@($Mounts.Values) -ccontains $OldHomeVolume) { throw "The old home volume $OldHomeVolume must not be repos or state." }
+if ($OldContainer -ceq $Container) { throw "The old container $OldContainer must not be $Container." }
 
 # Old shape: no mounts reported and exactly the old image.
 function Test-OldShape($Item) {
@@ -62,13 +66,32 @@ function Test-NewShape($Item) {
     return $true
 }
 
-function Get-Container {
-    $Current = (& $Wslc container inspect -f json $Container) -join "`n"
+# Migrate source: why the inspected old runtime is not provably the stopped owner of the old home, or $null.
+function Get-OldSourceProblem($Item) {
+    if (-not $Item) { return "Source container $OldContainer is missing." }
+    if (([string] $Item.Name).TrimStart('/') -cne $OldContainer) { return "Inspect did not return $OldContainer." }
+    $Running = $Item.State.Running
+    if ($Running -isnot [bool]) { return "State of $OldContainer is unreadable." }
+    if ($Running -or ([string] $Item.State.Status) -ceq 'running') { return "$OldContainer is running." }
+    $AtHome = @(@($Item.Mounts) | Where-Object { $_ -and ([string] $_.Destination) -ceq '/home/dev' })
+    if ($AtHome.Count -ne 1 -or ([string] $AtHome[0].Type) -cne 'volume' -or ([string] $AtHome[0].Name) -cne $OldHomeVolume) {
+        return "$OldContainer does not provably mount volume $OldHomeVolume at /home/dev."
+    }
+    return $null
+}
+
+function Get-Container([string] $Name) {
+    $Current = (& $Wslc container inspect -f json $Name) -join "`n"
     if ($LASTEXITCODE -ne 0) { return $null }
     $Parsed = $Current | ConvertFrom-Json
     $Items = @($Parsed)
-    if ($Items.Count -ne 1) { throw "Expected one container named $Container." }
+    if ($Items.Count -ne 1) { throw "Expected one container named $Name." }
     return $Items[0]
+}
+
+function Assert-OldSourceStopped {
+    $Problem = Get-OldSourceProblem (Get-Container $OldContainer)
+    if ($Problem) { throw "$Problem Not migrating." }
 }
 
 if ($Step -in @('Plan', 'Pull', 'Create', 'Replace', 'Migrate')) {
@@ -98,7 +121,8 @@ if ($Step -eq 'Plan') {
         replaceAccepts = "exactly $OldImage with no mounts, or exactly $($ReposVolume):/work/repos and $($StateVolume):/var/lib/rent"
         replaceStop = @($Wslc, 'stop', $Container)
         replaceRemove = @($Wslc, 'remove', $Container)
-        migrateAccepts = "$Container absent or still the old shape, after the old runtime stopped using session $SessionId"
+        migrateAccepts = "$OldContainer exists, is not running, and mounts volume $OldHomeVolume at /home/dev (checked before and right before the helper); $Container absent or still the old shape"
+        migrateSourceInspect = @($Wslc, 'container', 'inspect', '-f', 'json', $OldContainer)
         migrate = @($Wslc) + $MigrateArgs
     } | ConvertTo-Json -Depth 3
     exit 0
@@ -129,16 +153,17 @@ if ($Step -eq 'LogonTask') {
 }
 
 if ($Step -eq 'Migrate') {
+    Assert-OldSourceStopped
     & $Wslc volume inspect $OldHomeVolume | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Old home volume is missing: $OldHomeVolume" }
-    $Item = Get-Container
+    $Item = Get-Container $Container
     if ($Item -and -not (Test-OldShape $Item)) { throw "Container $Container already uses the new shape; not migrating." }
 } else {
     # Create and Replace: repos must already exist (never create an empty one).
     & $Wslc volume inspect $ReposVolume | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Repos volume is missing: $ReposVolume" }
     if ($Step -eq 'Replace') {
-        $Item = Get-Container
+        $Item = Get-Container $Container
         if (-not $Item) { throw "Container to replace is missing: $Container" }
         if (-not ((Test-OldShape $Item) -or (Test-NewShape $Item))) {
             throw "Container $Container is neither the old $OldImage shape nor the two-volume shape; not replacing."
@@ -153,7 +178,8 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 if ($Step -eq 'Migrate') {
-    # One-shot helper removed by --rm; nothing is deleted from the old home.
+    # Recheck right before the helper; one-shot helper removed by --rm; nothing is deleted from the old home.
+    Assert-OldSourceStopped
     & $Wslc @MigrateArgs
     if ($LASTEXITCODE -ne 0) { throw "WSLC migrate helper failed: $LASTEXITCODE" }
     exit 0
