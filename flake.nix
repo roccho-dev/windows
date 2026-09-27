@@ -112,7 +112,7 @@
         # Nonblocking; no auth key: on first run this prints the login URL for a later browser login.
         tailscale --socket=${rentTsSocket} up --ssh --hostname="$RENT_TS_HOSTNAME" &
         up_pid=$!
-        sshd -D -e -f ${sshConfig} &
+        ${pkgs.openssh}/bin/sshd -D -e -f ${sshConfig} &
         sshd_pid=$!
         status=0
         wait -n "$ts_pid" "$sshd_pid" || status=$?
