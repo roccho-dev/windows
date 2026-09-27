@@ -37,15 +37,15 @@
         export DISABLE_AUTOUPDATER=1
         exec ${pkgs.glibc}/lib/ld-linux-x86-64.so.2 --library-path ${pkgs.glibc}/lib ${claudeBin} "$@"
       '';
-      # Later one-time import of exactly one Claude account and one session from an old home mounted read-only
-      # at /old into the state volume. Never run by rent-start; prints target names and sizes only.
-      claudeImport = pkgs.writeShellScriptBin "rent-claude-import" ''
+      # Later one-time import of exactly one Claude account and session, plus Codex auth, from an old home mounted
+      # read-only at /old into the state volume. Never run by rent-start; prints target names and sizes only.
+      stateImport = pkgs.writeShellScriptBin "rent-state-import" ''
         set -eu
         export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.diffutils ]}
-        fail() { echo "rent-claude-import: $*" >&2; exit 1; }
+        fail() { echo "rent-state-import: $*" >&2; exit 1; }
         id=''${1:-}
         [[ $id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] ||
-          fail 'usage: rent-claude-import <session-uuid>'
+          fail 'usage: rent-state-import <session-uuid>'
         mount_opts() {
           local _id _parent _dev _root mp opts _rest
           while read -r _id _parent _dev _root mp opts _rest; do
@@ -63,6 +63,7 @@
           "/old/.claude.json|$s/claude.json|f"
           "/old/.claude/$p/$id.jsonl|$s/claude/$p/$id.jsonl|f"
           "/old/.claude/$p/$id|$s/claude/$p/$id|d"
+          "/old/.codex/auth.json|$s/codex/auth.json|f"
         )
         for e in "''${pairs[@]}"; do
           IFS='|' read -r src dst kind <<< "$e"
@@ -77,7 +78,7 @@
           fi
         done
         install -d -m 755 -o 0 -g 0 "$s"
-        install -d -m 700 -o 1000 -g 1000 "$s/claude" "$s/claude/projects" "$s/claude/$p"
+        install -d -m 700 -o 1000 -g 1000 "$s/codex" "$s/claude" "$s/claude/projects" "$s/claude/$p"
         for e in "''${pairs[@]}"; do
           IFS='|' read -r src dst kind <<< "$e"
           case $kind in
@@ -93,7 +94,7 @@
       devTools = pkgs.buildEnv {
         name = "rent-dev-tools";
         paths = (with pkgs; [ coreutils git openssh gh tailscale ])
-          ++ [ (import ./hosts/own/codex.nix { inherit pkgs; }) claude claudeImport ];
+          ++ [ (import ./hosts/own/codex.nix { inherit pkgs; }) claude stateImport ];
         pathsToLink = [ "/bin" ];
       };
       sshConfig = pkgs.writeText "rent-sshd-config" (import ./hosts/rent/nix.nix {

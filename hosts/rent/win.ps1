@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Pull', 'Create', 'Replace', 'LogonTask')]
+    [ValidateSet('Plan', 'Pull', 'Create', 'Replace', 'Migrate', 'LogonTask')]
     [string] $Step,
 
     [Parameter(Mandatory)]
@@ -22,6 +22,11 @@ param(
     [ValidatePattern('^[a-z0-9][a-z0-9-]+$')]
     [string] $TsHostname = 'pc7337-windows-rent',
     [string] $PublicKeyFile,
+    # Migrate only: the old home is mounted read-only into a one-shot --rm helper, never into the rent container.
+    [ValidatePattern('^[a-z0-9][a-z0-9-]+$')]
+    [string] $OldHomeVolume = 'dev-home',
+    [ValidatePattern('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')]
+    [string] $SessionId = '4eba321e-6ade-4815-930d-dfa58b6fc960',
     [switch] $Apply
 )
 
@@ -30,12 +35,13 @@ if ($env:COMPUTERNAME -ine $ExpectHost) {
     throw "expected Windows host $ExpectHost, found $env:COMPUTERNAME"
 }
 $Wslc = 'C:\Program Files\WSL\wslc.exe'
-if (-not (Test-Path -LiteralPath $Wslc)) { throw "WSLC is missing: $Wslc" }
+if ($Step -ne 'Plan' -and -not (Test-Path -LiteralPath $Wslc)) { throw "WSLC is missing: $Wslc" }
 
 # The only pre-state image Replace may remove: the published rent image that kept /home/dev on a volume.
 $OldImage = 'ghcr.io/roccho-dev/windows-rent@sha256:da1393586b2e847c7508038675be8701c185b77be777ef1492689d4c604185ce'
 # Exactly these two named volumes; never the old home volume.
 $Mounts = [ordered]@{ '/work/repos' = $ReposVolume; '/var/lib/rent' = $StateVolume }
+if (@($Mounts.Values) -ccontains $OldHomeVolume) { throw "The old home volume $OldHomeVolume must not be repos or state." }
 
 # Old shape: no mounts reported and exactly the old image.
 function Test-OldShape($Item) {
@@ -56,15 +62,46 @@ function Test-NewShape($Item) {
     return $true
 }
 
-if ($Step -in @('Pull', 'Create', 'Replace')) {
+function Get-Container {
+    $Current = (& $Wslc container inspect -f json $Container) -join "`n"
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $Parsed = $Current | ConvertFrom-Json
+    $Items = @($Parsed)
+    if ($Items.Count -ne 1) { throw "Expected one container named $Container." }
+    return $Items[0]
+}
+
+if ($Step -in @('Plan', 'Pull', 'Create', 'Replace', 'Migrate')) {
     if ($Image -cnotmatch '^ghcr\.io/roccho-dev/windows-rent@sha256:[a-f0-9]{64}$') {
         throw 'Provide the CI image by exact GHCR digest.'
     }
 }
+$Key = "<contents of $PublicKeyFile>"
 if ($Step -in @('Create', 'Replace')) {
     if (-not $PublicKeyFile) { throw 'Provide a public key file.' }
     $Key = (Get-Content -LiteralPath $PublicKeyFile -Raw).Trim()
     if ($Key -notmatch '^ssh-ed25519 [A-Za-z0-9+/=]+(?: .*)?$') { throw 'Expected one ed25519 public key.' }
+}
+
+$RunArgs = @('run', '--name', $Container, '--detach', '--publish', "127.0.0.1:${Port}:2222")
+foreach ($Target in $Mounts.Keys) { $RunArgs += @('--volume', "$($Mounts[$Target]):$Target") }
+$RunArgs += @('--env', "RENT_TS_HOSTNAME=$TsHostname", '--env', "RENT_AUTHORIZED_KEY=$Key", $Image)
+$MigrateArgs = @('run', '--rm', '--volume', "${OldHomeVolume}:/old:ro", '--volume', "${StateVolume}:/var/lib/rent",
+    $Image, '/bin/rent-state-import', $SessionId)
+
+if ($Step -eq 'Plan') {
+    # Exact argv for every live step; touches nothing.
+    [ordered]@{
+        pull = @($Wslc, 'pull', $Image)
+        stateVolumeCreateOnce = @($Wslc, 'volume', 'create', $StateVolume)
+        create = @($Wslc) + $RunArgs
+        replaceAccepts = "exactly $OldImage with no mounts, or exactly $($ReposVolume):/work/repos and $($StateVolume):/var/lib/rent"
+        replaceStop = @($Wslc, 'stop', $Container)
+        replaceRemove = @($Wslc, 'remove', $Container)
+        migrateAccepts = "$Container absent or still the old shape, after the old runtime stopped using session $SessionId"
+        migrate = @($Wslc) + $MigrateArgs
+    } | ConvertTo-Json -Depth 3
+    exit 0
 }
 
 Write-Host "$Step on $env:COMPUTERNAME / $Container / TCP $Port"
@@ -91,17 +128,21 @@ if ($Step -eq 'LogonTask') {
     exit 0
 }
 
-# Create and Replace: repos must already exist (never create an empty one); state is created once.
-& $Wslc volume inspect $ReposVolume | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Repos volume is missing: $ReposVolume" }
-
-if ($Step -eq 'Replace') {
-    $Current = (& $Wslc container inspect -f json $Container) -join "`n"
-    if ($LASTEXITCODE -ne 0) { throw "Container to replace is missing: $Container" }
-    $Parsed = $Current | ConvertFrom-Json
-    $Items = @($Parsed)
-    if ($Items.Count -ne 1 -or -not ((Test-OldShape $Items[0]) -or (Test-NewShape $Items[0]))) {
-        throw "Container $Container is neither the old $OldImage shape nor the two-volume shape; not replacing."
+if ($Step -eq 'Migrate') {
+    & $Wslc volume inspect $OldHomeVolume | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Old home volume is missing: $OldHomeVolume" }
+    $Item = Get-Container
+    if ($Item -and -not (Test-OldShape $Item)) { throw "Container $Container already uses the new shape; not migrating." }
+} else {
+    # Create and Replace: repos must already exist (never create an empty one).
+    & $Wslc volume inspect $ReposVolume | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Repos volume is missing: $ReposVolume" }
+    if ($Step -eq 'Replace') {
+        $Item = Get-Container
+        if (-not $Item) { throw "Container to replace is missing: $Container" }
+        if (-not ((Test-OldShape $Item) -or (Test-NewShape $Item))) {
+            throw "Container $Container is neither the old $OldImage shape nor the two-volume shape; not replacing."
+        }
     }
 }
 
@@ -109,6 +150,13 @@ if ($Step -eq 'Replace') {
 if ($LASTEXITCODE -ne 0) {
     & $Wslc volume create $StateVolume
     if ($LASTEXITCODE -ne 0) { throw "WSLC volume create failed: $LASTEXITCODE" }
+}
+
+if ($Step -eq 'Migrate') {
+    # One-shot helper removed by --rm; nothing is deleted from the old home.
+    & $Wslc @MigrateArgs
+    if ($LASTEXITCODE -ne 0) { throw "WSLC migrate helper failed: $LASTEXITCODE" }
+    exit 0
 }
 
 if ($Step -eq 'Replace') {
@@ -123,8 +171,5 @@ if ($Step -eq 'Replace') {
     }
 }
 
-$RunArgs = @('run', '--name', $Container, '--detach', '--publish', "127.0.0.1:${Port}:2222")
-foreach ($Target in $Mounts.Keys) { $RunArgs += @('--volume', "$($Mounts[$Target]):$Target") }
-$RunArgs += @('--env', "RENT_TS_HOSTNAME=$TsHostname", '--env', "RENT_AUTHORIZED_KEY=$Key", $Image)
 & $Wslc @RunArgs
 if ($LASTEXITCODE -ne 0) { throw "WSLC run failed: $LASTEXITCODE" }

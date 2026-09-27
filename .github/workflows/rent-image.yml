@@ -13,12 +13,61 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - name: Parse the Windows script
+      - name: Parse and dry-plan the Windows script (no WSLC, no live effect)
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $Path = "$PWD/hosts/rent/win.ps1"
           $Errors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/hosts/rent/win.ps1", [ref] $null, [ref] $Errors) | Out-Null
+          $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref] $null, [ref] $Errors)
           if ($Errors) { $Errors; exit 1 }
+          $env:COMPUTERNAME = 'CI-HOST'
+          $Image = 'ghcr.io/roccho-dev/windows-rent@sha256:' + ('0' * 64)
+          $Base = @{ Step = 'Plan'; ExpectHost = 'CI-HOST'; Container = 'windows-rent'; Port = 2222; Image = $Image; PublicKeyFile = 'ci.pub' }
+          $Plan = (& $Path @Base) | ConvertFrom-Json
+          $W = 'C:\Program Files\WSL\wslc.exe'
+          $Want = [ordered]@{
+            create = @($W, 'run', '--name', 'windows-rent', '--detach', '--publish', '127.0.0.1:2222:2222',
+              '--volume', 'repos:/work/repos', '--volume', 'windows-rent-state:/var/lib/rent',
+              '--env', 'RENT_TS_HOSTNAME=pc7337-windows-rent', '--env', 'RENT_AUTHORIZED_KEY=<contents of ci.pub>', $Image)
+            replaceStop = @($W, 'stop', 'windows-rent')
+            replaceRemove = @($W, 'remove', 'windows-rent')
+            migrate = @($W, 'run', '--rm', '--volume', 'dev-home:/old:ro', '--volume', 'windows-rent-state:/var/lib/rent',
+              $Image, '/bin/rent-state-import', '4eba321e-6ade-4815-930d-dfa58b6fc960')
+            stateVolumeCreateOnce = @($W, 'volume', 'create', 'windows-rent-state')
+          }
+          foreach ($K in $Want.Keys) {
+            if ((@($Plan.$K) -join "`n") -cne ($Want[$K] -join "`n")) { "$K differs: $(@($Plan.$K) -join ' ')"; exit 1 }
+          }
+          # Refusals before any WSLC call.
+          foreach ($Bad in @(@{ OldHomeVolume = 'repos' }, @{ OldHomeVolume = 'windows-rent-state' }, @{ SessionId = 'not-a-session' },
+              @{ Image = 'ghcr.io/roccho-dev/windows-rent:latest' })) {
+            $Refused = $false
+            $Args2 = $Base.Clone(); foreach ($K in $Bad.Keys) { $Args2[$K] = $Bad[$K] }
+            try { & $Path @Args2 | Out-Null } catch { $Refused = $true }
+            if (-not $Refused) { "not refused: $($Bad | ConvertTo-Json -Compress)"; exit 1 }
+          }
+          # Replace/Migrate shape guards, taken from the script itself, on synthetic inspect objects.
+          $ReposVolume = 'repos'; $StateVolume = 'windows-rent-state'
+          foreach ($N in $Ast.FindAll({ param($n)
+              ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Test-OldShape', 'Test-NewShape') -or
+              ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in '$OldImage', '$Mounts') }, $true)) {
+            . ([scriptblock]::Create($N.Extent.Text))
+          }
+          function V($Name, $Target) { [pscustomobject]@{ Type = 'volume'; Name = $Name; Destination = $Target } }
+          $Two = @((V repos /work/repos), (V windows-rent-state /var/lib/rent))
+          $Cases = @(
+            @{ Old = $true; New = $false; Item = [pscustomobject]@{ Image = $OldImage; Mounts = @() } },
+            @{ Old = $true; New = $false; Item = [pscustomobject]@{ Config = [pscustomobject]@{ Image = $OldImage }; Mounts = $null } },
+            @{ Old = $false; New = $false; Item = [pscustomobject]@{ Image = $OldImage; Mounts = @((V dev-home /home/dev)) } },
+            @{ Old = $false; New = $false; Item = [pscustomobject]@{ Image = $Image; Mounts = @() } },
+            @{ Old = $false; New = $true; Item = [pscustomobject]@{ Image = $Image; Mounts = $Two } },
+            @{ Old = $false; New = $false; Item = [pscustomobject]@{ Image = $Image; Mounts = $Two + @((V dev-home /home/dev)) } },
+            @{ Old = $false; New = $false; Item = [pscustomobject]@{ Image = $Image; Mounts = @((V repos /work/repos), (V other /var/lib/rent)) } }
+          )
+          foreach ($C in $Cases) {
+            if ((Test-OldShape $C.Item) -ne $C.Old -or (Test-NewShape $C.Item) -ne $C.New) { $C.Item | ConvertTo-Json -Depth 4; exit 1 }
+          }
       - uses: cachix/install-nix-action@v31
       - name: Build from locked Nix inputs
         run: nix build .#rent-image --no-write-lock-file --print-build-logs
@@ -52,26 +101,26 @@ jobs:
           refuse '/home/dev must not be a mount' -v rent-smoke-repos:/work/repos -v rent-smoke-state:/var/lib/rent \
             -v rent-smoke-home:/home/dev
 
-          # Later Claude import, synthetic files only: exactly four paths from a read-only old home, gated and once.
+          # Later state import, synthetic files only: exact Claude and Codex auth/session paths from a read-only old home, once.
           sid=00000000-0000-4000-8000-000000000000
           docker volume create rent-smoke-old
           docker volume create rent-smoke-import
           docker run --rm -v rent-smoke-old:/o "$image" /bin/bash -c "set -eu
             p=/o/.claude/projects/-home-dev
-            mkdir -p \$p/$sid/subagents \$p/other /o/.ssh
+            mkdir -p \$p/$sid/subagents \$p/other /o/.ssh /o/.codex
             for f in /o/.claude/.credentials.json /o/.claude.json \$p/$sid.jsonl \$p/$sid/subagents/a.jsonl \
-              /o/.claude/history.jsonl /o/.ssh/id_synthetic \$p/other.jsonl; do echo \"synthetic \$f\" > \$f; done
+              /o/.claude/history.jsonl /o/.ssh/id_synthetic \$p/other.jsonl /o/.codex/auth.json /o/.codex/history.jsonl; do echo \"synthetic \$f\" > \$f; done
             chown -R 1000:1000 /o
-            chmod 600 /o/.claude/.credentials.json /o/.claude.json \$p/$sid.jsonl"
-          claude_import() { docker run --rm -v "rent-smoke-old:/old$1" -v rent-smoke-import:/var/lib/rent "$image" /bin/rent-claude-import "$sid"; }
-          if claude_import '' > "$key_dir/import" 2>&1; then echo 'imported from a writable old home' >&2; exit 1; fi
+            chmod 600 /o/.claude/.credentials.json /o/.claude.json \$p/$sid.jsonl /o/.codex/auth.json"
+          state_import() { docker run --rm -v "rent-smoke-old:/old$1" -v rent-smoke-import:/var/lib/rent "$image" /bin/rent-state-import "$sid"; }
+          if state_import '' > "$key_dir/import" 2>&1; then echo 'imported from a writable old home' >&2; exit 1; fi
           grep -qF '/old must be mounted read-only' "$key_dir/import"
-          claude_import :ro > "$key_dir/import"
+          state_import :ro > "$key_dir/import"
           if grep -q synthetic "$key_dir/import"; then echo 'import printed file contents' >&2; exit 1; fi
-          if claude_import :ro > /dev/null 2>&1; then echo 'import ran twice' >&2; exit 1; fi
+          if state_import :ro > /dev/null 2>&1; then echo 'import ran twice' >&2; exit 1; fi
           docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c \
             'shopt -s globstar dotglob; cd /s; for f in **; do stat -c "%a %u %n" "$f"; done' | LC_ALL=C sort > "$key_dir/imported"
-          printf '%s\n' '755 0 dev' '700 1000 dev/claude' '600 1000 dev/claude.json' '600 1000 dev/claude/.credentials.json' \
+          printf '%s\n' '755 0 dev' '700 1000 dev/codex' '600 1000 dev/codex/auth.json' '700 1000 dev/claude' '600 1000 dev/claude.json' '600 1000 dev/claude/.credentials.json' \
             '700 1000 dev/claude/projects' '700 1000 dev/claude/projects/-home-dev' \
             "755 1000 dev/claude/projects/-home-dev/$sid" "600 1000 dev/claude/projects/-home-dev/$sid.jsonl" \
             "755 1000 dev/claude/projects/-home-dev/$sid/subagents" "644 1000 dev/claude/projects/-home-dev/$sid/subagents/a.jsonl" |
