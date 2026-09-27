@@ -172,6 +172,8 @@ jobs:
             if ($Got -notlike $Case.Want -or ($Calls -join "`n") -cne ($Case.Calls -join "`n")) { "recovery '$K' gave: $Got"; $Calls; exit 1 }
             if (@($Calls) -cmatch '(^| )(-f|-v|--force|--volumes)( |$)|^volume (remove|rm|prune)') { "recovery '$K' used a forbidden flag"; exit 1 }
           }
+          # The fake's last exit code must not become this step's exit code.
+          $global:LASTEXITCODE = 0
       - uses: cachix/install-nix-action@v31
       - name: Build from locked Nix inputs
         run: nix build .#rent-image --no-write-lock-file --print-build-logs
