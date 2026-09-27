@@ -1,3 +1,4 @@
+#Requires -Version 7
 param(
     [Parameter(Mandatory)]
     [ValidateSet('Plan', 'Pull', 'Create', 'Replace', 'Migrate', 'LogonTask')]
@@ -39,6 +40,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# WSLC exit codes are checked explicitly and never throw, so no failure can skip a recovery step.
+$PSNativeCommandUseErrorActionPreference = $false
 if ($env:COMPUTERNAME -ine $ExpectHost) {
     throw "expected Windows host $ExpectHost, found $env:COMPUTERNAME"
 }
@@ -151,8 +154,9 @@ if ($Step -eq 'Plan') {
         replaceAccepts = "$Container on exactly $OldImage or $Image (inspect name and image only), with a pre-recorded rollback argv"
         replaceStop = @($Wslc, 'stop', $Container)
         replaceRemove = @($Wslc, 'remove', $Container)
-        postGate = "within 60 s: $Container Running and its log has the line '$Proof'; otherwise Replace rolls back"
+        postGate = "within 60 s: $Container Running and its log has the line '$Proof'. Any failure after replaceStop rolls back and Replace still fails: rollbackStart if the old container was never removed, else replaceStop and replaceRemove of only the new container, then the -RollbackArgvFile argv"
         postGateLogs = @($Wslc, 'logs', $Container)
+        rollbackStart = @($Wslc, 'start', $Container)
         migrateAccepts = "$OldContainer exists, is stopped, and is exactly $OldImageSource (checked before and right before the helper); every other container except $Container is stopped; $Container absent or exactly $OldImage"
         migrateSourceInspect = @($Wslc, 'inspect', $OldContainer)
         migrateContainerList = @($Wslc) + $ListArgs
@@ -233,36 +237,74 @@ if ($Step -eq 'Migrate') {
     exit 0
 }
 
-if ($Step -eq 'Replace') {
-    # Container only: no -f, no -v; every volume, including the old home volume, is kept.
-    & $Wslc stop $Container
-    if ($LASTEXITCODE -ne 0) { throw "WSLC stop failed: $LASTEXITCODE" }
-    & $Wslc remove $Container
-    if ($LASTEXITCODE -ne 0) { throw "WSLC remove failed: $LASTEXITCODE" }
-    foreach ($Volume in $Mounts.Values) {
-        & $Wslc volume inspect $Volume | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "Volume lost after remove: $Volume" }
+# Create/Replace outcome: Running and rent-start's fixed mount proof in its log, polled for 60 s.
+function Wait-RunningProof {
+    for ($Second = 0; $Second -lt 60; $Second++) {
+        Start-Sleep -Seconds 1
+        if (Test-RunningProof (Get-Container $Container) @(& $Wslc logs $Container 2>$null)) { return $true }
     }
+    return $false
 }
 
-& $Wslc @RunArgs
-$RunCode = $LASTEXITCODE
-$Proven = $false
-if ($RunCode -eq 0) {
-    for ($Second = 0; $Second -lt 60 -and -not $Proven; $Second++) {
-        Start-Sleep -Seconds 1
-        $Proven = Test-RunningProof (Get-Container $Container) @(& $Wslc logs $Container 2>$null)
+# Replace rollback: start the old container if it was never removed; otherwise remove only the partial new
+# container (no -f, no -v) and run only the recorded argv. Every step and exit is appended to $Steps.
+function Invoke-Rollback($Argv, $Old, [bool] $Removed, $Steps) {
+    try {
+        $Now = Get-Container $Container
+        $State = if (-not $Now) { 'absent' } elseif ("$(Get-Images $Now)" -ceq "$(Get-Images $Old)") { 'present, same image' } else { 'present, other image' }
+    } catch { $State = "unknown ($($_.Exception.Message))" }
+    $Steps.Add("inspect: $State")
+    if (-not $Removed -and $State -ne 'absent') {
+        if ($State -eq 'present, other image') { $Steps.Add('not the old container; left untouched'); return $false }
+        & $Wslc start $Container | Out-Host
+        $Steps.Add("start old exit $LASTEXITCODE")
+        if ($LASTEXITCODE -eq 0) { return $true }
+        if ($State -eq 'present, same image') { return $false }
+    } elseif ($Removed -and $State -ne 'absent') {
+        & $Wslc stop $Container | Out-Host
+        $Steps.Add("stop new exit $LASTEXITCODE")
+        & $Wslc remove $Container | Out-Host
+        $Steps.Add("remove new exit $LASTEXITCODE")
     }
+    & $Wslc @Argv | Out-Host
+    $Steps.Add("recorded argv exit $LASTEXITCODE")
+    return ($LASTEXITCODE -eq 0)
 }
-if ($Proven) { Write-Output $Proof; exit 0 }
+
+# Replace after a successful stop: one guarded path through the post-gate. Any failure or exception rolls back,
+# and Replace still fails, reporting both outcomes.
+function Complete-Replace($Rollback, $Old) {
+    $Removed = $false
+    try {
+        # Container only: no -f, no -v; every volume, including the old home volume, is kept.
+        & $Wslc remove $Container | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "WSLC remove failed: $LASTEXITCODE" }
+        $Removed = $true
+        foreach ($Volume in $Mounts.Values) {
+            & $Wslc volume inspect $Volume | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Volume lost after remove: $Volume" }
+        }
+        & $Wslc @RunArgs | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "WSLC run failed: $LASTEXITCODE" }
+        if (Wait-RunningProof) { return }
+        throw "New $Container did not show Running and '$Proof' within 60 s."
+    } catch {
+        $Failure = $_.Exception.Message
+    }
+    $Steps = [System.Collections.Generic.List[string]]::new()
+    try { $Ok = Invoke-Rollback $Rollback $Old $Removed $Steps } catch { $Ok = $false; $Steps.Add("error: $($_.Exception.Message)") }
+    $Outcome = if ($Ok) { 'succeeded' } else { 'FAILED' }
+    throw "Replace failed: $Failure | rollback ${Outcome}: $($Steps -join '; ')"
+}
+
 if ($Step -eq 'Replace') {
-    # Only the pre-recorded argv; every volume is kept.
-    if (Get-Container $Container) {
-        & $Wslc stop $Container | Out-Null
-        & $Wslc remove $Container
-        if ($LASTEXITCODE -ne 0) { throw "New $Container failed its post-gate and could not be removed; not rolling back." }
-    }
-    & $Wslc @Rollback
-    throw "New $Container failed its post-gate (run exit $RunCode); rolled back with the pre-recorded argv (exit $LASTEXITCODE)."
+    & $Wslc stop $Container
+    if ($LASTEXITCODE -ne 0) { throw "WSLC stop failed: $LASTEXITCODE" }
+    Complete-Replace $Rollback $Item
+} else {
+    & $Wslc @RunArgs
+    if ($LASTEXITCODE -ne 0) { throw "WSLC run of $Container failed: $LASTEXITCODE" }
+    if (-not (Wait-RunningProof)) { throw "WSLC run of $Container failed its post-gate." }
 }
-throw "WSLC run of $Container failed its post-gate (run exit $RunCode)."
+Write-Output $Proof
+exit 0
