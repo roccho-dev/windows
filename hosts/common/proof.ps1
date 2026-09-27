@@ -9,22 +9,33 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hoste
 function Run([string]$Mode) {
     (& (Join-Path $PSScriptRoot 'win.ps1') -Mode $Mode) | ConvertFrom-Json
 }
-function MustReject([scriptblock]$Action) {
-    $rejected = $false
-    try { $null = & $Action } catch { $rejected = $true }
-    if (-not $rejected) { throw 'Negative control unexpectedly passed.' }
+function MustReject([scriptblock]$Action, [string]$Pattern) {
+    try { $null = & $Action }
+    catch {
+        if ($_.Exception.Message -notlike $Pattern) { throw }
+        return
+    }
+    throw 'Negative control unexpectedly passed.'
 }
 $validated = Run 'Validate'
 if ($validated.source -ne $ExpectedSource -or $ExpectedSource -notmatch '^[0-9a-f]{40}$') { throw 'Source mismatch.' }
+$manifest = Get-Content (Join-Path $PSScriptRoot 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+$config = Get-Content (Join-Path $PSScriptRoot 'configuration.dsc.json') -Raw -Encoding utf8 | ConvertFrom-Json
+
+# Seed damaged bytes BEFORE registration: Windows may lock registered fonts.
+# This models an interrupted first installation, without stopping OS services.
+$installed = Join-Path $validated.fontDirectory $manifest.fonts[0].file
+if (Test-Path -LiteralPath $installed) { throw 'Proof requires a fresh disposable font target.' }
+$null = New-Item -ItemType Directory -Path $validated.fontDirectory -Force
+[IO.File]::WriteAllText($installed, 'negative-control')
+MustReject { Run 'Test' } 'Installed bytes differ:*'
 $first = Run 'Apply'
+if ($first.copied -lt 1) { throw 'Preexisting corruption was not repaired.' }
 $second = Run 'Apply'
 if ($second.copied -ne 0 -or $second.changedProperties -ne 0) { throw 'Second apply changed state.' }
 $null = Run 'Test'
 
-# Independent provider readback, using the generated declaration rather than
-# another product list. Read actual registry values and installed file hashes.
-$manifest = Get-Content (Join-Path $PSScriptRoot 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
-$config = Get-Content (Join-Path $PSScriptRoot 'configuration.dsc.json') -Raw -Encoding utf8 | ConvertFrom-Json
+# Independent provider readback uses the generated declaration, not a second Spec.
 for ($i = 0; $i -lt $manifest.fonts.Count; $i++) {
     $resource = $config.resources[$i].properties
     $path = 'Registry::' + ($resource.keyPath -replace '^HKCU\\', 'HKEY_CURRENT_USER\')
@@ -32,31 +43,24 @@ for ($i = 0; $i -lt $manifest.fonts.Count; $i++) {
     if ($actual -ne (Join-Path $first.fontDirectory $manifest.fonts[$i].file)) { throw 'Independent registry readback failed.' }
 }
 
-# Installed-byte drift must fail Test and be repaired by the same artifact.
-$installed = Join-Path $first.fontDirectory $manifest.fonts[0].file
-[IO.File]::WriteAllText($installed, 'negative-control')
-MustReject { Run 'Test' }
-$repair = Run 'Apply'
-if ($repair.copied -ne 1) { throw 'Expected one repaired file.' }
-$null = Run 'Test'
-
-# Registry drift must also fail the native DSC test (exit code alone is not enough).
+# Drift must fail specifically because DSC reports nonconvergence, not any error.
 $resource = $config.resources[0].properties
 $key = 'Registry::' + ($resource.keyPath -replace '^HKCU\\', 'HKEY_CURRENT_USER\')
 Set-ItemProperty -LiteralPath $key -Name $resource.valueName -Value 'negative-control'
-MustReject { Run 'Test' }
+MustReject { Run 'Test' } 'Registry drift:*'
 $null = Run 'Apply'
 $null = Run 'Test'
 
-# Valid JSON with altered bytes still fails the package inventory before effects.
+# Valid JSON with altered bytes still fails the inventory before effects.
 $path = Join-Path $PSScriptRoot 'configuration.dsc.json'
 $original = [IO.File]::ReadAllBytes($path)
 try {
     [IO.File]::AppendAllText($path, "`n")
-    MustReject { Run 'Validate' }
+    MustReject { Run 'Validate' } 'Bundle content mismatch:*'
 }
 finally { [IO.File]::WriteAllBytes($path, $original) }
 $null = Run 'Test'
 [ordered]@{ source = $ExpectedSource; proof = 'PASS'; fonts = $first.fonts;
-    secondApplyChanges = 0; installedDriftRejected = $true; registryDriftRejected = $true; corruptionRejected = $true;
+    secondApplyChanges = 0; preexistingCorruptionRepaired = $true;
+    registryDriftRejected = $true; corruptionRejected = $true;
     scope = 'current-user file and registry convergence; not rendering or real-host UX' } | ConvertTo-Json
