@@ -10,6 +10,10 @@
       ownSpec = builtins.fromJSON (builtins.readFile ./hosts/own/spec.json);
       own = import ./hosts/own/nix.nix { inherit pkgs; spec = ownSpec; };
       dev = import ./oci/dev/nix.nix { inherit pkgs; };
+      common = import ./hosts/common/nix.nix {
+        inherit pkgs;
+        source = self.rev or "uncommitted";
+      };
       ownConfig = {
         Cmd = [ "${own.start}/bin/own-start" ];
         Env = [ "HOME=${ownSpec.stateMount}" "PATH=/bin:/usr/bin" ];
@@ -79,7 +83,10 @@
           };
         };
         dev-profile = dev.profile;
+        common-fonts = common.fonts;
+        windows-dist = common.dist;
       };
+      checks.${system}.windows-dist = common.check;
       # Fails when the own image or its scripts disagree with hosts/own/spec.json.
       checks.${system}.own-spec = pkgs.runCommand "own-spec-check" {
         nativeBuildInputs = [ pkgs.jq ];
