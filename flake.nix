@@ -25,10 +25,75 @@
       rentState = "/var/lib/rent";
       rentCert = "/etc/ssl/certs/ca-certificates.crt";
       rentTsSocket = "/var/run/tailscale/tailscaled.sock";
+      # Official Claude Code native build, pinned to platforms.linux-x64 of
+      # https://downloads.claude.ai/claude-code-releases/2.1.283/manifest.json (size 241556664).
+      claudeVersion = "2.1.283";
+      claudeBin = pkgs.fetchurl {
+        url = "https://downloads.claude.ai/claude-code-releases/${claudeVersion}/linux-x64/claude";
+        sha256 = "1859583ce32920595c61ef868bee52e1b1594f7486db209935e01f1e5e804ae2";
+      };
+      # The glibc build runs through the pinned glibc loader, as the fixed W runtime runs it; updates are off.
+      claude = pkgs.writeShellScriptBin "claude" ''
+        export DISABLE_AUTOUPDATER=1
+        exec ${pkgs.glibc}/lib/ld-linux-x86-64.so.2 --library-path ${pkgs.glibc}/lib ${claudeBin} "$@"
+      '';
+      # Later one-time import of exactly one Claude account and one session from an old home mounted read-only
+      # at /old into the state volume. Never run by rent-start; prints target names and sizes only.
+      claudeImport = pkgs.writeShellScriptBin "rent-claude-import" ''
+        set -eu
+        export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.diffutils ]}
+        fail() { echo "rent-claude-import: $*" >&2; exit 1; }
+        id=''${1:-}
+        [[ $id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] ||
+          fail 'usage: rent-claude-import <session-uuid>'
+        mount_opts() {
+          local _id _parent _dev _root mp opts _rest
+          while read -r _id _parent _dev _root mp opts _rest; do
+            [ "$mp" = "$1" ] && { printf '%s\n' "$opts"; return 0; }
+          done < /proc/self/mountinfo
+          return 1
+        }
+        opts=$(mount_opts /old) || fail '/old must be the old home, mounted read-only'
+        case ",$opts," in *,ro,*) ;; *) fail '/old must be mounted read-only' ;; esac
+        mount_opts ${rentState} > /dev/null || fail '${rentState} must be the state volume'
+        s=${rentState}/dev
+        p=projects/-home-dev
+        pairs=(
+          "/old/.claude/.credentials.json|$s/claude/.credentials.json|f"
+          "/old/.claude.json|$s/claude.json|f"
+          "/old/.claude/$p/$id.jsonl|$s/claude/$p/$id.jsonl|f"
+          "/old/.claude/$p/$id|$s/claude/$p/$id|d"
+        )
+        for e in "''${pairs[@]}"; do
+          IFS='|' read -r src dst kind <<< "$e"
+          [ ! -L "$src" ] || fail "$src is a symlink"
+          case $kind in
+            f) [ -f "$src" ] && [ "$(stat -c '%u %a' "$src")" = '1000 600' ] || fail "$src must be a UID 1000 mode 600 file" ;;
+            d) [ -d "$src" ] && [ "$(stat -c %u "$src")" = 1000 ] || fail "$src must be a UID 1000 directory" ;;
+          esac
+          # Only rent-start's placeholder may be replaced.
+          if [ -e "$dst" ] || [ -L "$dst" ]; then
+            [ "$dst" = "$s/claude.json" ] && [ ! -L "$dst" ] && [ "$(cat "$dst")" = '{}' ] || fail "$dst already exists"
+          fi
+        done
+        install -d -m 755 -o 0 -g 0 "$s"
+        install -d -m 700 -o 1000 -g 1000 "$s/claude" "$s/claude/projects" "$s/claude/$p"
+        for e in "''${pairs[@]}"; do
+          IFS='|' read -r src dst kind <<< "$e"
+          case $kind in
+            f) install -m 600 -o 1000 -g 1000 "$src" "$dst"
+               cmp -s "$src" "$dst" || fail "$dst differs from its source" ;;
+            d) cp -R --no-dereference --preserve=mode,timestamps "$src" "$dst"
+               chown -R -h 1000:1000 "$dst"
+               diff -r -q --no-dereference "$src" "$dst" > /dev/null || fail "$dst differs from its source" ;;
+          esac
+          echo "imported $dst ($(du -sb "$dst" | cut -f1) bytes)"
+        done
+      '';
       devTools = pkgs.buildEnv {
         name = "rent-dev-tools";
         paths = (with pkgs; [ coreutils git openssh gh tailscale ])
-          ++ [ (import ./hosts/own/codex.nix { inherit pkgs; }) ];
+          ++ [ (import ./hosts/own/codex.nix { inherit pkgs; }) claude claudeImport ];
         pathsToLink = [ "/bin" ];
       };
       sshConfig = pkgs.writeText "rent-sshd-config" (import ./hosts/rent/nix.nix {
@@ -61,6 +126,16 @@
         dir 755 0:0 "$state/dev"
         dir 700 1000:1000 "$state/dev/codex"
         dir 700 1000:1000 "$state/dev/gh"
+        dir 700 1000:1000 "$state/dev/claude"
+        # Claude writes ~/.claude.json through the link; the placeholder lets it start in a root-owned directory.
+        if [ ! -e "$state/dev/claude.json" ] && [ ! -L "$state/dev/claude.json" ]; then
+          printf '{}\n' > "$state/dev/claude.json"
+        fi
+        if [ -L "$state/dev/claude.json" ] || [ ! -f "$state/dev/claude.json" ]; then
+          echo "$state/dev/claude.json must be a regular file" >&2; exit 1
+        fi
+        chown 1000:1000 "$state/dev/claude.json"
+        chmod 600 "$state/dev/claude.json"
         dir 700 1000:1000 /home/dev
         dir 755 1000:1000 /home/dev/.config
         link() {
@@ -75,6 +150,8 @@
         }
         link "$state/dev/codex" /home/dev/.codex
         link "$state/dev/gh" /home/dev/.config/gh
+        link "$state/dev/claude" /home/dev/.claude
+        link "$state/dev/claude.json" /home/dev/.claude.json
 
         if [ ! -s "$state/ssh/authorized_keys" ]; then
           if [ -z "''${RENT_AUTHORIZED_KEY:-}" ]; then

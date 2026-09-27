@@ -29,7 +29,7 @@ jobs:
           image=ghcr.io/roccho-dev/windows-rent:nix
           docker load < result
           key_dir="$(mktemp -d)"
-          trap 'status=$?; [ "$status" -eq 0 ] || docker logs rent-smoke 2>&1 | tail -n 40 || true; docker rm -f rent-smoke rent-refuse >/dev/null 2>&1 || true; docker volume rm rent-smoke-repos rent-smoke-state rent-smoke-home >/dev/null 2>&1 || true; rm -rf "$key_dir"' EXIT
+          trap 'status=$?; [ "$status" -eq 0 ] || docker logs rent-smoke 2>&1 | tail -n 40 || true; docker rm -f rent-smoke rent-refuse >/dev/null 2>&1 || true; docker volume rm rent-smoke-repos rent-smoke-state rent-smoke-home rent-smoke-old rent-smoke-import >/dev/null 2>&1 || true; rm -rf "$key_dir"' EXIT
           test "$(docker image inspect --format '{{json .Config.Volumes}}' "$image")" = null
           ssh-keygen -q -t ed25519 -N '' -f "$key_dir/key"
           docker volume create rent-smoke-repos
@@ -51,6 +51,33 @@ jobs:
           refuse '/var/lib/rent must be a mounted volume' -v rent-smoke-repos:/work/repos
           refuse '/home/dev must not be a mount' -v rent-smoke-repos:/work/repos -v rent-smoke-state:/var/lib/rent \
             -v rent-smoke-home:/home/dev
+
+          # Later Claude import, synthetic files only: exactly four paths from a read-only old home, gated and once.
+          sid=00000000-0000-4000-8000-000000000000
+          docker volume create rent-smoke-old
+          docker volume create rent-smoke-import
+          docker run --rm -v rent-smoke-old:/o "$image" /bin/bash -c "set -eu
+            p=/o/.claude/projects/-home-dev
+            mkdir -p \$p/$sid/subagents \$p/other /o/.ssh
+            for f in /o/.claude/.credentials.json /o/.claude.json \$p/$sid.jsonl \$p/$sid/subagents/a.jsonl \
+              /o/.claude/history.jsonl /o/.ssh/id_synthetic \$p/other.jsonl; do echo \"synthetic \$f\" > \$f; done
+            chown -R 1000:1000 /o
+            chmod 600 /o/.claude/.credentials.json /o/.claude.json \$p/$sid.jsonl"
+          claude_import() { docker run --rm -v "rent-smoke-old:/old$1" -v rent-smoke-import:/var/lib/rent "$image" /bin/rent-claude-import "$sid"; }
+          if claude_import '' > "$key_dir/import" 2>&1; then echo 'imported from a writable old home' >&2; exit 1; fi
+          grep -qF '/old must be mounted read-only' "$key_dir/import"
+          claude_import :ro > "$key_dir/import"
+          if grep -q synthetic "$key_dir/import"; then echo 'import printed file contents' >&2; exit 1; fi
+          if claude_import :ro > /dev/null 2>&1; then echo 'import ran twice' >&2; exit 1; fi
+          docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c \
+            'shopt -s globstar dotglob; cd /s; for f in **; do stat -c "%a %u %n" "$f"; done' | LC_ALL=C sort > "$key_dir/imported"
+          printf '%s\n' '755 0 dev' '700 1000 dev/claude' '600 1000 dev/claude.json' '600 1000 dev/claude/.credentials.json' \
+            '700 1000 dev/claude/projects' '700 1000 dev/claude/projects/-home-dev' \
+            "755 1000 dev/claude/projects/-home-dev/$sid" "600 1000 dev/claude/projects/-home-dev/$sid.jsonl" \
+            "755 1000 dev/claude/projects/-home-dev/$sid/subagents" "644 1000 dev/claude/projects/-home-dev/$sid/subagents/a.jsonl" |
+            LC_ALL=C sort | diff - "$key_dir/imported"
+          test "$(docker run --rm -v rent-smoke-import:/s "$image" /bin/cat /s/dev/claude/.credentials.json)" = \
+            'synthetic /o/.claude/.credentials.json'
 
           run() {
             docker run -d --name rent-smoke -p 127.0.0.1:2222:2222 \
@@ -116,17 +143,30 @@ jobs:
           test "$("${ssh_cmd[@]}" codex --version)" = 'codex-cli 0.157.1'
           "${ssh_cmd[@]}" tailscale version > "$key_dir/tailscale"
           grep -qE '^1\.98\.[0-9]+$' "$key_dir/tailscale"
+          test "$("${ssh_cmd[@]}" claude --version)" = '2.1.283 (Claude Code)'
           docker exec rent-smoke /bin/stat -c '%a %u %n' /home/dev /var/lib/rent/tailscale /var/lib/rent/ssh \
             /var/lib/rent/ssh/ssh_host_ed25519_key /var/lib/rent/ssh/authorized_keys \
-            /var/lib/rent/dev/codex /var/lib/rent/dev/gh > "$key_dir/modes"
+            /var/lib/rent/dev/codex /var/lib/rent/dev/gh /var/lib/rent/dev/claude /var/lib/rent/dev/claude.json > "$key_dir/modes"
           printf '%s\n' '700 1000 /home/dev' '700 0 /var/lib/rent/tailscale' '755 0 /var/lib/rent/ssh' \
             '600 0 /var/lib/rent/ssh/ssh_host_ed25519_key' '644 0 /var/lib/rent/ssh/authorized_keys' \
-            '700 1000 /var/lib/rent/dev/codex' '700 1000 /var/lib/rent/dev/gh' | diff - "$key_dir/modes"
+            '700 1000 /var/lib/rent/dev/codex' '700 1000 /var/lib/rent/dev/gh' \
+            '700 1000 /var/lib/rent/dev/claude' '600 1000 /var/lib/rent/dev/claude.json' | diff - "$key_dir/modes"
           test "$(docker exec rent-smoke /bin/readlink /home/dev/.codex)" = /var/lib/rent/dev/codex
           test "$(docker exec rent-smoke /bin/readlink /home/dev/.config/gh)" = /var/lib/rent/dev/gh
+          test "$(docker exec rent-smoke /bin/readlink /home/dev/.claude)" = /var/lib/rent/dev/claude
+          test "$(docker exec rent-smoke /bin/readlink /home/dev/.claude.json)" = /var/lib/rent/dev/claude.json
+          # A real unauthenticated Claude start writes its config through the link; nothing is logged in.
+          "${ssh_cmd[@]}" 'cd ~ && CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 \
+            claude -p ci < /dev/null > /dev/null 2>&1 || true
+            test -L ~/.claude.json && test -L ~/.claude'
+          "${ssh_cmd[@]}" 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 claude auth status || true' | jq -e '.loggedIn == false' > /dev/null
+          test "$(docker exec rent-smoke /bin/stat -c %s /var/lib/rent/dev/claude.json)" -gt 3
+          claude_config() { docker exec rent-smoke /bin/sha256sum /var/lib/rent/dev/claude.json | cut -d' ' -f1; }
+          config="$(claude_config)"
           ts_ready
           machine="$(machine_key_hash)"
-          "${ssh_cmd[@]}" 'echo codex > ~/.codex/ci-marker && echo home > ~/home-marker'
+          "${ssh_cmd[@]}" 'echo codex > ~/.codex/ci-marker && echo claude > ~/.claude/ci-marker && echo home > ~/home-marker'
+          markers='test "$(cat ~/.codex/ci-marker)" = codex && test "$(cat ~/.claude/ci-marker)" = claude'
 
           # Restart: same container; TERM reaches the supervisor, and home, state, and host key remain.
           before="$(docker inspect --format '{{.Id}}' rent-smoke)"
@@ -135,7 +175,8 @@ jobs:
           docker start rent-smoke
           test "$(docker inspect --format '{{.Id}}' rent-smoke)" = "$before"
           ssh_ready
-          "${ssh_cmd[@]}" 'test "$(cat ~/.codex/ci-marker)" = codex && test "$(cat ~/home-marker)" = home'
+          "${ssh_cmd[@]}" "$markers"' && test "$(cat ~/home-marker)" = home'
+          test "$(claude_config)" = "$config"
           ts_ready
           test "$(machine_key_hash)" = "$machine"
           repos_untouched
@@ -145,7 +186,8 @@ jobs:
           docker rm rent-smoke
           run -e RENT_TS_HOSTNAME=rent-ci-smoke
           ssh_ready
-          "${ssh_cmd[@]}" 'test "$(cat ~/.codex/ci-marker)" = codex && test ! -e ~/home-marker'
+          "${ssh_cmd[@]}" "$markers"' && test ! -e ~/home-marker'
+          test "$(claude_config)" = "$config"
           ts_ready
           test "$(machine_key_hash)" = "$machine"
           repos_untouched
