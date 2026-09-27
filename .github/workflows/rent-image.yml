@@ -2,8 +2,8 @@ name: rent image
 
 on:
   push:
-    branches: [main, feat/rent-ci]
-    paths: ["flake.nix", "flake.lock", "hosts/rent/**", ".github/workflows/rent-image.yml"]
+    branches: [main, feat/rent-ci, f/rent-final]
+    paths: ["flake.nix", "flake.lock", "hosts/rent/**", "hosts/own/codex.nix", ".github/workflows/rent-image.yml"]
 
 jobs:
   build-test-publish:
@@ -13,45 +13,142 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+      - name: Parse the Windows script
+        shell: pwsh
+        run: |
+          $Errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/hosts/rent/win.ps1", [ref] $null, [ref] $Errors) | Out-Null
+          if ($Errors) { $Errors; exit 1 }
       - uses: cachix/install-nix-action@v31
       - name: Build from locked Nix inputs
         run: nix build .#rent-image --no-write-lock-file --print-build-logs
-      - name: Load and test SSH and persistent home
+      - name: Load and test tools, mounts, state, restart, and recreate
         shell: bash
         run: |
           set -euo pipefail
+          image=ghcr.io/roccho-dev/windows-rent:nix
           docker load < result
           key_dir="$(mktemp -d)"
-          trap 'docker rm -f rent-smoke >/dev/null 2>&1 || true; docker volume rm rent-smoke-home >/dev/null 2>&1 || true; rm -rf "$key_dir"' EXIT
+          trap 'status=$?; [ "$status" -eq 0 ] || docker logs rent-smoke 2>&1 | tail -n 40 || true; docker rm -f rent-smoke rent-refuse >/dev/null 2>&1 || true; docker volume rm rent-smoke-repos rent-smoke-state rent-smoke-home >/dev/null 2>&1 || true; rm -rf "$key_dir"' EXIT
+          test "$(docker image inspect --format '{{json .Config.Volumes}}' "$image")" = null
           ssh-keygen -q -t ed25519 -N '' -f "$key_dir/key"
+          docker volume create rent-smoke-repos
+          docker volume create rent-smoke-state
           docker volume create rent-smoke-home
-          docker run -d --name rent-smoke -p 127.0.0.1:2222:2222 \
-            -v rent-smoke-home:/home/dev \
-            -e "RENT_AUTHORIZED_KEY=$(cat "$key_dir/key.pub")" \
-            ghcr.io/roccho-dev/windows-rent:nix
-          ssh_cmd=(ssh -F /dev/null -p 2222 -i "$key_dir/key" -o IdentitiesOnly=yes \
-            -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-            -o "UserKnownHostsFile=$key_dir/known_hosts" dev@127.0.0.1)
-          for attempt in {1..20}; do
-            if "${ssh_cmd[@]}" id -un > "$key_dir/answer" 2>/dev/null; then break; fi
+          # Existing repos content with a foreign owner; rent-start must never chown it.
+          docker run --rm -v rent-smoke-repos:/r "$image" /bin/bash -c 'echo repo > /r/marker && chown 4242:4243 /r/marker'
+          env_args=(-e "RENT_AUTHORIZED_KEY=$(cat "$key_dir/key.pub")" -e RENT_TS_HOSTNAME=rent-ci-smoke)
+
+          # Fail closed: repos and state are both required, and /home/dev must not be a mount.
+          refuse() {
+            local want=$1; shift
+            if timeout 60 docker run --rm --name rent-refuse "$@" "${env_args[@]}" "$image" > "$key_dir/refuse" 2>&1; then
+              echo "started despite: $want" >&2; return 1
+            fi
+            grep -qF "$want" "$key_dir/refuse"
+          }
+          refuse '/work/repos must be a mounted volume' -v rent-smoke-state:/var/lib/rent
+          refuse '/var/lib/rent must be a mounted volume' -v rent-smoke-repos:/work/repos
+          refuse '/home/dev must not be a mount' -v rent-smoke-repos:/work/repos -v rent-smoke-state:/var/lib/rent \
+            -v rent-smoke-home:/home/dev
+
+          run() {
+            docker run -d --name rent-smoke -p 127.0.0.1:2222:2222 \
+              -v rent-smoke-repos:/work/repos -v rent-smoke-state:/var/lib/rent "$@" "$image"
+          }
+          run "${env_args[@]}"
+          for attempt in {1..30}; do
+            if docker exec rent-smoke /bin/cat /var/lib/rent/ssh/ssh_host_ed25519_key.pub > "$key_dir/host.pub" 2>/dev/null; then break; fi
             sleep 1
           done
-          test "$(cat "$key_dir/answer")" = dev
+          # Strict from the first connection: the host key is pinned from the state volume, never accepted anew.
+          printf '[127.0.0.1]:2222 %s\n' "$(cut -d' ' -f1,2 "$key_dir/host.pub")" > "$key_dir/known_hosts"
+          ssh_cmd=(ssh -F /dev/null -p 2222 -i "$key_dir/key" -o IdentitiesOnly=yes \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null \
+            -o "UserKnownHostsFile=$key_dir/known_hosts" dev@127.0.0.1)
+          ssh_ready() {
+            : > "$key_dir/answer"
+            for attempt in {1..30}; do
+              if "${ssh_cmd[@]}" id -un > "$key_dir/answer" 2>/dev/null; then break; fi
+              sleep 1
+            done
+            test "$(cat "$key_dir/answer")" = dev
+          }
+          # Userspace tailscaled without auth: NeedsLogin, with up --ssh --hostname applied and a machine key in state.
+          ts_ready() {
+            for attempt in {1..60}; do
+              docker exec rent-smoke /bin/tailscale status --json > "$key_dir/ts.json" 2>/dev/null || true
+              docker exec rent-smoke /bin/tailscale debug prefs > "$key_dir/prefs.json" 2>/dev/null || true
+              docker exec rent-smoke /bin/cat /var/lib/rent/tailscale/tailscaled.state > "$key_dir/ts.state" 2>/dev/null || true
+              if jq -e '.BackendState == "NeedsLogin"' "$key_dir/ts.json" >/dev/null 2>&1 &&
+                jq -e '.RunSSH == true and .WantRunning == true and .Hostname == "rent-ci-smoke"' "$key_dir/prefs.json" >/dev/null 2>&1 &&
+                jq -e 'has("_machinekey")' "$key_dir/ts.state" >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 1
+            done
+            jq -c '{BackendState}' "$key_dir/ts.json" >&2 || true
+            return 1
+          }
+          machine_key_hash() { jq -r ._machinekey "$key_dir/ts.state" | sha256sum | cut -d' ' -f1; }
+          repos_untouched() {
+            docker exec rent-smoke /bin/cat /proc/1/mountinfo > "$key_dir/mountinfo"
+            awk '$5 == "/work/repos" { r++ } $5 == "/var/lib/rent" { s++ } $5 == "/home/dev" { h++ }
+              END { exit !(r == 1 && s == 1 && h == 0) }' "$key_dir/mountinfo"
+            test "$(docker exec rent-smoke /bin/stat -c '%u:%g' /work/repos/marker)" = 4242:4243
+            test "$(docker exec rent-smoke /bin/cat /work/repos/marker)" = repo
+          }
+
+          ssh_ready
+          test "$(docker port rent-smoke)" = "2222/tcp -> 127.0.0.1:2222"
+          repos_untouched
           "${ssh_cmd[@]}" 'set -eu
+            test "$(id -u):$(id -g)" = 1000:1000
             if command -v nix-instantiate >/dev/null; then exit 1; fi
             command -v git >/dev/null
+            test "$SSL_CERT_FILE" = /etc/ssl/certs/ca-certificates.crt
             test -r "$SSL_CERT_FILE"
             git --version >/dev/null
-            git ls-remote --exit-code https://github.com/roccho-dev/windows.git HEAD >/dev/null'
-          "${ssh_cmd[@]}" 'echo persisted > /home/dev/proof'
+            git ls-remote --exit-code https://github.com/roccho-dev/windows.git HEAD >/dev/null
+            env -i HOME=/home/dev /bin/git ls-remote --exit-code https://github.com/roccho-dev/windows.git HEAD >/dev/null'
+          "${ssh_cmd[@]}" gh --version > "$key_dir/gh"
+          grep -qE '^gh version 2\.96\.0( |$)' "$key_dir/gh"
+          test "$("${ssh_cmd[@]}" codex --version)" = 'codex-cli 0.157.1'
+          "${ssh_cmd[@]}" tailscale version > "$key_dir/tailscale"
+          grep -qE '^1\.98\.[0-9]+$' "$key_dir/tailscale"
+          docker exec rent-smoke /bin/stat -c '%a %u %n' /home/dev /var/lib/rent/tailscale /var/lib/rent/ssh \
+            /var/lib/rent/ssh/ssh_host_ed25519_key /var/lib/rent/ssh/authorized_keys \
+            /var/lib/rent/dev/codex /var/lib/rent/dev/gh > "$key_dir/modes"
+          printf '%s\n' '700 1000 /home/dev' '700 0 /var/lib/rent/tailscale' '755 0 /var/lib/rent/ssh' \
+            '600 0 /var/lib/rent/ssh/ssh_host_ed25519_key' '644 0 /var/lib/rent/ssh/authorized_keys' \
+            '700 1000 /var/lib/rent/dev/codex' '700 1000 /var/lib/rent/dev/gh' | diff - "$key_dir/modes"
+          test "$(docker exec rent-smoke /bin/readlink /home/dev/.codex)" = /var/lib/rent/dev/codex
+          test "$(docker exec rent-smoke /bin/readlink /home/dev/.config/gh)" = /var/lib/rent/dev/gh
+          ts_ready
+          machine="$(machine_key_hash)"
+          "${ssh_cmd[@]}" 'echo codex > ~/.codex/ci-marker && echo home > ~/home-marker'
+
+          # Restart: same container; TERM reaches the supervisor, and home, state, and host key remain.
           before="$(docker inspect --format '{{.Id}}' rent-smoke)"
-          docker restart rent-smoke
+          docker stop -t 30 rent-smoke
+          test "$(docker inspect --format '{{.State.ExitCode}}' rent-smoke)" = 143
+          docker start rent-smoke
           test "$(docker inspect --format '{{.Id}}' rent-smoke)" = "$before"
-          for attempt in {1..20}; do
-            if "${ssh_cmd[@]}" cat /home/dev/proof > "$key_dir/answer" 2>/dev/null; then break; fi
-            sleep 1
-          done
-          test "$(cat "$key_dir/answer")" = persisted
+          ssh_ready
+          "${ssh_cmd[@]}" 'test "$(cat ~/.codex/ci-marker)" = codex && test "$(cat ~/home-marker)" = home'
+          ts_ready
+          test "$(machine_key_hash)" = "$machine"
+          repos_untouched
+
+          # Recreate on the same volumes without the key env: state and host key remain, the plain home does not.
+          docker stop -t 30 rent-smoke
+          docker rm rent-smoke
+          run -e RENT_TS_HOSTNAME=rent-ci-smoke
+          ssh_ready
+          "${ssh_cmd[@]}" 'test "$(cat ~/.codex/ci-marker)" = codex && test ! -e ~/home-marker'
+          ts_ready
+          test "$(machine_key_hash)" = "$machine"
+          repos_untouched
       - name: Publish exact image from this repository
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

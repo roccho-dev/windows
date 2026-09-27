@@ -20,33 +20,105 @@
         Volumes.${ownSpec.stateMount} = {};
         Labels."org.opencontainers.image.source" = "https://github.com/roccho-dev/windows";
       };
+      # rent: tools live in the image; /home/dev is fresh per container; only /var/lib/rent (state) and
+      # /work/repos (existing repos, never copied or chowned) are volumes.
+      rentState = "/var/lib/rent";
+      rentCert = "/etc/ssl/certs/ca-certificates.crt";
+      rentTsSocket = "/var/run/tailscale/tailscaled.sock";
       devTools = pkgs.buildEnv {
         name = "rent-dev-tools";
-        paths = with pkgs; [ coreutils git openssh ];
+        paths = (with pkgs; [ coreutils git openssh gh tailscale ])
+          ++ [ (import ./hosts/own/codex.nix { inherit pkgs; }) ];
         pathsToLink = [ "/bin" ];
       };
       sshConfig = pkgs.writeText "rent-sshd-config" (import ./hosts/rent/nix.nix {
         port = 2222;
-        certFile = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+        sshDir = "${rentState}/ssh";
+        certFile = rentCert;
       });
+      # PID 1: fail closed on mounts, lay out state, then supervise tailscaled and sshd until either exits or TERM.
       rentStart = pkgs.writeShellScriptBin "rent-start" ''
         set -eu
-        ${pkgs.coreutils}/bin/chown 1000:1000 /home/dev
-        ${pkgs.coreutils}/bin/install -d -m 700 -o 1000 -g 1000 /home/dev/.ssh
-        if [ ! -s /home/dev/.ssh/authorized_keys ]; then
+        export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.openssh pkgs.tailscale ]}
+        state=${rentState}
+        is_mount() {
+          local _id _parent _dev _root mp _rest
+          while read -r _id _parent _dev _root mp _rest; do
+            [ "$mp" = "$1" ] && return 0
+          done < /proc/self/mountinfo
+          return 1
+        }
+        for m in /work/repos "$state"; do
+          is_mount "$m" || { echo "$m must be a mounted volume" >&2; exit 1; }
+        done
+        if is_mount /home/dev; then echo '/home/dev must not be a mount' >&2; exit 1; fi
+        if [ -z "''${RENT_TS_HOSTNAME:-}" ]; then echo 'Set RENT_TS_HOSTNAME' >&2; exit 1; fi
+
+        dir() { install -d "$3"; chown "$2" "$3"; chmod "$1" "$3"; }
+        dir 755 0:0 "$state"
+        dir 700 0:0 "$state/tailscale"
+        dir 755 0:0 "$state/ssh"
+        dir 755 0:0 "$state/dev"
+        dir 700 1000:1000 "$state/dev/codex"
+        dir 700 1000:1000 "$state/dev/gh"
+        dir 700 1000:1000 /home/dev
+        dir 755 1000:1000 /home/dev/.config
+        link() {
+          if [ -L "$2" ]; then
+            [ "$(readlink "$2")" = "$1" ] || { echo "$2 does not point to $1" >&2; exit 1; }
+          elif [ -e "$2" ]; then
+            echo "$2 exists and is not a link to $1" >&2; exit 1
+          else
+            ln -s "$1" "$2"
+            chown -h 1000:1000 "$2"
+          fi
+        }
+        link "$state/dev/codex" /home/dev/.codex
+        link "$state/dev/gh" /home/dev/.config/gh
+
+        if [ ! -s "$state/ssh/authorized_keys" ]; then
           if [ -z "''${RENT_AUTHORIZED_KEY:-}" ]; then
             echo "Set RENT_AUTHORIZED_KEY on first creation" >&2
             exit 1
           fi
-          printf '%s\n' "$RENT_AUTHORIZED_KEY" > /home/dev/.ssh/authorized_keys
+          printf '%s\n' "$RENT_AUTHORIZED_KEY" > "$state/ssh/authorized_keys"
         fi
-        ${pkgs.coreutils}/bin/chown 1000:1000 /home/dev/.ssh/authorized_keys
-        ${pkgs.coreutils}/bin/chmod 600 /home/dev/.ssh/authorized_keys
-        if [ ! -s /home/dev/.ssh/ssh_host_ed25519_key ]; then
-          ${pkgs.openssh}/bin/ssh-keygen -q -t ed25519 -N "" -f /home/dev/.ssh/ssh_host_ed25519_key
+        chown 0:0 "$state/ssh/authorized_keys"
+        chmod 644 "$state/ssh/authorized_keys"
+        if [ ! -s "$state/ssh/ssh_host_ed25519_key" ]; then
+          ssh-keygen -q -t ed25519 -N "" -f "$state/ssh/ssh_host_ed25519_key"
         fi
-        ${pkgs.coreutils}/bin/chmod 600 /home/dev/.ssh/ssh_host_ed25519_key
-        exec ${pkgs.openssh}/bin/sshd -D -e -f ${sshConfig}
+        chmod 600 "$state/ssh/ssh_host_ed25519_key"
+
+        install -d -m 755 ${builtins.dirOf rentTsSocket}
+        TS_LOGS_DIR="$state/tailscale" tailscaled --tun=userspace-networking \
+          --statedir="$state/tailscale" --socket=${rentTsSocket} &
+        ts_pid=$!
+        up_pid=
+        sshd_pid=
+        cleanup() {
+          trap - TERM INT
+          kill -TERM $up_pid $sshd_pid "$ts_pid" 2>/dev/null || true
+          wait || true
+        }
+        trap 'cleanup; exit 143' TERM INT
+        ready=
+        for _ in $(seq 30); do
+          if tailscale --socket=${rentTsSocket} status --json >/dev/null 2>&1; then ready=1; break; fi
+          kill -0 "$ts_pid" 2>/dev/null || break
+          sleep 1
+        done
+        if [ -z "$ready" ]; then echo 'tailscaled did not become ready' >&2; cleanup; exit 1; fi
+        # Nonblocking; no auth key: on first run this prints the login URL for a later browser login.
+        tailscale --socket=${rentTsSocket} up --ssh --hostname="$RENT_TS_HOSTNAME" &
+        up_pid=$!
+        sshd -D -e -f ${sshConfig} &
+        sshd_pid=$!
+        status=0
+        wait -n "$ts_pid" "$sshd_pid" || status=$?
+        echo "rent-start: tailscaled or sshd exited ($status); stopping" >&2
+        cleanup
+        exit 1
       '';
     in {
       packages.${system} = {
@@ -68,16 +140,18 @@
           tag = "nix";
           contents = [ pkgs.bash pkgs.cacert devTools rentStart ];
           extraCommands = ''
-            mkdir -p etc home/dev tmp var/empty
+            mkdir -p etc/ssl/certs home/dev tmp var/empty
             printf 'root:x:0:0:root:/root:/bin/sh\nsshd:x:74:74:sshd:/var/empty:/bin/sh\ndev:x:1000:1000:Development user:/home/dev:/bin/sh\n' > etc/passwd
             printf 'root:x:0:\nsshd:x:74:\ndev:x:1000:\n' > etc/group
+            # Default CA path, so TLS works in sessions that do not inherit SSL_CERT_FILE (Tailscale SSH).
+            ln -s ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt .${rentCert}
             chmod 1777 tmp
           '';
+          # No Volumes: an image-declared volume would silently satisfy a missing mount.
           config = {
             Cmd = [ "${rentStart}/bin/rent-start" ];
-            Env = [ "HOME=/home/dev" "PATH=/bin:/usr/bin" ];
+            Env = [ "HOME=/home/dev" "PATH=/bin:/usr/bin" "SSL_CERT_FILE=${rentCert}" ];
             ExposedPorts."2222/tcp" = {};
-            Volumes."/home/dev" = {};
             Labels."org.opencontainers.image.source" = "https://github.com/roccho-dev/windows";
           };
         };
