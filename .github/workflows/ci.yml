@@ -1,0 +1,83 @@
+name: windows dist
+
+on:
+  pull_request:
+    paths: ['flake.nix', 'flake.lock', 'hosts/common/**', '.github/workflows/ci.yml']
+  push:
+    branches: [main]
+    paths: ['flake.nix', 'flake.lock', 'hosts/common/**', '.github/workflows/ci.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      source: ${{ steps.source.outputs.sha }}
+      artifact: ${{ steps.upload.outputs.artifact-id }}
+      checksum: ${{ steps.source.outputs.checksum }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      - run: nix flake check --no-write-lock-file --print-build-logs
+      - run: nix build .#windows-dist --no-write-lock-file --print-build-logs
+      - id: source
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "checksum=$(cut -d ' ' -f 1 result/windows-dist.zip.sha256)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        id: upload
+        with:
+          name: windows-dist
+          path: |
+            result/windows-dist.zip
+            result/windows-dist.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact }}
+          merge-multiple: true
+      - shell: pwsh
+        env:
+          EXPECTED_SHA256: ${{ needs.build.outputs.checksum }}
+          EXPECTED_SOURCE: ${{ needs.build.outputs.source }}
+        run: |
+          if ((Get-FileHash windows-dist.zip -Algorithm SHA256).Hash -ne $env:EXPECTED_SHA256) { throw 'Transport checksum mismatch' }
+          Expand-Archive windows-dist.zip bundle
+          & ./bundle/proof.ps1 -ExpectedSource $env:EXPECTED_SOURCE
+
+  publish:
+    needs: [build, windows]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact }}
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE: ${{ needs.build.outputs.source }}
+          EXPECTED_SHA256: ${{ needs.build.outputs.checksum }}
+        run: |
+          test "$SOURCE" = "$GITHUB_SHA"
+          printf '%s  windows-dist.zip\n' "$EXPECTED_SHA256" | sha256sum --check --strict
+          gh release create "windows-$SOURCE" windows-dist.zip windows-dist.zip.sha256 \
+            --target "$SOURCE" --title "Windows $SOURCE" --latest=false \
+            --notes "Exact artifact from passing build and Windows proof; source $SOURCE. Real-host UX is not claimed."
