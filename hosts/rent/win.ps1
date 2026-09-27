@@ -30,6 +30,11 @@ param(
     [string] $OldContainer = 'envs-dev-mutable',
     [ValidatePattern('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')]
     [string] $SessionId = '4eba321e-6ade-4815-930d-dfa58b6fc960',
+    # Migrate only: the exact pre-recorded image of the old source container.
+    [ValidatePattern('^[^\s"'']+$')]
+    [string] $OldImageSource,
+    # Replace only: JSON array holding the pre-recorded argv (no secrets) that recreates the current container.
+    [string] $RollbackArgvFile,
     [switch] $Apply
 )
 
@@ -47,36 +52,58 @@ $Mounts = [ordered]@{ '/work/repos' = $ReposVolume; '/var/lib/rent' = $StateVolu
 if (@($Mounts.Values) -ccontains $OldHomeVolume) { throw "The old home volume $OldHomeVolume must not be repos or state." }
 if ($OldContainer -ceq $Container) { throw "The old container $OldContainer must not be $Container." }
 
-# Old shape: no mounts reported and exactly the old image.
-function Test-OldShape($Item) {
-    if (@(@($Item.Mounts) | Where-Object { $_ }).Count -ne 0) { return $false }
-    return @(@($Item.Image, $Item.Config.Image) | Where-Object { $_ } | ForEach-Object { [string] $_ }) -ccontains $OldImage
+# WSLC inspect is the authority for name, state and image only; mounts are proven inside the container
+# (rent-start and rent-state-import read their own mountinfo).
+function Get-Images($Item) { @(@($Item.Image, $Item.Config.Image) | Where-Object { $_ } | ForEach-Object { [string] $_ }) }
+
+function Test-Stopped($Item) {
+    $Running = $Item.State.Running
+    return ($Running -is [bool]) -and -not $Running -and ([string] $Item.State.Status) -cne 'running'
 }
 
-# New shape: exactly the two named volumes at their targets and nothing else.
-function Test-NewShape($Item) {
-    $All = @(@($Item.Mounts) | Where-Object { $_ })
-    if ($All.Count -ne $Mounts.Count) { return $false }
-    foreach ($Target in $Mounts.Keys) {
-        $At = @($All | Where-Object { ([string] $_.Destination) -ceq $Target })
-        if ($At.Count -ne 1 -or ([string] $At[0].Type) -cne 'volume' -or ([string] $At[0].Name) -cne $Mounts[$Target]) {
-            return $false
-        }
-    }
-    return $true
+# Replace target: exactly $Container on the pre-recorded old image or on this Binding's image.
+function Test-ReplaceableImage($Item) {
+    if (([string] $Item.Name).TrimStart('/') -cne $Container) { return $false }
+    $Images = Get-Images $Item
+    return ($Images -ccontains $OldImage) -or ($Images -ccontains $Image)
 }
 
-# Migrate source: why the inspected old runtime is not provably the stopped owner of the old home, or $null.
+# Migrate source: why the inspected old runtime is not the stopped, pinned source, or $null.
 function Get-OldSourceProblem($Item) {
     if (-not $Item) { return "Source container $OldContainer is missing." }
     if (([string] $Item.Name).TrimStart('/') -cne $OldContainer) { return "Inspect did not return $OldContainer." }
-    $Running = $Item.State.Running
-    if ($Running -isnot [bool]) { return "State of $OldContainer is unreadable." }
-    if ($Running -or ([string] $Item.State.Status) -ceq 'running') { return "$OldContainer is running." }
-    $AtHome = @(@($Item.Mounts) | Where-Object { $_ -and ([string] $_.Destination) -ceq '/home/dev' })
-    if ($AtHome.Count -ne 1 -or ([string] $AtHome[0].Type) -cne 'volume' -or ([string] $AtHome[0].Name) -cne $OldHomeVolume) {
-        return "$OldContainer does not provably mount volume $OldHomeVolume at /home/dev."
+    if ($Item.State.Running -isnot [bool]) { return "State of $OldContainer is unreadable." }
+    if (-not (Test-Stopped $Item)) { return "$OldContainer is running." }
+    if (-not ((Get-Images $Item) -ccontains $OldImageSource)) { return "$OldContainer is not the pinned image $OldImageSource." }
+    return $null
+}
+
+# Possible concurrent writers of the old home: any container other than $Container that is not provably stopped.
+function Get-WriterProblem($Items) {
+    foreach ($Item in @($Items)) {
+        $Name = ([string] $Item.Name).TrimStart('/')
+        if ($Name -ceq $Container) { continue }
+        if (-not (Test-Stopped $Item)) { return "Container $Name is not provably stopped." }
     }
+    return $null
+}
+
+# Outcome of Create/Replace: running, and rent-start printed the fixed mount proof.
+$Proof = "rent-mounts ok repos=$ReposVolume state=$StateVolume"
+function Test-RunningProof($Item, $Logs) {
+    if (-not $Item -or $Item.State.Running -isnot [bool] -or -not $Item.State.Running) { return $false }
+    return @(@($Logs) | ForEach-Object { ([string] $_).TrimEnd() }) -ccontains $Proof
+}
+
+# Rollback: the pre-recorded argv must recreate exactly $Container on its current image, without secrets.
+function Get-RollbackProblem($Argv, $Item) {
+    $Argv = @($Argv)
+    if ($Argv.Count -lt 4 -or @($Argv | Where-Object { $_ -isnot [string] }).Count) { return 'Rollback argv must be a JSON array of strings.' }
+    if ($Argv[0] -cne 'run' -or $Argv -ccontains '--rm') { return 'Rollback argv must be one persistent run.' }
+    $At = [array]::IndexOf([string[]] $Argv, '--name')
+    if ($At -lt 0 -or $At + 1 -ge $Argv.Count -or $Argv[$At + 1] -cne $Container) { return "Rollback argv must name $Container." }
+    if (-not ((Get-Images $Item) -ccontains $Argv[-1])) { return 'Rollback argv must end with the current container image.' }
+    if (@($Argv | Where-Object { $_ -match '(?i)(token|secret|password|credential|private)' }).Count) { return 'Rollback argv must not carry secrets.' }
     return $null
 }
 
@@ -108,9 +135,12 @@ if ($Step -in @('Create', 'Replace')) {
 
 $RunArgs = @('run', '--name', $Container, '--detach', '--publish', "127.0.0.1:${Port}:2222")
 foreach ($Target in $Mounts.Keys) { $RunArgs += @('--volume', "$($Mounts[$Target]):$Target") }
-$RunArgs += @('--env', "RENT_TS_HOSTNAME=$TsHostname", '--env', "RENT_AUTHORIZED_KEY=$Key", $Image)
+$RunArgs += @('--env', "RENT_REPOS_VOLUME=$ReposVolume", '--env', "RENT_STATE_VOLUME=$StateVolume",
+    '--env', "RENT_TS_HOSTNAME=$TsHostname", '--env', "RENT_AUTHORIZED_KEY=$Key", $Image)
 $MigrateArgs = @('run', '--rm', '--volume', "${OldHomeVolume}:/old:ro", '--volume', "${StateVolume}:/var/lib/rent",
+    '--env', "RENT_OLD_VOLUME=$OldHomeVolume", '--env', "RENT_STATE_VOLUME=$StateVolume",
     $Image, '/bin/rent-state-import', $SessionId)
+$ListArgs = @('container', 'list', '--all', '-q')
 
 if ($Step -eq 'Plan') {
     # Exact argv for every live step; touches nothing.
@@ -118,11 +148,14 @@ if ($Step -eq 'Plan') {
         pull = @($Wslc, 'pull', $Image)
         stateVolumeCreateOnce = @($Wslc, 'volume', 'create', $StateVolume)
         create = @($Wslc) + $RunArgs
-        replaceAccepts = "exactly $OldImage with no mounts, or exactly $($ReposVolume):/work/repos and $($StateVolume):/var/lib/rent"
+        replaceAccepts = "$Container on exactly $OldImage or $Image (inspect name and image only), with a pre-recorded rollback argv"
         replaceStop = @($Wslc, 'stop', $Container)
         replaceRemove = @($Wslc, 'remove', $Container)
-        migrateAccepts = "$OldContainer exists, is not running, and mounts volume $OldHomeVolume at /home/dev (checked before and right before the helper); $Container absent or still the old shape"
+        postGate = "within 60 s: $Container Running and its log has the line '$Proof'; otherwise Replace rolls back"
+        postGateLogs = @($Wslc, 'logs', $Container)
+        migrateAccepts = "$OldContainer exists, is stopped, and is exactly $OldImageSource (checked before and right before the helper); every other container except $Container is stopped; $Container absent or exactly $OldImage"
         migrateSourceInspect = @($Wslc, 'inspect', $OldContainer)
+        migrateContainerList = @($Wslc) + $ListArgs
         migrate = @($Wslc) + $MigrateArgs
     } | ConvertTo-Json -Depth 3
     exit 0
@@ -152,12 +185,21 @@ if ($Step -eq 'LogonTask') {
     exit 0
 }
 
+function Assert-NoOtherWriter {
+    $Ids = @(& $Wslc @ListArgs | Where-Object { $_ })
+    if ($LASTEXITCODE -ne 0 -or $Ids.Count -gt 64) { throw 'Container list is unreadable; not migrating.' }
+    $Problem = Get-WriterProblem @($Ids | ForEach-Object { Get-Container $_ })
+    if ($Problem) { throw "$Problem Not migrating." }
+}
+
 if ($Step -eq 'Migrate') {
+    if (-not $OldImageSource) { throw 'Migrate needs -OldImageSource, the pre-recorded image of the old container.' }
     Assert-OldSourceStopped
+    Assert-NoOtherWriter
     & $Wslc volume inspect $OldHomeVolume | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Old home volume is missing: $OldHomeVolume" }
     $Item = Get-Container $Container
-    if ($Item -and -not (Test-OldShape $Item)) { throw "Container $Container already uses the new shape; not migrating." }
+    if ($Item -and -not ((Get-Images $Item) -ccontains $OldImage)) { throw "Container $Container is not the old $OldImage; not migrating." }
 } else {
     # Create and Replace: repos must already exist (never create an empty one).
     & $Wslc volume inspect $ReposVolume | Out-Null
@@ -165,9 +207,11 @@ if ($Step -eq 'Migrate') {
     if ($Step -eq 'Replace') {
         $Item = Get-Container $Container
         if (-not $Item) { throw "Container to replace is missing: $Container" }
-        if (-not ((Test-OldShape $Item) -or (Test-NewShape $Item))) {
-            throw "Container $Container is neither the old $OldImage shape nor the two-volume shape; not replacing."
-        }
+        if (-not (Test-ReplaceableImage $Item)) { throw "Container $Container is neither exactly $OldImage nor $Image; not replacing." }
+        if (-not $RollbackArgvFile) { throw 'Replace needs -RollbackArgvFile with the pre-recorded argv of the current container.' }
+        $Rollback = @((Get-Content -LiteralPath $RollbackArgvFile -Raw) | ConvertFrom-Json)
+        $Problem = Get-RollbackProblem $Rollback $Item
+        if ($Problem) { throw "$Problem Not replacing." }
     }
 }
 
@@ -179,7 +223,11 @@ if ($LASTEXITCODE -ne 0) {
 
 if ($Step -eq 'Migrate') {
     # Recheck right before the helper; one-shot helper removed by --rm; nothing is deleted from the old home.
+    # The helper itself proves /old and the state mount from its own mountinfo before importing.
+    & $Wslc volume inspect $StateVolume | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "State volume is missing: $StateVolume" }
     Assert-OldSourceStopped
+    Assert-NoOtherWriter
     & $Wslc @MigrateArgs
     if ($LASTEXITCODE -ne 0) { throw "WSLC migrate helper failed: $LASTEXITCODE" }
     exit 0
@@ -198,4 +246,23 @@ if ($Step -eq 'Replace') {
 }
 
 & $Wslc @RunArgs
-if ($LASTEXITCODE -ne 0) { throw "WSLC run failed: $LASTEXITCODE" }
+$RunCode = $LASTEXITCODE
+$Proven = $false
+if ($RunCode -eq 0) {
+    for ($Second = 0; $Second -lt 60 -and -not $Proven; $Second++) {
+        Start-Sleep -Seconds 1
+        $Proven = Test-RunningProof (Get-Container $Container) @(& $Wslc logs $Container 2>$null)
+    }
+}
+if ($Proven) { Write-Output $Proof; exit 0 }
+if ($Step -eq 'Replace') {
+    # Only the pre-recorded argv; every volume is kept.
+    if (Get-Container $Container) {
+        & $Wslc stop $Container | Out-Null
+        & $Wslc remove $Container
+        if ($LASTEXITCODE -ne 0) { throw "New $Container failed its post-gate and could not be removed; not rolling back." }
+    }
+    & $Wslc @Rollback
+    throw "New $Container failed its post-gate (run exit $RunCode); rolled back with the pre-recorded argv (exit $LASTEXITCODE)."
+}
+throw "WSLC run of $Container failed its post-gate (run exit $RunCode)."

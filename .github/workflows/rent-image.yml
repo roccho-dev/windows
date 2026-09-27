@@ -29,14 +29,19 @@ jobs:
           $Want = [ordered]@{
             create = @($W, 'run', '--name', 'windows-rent', '--detach', '--publish', '127.0.0.1:2222:2222',
               '--volume', 'repos:/work/repos', '--volume', 'windows-rent-state:/var/lib/rent',
+              '--env', 'RENT_REPOS_VOLUME=repos', '--env', 'RENT_STATE_VOLUME=windows-rent-state',
               '--env', 'RENT_TS_HOSTNAME=pc7337-windows-rent', '--env', 'RENT_AUTHORIZED_KEY=<contents of ci.pub>', $Image)
             replaceStop = @($W, 'stop', 'windows-rent')
             replaceRemove = @($W, 'remove', 'windows-rent')
+            postGateLogs = @($W, 'logs', 'windows-rent')
             migrate = @($W, 'run', '--rm', '--volume', 'dev-home:/old:ro', '--volume', 'windows-rent-state:/var/lib/rent',
+              '--env', 'RENT_OLD_VOLUME=dev-home', '--env', 'RENT_STATE_VOLUME=windows-rent-state',
               $Image, '/bin/rent-state-import', '4eba321e-6ade-4815-930d-dfa58b6fc960')
             stateVolumeCreateOnce = @($W, 'volume', 'create', 'windows-rent-state')
             migrateSourceInspect = @($W, 'inspect', 'envs-dev-mutable')
+            migrateContainerList = @($W, 'container', 'list', '--all', '-q')
           }
+          if ($Plan.postGate -notlike "*rent-mounts ok repos=repos state=windows-rent-state*") { 'postGate line differs'; exit 1 }
           foreach ($K in $Want.Keys) {
             if ((@($Plan.$K) -join "`n") -cne ($Want[$K] -join "`n")) { "$K differs: $(@($Plan.$K) -join ' ')"; exit 1 }
           }
@@ -48,45 +53,66 @@ jobs:
             try { & $Path @Args2 | Out-Null } catch { $Refused = $true }
             if (-not $Refused) { "not refused: $($Bad | ConvertTo-Json -Compress)"; exit 1 }
           }
-          # Replace/Migrate shape guards, taken from the script itself, on synthetic inspect objects.
+          # Identity/state/image guards, taken from the script itself, on synthetic inspect JSON (not recorded WSLC output).
+          # Every case reports Mounts=[] as WSLC 2.9.3 was observed to: mounts are never an inspect authority.
           $ReposVolume = 'repos'; $StateVolume = 'windows-rent-state'; $OldContainer = 'envs-dev-mutable'; $OldHomeVolume = 'dev-home'
+          $Container = 'windows-rent'; $OldImageSource = 'ghcr.io/roccho-dev/envs-dev@sha256:' + ('1' * 64)
           foreach ($N in $Ast.FindAll({ param($n)
-              ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Test-OldShape', 'Test-NewShape', 'Get-OldSourceProblem') -or
-              ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in '$OldImage', '$Mounts') }, $true)) {
+              ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Get-Images', 'Test-Stopped', 'Test-ReplaceableImage', 'Get-OldSourceProblem', 'Get-WriterProblem', 'Test-RunningProof', 'Get-RollbackProblem') -or
+              ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in '$OldImage', '$Mounts', '$Proof') }, $true)) {
             . ([scriptblock]::Create($N.Extent.Text))
           }
-          function V($Name, $Target) { [pscustomobject]@{ Type = 'volume'; Name = $Name; Destination = $Target } }
-          $Two = @((V repos /work/repos), (V windows-rent-state /var/lib/rent))
-          $Cases = @(
-            @{ Old = $true; New = $false; Item = [pscustomobject]@{ Image = $OldImage; Mounts = @() } },
-            @{ Old = $true; New = $false; Item = [pscustomobject]@{ Config = [pscustomobject]@{ Image = $OldImage }; Mounts = $null } },
-            @{ Old = $false; New = $false; Item = [pscustomobject]@{ Image = $OldImage; Mounts = @((V dev-home /home/dev)) } },
-            @{ Old = $false; New = $false; Item = [pscustomobject]@{ Image = $Image; Mounts = @() } },
-            @{ Old = $false; New = $true; Item = [pscustomobject]@{ Image = $Image; Mounts = $Two } },
-            @{ Old = $false; New = $false; Item = [pscustomobject]@{ Image = $Image; Mounts = $Two + @((V dev-home /home/dev)) } },
-            @{ Old = $false; New = $false; Item = [pscustomobject]@{ Image = $Image; Mounts = @((V repos /work/repos), (V other /var/lib/rent)) } }
-          )
-          foreach ($C in $Cases) {
-            if ((Test-OldShape $C.Item) -ne $C.Old -or (Test-NewShape $C.Item) -ne $C.New) { $C.Item | ConvertTo-Json -Depth 4; exit 1 }
+          function J($Text) { $Text | ConvertFrom-Json }
+          $Other = 'ghcr.io/roccho-dev/windows-rent@sha256:' + ('2' * 64)
+          $Replace = [ordered]@{
+            'old image' = @{ Ok = $true; Item = J ('{"Name":"windows-rent","Image":"sha256:' + ('3' * 64) + '","Config":{"Image":"' + $OldImage + '"},"Mounts":[]}') }
+            'binding image' = @{ Ok = $true; Item = J ('{"Name":"/windows-rent","Image":"' + $Image + '","Mounts":[]}') }
+            'other digest' = @{ Ok = $false; Item = J ('{"Name":"windows-rent","Config":{"Image":"' + $Other + '"},"Mounts":[]}') }
+            'other name' = @{ Ok = $false; Item = J ('{"Name":"envs-dev-mutable","Config":{"Image":"' + $OldImage + '"},"Mounts":[]}') }
+            'no image' = @{ Ok = $false; Item = J '{"Name":"windows-rent","Mounts":[]}' }
           }
-          # Migrate source guard on synthetic inspect JSON: only an existing, stopped envs-dev-mutable with dev-home at /home/dev.
-          $HomeMount = '{"Type":"volume","Name":"dev-home","Destination":"/home/dev"}'
+          foreach ($K in $Replace.Keys) { if ((Test-ReplaceableImage $Replace[$K].Item) -ne $Replace[$K].Ok) { "replace guard wrong for '$K'"; exit 1 } }
+          # Migrate source guard: only an existing, stopped envs-dev-mutable on exactly the pinned source image.
+          $Src = '"Config":{"Image":"' + $OldImageSource + '"},"Mounts":[]'
           $Sources = [ordered]@{
-            'stopped valid' = @{ Ok = $true; Json = '{"Name":"/envs-dev-mutable","State":{"Running":false,"Status":"exited"},"Mounts":[' + $HomeMount + ',{"Type":"volume","Name":"repos","Destination":"/work/repos"}]}' }
+            'stopped valid' = @{ Ok = $true; Json = '{"Name":"/envs-dev-mutable","State":{"Running":false,"Status":"exited"},' + $Src + '}' }
             'missing' = @{ Ok = $false; Json = $null }
-            'running' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":true,"Status":"running"},"Mounts":[' + $HomeMount + ']}' }
-            'status running' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":false,"Status":"running"},"Mounts":[' + $HomeMount + ']}' }
-            'no state' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","Mounts":[' + $HomeMount + ']}' }
-            'string state' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":"false"},"Mounts":[' + $HomeMount + ']}' }
-            'wrong container' = @{ Ok = $false; Json = '{"Name":"windows-rent","State":{"Running":false},"Mounts":[' + $HomeMount + ']}' }
-            'no mounts' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":false},"Mounts":[]}' }
-            'other home volume' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":false},"Mounts":[{"Type":"volume","Name":"other","Destination":"/home/dev"}]}' }
-            'bind home' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":false},"Mounts":[{"Type":"bind","Name":"dev-home","Destination":"/home/dev"}]}' }
+            'running' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":true,"Status":"running"},' + $Src + '}' }
+            'status running' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":false,"Status":"running"},' + $Src + '}' }
+            'no state' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable",' + $Src + '}' }
+            'string state' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":"false"},' + $Src + '}' }
+            'wrong container' = @{ Ok = $false; Json = '{"Name":"windows-rent","State":{"Running":false},' + $Src + '}' }
+            'wrong image' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":false},"Config":{"Image":"' + $Other + '"},"Mounts":[]}' }
+            'no image' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":false},"Mounts":[]}' }
           }
           foreach ($K in $Sources.Keys) {
-            $Item = if ($Sources[$K].Json) { $Sources[$K].Json | ConvertFrom-Json } else { $null }
+            $Item = if ($Sources[$K].Json) { J $Sources[$K].Json } else { $null }
             $Problem = Get-OldSourceProblem $Item
             if ([bool] (-not $Problem) -ne $Sources[$K].Ok) { "source guard wrong for '$K': $Problem"; exit 1 }
+          }
+          # Concurrent-writer guard: every container except the rent container must be provably stopped.
+          $Stopped = J '{"Name":"envs-dev-mutable","State":{"Running":false,"Status":"exited"},"Mounts":[]}'
+          $RentRunning = J '{"Name":"windows-rent","State":{"Running":true,"Status":"running"},"Mounts":[]}'
+          $OtherRunning = J '{"Name":"other","State":{"Running":true,"Status":"running"},"Mounts":[]}'
+          if (Get-WriterProblem @($Stopped, $RentRunning)) { 'writer guard refused a stopped source'; exit 1 }
+          if (-not (Get-WriterProblem @($Stopped, $OtherRunning))) { 'writer guard allowed another running container'; exit 1 }
+          if (-not (Get-WriterProblem @($Stopped, $null))) { 'writer guard allowed an unreadable container'; exit 1 }
+          # Post-gate: running and the exact rent-start proof line, nothing less.
+          $Up = J '{"Name":"windows-rent","State":{"Running":true},"Mounts":[]}'
+          $Down = J '{"Name":"windows-rent","State":{"Running":false},"Mounts":[]}'
+          if (-not (Test-RunningProof $Up @('x', "$Proof`r"))) { 'post-gate refused a proven start'; exit 1 }
+          foreach ($Bad in @(@($Up, @('rent-mounts ok repos=other state=windows-rent-state')), @($Down, @($Proof)), @($null, @($Proof)),
+              @((J '{"State":{"Running":"true"}}'), @($Proof)))) {
+            if (Test-RunningProof $Bad[0] $Bad[1]) { 'post-gate passed without proof'; exit 1 }
+          }
+          # Rollback: the pre-recorded argv recreates exactly windows-rent on its current image, without secrets.
+          $Cur = $Replace['old image'].Item
+          $Good = @('run', '--name', 'windows-rent', '--detach', '--publish', '127.0.0.1:2222:2222', '--volume', 'windows-rent-home:/home/dev', $OldImage)
+          if (Get-RollbackProblem $Good $Cur) { "rollback refused: $(Get-RollbackProblem $Good $Cur)"; exit 1 }
+          foreach ($Bad in @(@(), @('run', '--name', 'other', $OldImage, 'x'), @('run', '--rm', '--name', 'windows-rent', $OldImage),
+              @('run', '--name', 'windows-rent', '--detach', $Other), @('run', '--name', 'windows-rent', '--env', 'GH_TOKEN=x', $OldImage),
+              @('create', '--name', 'windows-rent', '--detach', $OldImage))) {
+            if (-not (Get-RollbackProblem $Bad $Cur)) { "rollback allowed: $($Bad -join ' ')"; exit 1 }
           }
       - uses: cachix/install-nix-action@v31
       - name: Build from locked Nix inputs
@@ -106,20 +132,34 @@ jobs:
           docker volume create rent-smoke-home
           # Existing repos content with a foreign owner; rent-start must never chown it.
           docker run --rm -v rent-smoke-repos:/r "$image" /bin/bash -c 'echo repo > /r/marker && chown 4242:4243 /r/marker'
+          ids=(-e RENT_REPOS_VOLUME=rent-smoke-repos -e RENT_STATE_VOLUME=rent-smoke-state)
           env_args=(-e "RENT_AUTHORIZED_KEY=$(cat "$key_dir/key.pub")" -e RENT_TS_HOSTNAME=rent-ci-smoke)
+          proof='rent-mounts ok repos=rent-smoke-repos state=rent-smoke-state'
 
-          # Fail closed: repos and state are both required, and /home/dev must not be a mount.
+          # Fail closed before any service: exactly the named repos and state volumes, rw, nothing else, no /home/dev mount.
           refuse() {
             local want=$1; shift
             if timeout 60 docker run --rm --name rent-refuse "$@" "${env_args[@]}" "$image" > "$key_dir/refuse" 2>&1; then
               echo "started despite: $want" >&2; return 1
             fi
             grep -qF "$want" "$key_dir/refuse"
+            if grep -qF 'rent-mounts ok' "$key_dir/refuse"; then echo "gate passed despite: $want" >&2; return 1; fi
           }
-          refuse '/work/repos must be a mounted volume' -v rent-smoke-state:/var/lib/rent
-          refuse '/var/lib/rent must be a mounted volume' -v rent-smoke-repos:/work/repos
-          refuse '/home/dev must not be a mount' -v rent-smoke-repos:/work/repos -v rent-smoke-state:/var/lib/rent \
-            -v rent-smoke-home:/home/dev
+          bind_dir="$(mktemp -d)"
+          both=(-v rent-smoke-repos:/work/repos -v rent-smoke-state:/var/lib/rent)
+          refuse 'rent-mounts: set RENT_REPOS_VOLUME and RENT_STATE_VOLUME' "${both[@]}"
+          refuse 'rent-mounts: /work/repos must be exactly volume rent-smoke-repos' -v rent-smoke-state:/var/lib/rent "${ids[@]}"
+          refuse 'rent-mounts: /var/lib/rent must be exactly volume rent-smoke-state' -v rent-smoke-repos:/work/repos "${ids[@]}"
+          refuse 'rent-mounts: /work/repos must be exactly volume rent-smoke-repos' \
+            -v rent-smoke-home:/work/repos -v rent-smoke-state:/var/lib/rent "${ids[@]}"
+          refuse 'rent-mounts: /var/lib/rent must be exactly volume rent-smoke-state' \
+            -v rent-smoke-repos:/work/repos -v rent-smoke-home:/var/lib/rent "${ids[@]}"
+          refuse 'rent-mounts: /work/repos must be exactly volume rent-smoke-repos, rw' \
+            -v rent-smoke-repos:/work/repos:ro -v rent-smoke-state:/var/lib/rent "${ids[@]}"
+          refuse 'rent-mounts: /work/repos must be exactly volume rent-smoke-repos' \
+            -v "$bind_dir:/work/repos" -v rent-smoke-state:/var/lib/rent "${ids[@]}"
+          refuse 'rent-mounts: /home/dev must not be a mount' "${both[@]}" -v rent-smoke-home:/home/dev "${ids[@]}"
+          refuse 'rent-mounts: exactly two volumes are allowed' "${both[@]}" -v rent-smoke-home:/extra "${ids[@]}"
 
           # Later state import, synthetic files only: exact Claude and Codex auth/session paths from a read-only old home, once.
           sid=00000000-0000-4000-8000-000000000000
@@ -132,9 +172,25 @@ jobs:
               /o/.claude/history.jsonl /o/.ssh/id_synthetic \$p/other.jsonl /o/.codex/auth.json /o/.codex/history.jsonl; do echo \"synthetic \$f\" > \$f; done
             chown -R 1000:1000 /o
             chmod 600 /o/.claude/.credentials.json /o/.claude.json \$p/$sid.jsonl /o/.codex/auth.json"
-          state_import() { docker run --rm -v "rent-smoke-old:/old$1" -v rent-smoke-import:/var/lib/rent "$image" /bin/rent-state-import "$sid"; }
-          if state_import '' > "$key_dir/import" 2>&1; then echo 'imported from a writable old home' >&2; exit 1; fi
-          grep -qF '/old must be mounted read-only' "$key_dir/import"
+          state_import() {
+            docker run --rm -v "rent-smoke-old:/old$1" -v rent-smoke-import:/var/lib/rent \
+              -e "RENT_OLD_VOLUME=${2:-rent-smoke-old}" -e RENT_STATE_VOLUME=rent-smoke-import "$image" /bin/rent-state-import "$sid"
+          }
+          import_refused() {
+            if "$@" > "$key_dir/import" 2>&1; then echo "imported despite: $*" >&2; exit 1; fi
+            if docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c 'shopt -s nullglob dotglob; f=(/s/*); ((${#f[@]}))'; then
+              echo "refused import wrote state: $*" >&2; exit 1
+            fi
+          }
+          import_refused state_import ''
+          grep -qF '/old must be exactly volume rent-smoke-old, mounted read-only' "$key_dir/import"
+          import_refused state_import :ro rent-smoke-home
+          grep -qF '/old must be exactly volume rent-smoke-home, mounted read-only' "$key_dir/import"
+          import_refused docker run --rm -v rent-smoke-old:/old:ro -v rent-smoke-import:/var/lib/rent "$image" /bin/rent-state-import "$sid"
+          grep -qF 'set RENT_OLD_VOLUME and RENT_STATE_VOLUME' "$key_dir/import"
+          import_refused docker run --rm -v rent-smoke-old:/old:ro -v rent-smoke-import:/var/lib/rent:ro \
+            -e RENT_OLD_VOLUME=rent-smoke-old -e RENT_STATE_VOLUME=rent-smoke-import "$image" /bin/rent-state-import "$sid"
+          grep -qF '/var/lib/rent must be exactly volume rent-smoke-import, writable' "$key_dir/import"
           state_import :ro > "$key_dir/import"
           if grep -q synthetic "$key_dir/import"; then echo 'import printed file contents' >&2; exit 1; fi
           # An identical rerun (as after an interruption) is a no-op; a differing target is never overwritten.
@@ -154,8 +210,10 @@ jobs:
 
           run() {
             docker run -d --name rent-smoke -p 127.0.0.1:2222:2222 \
-              -v rent-smoke-repos:/work/repos -v rent-smoke-state:/var/lib/rent "$@" "$image"
+              -v rent-smoke-repos:/work/repos -v rent-smoke-state:/var/lib/rent "${ids[@]}" "$@" "$image"
           }
+          # The one fixed proof line, from rent-start itself, once per start.
+          proven() { test "$(docker logs rent-smoke 2>&1 | grep -cxF "$proof")" = "$1"; }
           run "${env_args[@]}"
           for attempt in {1..30}; do
             if docker exec rent-smoke /bin/cat /var/lib/rent/ssh/ssh_host_ed25519_key.pub > "$key_dir/host.pub" 2>/dev/null; then break; fi
@@ -200,6 +258,7 @@ jobs:
           }
 
           ssh_ready
+          proven 1
           test "$(docker port rent-smoke)" = "2222/tcp -> 127.0.0.1:2222"
           repos_untouched
           "${ssh_cmd[@]}" 'set -eu
@@ -248,6 +307,7 @@ jobs:
           docker start rent-smoke
           test "$(docker inspect --format '{{.Id}}' rent-smoke)" = "$before"
           ssh_ready
+          proven 2
           "${ssh_cmd[@]}" "$markers"' && test "$(cat ~/home-marker)" = home'
           test "$(claude_config)" = "$config"
           ts_ready
@@ -259,6 +319,7 @@ jobs:
           docker rm rent-smoke
           run -e RENT_TS_HOSTNAME=rent-ci-smoke
           ssh_ready
+          proven 1
           "${ssh_cmd[@]}" "$markers"' && test ! -e ~/home-marker'
           test "$(claude_config)" = "$config"
           ts_ready

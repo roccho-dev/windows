@@ -37,6 +37,35 @@
         export DISABLE_AUTOUPDATER=1
         exec ${pkgs.glibc}/lib/ld-linux-x86-64.so.2 --library-path ${pkgs.glibc}/lib ${claudeBin} "$@"
       '';
+      # The one mount authority: this container's own /proc/self/mountinfo, read within 10 s. A named volume is a
+      # mount whose root ends in /volumes/<name>/_data, as WSLC and Docker both report; WSLC inspect Mounts is not used.
+      mountLib = ''
+        mounts=$(timeout 10 cat /proc/self/mountinfo) || { echo "$(basename "$0"): mountinfo unreadable within 10 s" >&2; exit 1; }
+        # target name mode: exactly one mount at target, and it is that named volume with that mode.
+        volume_at() {
+          local n=0 ok=1 _id _parent _dev root mp opts _rest
+          while read -r _id _parent _dev root mp opts _rest; do
+            [ "$mp" = "$1" ] || continue
+            n=$((n + 1))
+            case "$root" in */volumes/"$2"/_data) ;; *) ok=0 ;; esac
+            case ",$opts," in *,"$3",*) ;; *) ok=0 ;; esac
+          done <<< "$mounts"
+          [ "$n" = 1 ] && [ "$ok" = 1 ]
+        }
+        volume_count() {
+          local n=0 _id _parent _dev root _rest
+          while read -r _id _parent _dev root _rest; do
+            case "$root" in */volumes/*/_data) n=$((n + 1)) ;; esac
+          done <<< "$mounts"
+          echo "$n"
+        }
+        mounted() {
+          local _id _parent _dev _root mp _rest
+          while read -r _id _parent _dev _root mp _rest; do [ "$mp" = "$1" ] && return 0; done <<< "$mounts"
+          return 1
+        }
+        volume_name() { case ''${1:-} in ""|*[!a-z0-9-]*) return 1 ;; esac; }
+      '';
       # Later one-time import of exactly one Claude account and session, plus Codex auth, from an old home mounted
       # read-only at /old into the state volume. Never run by rent-start; prints target names and sizes only.
       stateImport = pkgs.writeShellScriptBin "rent-state-import" ''
@@ -46,16 +75,12 @@
         id=''${1:-}
         [[ $id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] ||
           fail 'usage: rent-state-import <session-uuid>'
-        mount_opts() {
-          local _id _parent _dev _root mp opts _rest
-          while read -r _id _parent _dev _root mp opts _rest; do
-            [ "$mp" = "$1" ] && { printf '%s\n' "$opts"; return 0; }
-          done < /proc/self/mountinfo
-          return 1
-        }
-        opts=$(mount_opts /old) || fail '/old must be the old home, mounted read-only'
-        case ",$opts," in *,ro,*) ;; *) fail '/old must be mounted read-only' ;; esac
-        mount_opts ${rentState} > /dev/null || fail '${rentState} must be the state volume'
+        ${mountLib}
+        oldvol=''${RENT_OLD_VOLUME:-}
+        statevol=''${RENT_STATE_VOLUME:-}
+        volume_name "$oldvol" && volume_name "$statevol" || fail 'set RENT_OLD_VOLUME and RENT_STATE_VOLUME to volume names'
+        volume_at /old "$oldvol" ro || fail "/old must be exactly volume $oldvol, mounted read-only"
+        volume_at ${rentState} "$statevol" rw || fail "${rentState} must be exactly volume $statevol, writable"
         s=${rentState}/dev
         p=projects/-home-dev
         same() { if [ -d "$1" ]; then diff -r -q --no-dereference "$1" "$2" > /dev/null 2>&1; else cmp -s "$1" "$2"; fi; }
@@ -114,17 +139,17 @@
         set -eu
         export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.openssh pkgs.tailscale ]}
         state=${rentState}
-        is_mount() {
-          local _id _parent _dev _root mp _rest
-          while read -r _id _parent _dev _root mp _rest; do
-            [ "$mp" = "$1" ] && return 0
-          done < /proc/self/mountinfo
-          return 1
-        }
-        for m in /work/repos "$state"; do
-          is_mount "$m" || { echo "$m must be a mounted volume" >&2; exit 1; }
-        done
-        if is_mount /home/dev; then echo '/home/dev must not be a mount' >&2; exit 1; fi
+        # One gate before any service: exactly the Binding repos and state volumes, both writable, nothing else.
+        ${mountLib}
+        repos=''${RENT_REPOS_VOLUME:-}
+        statevol=''${RENT_STATE_VOLUME:-}
+        volume_name "$repos" && volume_name "$statevol" ||
+          { echo 'rent-mounts: set RENT_REPOS_VOLUME and RENT_STATE_VOLUME to volume names' >&2; exit 1; }
+        volume_at /work/repos "$repos" rw || { echo "rent-mounts: /work/repos must be exactly volume $repos, rw" >&2; exit 1; }
+        volume_at "$state" "$statevol" rw || { echo "rent-mounts: $state must be exactly volume $statevol, rw" >&2; exit 1; }
+        if mounted /home/dev; then echo 'rent-mounts: /home/dev must not be a mount' >&2; exit 1; fi
+        [ "$(volume_count)" = 2 ] || { echo 'rent-mounts: exactly two volumes are allowed' >&2; exit 1; }
+        echo "rent-mounts ok repos=$repos state=$statevol"
         if [ -z "''${RENT_TS_HOSTNAME:-}" ]; then echo 'Set RENT_TS_HOSTNAME' >&2; exit 1; fi
 
         dir() { install -d "$3"; chown "$2" "$3"; chmod "$1" "$3"; }
