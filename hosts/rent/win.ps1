@@ -81,7 +81,7 @@ function Get-OldSourceProblem($Item) {
 }
 
 function Get-Container([string] $Name) {
-    $Current = (& $Wslc container inspect -f json $Name) -join "`n"
+    $Current = (& $Wslc inspect $Name) -join "`n"
     if ($LASTEXITCODE -ne 0) { return $null }
     $Parsed = $Current | ConvertFrom-Json
     $Items = @($Parsed)
@@ -122,7 +122,7 @@ if ($Step -eq 'Plan') {
         replaceStop = @($Wslc, 'stop', $Container)
         replaceRemove = @($Wslc, 'remove', $Container)
         migrateAccepts = "$OldContainer exists, is not running, and mounts volume $OldHomeVolume at /home/dev (checked before and right before the helper); $Container absent or still the old shape"
-        migrateSourceInspect = @($Wslc, 'container', 'inspect', '-f', 'json', $OldContainer)
+        migrateSourceInspect = @($Wslc, 'inspect', $OldContainer)
         migrate = @($Wslc) + $MigrateArgs
     } | ConvertTo-Json -Depth 3
     exit 0

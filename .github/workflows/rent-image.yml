@@ -35,7 +35,7 @@ jobs:
             migrate = @($W, 'run', '--rm', '--volume', 'dev-home:/old:ro', '--volume', 'windows-rent-state:/var/lib/rent',
               $Image, '/bin/rent-state-import', '4eba321e-6ade-4815-930d-dfa58b6fc960')
             stateVolumeCreateOnce = @($W, 'volume', 'create', 'windows-rent-state')
-            migrateSourceInspect = @($W, 'container', 'inspect', '-f', 'json', 'envs-dev-mutable')
+            migrateSourceInspect = @($W, 'inspect', 'envs-dev-mutable')
           }
           foreach ($K in $Want.Keys) {
             if ((@($Plan.$K) -join "`n") -cne ($Want[$K] -join "`n")) { "$K differs: $(@($Plan.$K) -join ' ')"; exit 1 }
