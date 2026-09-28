@@ -1,9 +1,13 @@
 name: rent image
 
 on:
-  push:
-    branches: [main, feat/rent-ci, f/rent-final]
-    paths: ["flake.nix", "flake.lock", "hosts/rent/**", "hosts/own/codex.nix", ".github/workflows/rent-image.yml"]
+  workflow_call:
+    inputs:
+      publish:
+        description: Publish the exact tested image
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   build-test-publish:
@@ -390,6 +394,7 @@ jobs:
           test "$(machine_key_hash)" = "$machine"
           repos_untouched
       - name: Publish exact image from this repository
+        if: inputs.publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
