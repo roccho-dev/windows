@@ -1,0 +1,39 @@
+name: dev image
+
+on:
+  pull_request:
+    paths: ["flake.nix", "flake.lock", "oci/dev/**", ".github/workflows/dev-image.yml"]
+  push:
+    branches: [main]
+    paths: ["flake.nix", "flake.lock", "oci/dev/**", ".github/workflows/dev-image.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-image-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fresh-develop-replace-continue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      - name: Build the locked dev image
+        run: |
+          set -euo pipefail
+          nix build .#dev-image --no-write-lock-file --print-build-logs
+          git diff --exit-code -- flake.lock
+          printf 'source %s\ndrvPath %s\n' "$(git rev-parse HEAD)" \
+            "$(nix eval --raw .#dev-image.drvPath --no-write-lock-file)" >> "$GITHUB_STEP_SUMMARY"
+          sha256sum result >> "$GITHUB_STEP_SUMMARY"
+      - name: Prove actual development continues after replacement
+        run: |
+          set -euo pipefail
+          bash oci/dev/proof.sh result 2>&1 | tee dev-proof.log
+          grep -E '^(image |apps revision |PASS )' dev-proof.log >> "$GITHUB_STEP_SUMMARY"
