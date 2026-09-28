@@ -34,7 +34,7 @@ jobs:
             create = @($W, 'run', '--name', 'windows-rent', '--detach', '--publish', '127.0.0.1:2222:2222',
               '--volume', 'repos:/work/repos', '--volume', 'windows-rent-state:/var/lib/rent',
               '--env', 'RENT_REPOS_VOLUME=repos', '--env', 'RENT_STATE_VOLUME=windows-rent-state',
-              '--env', 'RENT_TS_HOSTNAME=pc7337-windows-rent', '--env', 'RENT_AUTHORIZED_KEY=<contents of ci.pub>', $Image)
+              '--env', 'RENT_TS_HOSTNAME=pc7337-windows-rent', '--env', 'RENT_AUTHORIZED_KEY=<contents of ci.pub>', '--env', 'TS_FORCE_NOISE_443=1', $Image)
             replaceStop = @($W, 'stop', 'windows-rent')
             replaceRemove = @($W, 'remove', 'windows-rent')
             postGateLogs = @($W, 'logs', 'windows-rent')
