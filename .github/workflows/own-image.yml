@@ -2,19 +2,38 @@ name: own trial image
 
 on:
   push:
-    branches: [main, feat/rent-ci]
+    branches: [main, feat/rent-ci, codex/own-iac-derivative]
+    paths: ["flake.nix", "flake.lock", "hosts/own/**", ".github/workflows/own-image.yml"]
+  pull_request:
     paths: ["flake.nix", "flake.lock", "hosts/own/**", ".github/workflows/own-image.yml"]
 
 jobs:
-  build-test-publish:
+  build-test:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
     timeout-minutes: 90
+    outputs:
+      source: ${{ steps.source.outputs.sha }}
+      drv: ${{ steps.source.outputs.drv }}
     steps:
+      # Test the exact PR head, not the refs/pull/N/merge commit.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - uses: cachix/install-nix-action@v31
+      - name: Record source commit and own-image drvPath
+        id: source
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          drv="$(nix eval --raw .#own-image.drvPath --no-write-lock-file)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "drv=$drv" >> "$GITHUB_OUTPUT"
+          printf 'source %s\ndrvPath %s\nworkflow blob %s\n' "$sha" "$drv" "$(git rev-parse HEAD:.github/workflows/own-image.yml)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Evaluate flake checks
+        run: nix flake check --no-write-lock-file --print-build-logs
       - name: Build actual own OCI image
         run: nix build .#own-image --no-write-lock-file --print-build-logs
       - name: Test synthetic trial mode, restart, and volume reuse (no real logins)
@@ -112,13 +131,40 @@ jobs:
           grep -q '"title": "own agent A"' "$key_dir/pages"
           grep -q '"title": "own agent B"' "$key_dir/pages"
           "${ssh_cmd[@]}" 'test -d /home/dev/chromium/Default && test -d "/home/dev/chromium/Profile 1" && test -d "/home/dev/chromium/Profile 2"'
+      - name: Keep the tested image for publishing
+        if: github.event_name == 'push'
+        run: cp -L result own-image.tar.gz
+      - if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: own-image
+          path: own-image.tar.gz
+          retention-days: 1
+
+  # Only trusted pushes to the listed branches receive package write access.
+  publish:
+    needs: build-test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: own-image
       - name: Publish tested image by commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE: ${{ needs.build-test.outputs.source }}
+          DRV: ${{ needs.build-test.outputs.drv }}
         run: |
           set -euo pipefail
+          test "$SOURCE" = "$GITHUB_SHA"
+          docker load < own-image.tar.gz
           echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          image="ghcr.io/roccho-dev/windows-own:sha-${GITHUB_SHA}"
+          image="ghcr.io/roccho-dev/windows-own:sha-${SOURCE}"
           docker tag ghcr.io/roccho-dev/windows-own:nix "$image"
           docker push "$image"
-          docker image inspect "$image" --format '{{index .RepoDigests 0}}' >> "$GITHUB_STEP_SUMMARY"
+          printf 'source %s\ndrvPath %s\ndigest %s\n' "$SOURCE" "$DRV" "$(docker image inspect "$image" --format '{{index .RepoDigests 0}}')" >> "$GITHUB_STEP_SUMMARY"
