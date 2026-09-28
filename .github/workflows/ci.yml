@@ -3,7 +3,7 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [proposals]
   workflow_dispatch:
 
 jobs:
@@ -13,7 +13,7 @@ jobs:
       packages: write
     uses: ./.github/workflows/own-image.yml
     with:
-      publish: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      publish: ${{ github.event_name == 'push' && github.ref == 'refs/heads/proposals' }}
     secrets: inherit
 
   rent:
@@ -22,7 +22,7 @@ jobs:
       packages: write
     uses: ./.github/workflows/rent-image.yml
     with:
-      publish: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      publish: ${{ github.event_name == 'push' && github.ref == 'refs/heads/proposals' }}
     secrets: inherit
 
   dev:
@@ -83,7 +83,7 @@ jobs:
 
   publish:
     needs: [build, windows]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/proposals'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
