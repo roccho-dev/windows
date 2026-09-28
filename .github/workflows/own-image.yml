@@ -2,7 +2,7 @@ name: own trial image
 
 on:
   push:
-    branches: [main, feat/rent-ci, codex/own-iac-derivative]
+    branches: [main, feat/rent-ci, codex/own-iac-derivative, codex/remote-ssh-codex]
     paths: ["flake.nix", "flake.lock", "hosts/own/**", ".github/workflows/own-image.yml"]
   pull_request:
     paths: ["flake.nix", "flake.lock", "hosts/own/**", ".github/workflows/own-image.yml"]
@@ -53,25 +53,39 @@ jobs:
           ssh_cmd=(ssh -F /dev/null -p 2223 -i "$key_dir/key" -o IdentitiesOnly=yes \
             -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
             -o "UserKnownHostsFile=$key_dir/known_hosts" dev@127.0.0.1)
+          # Three headless profiles: distinct CDP endpoints on 9222-9224, each loopback-only, and only 2223 published.
+          browsers() {
+            : > "$key_dir/ws"
+            for n in 1 2 3; do
+              port=$((9221 + n))
+              for attempt in {1..60}; do
+                if docker exec own-smoke /bin/curl -fsS "http://127.0.0.1:$port/json/list" > "$key_dir/pages$n" 2>/dev/null &&
+                  grep -q "own p$n" "$key_dir/pages$n"; then break; fi
+                sleep 1
+              done
+              grep -q "own p$n" "$key_dir/pages$n"
+              docker exec own-smoke /bin/curl -fsS "http://127.0.0.1:$port/json/version" > "$key_dir/cdp$n"
+              grep -q '"Browser": "Chrome/150\.' "$key_dir/cdp$n"
+              grep -o '"webSocketDebuggerUrl": "[^"]*"' "$key_dir/cdp$n" >> "$key_dir/ws"
+              "${ssh_cmd[@]}" "test -d /home/dev/chromium/p$n/Default"
+            done
+            test "$(sort -u "$key_dir/ws" | wc -l)" -eq 3
+            docker exec own-smoke /bin/cat /proc/net/tcp /proc/net/tcp6 > "$key_dir/tcp"
+            for port in 9222 9223 9224; do
+              awk -v h=":$(printf '%04X' "$port")" '$4 == "0A" && substr($2, length($2) - 4) == h { n++; if ($2 !~ /^(0100007F|00000000000000000000000001000000):/) bad++ } END { exit !(n >= 1 && bad == 0) }' "$key_dir/tcp"
+            done
+            test "$(docker port own-smoke)" = "2223/tcp -> 127.0.0.1:2223"
+            "${ssh_cmd[@]}" 'test -x "$(command -v cdp-tty)" && test -x "$(command -v own-view)"'
+          }
           for attempt in {1..60}; do
             if "${ssh_cmd[@]}" id -un > "$key_dir/answer" 2>/dev/null; then break; fi
             sleep 1
           done
           test "$(cat "$key_dir/answer")" = dev
-          for attempt in {1..60}; do
-            if docker exec own-smoke /bin/curl -fsS http://127.0.0.1:9222/json/version > "$key_dir/cdp" 2>/dev/null; then break; fi
-            sleep 1
-          done
-          grep -q '"Browser": "Chrome/' "$key_dir/cdp"
-          for attempt in {1..30}; do
-            docker exec own-smoke /bin/curl -fsS http://127.0.0.1:9222/json/list > "$key_dir/pages"
-            if grep -q '"title": "own agent B"' "$key_dir/pages"; then break; fi
-            sleep 1
-          done
-          grep -q '"title": "own human"' "$key_dir/pages"
-          grep -q '"title": "own agent A"' "$key_dir/pages"
-          grep -q '"title": "own agent B"' "$key_dir/pages"
-          "${ssh_cmd[@]}" 'test -s /home/dev/chromium/Local\ State; test -d /home/dev/chromium/Default; test -d "/home/dev/chromium/Profile 1"; test -d "/home/dev/chromium/Profile 2"'
+          "${ssh_cmd[@]}" 'test "$(command -v codex)" = /bin/codex && test "$(codex --version)" = "codex-cli 0.157.1" && codex app-server --help >/dev/null && codex_bin="$(readlink -f /bin/codex)" && test -x "${codex_bin%/*}/codex-code-mode-host"'
+          "${ssh_cmd[@]}" 'gh --version >/dev/null'
+          "${ssh_cmd[@]}" 'test -s "$SSL_CERT_FILE" && curl -fsSI https://github.com/ >/dev/null'
+          browsers
           ssh -F /dev/null -N -p 2223 -i "$key_dir/key" -o IdentitiesOnly=yes \
             -o BatchMode=yes -o StrictHostKeyChecking=yes \
             -o "UserKnownHostsFile=$key_dir/known_hosts" \
@@ -104,11 +118,7 @@ jobs:
           wait "$tunnel_pid" || true
           unset tunnel_pid
           docker restart own-smoke
-          for attempt in {1..60}; do
-            if "${ssh_cmd[@]}" 'test -d /home/dev/chromium/Default && test -d "/home/dev/chromium/Profile 1" && test -d "/home/dev/chromium/Profile 2"' 2>/dev/null; then break; fi
-            sleep 1
-          done
-          "${ssh_cmd[@]}" 'test -d /home/dev/chromium/Default && test -d "/home/dev/chromium/Profile 1" && test -d "/home/dev/chromium/Profile 2"'
+          browsers
           old_id="$(docker inspect --format '{{.Id}}' own-smoke)"
           docker rm -f own-smoke
           docker run -d --name own-smoke --shm-size 1g -p 127.0.0.1:2223:2223 \
@@ -117,20 +127,7 @@ jobs:
             -e OWN_TRIAL_UNSANDBOXED=1 \
             ghcr.io/roccho-dev/windows-own:nix
           test "$(docker inspect --format '{{.Id}}' own-smoke)" != "$old_id"
-          for attempt in {1..60}; do
-            if docker exec own-smoke /bin/curl -fsS http://127.0.0.1:9222/json/version > "$key_dir/cdp" 2>/dev/null; then break; fi
-            sleep 1
-          done
-          grep -q '"Browser": "Chrome/' "$key_dir/cdp"
-          for attempt in {1..30}; do
-            docker exec own-smoke /bin/curl -fsS http://127.0.0.1:9222/json/list > "$key_dir/pages"
-            if grep -q '"title": "own agent B"' "$key_dir/pages"; then break; fi
-            sleep 1
-          done
-          grep -q '"title": "own human"' "$key_dir/pages"
-          grep -q '"title": "own agent A"' "$key_dir/pages"
-          grep -q '"title": "own agent B"' "$key_dir/pages"
-          "${ssh_cmd[@]}" 'test -d /home/dev/chromium/Default && test -d "/home/dev/chromium/Profile 1" && test -d "/home/dev/chromium/Profile 2"'
+          browsers
       - name: Keep the tested image for publishing
         if: github.event_name == 'push'
         run: cp -L result own-image.tar.gz

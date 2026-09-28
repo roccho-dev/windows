@@ -1,12 +1,14 @@
-{ port, certFile }:
+{ port, sshDir, certFile }:
 
 assert builtins.isInt port && port > 1023 && port < 65536;
+assert builtins.isString sshDir && builtins.substring 0 1 sshDir == "/";
 assert builtins.isString certFile;
+# Host key and authorized keys live only in the state volume, never in the home.
 ''
   Port ${builtins.toString port}
   ListenAddress 0.0.0.0
-  HostKey /home/dev/.ssh/ssh_host_ed25519_key
-  AuthorizedKeysFile .ssh/authorized_keys
+  HostKey ${sshDir}/ssh_host_ed25519_key
+  AuthorizedKeysFile ${sshDir}/authorized_keys
   PubkeyAuthentication yes
   PasswordAuthentication no
   KbdInteractiveAuthentication no
