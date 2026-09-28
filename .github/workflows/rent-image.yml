@@ -2,8 +2,8 @@ name: rent image
 
 on:
   push:
-    branches: [main, feat/rent-ci]
-    paths: ["flake.nix", "flake.lock", "hosts/rent/**", ".github/workflows/rent-image.yml"]
+    branches: [main, feat/rent-ci, f/rent-final]
+    paths: ["flake.nix", "flake.lock", "hosts/rent/**", "hosts/own/codex.nix", ".github/workflows/rent-image.yml"]
 
 jobs:
   build-test-publish:
@@ -13,45 +13,382 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+      - name: Parse and dry-plan the Windows script (no WSLC, no live effect)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Path = "$PWD/hosts/rent/win.ps1"
+          $Errors = $null
+          $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref] $null, [ref] $Errors)
+          if ($Errors) { $Errors; exit 1 }
+          $env:COMPUTERNAME = 'CI-HOST'
+          $Image = 'ghcr.io/roccho-dev/windows-rent@sha256:' + ('0' * 64)
+          $Base = @{ Step = 'Plan'; ExpectHost = 'CI-HOST'; Container = 'windows-rent'; Port = 2222; Image = $Image; PublicKeyFile = 'ci.pub' }
+          $Plan = (& $Path @Base) | ConvertFrom-Json
+          $W = 'C:\Program Files\WSL\wslc.exe'
+          $Want = [ordered]@{
+            create = @($W, 'run', '--name', 'windows-rent', '--detach', '--publish', '127.0.0.1:2222:2222',
+              '--volume', 'repos:/work/repos', '--volume', 'windows-rent-state:/var/lib/rent',
+              '--env', 'RENT_REPOS_VOLUME=repos', '--env', 'RENT_STATE_VOLUME=windows-rent-state',
+              '--env', 'RENT_TS_HOSTNAME=pc7337-windows-rent', '--env', 'RENT_AUTHORIZED_KEY=<contents of ci.pub>', $Image)
+            replaceStop = @($W, 'stop', 'windows-rent')
+            replaceRemove = @($W, 'remove', 'windows-rent')
+            postGateLogs = @($W, 'logs', 'windows-rent')
+            rollbackStart = @($W, 'start', 'windows-rent')
+            migrate = @($W, 'run', '--rm', '--volume', 'dev-home:/old:ro', '--volume', 'windows-rent-state:/var/lib/rent',
+              '--env', 'RENT_OLD_VOLUME=dev-home', '--env', 'RENT_STATE_VOLUME=windows-rent-state',
+              $Image, '/bin/rent-state-import', '4eba321e-6ade-4815-930d-dfa58b6fc960')
+            stateVolumeCreateOnce = @($W, 'volume', 'create', 'windows-rent-state')
+            migrateSourceInspect = @($W, 'inspect', 'envs-dev-mutable')
+            migrateContainerList = @($W, 'container', 'list', '--all', '-q')
+          }
+          if ($Plan.postGate -notlike "*rent-mounts ok repos=repos state=windows-rent-state*") { 'postGate line differs'; exit 1 }
+          foreach ($K in $Want.Keys) {
+            if ((@($Plan.$K) -join "`n") -cne ($Want[$K] -join "`n")) { "$K differs: $(@($Plan.$K) -join ' ')"; exit 1 }
+          }
+          # Refusals before any WSLC call.
+          foreach ($Bad in @(@{ OldHomeVolume = 'repos' }, @{ OldHomeVolume = 'windows-rent-state' }, @{ SessionId = 'not-a-session' }, @{ OldContainer = 'windows-rent' },
+              @{ Image = 'ghcr.io/roccho-dev/windows-rent:latest' })) {
+            $Refused = $false
+            $Args2 = $Base.Clone(); foreach ($K in $Bad.Keys) { $Args2[$K] = $Bad[$K] }
+            try { & $Path @Args2 | Out-Null } catch { $Refused = $true }
+            if (-not $Refused) { "not refused: $($Bad | ConvertTo-Json -Compress)"; exit 1 }
+          }
+          # Identity/state/image guards, taken from the script itself, on synthetic inspect JSON (not recorded WSLC output).
+          # Every case reports Mounts=[] as WSLC 2.9.3 was observed to: mounts are never an inspect authority.
+          $ReposVolume = 'repos'; $StateVolume = 'windows-rent-state'; $OldContainer = 'envs-dev-mutable'; $OldHomeVolume = 'dev-home'
+          $Container = 'windows-rent'; $OldImageSource = 'ghcr.io/roccho-dev/envs-dev@sha256:' + ('1' * 64)
+          foreach ($N in $Ast.FindAll({ param($n)
+              ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Get-Images', 'Test-Stopped', 'Test-ReplaceableImage', 'Get-OldSourceProblem', 'Get-WriterProblem', 'Test-RunningProof', 'Get-RollbackProblem') -or
+              ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in '$OldImage', '$Mounts', '$Proof') }, $true)) {
+            . ([scriptblock]::Create($N.Extent.Text))
+          }
+          function J($Text) { $Text | ConvertFrom-Json }
+          $Other = 'ghcr.io/roccho-dev/windows-rent@sha256:' + ('2' * 64)
+          $Replace = [ordered]@{
+            'old image' = @{ Ok = $true; Item = J ('{"Name":"windows-rent","Image":"sha256:' + ('3' * 64) + '","Config":{"Image":"' + $OldImage + '"},"Mounts":[]}') }
+            'binding image' = @{ Ok = $true; Item = J ('{"Name":"/windows-rent","Image":"' + $Image + '","Mounts":[]}') }
+            'other digest' = @{ Ok = $false; Item = J ('{"Name":"windows-rent","Config":{"Image":"' + $Other + '"},"Mounts":[]}') }
+            'other name' = @{ Ok = $false; Item = J ('{"Name":"envs-dev-mutable","Config":{"Image":"' + $OldImage + '"},"Mounts":[]}') }
+            'no image' = @{ Ok = $false; Item = J '{"Name":"windows-rent","Mounts":[]}' }
+          }
+          foreach ($K in $Replace.Keys) { if ((Test-ReplaceableImage $Replace[$K].Item) -ne $Replace[$K].Ok) { "replace guard wrong for '$K'"; exit 1 } }
+          # Migrate source guard: only an existing, stopped envs-dev-mutable on exactly the pinned source image.
+          $Src = '"Config":{"Image":"' + $OldImageSource + '"},"Mounts":[]'
+          $Sources = [ordered]@{
+            'stopped valid' = @{ Ok = $true; Json = '{"Name":"/envs-dev-mutable","State":{"Running":false,"Status":"exited"},' + $Src + '}' }
+            'missing' = @{ Ok = $false; Json = $null }
+            'running' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":true,"Status":"running"},' + $Src + '}' }
+            'status running' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":false,"Status":"running"},' + $Src + '}' }
+            'no state' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable",' + $Src + '}' }
+            'string state' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":"false"},' + $Src + '}' }
+            'wrong container' = @{ Ok = $false; Json = '{"Name":"windows-rent","State":{"Running":false},' + $Src + '}' }
+            'wrong image' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":false},"Config":{"Image":"' + $Other + '"},"Mounts":[]}' }
+            'no image' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":false},"Mounts":[]}' }
+          }
+          foreach ($K in $Sources.Keys) {
+            $Item = if ($Sources[$K].Json) { J $Sources[$K].Json } else { $null }
+            $Problem = Get-OldSourceProblem $Item
+            if ([bool] (-not $Problem) -ne $Sources[$K].Ok) { "source guard wrong for '$K': $Problem"; exit 1 }
+          }
+          # Concurrent-writer guard: every container except the rent container must be provably stopped.
+          $Stopped = J '{"Name":"envs-dev-mutable","State":{"Running":false,"Status":"exited"},"Mounts":[]}'
+          $RentRunning = J '{"Name":"windows-rent","State":{"Running":true,"Status":"running"},"Mounts":[]}'
+          $OtherRunning = J '{"Name":"other","State":{"Running":true,"Status":"running"},"Mounts":[]}'
+          if (Get-WriterProblem @($Stopped, $RentRunning)) { 'writer guard refused a stopped source'; exit 1 }
+          if (-not (Get-WriterProblem @($Stopped, $OtherRunning))) { 'writer guard allowed another running container'; exit 1 }
+          if (-not (Get-WriterProblem @($Stopped, $null))) { 'writer guard allowed an unreadable container'; exit 1 }
+          # Post-gate: running and the exact rent-start proof line, nothing less.
+          $Up = J '{"Name":"windows-rent","State":{"Running":true},"Mounts":[]}'
+          $Down = J '{"Name":"windows-rent","State":{"Running":false},"Mounts":[]}'
+          if (-not (Test-RunningProof $Up @('x', "$Proof`r"))) { 'post-gate refused a proven start'; exit 1 }
+          foreach ($Bad in @(@($Up, @('rent-mounts ok repos=other state=windows-rent-state')), @($Down, @($Proof)), @($null, @($Proof)),
+              @((J '{"State":{"Running":"true"}}'), @($Proof)))) {
+            if (Test-RunningProof $Bad[0] $Bad[1]) { 'post-gate passed without proof'; exit 1 }
+          }
+          # Rollback: the pre-recorded argv recreates exactly windows-rent on its current image, without secrets.
+          $Cur = $Replace['old image'].Item
+          $Good = @('run', '--name', 'windows-rent', '--detach', '--publish', '127.0.0.1:2222:2222', '--volume', 'windows-rent-home:/home/dev', $OldImage)
+          if (Get-RollbackProblem $Good $Cur) { "rollback refused: $(Get-RollbackProblem $Good $Cur)"; exit 1 }
+          foreach ($Bad in @(@(), @('run', '--name', 'other', $OldImage, 'x'), @('run', '--rm', '--name', 'windows-rent', $OldImage),
+              @('run', '--name', 'windows-rent', '--detach', $Other), @('run', '--name', 'windows-rent', '--env', 'GH_TOKEN=x', $OldImage),
+              @('create', '--name', 'windows-rent', '--detach', $OldImage))) {
+            if (-not (Get-RollbackProblem $Bad $Cur)) { "rollback allowed: $($Bad -join ' ')"; exit 1 }
+          }
+          # The rollback argv file, parsed by the script's own statement under the PowerShell 7 it requires.
+          if ($Ast.ScriptRequirements.RequiredPSVersion -ne [version] '7.0') { 'win.ps1 must require PowerShell 7'; exit 1 }
+          $ReadRollback = [scriptblock]::Create($Ast.Find({ param($n)
+              $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$Rollback' }, $true).Extent.Text)
+          $GoodJson = ConvertTo-Json -InputObject $Good -Compress
+          $RollbackArgvFile = (New-TemporaryFile).FullName
+          foreach ($Json in @($GoodJson, "[$GoodJson]", "{`"argv`":$GoodJson}", '"run"')) {
+            Set-Content -LiteralPath $RollbackArgvFile -Value $Json
+            . $ReadRollback
+            $Parsed = -not (Get-RollbackProblem $Rollback $Cur) -and ($Rollback -join "`n") -ceq ($Good -join "`n")
+            if ($Parsed -ne ($Json -ceq $GoodJson)) { "rollback file parsed wrong: $Json"; exit 1 }
+          }
+          # Replace after a successful stop, on a fake WSLC: every failure rolls back with only the recorded argv (never
+          # -f or -v), and Replace still fails, reporting both outcomes.
+          foreach ($N in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+              $n.Name -in 'Get-Container', 'Wait-RunningProof', 'Invoke-Rollback', 'Complete-Replace' }, $true)) {
+            . ([scriptblock]::Create($N.Extent.Text))
+          }
+          function Start-Sleep { }
+          $RunArgs = @($Plan.create | Select-Object -Skip 1)
+          $NewUp = '{"Name":"windows-rent","State":{"Running":true},"Config":{"Image":"' + $Image + '"},"Mounts":[]}'
+          $OldJson = $Cur | ConvertTo-Json -Compress
+          $Wslc = {
+            $A = @($args) -join ' '
+            $Calls.Add($A)
+            $global:LASTEXITCODE = if ($Case.Exit -and $Case.Exit.ContainsKey($A)) { $Case.Exit[$A] } else { 0 }
+            if ($A -ceq 'inspect windows-rent') {
+              $Case.Seen++
+              $Out = & $Case.Inspect $Case.Seen
+              if ($null -eq $Out) { $global:LASTEXITCODE = 1 } else { $Out }
+            } elseif ($A -ceq 'logs windows-rent') { if ($Case.Logs) { $Case.Logs } else { $Proof } } else { 'wslc output' }
+          }
+          $R = $RunArgs -join ' '; $G = $Good -join ' '
+          $Head = @('remove windows-rent', 'volume inspect repos', 'volume inspect windows-rent-state', $R)
+          $Gate = @('inspect windows-rent', 'logs windows-rent')
+          $Clear = @('inspect windows-rent', 'stop windows-rent', 'remove windows-rent', $G)
+          $Recovery = [ordered]@{
+            'proven' = @{ Inspect = { $NewUp }; Want = 'ok'; Calls = $Head + $Gate }
+            'remove fails' = @{ Exit = @{ 'remove windows-rent' = 1 }; Inspect = { $OldJson }; Calls = @('remove windows-rent', 'inspect windows-rent', 'start windows-rent')
+              Want = 'Replace failed: WSLC remove failed: 1 | rollback succeeded: inspect: present, same image; start old exit 0' }
+            'remove fails, name now other' = @{ Exit = @{ 'remove windows-rent' = 1 }; Inspect = { $NewUp }; Calls = @('remove windows-rent', 'inspect windows-rent')
+              Want = 'Replace failed: WSLC remove failed: 1 | rollback FAILED: inspect: present, other image; not the old container; left untouched' }
+            'volume lost after remove' = @{ Exit = @{ 'volume inspect windows-rent-state' = 1 }; Inspect = { $null }; Calls = $Head[0..2] + @('inspect windows-rent', $G)
+              Want = 'Replace failed: Volume lost after remove: windows-rent-state | rollback succeeded: inspect: absent; recorded argv exit 0' }
+            'post-gate inspect throws' = @{ Inspect = { param($I) if ($I -eq 1) { '[{"Name":"a"},{"Name":"b"}]' } else { $NewUp } }; Calls = $Head + @('inspect windows-rent') + $Clear
+              Want = 'Replace failed: Expected one container named windows-rent. | rollback succeeded: inspect: present, other image; stop new exit 0; remove new exit 0; recorded argv exit 0' }
+            'run fails, rollback inspect throws' = @{ Exit = @{ $R = 1 }; Inspect = { 'not json' }; Calls = $Head + $Clear
+              Want = 'Replace failed: WSLC run failed: 1 | rollback succeeded: inspect: unknown (*); stop new exit 0; remove new exit 0; recorded argv exit 0' }
+            'unproven, rollback fails' = @{ Exit = @{ $G = 1 }; Inspect = { $NewUp }; Logs = 'x'; Calls = $Head + @(1..60 | ForEach-Object { $Gate }) + $Clear
+              Want = "Replace failed: New windows-rent did not show Running and '$Proof' within 60 s. | rollback FAILED: inspect: present, other image; stop new exit 0; remove new exit 0; recorded argv exit 1" }
+          }
+          foreach ($K in $Recovery.Keys) {
+            $Case = $Recovery[$K]; $Calls = [System.Collections.Generic.List[string]]::new()
+            $Got = try { Complete-Replace $Good $Cur; 'ok' } catch { $_.Exception.Message }
+            if ($Got -notlike $Case.Want -or ($Calls -join "`n") -cne ($Case.Calls -join "`n")) { "recovery '$K' gave: $Got"; $Calls; exit 1 }
+            if (@($Calls) -cmatch '(^| )(-f|-v|--force|--volumes)( |$)|^volume (remove|rm|prune)') { "recovery '$K' used a forbidden flag"; exit 1 }
+          }
+          # The fake's last exit code must not become this step's exit code.
+          $global:LASTEXITCODE = 0
       - uses: cachix/install-nix-action@v31
       - name: Build from locked Nix inputs
         run: nix build .#rent-image --no-write-lock-file --print-build-logs
-      - name: Load and test SSH and persistent home
+      - name: Load and test tools, mounts, state, restart, and recreate
         shell: bash
         run: |
           set -euo pipefail
+          image=ghcr.io/roccho-dev/windows-rent:nix
           docker load < result
           key_dir="$(mktemp -d)"
-          trap 'docker rm -f rent-smoke >/dev/null 2>&1 || true; docker volume rm rent-smoke-home >/dev/null 2>&1 || true; rm -rf "$key_dir"' EXIT
+          trap 'status=$?; [ "$status" -eq 0 ] || docker logs rent-smoke 2>&1 | tail -n 40 || true; docker rm -f rent-smoke rent-refuse >/dev/null 2>&1 || true; docker volume rm rent-smoke-repos rent-smoke-state rent-smoke-home rent-smoke-old rent-smoke-import >/dev/null 2>&1 || true; rm -rf "$key_dir"' EXIT
+          test "$(docker image inspect --format '{{json .Config.Volumes}}' "$image")" = null
           ssh-keygen -q -t ed25519 -N '' -f "$key_dir/key"
+          docker volume create rent-smoke-repos
+          docker volume create rent-smoke-state
           docker volume create rent-smoke-home
-          docker run -d --name rent-smoke -p 127.0.0.1:2222:2222 \
-            -v rent-smoke-home:/home/dev \
-            -e "RENT_AUTHORIZED_KEY=$(cat "$key_dir/key.pub")" \
-            ghcr.io/roccho-dev/windows-rent:nix
-          ssh_cmd=(ssh -F /dev/null -p 2222 -i "$key_dir/key" -o IdentitiesOnly=yes \
-            -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-            -o "UserKnownHostsFile=$key_dir/known_hosts" dev@127.0.0.1)
-          for attempt in {1..20}; do
-            if "${ssh_cmd[@]}" id -un > "$key_dir/answer" 2>/dev/null; then break; fi
+          # Existing repos content with a foreign owner; rent-start must never chown it.
+          docker run --rm -v rent-smoke-repos:/r "$image" /bin/bash -c 'echo repo > /r/marker && chown 4242:4243 /r/marker'
+          ids=(-e RENT_REPOS_VOLUME=rent-smoke-repos -e RENT_STATE_VOLUME=rent-smoke-state)
+          env_args=(-e "RENT_AUTHORIZED_KEY=$(cat "$key_dir/key.pub")" -e RENT_TS_HOSTNAME=rent-ci-smoke)
+          proof='rent-mounts ok repos=rent-smoke-repos state=rent-smoke-state'
+
+          # Fail closed before any service: exactly the named repos and state volumes, rw, nothing else, no /home/dev mount.
+          refuse() {
+            local want=$1; shift
+            if timeout 60 docker run --rm --name rent-refuse "$@" "${env_args[@]}" "$image" > "$key_dir/refuse" 2>&1; then
+              echo "started despite: $want" >&2; return 1
+            fi
+            grep -qF "$want" "$key_dir/refuse"
+            if grep -qF 'rent-mounts ok' "$key_dir/refuse"; then echo "gate passed despite: $want" >&2; return 1; fi
+          }
+          bind_dir="$(mktemp -d)"
+          both=(-v rent-smoke-repos:/work/repos -v rent-smoke-state:/var/lib/rent)
+          refuse 'rent-mounts: set RENT_REPOS_VOLUME and RENT_STATE_VOLUME' "${both[@]}"
+          refuse 'rent-mounts: /work/repos must be exactly volume rent-smoke-repos' -v rent-smoke-state:/var/lib/rent "${ids[@]}"
+          refuse 'rent-mounts: /var/lib/rent must be exactly volume rent-smoke-state' -v rent-smoke-repos:/work/repos "${ids[@]}"
+          refuse 'rent-mounts: /work/repos must be exactly volume rent-smoke-repos' \
+            -v rent-smoke-home:/work/repos -v rent-smoke-state:/var/lib/rent "${ids[@]}"
+          refuse 'rent-mounts: /var/lib/rent must be exactly volume rent-smoke-state' \
+            -v rent-smoke-repos:/work/repos -v rent-smoke-home:/var/lib/rent "${ids[@]}"
+          refuse 'rent-mounts: /work/repos must be exactly volume rent-smoke-repos, rw' \
+            -v rent-smoke-repos:/work/repos:ro -v rent-smoke-state:/var/lib/rent "${ids[@]}"
+          refuse 'rent-mounts: /work/repos must be exactly volume rent-smoke-repos' \
+            -v "$bind_dir:/work/repos" -v rent-smoke-state:/var/lib/rent "${ids[@]}"
+          refuse 'rent-mounts: /home/dev must not be a mount' "${both[@]}" -v rent-smoke-home:/home/dev "${ids[@]}"
+          refuse 'rent-mounts: exactly two volumes are allowed' "${both[@]}" -v rent-smoke-home:/extra "${ids[@]}"
+          # A synthetic line in the WSLC mount-root form (no /var/lib/docker prefix), on the mount functions as built into the image.
+          docker run --rm "$image" /bin/cat /bin/rent-state-import | sed -n '/^volume_at() {$/,/^volume_name() /p' > "$key_dir/mountlib.sh"
+          bash -c 'set -eu; source "$1"; mounts="20 1 0:20 /volumes/dev-home/_data /old ro,relatime - ext4 /dev/sdc rw"
+            volume_at /old dev-home ro; if volume_at /old dev-home rw || volume_at /old home ro; then exit 1; fi' _ "$key_dir/mountlib.sh"
+
+          # Later state import, synthetic files only: exact Claude and Codex auth/session paths from a read-only old home, once.
+          sid=00000000-0000-4000-8000-000000000000
+          docker volume create rent-smoke-old
+          docker volume create rent-smoke-import
+          docker run --rm -v rent-smoke-old:/o "$image" /bin/bash -c "set -eu
+            p=/o/.claude/projects/-home-dev
+            mkdir -p \$p/$sid/subagents \$p/other /o/.ssh /o/.codex
+            for f in /o/.claude/.credentials.json /o/.claude.json \$p/$sid.jsonl \$p/$sid/subagents/a.jsonl \
+              /o/.claude/history.jsonl /o/.ssh/id_synthetic \$p/other.jsonl /o/.codex/auth.json /o/.codex/history.jsonl; do echo \"synthetic \$f\" > \$f; done
+            chown -R 1000:1000 /o
+            chmod 600 /o/.claude/.credentials.json /o/.claude.json \$p/$sid.jsonl /o/.codex/auth.json"
+          state_import() {
+            docker run --rm -v "rent-smoke-old:/old$1" -v rent-smoke-import:/var/lib/rent \
+              -e "RENT_OLD_VOLUME=${2:-rent-smoke-old}" -e RENT_STATE_VOLUME=rent-smoke-import "$image" /bin/rent-state-import "$sid"
+          }
+          import_refused() {
+            if "$@" > "$key_dir/import" 2>&1; then echo "imported despite: $*" >&2; exit 1; fi
+            if docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c 'shopt -s nullglob dotglob; f=(/s/*); ((${#f[@]}))'; then
+              echo "refused import wrote state: $*" >&2; exit 1
+            fi
+          }
+          import_refused state_import ''
+          grep -qF '/old must be exactly volume rent-smoke-old, mounted read-only' "$key_dir/import"
+          import_refused state_import :ro rent-smoke-home
+          grep -qF '/old must be exactly volume rent-smoke-home, mounted read-only' "$key_dir/import"
+          import_refused docker run --rm -v rent-smoke-old:/old:ro -v rent-smoke-import:/var/lib/rent "$image" /bin/rent-state-import "$sid"
+          grep -qF 'set RENT_OLD_VOLUME and RENT_STATE_VOLUME' "$key_dir/import"
+          import_refused docker run --rm -v rent-smoke-old:/old:ro -v rent-smoke-import:/var/lib/rent:ro \
+            -e RENT_OLD_VOLUME=rent-smoke-old -e RENT_STATE_VOLUME=rent-smoke-import "$image" /bin/rent-state-import "$sid"
+          grep -qF '/var/lib/rent must be exactly volume rent-smoke-import, writable' "$key_dir/import"
+          state_import :ro > "$key_dir/import"
+          if grep -q synthetic "$key_dir/import"; then echo 'import printed file contents' >&2; exit 1; fi
+          # An identical rerun (as after an interruption) is a no-op; a differing target is never overwritten.
+          state_import :ro > /dev/null
+          docker run --rm -v rent-smoke-old:/o "$image" /bin/bash -c 'echo changed >> /o/.codex/auth.json'
+          if state_import :ro > "$key_dir/import" 2>&1; then echo 'overwrote a differing target' >&2; exit 1; fi
+          grep -qF 'already exists and differs from its source' "$key_dir/import"
+          docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c \
+            'shopt -s globstar dotglob; cd /s; for f in **; do stat -c "%a %u %n" "$f"; done' | LC_ALL=C sort > "$key_dir/imported"
+          printf '%s\n' '755 0 dev' '700 1000 dev/codex' '600 1000 dev/codex/auth.json' '700 1000 dev/claude' '600 1000 dev/claude.json' '600 1000 dev/claude/.credentials.json' \
+            '700 1000 dev/claude/projects' '700 1000 dev/claude/projects/-home-dev' \
+            "755 1000 dev/claude/projects/-home-dev/$sid" "600 1000 dev/claude/projects/-home-dev/$sid.jsonl" \
+            "755 1000 dev/claude/projects/-home-dev/$sid/subagents" "644 1000 dev/claude/projects/-home-dev/$sid/subagents/a.jsonl" |
+            LC_ALL=C sort | diff - "$key_dir/imported"
+          test "$(docker run --rm -v rent-smoke-import:/s "$image" /bin/cat /s/dev/claude/.credentials.json)" = \
+            'synthetic /o/.claude/.credentials.json'
+
+          run() {
+            docker run -d --name rent-smoke -p 127.0.0.1:2222:2222 \
+              -v rent-smoke-repos:/work/repos -v rent-smoke-state:/var/lib/rent "${ids[@]}" "$@" "$image"
+          }
+          # The one fixed proof line, from rent-start itself, once per start.
+          proven() { test "$(docker logs rent-smoke 2>&1 | grep -cxF "$proof")" = "$1"; }
+          run "${env_args[@]}"
+          for attempt in {1..30}; do
+            if docker exec rent-smoke /bin/cat /var/lib/rent/ssh/ssh_host_ed25519_key.pub > "$key_dir/host.pub" 2>/dev/null; then break; fi
             sleep 1
           done
-          test "$(cat "$key_dir/answer")" = dev
+          # Strict from the first connection: the host key is pinned from the state volume, never accepted anew.
+          printf '[127.0.0.1]:2222 %s\n' "$(cut -d' ' -f1,2 "$key_dir/host.pub")" > "$key_dir/known_hosts"
+          ssh_cmd=(ssh -F /dev/null -p 2222 -i "$key_dir/key" -o IdentitiesOnly=yes \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null \
+            -o "UserKnownHostsFile=$key_dir/known_hosts" dev@127.0.0.1)
+          ssh_ready() {
+            : > "$key_dir/answer"
+            for attempt in {1..30}; do
+              if "${ssh_cmd[@]}" id -un > "$key_dir/answer" 2>/dev/null; then break; fi
+              sleep 1
+            done
+            test "$(cat "$key_dir/answer")" = dev
+          }
+          # Userspace tailscaled without auth: NeedsLogin, with up --ssh --hostname applied and a machine key in state.
+          ts_ready() {
+            for attempt in {1..60}; do
+              docker exec rent-smoke /bin/tailscale status --json > "$key_dir/ts.json" 2>/dev/null || true
+              docker exec rent-smoke /bin/tailscale debug prefs > "$key_dir/prefs.json" 2>/dev/null || true
+              docker exec rent-smoke /bin/cat /var/lib/rent/tailscale/tailscaled.state > "$key_dir/ts.state" 2>/dev/null || true
+              if jq -e '.BackendState == "NeedsLogin"' "$key_dir/ts.json" >/dev/null 2>&1 &&
+                jq -e '.RunSSH == true and .WantRunning == true and .Hostname == "rent-ci-smoke"' "$key_dir/prefs.json" >/dev/null 2>&1 &&
+                jq -e 'has("_machinekey")' "$key_dir/ts.state" >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 1
+            done
+            jq -c '{BackendState}' "$key_dir/ts.json" >&2 || true
+            return 1
+          }
+          machine_key_hash() { jq -r ._machinekey "$key_dir/ts.state" | sha256sum | cut -d' ' -f1; }
+          repos_untouched() {
+            docker exec rent-smoke /bin/cat /proc/1/mountinfo > "$key_dir/mountinfo"
+            awk '$5 == "/work/repos" { r++ } $5 == "/var/lib/rent" { s++ } $5 == "/home/dev" { h++ }
+              END { exit !(r == 1 && s == 1 && h == 0) }' "$key_dir/mountinfo"
+            test "$(docker exec rent-smoke /bin/stat -c '%u:%g' /work/repos/marker)" = 4242:4243
+            test "$(docker exec rent-smoke /bin/cat /work/repos/marker)" = repo
+          }
+
+          ssh_ready
+          proven 1
+          test "$(docker port rent-smoke)" = "2222/tcp -> 127.0.0.1:2222"
+          repos_untouched
           "${ssh_cmd[@]}" 'set -eu
+            test "$(id -u):$(id -g)" = 1000:1000
             if command -v nix-instantiate >/dev/null; then exit 1; fi
             command -v git >/dev/null
+            test "$SSL_CERT_FILE" = /etc/ssl/certs/ca-certificates.crt
             test -r "$SSL_CERT_FILE"
             git --version >/dev/null
-            git ls-remote --exit-code https://github.com/roccho-dev/windows.git HEAD >/dev/null'
-          "${ssh_cmd[@]}" 'echo persisted > /home/dev/proof'
+            git ls-remote --exit-code https://github.com/roccho-dev/windows.git HEAD >/dev/null
+            env -i HOME=/home/dev /bin/git ls-remote --exit-code https://github.com/roccho-dev/windows.git HEAD >/dev/null'
+          "${ssh_cmd[@]}" gh --version > "$key_dir/gh"
+          grep -qE '^gh version 2\.96\.0( |$)' "$key_dir/gh"
+          test "$("${ssh_cmd[@]}" codex --version)" = 'codex-cli 0.157.1'
+          "${ssh_cmd[@]}" tailscale version > "$key_dir/tailscale"
+          grep -qE '^1\.98\.[0-9]+$' "$key_dir/tailscale"
+          test "$("${ssh_cmd[@]}" claude --version)" = '2.1.283 (Claude Code)'
+          docker exec rent-smoke /bin/stat -c '%a %u %n' /home/dev /var/lib/rent/tailscale /var/lib/rent/ssh \
+            /var/lib/rent/ssh/ssh_host_ed25519_key /var/lib/rent/ssh/authorized_keys \
+            /var/lib/rent/dev/codex /var/lib/rent/dev/gh /var/lib/rent/dev/claude /var/lib/rent/dev/claude.json > "$key_dir/modes"
+          printf '%s\n' '700 1000 /home/dev' '700 0 /var/lib/rent/tailscale' '755 0 /var/lib/rent/ssh' \
+            '600 0 /var/lib/rent/ssh/ssh_host_ed25519_key' '644 0 /var/lib/rent/ssh/authorized_keys' \
+            '700 1000 /var/lib/rent/dev/codex' '700 1000 /var/lib/rent/dev/gh' \
+            '700 1000 /var/lib/rent/dev/claude' '600 1000 /var/lib/rent/dev/claude.json' | diff - "$key_dir/modes"
+          test "$(docker exec rent-smoke /bin/readlink /home/dev/.codex)" = /var/lib/rent/dev/codex
+          test "$(docker exec rent-smoke /bin/readlink /home/dev/.config/gh)" = /var/lib/rent/dev/gh
+          test "$(docker exec rent-smoke /bin/readlink /home/dev/.claude)" = /var/lib/rent/dev/claude
+          test "$(docker exec rent-smoke /bin/readlink /home/dev/.claude.json)" = /var/lib/rent/dev/claude.json
+          # A real unauthenticated Claude start writes its config through the link; nothing is logged in.
+          "${ssh_cmd[@]}" 'cd ~ && CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 \
+            claude -p ci < /dev/null > /dev/null 2>&1 || true
+            test -L ~/.claude.json && test -L ~/.claude'
+          "${ssh_cmd[@]}" 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 claude auth status || true' | jq -e '.loggedIn == false' > /dev/null
+          test "$(docker exec rent-smoke /bin/stat -c %s /var/lib/rent/dev/claude.json)" -gt 3
+          claude_config() { docker exec rent-smoke /bin/sha256sum /var/lib/rent/dev/claude.json | cut -d' ' -f1; }
+          config="$(claude_config)"
+          ts_ready
+          machine="$(machine_key_hash)"
+          "${ssh_cmd[@]}" 'echo codex > ~/.codex/ci-marker && echo claude > ~/.claude/ci-marker && echo home > ~/home-marker'
+          markers='test "$(cat ~/.codex/ci-marker)" = codex && test "$(cat ~/.claude/ci-marker)" = claude'
+
+          # Restart: same container; TERM reaches the supervisor, and home, state, and host key remain.
           before="$(docker inspect --format '{{.Id}}' rent-smoke)"
-          docker restart rent-smoke
+          docker stop -t 30 rent-smoke
+          test "$(docker inspect --format '{{.State.ExitCode}}' rent-smoke)" = 143
+          docker start rent-smoke
           test "$(docker inspect --format '{{.Id}}' rent-smoke)" = "$before"
-          for attempt in {1..20}; do
-            if "${ssh_cmd[@]}" cat /home/dev/proof > "$key_dir/answer" 2>/dev/null; then break; fi
-            sleep 1
-          done
-          test "$(cat "$key_dir/answer")" = persisted
+          ssh_ready
+          proven 2
+          "${ssh_cmd[@]}" "$markers"' && test "$(cat ~/home-marker)" = home'
+          test "$(claude_config)" = "$config"
+          ts_ready
+          test "$(machine_key_hash)" = "$machine"
+          repos_untouched
+
+          # Recreate on the same volumes without the key env: state and host key remain, the plain home does not.
+          docker stop -t 30 rent-smoke
+          docker rm rent-smoke
+          run -e RENT_TS_HOSTNAME=rent-ci-smoke
+          ssh_ready
+          proven 1
+          "${ssh_cmd[@]}" "$markers"' && test ! -e ~/home-marker'
+          test "$(claude_config)" = "$config"
+          ts_ready
+          test "$(machine_key_hash)" = "$machine"
+          repos_untouched
       - name: Publish exact image from this repository
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
