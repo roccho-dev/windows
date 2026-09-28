@@ -10,6 +10,10 @@
       ownSpec = builtins.fromJSON (builtins.readFile ./hosts/own/spec.json);
       own = import ./hosts/own/nix.nix { inherit pkgs; spec = ownSpec; };
       dev = import ./oci/dev/nix.nix { inherit pkgs; };
+      common = import ./hosts/common/nix.nix {
+        inherit pkgs;
+        source = self.rev or "uncommitted";
+      };
       ownConfig = {
         Cmd = [ "${own.start}/bin/own-start" ];
         Env = [
@@ -268,25 +272,30 @@
         };
         dev-profile = dev.profile;
         dev-image = dev.image;
+        common-fonts = common.fonts;
+        windows-dist = common.dist;
       };
-      # Fails when the own image or its scripts disagree with hosts/own/spec.json.
-      checks.${system}.own-spec = pkgs.runCommand "own-spec-check" {
-        nativeBuildInputs = [ pkgs.jq ];
-        config = builtins.toJSON ownConfig;
-        spec = builtins.toJSON ownSpec;
-      } ''
-        set -eu
-        port=$(jq -r .sshPort <<<"$spec"); mount=$(jq -r .stateMount <<<"$spec")
-        jq -e --arg p "$port/tcp" --arg m "$mount" \
-          '(.ExposedPorts | has($p)) and (.Volumes | has($m)) and (.Env | index("HOME=" + $m))' <<<"$config"
-        grep -qx "Port $port" ${own.sshConfig}
-        grep -qF "HostKey $mount/.ssh/" ${own.sshConfig}
-        grep -qF "$(jq -r .authorizedKeyEnv <<<"$spec")" ${own.start}/bin/own-start
-        grep -qF "$mount/.ssh/authorized_keys" ${own.start}/bin/own-start
-        grep -qF "127.0.0.1:$(jq -r .xpraPort <<<"$spec")" ${own.start}/bin/own-start
-        grep -qF "$(jq -r .syntheticTrialEnv <<<"$spec")" ${own.browser}
-        grep -qF "remote-debugging-port=$(jq -r .cdpPort <<<"$spec")" ${own.browser}
-        touch $out
-      '';
+      checks.${system} = {
+        windows-dist = common.check;
+        # Fails when the own image or its scripts disagree with hosts/own/spec.json.
+        own-spec = pkgs.runCommand "own-spec-check" {
+          nativeBuildInputs = [ pkgs.jq ];
+          config = builtins.toJSON ownConfig;
+          spec = builtins.toJSON ownSpec;
+        } ''
+          set -eu
+          port=$(jq -r .sshPort <<<"$spec"); mount=$(jq -r .stateMount <<<"$spec")
+          jq -e --arg p "$port/tcp" --arg m "$mount" \
+            '(.ExposedPorts | has($p)) and (.Volumes | has($m)) and (.Env | index("HOME=" + $m))' <<<"$config"
+          grep -qx "Port $port" ${own.sshConfig}
+          grep -qF "HostKey $mount/.ssh/" ${own.sshConfig}
+          grep -qF "$(jq -r .authorizedKeyEnv <<<"$spec")" ${own.start}/bin/own-start
+          grep -qF "$mount/.ssh/authorized_keys" ${own.start}/bin/own-start
+          grep -qF "127.0.0.1:$(jq -r .xpraPort <<<"$spec")" ${own.start}/bin/own-start
+          grep -qF "$(jq -r .syntheticTrialEnv <<<"$spec")" ${own.browser}
+          grep -qF "remote-debugging-port=$(jq -r .cdpPort <<<"$spec")" ${own.browser}
+          touch $out
+        '';
+      };
     };
 }
