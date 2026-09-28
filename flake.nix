@@ -91,7 +91,6 @@
         same() { if [ -d "$1" ]; then diff -r -q --no-dereference "$1" "$2" > /dev/null 2>&1; else cmp -s "$1" "$2"; fi; }
         pairs=(
           "/old/.claude/.credentials.json|$s/claude/.credentials.json|f"
-          "/old/.claude.json|$s/claude.json|f"
           "/old/.claude/$p/$id.jsonl|$s/claude/$p/$id.jsonl|f"
           "/old/.claude/$p/$id|$s/claude/$p/$id|d"
           "/old/.codex/auth.json|$s/codex/auth.json|f"
