@@ -47,7 +47,7 @@ let
       fontFamily = "PlemolJP Console NF";
     };
     packages = [
-      { name = "Chrome Beta"; id = "Google.Chrome.Beta"; version = "155.0.8059.12"; }
+      { name = "Chromium"; id = "Hibbiki.Chromium"; version = "154.0.8037.58"; }
       { name = "AutoHotkey"; id = "AutoHotkey.AutoHotkey"; version = "2.0.28"; }
     ];
   });

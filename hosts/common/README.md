@@ -33,12 +33,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RestoreT
 
 `Restore` converges the selected fonts, the pinned noctty portable ZIP and its
 `font-family = PlemolJP Console NF` configuration, and the pinned WinGet package
-IDs/versions for Chrome Beta and AutoHotkey through native DSC resources. The
-Chrome Beta installer may require elevation. The machine needs a network
-connection and a working WinGet source for those two packages; they are not
-redistributed in the ZIP. Noctty is included because its WinGet package is not
-published. The release ZIP can be downloaded again after a clean install; Nix
+IDs/versions for Chromium and AutoHotkey through native DSC resources. The
+selected Chromium WinGet manifest offers a current-user installer. The machine
+needs a network connection and a working WinGet source for those two packages;
+they are not redistributed in the ZIP. Noctty is included because its WinGet
+package is not published. The release ZIP can be downloaded again after a clean install; Nix
 is only needed to build it, not to apply it.
+
+Chromium does not update itself. Refresh the pinned version in `nix.nix`, build
+and prove a new release in CI, then reapply it to receive updates.
 
 `Apply` and `Test` retain their font-only meaning for the CI proof. They own
 selected content-addressed TTF files beneath the current user's
