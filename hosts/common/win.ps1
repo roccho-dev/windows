@@ -1,14 +1,17 @@
-#requires -Version 7.0
+#requires -Version 5.1
 [CmdletBinding()]
-param([ValidateSet('Validate', 'Test', 'Apply')][string]$Mode = 'Validate')
+param([ValidateSet('Validate', 'Test', 'Apply', 'Restore', 'RestoreTest')][string]$Mode = 'Validate')
 
-# One activation boundary. No product selection, download, WinGet, or admin effect.
+# One activation boundary. Product selection belongs to the built distribution.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-if (-not $IsWindows) { throw 'This activation backend requires Windows.' }
+if ($env:OS -ne 'Windows_NT') { throw 'This activation backend requires Windows.' }
 $root = [IO.Path]::GetFullPath($PSScriptRoot) + [IO.Path]::DirectorySeparatorChar
 $manifest = Get-Content -LiteralPath (Join-Path $root 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
-if ($manifest.schemaVersion -ne 1 -or @($manifest.fonts).Count -eq 0) { throw 'Invalid or empty distribution.' }
+if ($manifest.schemaVersion -ne 2 -or @($manifest.fonts).Count -eq 0 -or
+    @($manifest.packages).Count -eq 0 -or -not $manifest.noctty.version) {
+    throw 'Invalid or empty distribution.'
+}
 
 function BundlePath([string]$Relative) {
     if ($Relative -match '(^/|\\|:|(^|/)\.\.(/|$))') { throw "Unsafe bundle path: $Relative" }
@@ -38,27 +41,53 @@ foreach ($file in Get-ChildItem -LiteralPath $root -Recurse -Force) {
 $exe = BundlePath $manifest.backend
 if (-not $inventory.ContainsKey($manifest.backend)) { throw 'Unlisted backend.' }
 $configuration = BundlePath 'configuration.dsc.json'
+$packagesConfiguration = BundlePath 'packages.dsc.json'
 $fontDirectory = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Microsoft\Windows\Fonts'
+$localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+$nocttyDirectory = Join-Path $localAppData ('Programs\noctty-' + $manifest.noctty.version)
+$nocttyConfig = Join-Path $localAppData 'noctty\config.ghostty'
+$nocttyShortcut = Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs\noctty.lnk'
+$nocttyConfigText = 'font-family = ' + $manifest.noctty.fontFamily + "`n"
 $oldPath, $oldResources, $oldFontDirectory = $env:PATH, $env:DSC_RESOURCE_PATH, $env:WINDOWS_IAC_FONT_DIR
 $copied, $changed = 0, 0
 
-function InvokeDsc([string]$Operation) {
-    $raw = & $exe --ignore-settings-file config $Operation --file $configuration --output-format json
+function InvokeDsc([string]$Operation, [string]$Document, [int]$Count) {
+    $raw = & $exe --ignore-settings-file config $Operation --file $Document --output-format json
     if ($LASTEXITCODE -ne 0) { throw "DSC $Operation failed: $LASTEXITCODE" }
     $answer = ($raw -join "`n") | ConvertFrom-Json
-    if ($answer.hadErrors -ne $false -or @($answer.results).Count -ne @($manifest.fonts).Count) {
+    if ($answer.hadErrors -ne $false -or @($answer.results).Count -ne $Count) {
         throw "DSC $Operation did not evaluate every resource successfully."
     }
     return $answer
 }
 
+function TestNocttyFiles {
+    if (-not (Test-Path -LiteralPath $nocttyDirectory -PathType Container)) { return $false }
+    foreach ($entry in $manifest.noctty.files.PSObject.Properties) {
+        $relative = $entry.Name
+        if ($relative -notmatch '^noctty/[^:]+' -or $relative -match '(\\|(^|/)\.\.(/|$))') {
+            throw "Unsafe noctty path: $relative"
+        }
+        $path = Join-Path $nocttyDirectory ($relative.Replace('/', '\'))
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+            (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $entry.Value) { return $false }
+    }
+    return $true
+}
+
+function TestNoctty {
+    return (TestNocttyFiles) -and (Test-Path -LiteralPath $nocttyConfig -PathType Leaf) -and
+        ([IO.File]::ReadAllText($nocttyConfig) -ceq $nocttyConfigText) -and
+        (Test-Path -LiteralPath $nocttyShortcut -PathType Leaf)
+}
+
 try {
     # Resolve only the bundled native resources, not an ambient resource/version.
-    $env:PATH = Split-Path -Parent $exe
-    $env:DSC_RESOURCE_PATH = $env:PATH
+    $env:PATH = (Split-Path -Parent $exe) + ';' + $oldPath
+    $env:DSC_RESOURCE_PATH = Split-Path -Parent $exe
     $env:WINDOWS_IAC_FONT_DIR = $fontDirectory  # current-user Binding, not Spec
-    $null = InvokeDsc 'get'  # read-only interpretation, also used by Validate
-    if ($Mode -eq 'Apply') {
+    $null = InvokeDsc 'get' $configuration @($manifest.fonts).Count
+    if ($Mode -eq 'Apply' -or $Mode -eq 'Restore') {
         $null = New-Item -ItemType Directory -Path $fontDirectory -Force
         foreach ($font in $manifest.fonts) {
             if ($font.file -notmatch '^[0-9a-f]{64}\.ttf$') { throw 'Invalid content-addressed font name.' }
@@ -69,10 +98,25 @@ try {
                 $copied++
             }
         }
-        $set = InvokeDsc 'set'
+        $set = InvokeDsc 'set' $configuration @($manifest.fonts).Count
         foreach ($item in $set.results) {
             if ($null -ne $item.result.changedProperties) { $changed += @($item.result.changedProperties).Count }
         }
+    }
+    if ($Mode -eq 'Restore') {
+        if (-not (Test-Path -LiteralPath $nocttyDirectory -PathType Container)) {
+            $null = New-Item -ItemType Directory -Path $nocttyDirectory -Force
+            Expand-Archive -LiteralPath (BundlePath 'payload/noctty.zip') -DestinationPath $nocttyDirectory
+        }
+        if (-not (TestNocttyFiles)) { throw 'Noctty files differ; close noctty and repair the versioned directory.' }
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $nocttyConfig) -Force
+        [IO.File]::WriteAllText($nocttyConfig, $nocttyConfigText, [Text.UTF8Encoding]::new($false))
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $nocttyShortcut) -Force
+        $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($nocttyShortcut)
+        $shortcut.TargetPath = Join-Path $nocttyDirectory 'noctty\noctty.exe'
+        $shortcut.WorkingDirectory = Join-Path $nocttyDirectory 'noctty'
+        $shortcut.Save()
+        $null = InvokeDsc 'set' $packagesConfiguration @($manifest.packages).Count
     }
     if ($Mode -ne 'Validate') {
         foreach ($font in $manifest.fonts) {
@@ -83,13 +127,21 @@ try {
                 throw "Installed bytes differ: $($font.fullName)"
             }
         }
-        $test = InvokeDsc 'test'
+        $test = InvokeDsc 'test' $configuration @($manifest.fonts).Count
         foreach ($item in $test.results) {
             if ($item.result.inDesiredState -ne $true) { throw "Registry drift: $($item.name)" }
         }
     }
+    if ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest') {
+        if (-not (TestNoctty)) { throw 'Noctty files or font configuration drift.' }
+        $apps = InvokeDsc 'test' $packagesConfiguration @($manifest.packages).Count
+        foreach ($item in $apps.results) {
+            if ($item.result.inDesiredState -ne $true) { throw "Package drift: $($item.name)" }
+        }
+    }
     [ordered]@{ mode = $Mode; source = $manifest.source; fontDirectory = $fontDirectory;
         fonts = @($manifest.fonts).Count; copied = $copied; changedProperties = $changed;
+        noctty = $manifest.noctty.version; packages = @($manifest.packages).Count;
         inDesiredState = ($Mode -ne 'Validate') } | ConvertTo-Json -Compress
 }
 finally {

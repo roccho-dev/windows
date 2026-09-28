@@ -84,17 +84,26 @@ class CompilerTests(unittest.TestCase):
         with zipfile.ZipFile(backend, "w") as z:
             z.writestr("dsc.exe", "not executable: packaging fixture only")
             z.writestr("LICENSE.txt", "test license")
+        noctty = self.root / "noctty.zip"
+        with zipfile.ZipFile(noctty, "w") as z:
+            z.writestr("noctty/noctty.exe", "fixture application")
+            z.writestr("noctty/noctty.com", "fixture console entry")
+        choices = self.root / "choices.json"
+        choices.write_text(json.dumps({"noctty": {"version": "1.0", "fontFamily": "Test Font"},
+                                       "packages": [{"name": "Fixture", "id": "Fixture.App", "version": "1.0"}]}))
         scripts = self.root / "scripts"
         scripts.mkdir()
         for name in ("win.ps1", "proof.ps1", "README.md"):
             (scripts / name).write_text("fixture")
         for out in ("one", "two"):
-            pack.distribution(fonts, backend, scripts, "a" * 40, self.root / out)
+            pack.distribution(fonts, backend, noctty, choices, scripts, "a" * 40, self.root / out)
         first, second = [self.root / out / "windows-dist.zip" for out in ("one", "two")]
         self.assertEqual(first.read_bytes(), second.read_bytes())
         with zipfile.ZipFile(first) as z:
             manifest = json.loads(z.read("manifest.json"))
             self.assertEqual(manifest["source"], "a" * 40)
+            self.assertEqual(manifest["noctty"]["version"], "1.0")
+            self.assertEqual(len(manifest["packages"]), 1)
             self.assertEqual(set(manifest["files"]), set(z.namelist()) - {"manifest.json"})
             for name, sha in manifest["files"].items():
                 self.assertEqual(pack.hashlib.sha256(z.read(name)).hexdigest(), sha)
@@ -102,14 +111,24 @@ class CompilerTests(unittest.TestCase):
             self.assertEqual(config["resources"][0]["type"], "Microsoft.Windows/Registry")
             self.assertIn("envvar('WINDOWS_IAC_FONT_DIR')", config["resources"][0]["properties"]["valueData"]["String"])
             self.assertNotIn(str(self.root), json.dumps(manifest))
+            package_config = json.loads(z.read("packages.dsc.json"))
+            self.assertEqual(package_config["resources"][0]["type"], "Microsoft.WinGet/Package")
+            self.assertEqual(package_config["resources"][0]["properties"]["version"], "1.0")
 
     def test_backend_zip_traversal_fails(self):
         fonts = self.payload()
         backend = self.root / "dsc.zip"
         with zipfile.ZipFile(backend, "w") as z:
             z.writestr("../dsc.exe", "fixture")
+        noctty = self.root / "noctty.zip"
+        with zipfile.ZipFile(noctty, "w") as z:
+            z.writestr("noctty/noctty.exe", "fixture")
+            z.writestr("noctty/noctty.com", "fixture")
+        choices = self.root / "choices.json"
+        choices.write_text(json.dumps({"noctty": {"version": "1", "fontFamily": "Test Font"},
+                                       "packages": [{"name": "Fixture", "id": "Fixture.App", "version": "1"}]}))
         with self.assertRaisesRegex(ValueError, "Unsafe"):
-            pack.distribution(fonts, backend, self.root, "test", self.root / "out")
+            pack.distribution(fonts, backend, noctty, choices, self.root, "test", self.root / "out")
 
 
 if __name__ == "__main__":
