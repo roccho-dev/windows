@@ -1,18 +1,7 @@
 name: dev image
 
 on:
-  pull_request:
-    paths: ["flake.nix", "flake.lock", "oci/dev/**", ".github/workflows/dev-image.yml"]
-  push:
-    branches: [main]
-    paths: ["flake.nix", "flake.lock", "oci/dev/**", ".github/workflows/dev-image.yml"]
-
-permissions:
-  contents: read
-
-concurrency:
-  group: dev-image-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  workflow_call:
 
 jobs:
   fresh-develop-replace-continue:

@@ -1,17 +1,38 @@
-name: windows dist
+name: ci
 
 on:
   pull_request:
-    paths: ['flake.nix', 'flake.lock', 'hosts/common/**', '.github/workflows/ci.yml']
   push:
     branches: [main]
-    paths: ['flake.nix', 'flake.lock', 'hosts/common/**', '.github/workflows/ci.yml']
-
-permissions:
-  contents: read
+  workflow_dispatch:
 
 jobs:
+  own:
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/own-image.yml
+    with:
+      publish: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    secrets: inherit
+
+  rent:
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/rent-image.yml
+    with:
+      publish: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    secrets: inherit
+
+  dev:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/dev-image.yml
+
   build:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 45
     outputs:
@@ -41,6 +62,8 @@ jobs:
           retention-days: 7
 
   windows:
+    permissions:
+      contents: read
     needs: build
     runs-on: windows-latest
     timeout-minutes: 15

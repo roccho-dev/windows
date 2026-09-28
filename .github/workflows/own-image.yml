@@ -1,11 +1,13 @@
 name: own trial image
 
 on:
-  push:
-    branches: [main, feat/rent-ci, codex/own-iac-derivative, codex/remote-ssh-codex]
-    paths: ["flake.nix", "flake.lock", "hosts/own/**", ".github/workflows/own-image.yml"]
-  pull_request:
-    paths: ["flake.nix", "flake.lock", "hosts/own/**", ".github/workflows/own-image.yml"]
+  workflow_call:
+    inputs:
+      publish:
+        description: Publish the exact tested image
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   build-test:
@@ -129,9 +131,9 @@ jobs:
           test "$(docker inspect --format '{{.Id}}' own-smoke)" != "$old_id"
           browsers
       - name: Keep the tested image for publishing
-        if: github.event_name == 'push'
+        if: inputs.publish
         run: cp -L result own-image.tar.gz
-      - if: github.event_name == 'push'
+      - if: inputs.publish
         uses: actions/upload-artifact@v4
         with:
           name: own-image
@@ -141,7 +143,7 @@ jobs:
   # Only trusted pushes to the listed branches receive package write access.
   publish:
     needs: build-test
-    if: github.event_name == 'push'
+    if: inputs.publish
     runs-on: ubuntu-latest
     permissions:
       contents: read
