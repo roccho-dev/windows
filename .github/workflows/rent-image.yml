@@ -268,7 +268,7 @@ jobs:
           grep -qF 'already exists and differs from its source' "$key_dir/import"
           docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c \
             'shopt -s globstar dotglob; cd /s; for f in **; do stat -c "%a %u %n" "$f"; done' | LC_ALL=C sort > "$key_dir/imported"
-          printf '%s\n' '755 0 dev' '700 1000 dev/codex' '600 1000 dev/codex/auth.json' '700 1000 dev/claude' '600 1000 dev/claude.json' '600 1000 dev/claude/.credentials.json' \
+          printf '%s\n' '755 0 dev' '700 1000 dev/codex' '600 1000 dev/codex/auth.json' '700 1000 dev/claude' '600 1000 dev/claude/.credentials.json' \
             '700 1000 dev/claude/projects' '700 1000 dev/claude/projects/-home-dev' \
             "755 1000 dev/claude/projects/-home-dev/$sid" "600 1000 dev/claude/projects/-home-dev/$sid.jsonl" \
             "755 1000 dev/claude/projects/-home-dev/$sid/subagents" "644 1000 dev/claude/projects/-home-dev/$sid/subagents/a.jsonl" |
