@@ -1,4 +1,4 @@
-"""Compile pinned font selections into a portable, deterministic DSC distribution.
+"""Compile pinned Windows selections into a portable, deterministic DSC distribution.
 
 This module does not choose products, versions, URLs, or host/site values.
 Those inputs belong to nix.nix; Windows effects belong to win.ps1.
@@ -79,6 +79,38 @@ def configuration(entries: list[dict]) -> dict:
     }
 
 
+def package_configuration(packages: list[dict]) -> dict:
+    if not packages or len({p["id"].casefold() for p in packages}) != len(packages):
+        raise ValueError("Empty or duplicate package selection")
+    return {
+        "$schema": "https://aka.ms/dsc/schemas/v3/bundled/config/document.json",
+        "resources": [{
+            "name": package["name"],
+            "type": "Microsoft.WinGet/Package",
+            "properties": {"id": package["id"], "source": "winget",
+                           "version": package["version"], "acceptAgreements": True,
+                           "installMode": "silent"},
+        } for package in packages],
+    }
+
+
+def noctty_inventory(archive_path: Path) -> dict[str, str]:
+    files: dict[str, str] = {}
+    with zipfile.ZipFile(archive_path) as upstream:
+        for entry in upstream.infolist():
+            name = relative(entry.filename)
+            if entry.is_dir():
+                continue
+            if not name.startswith("noctty/") or name.casefold() in (n.casefold() for n in files):
+                raise ValueError(f"Unexpected or duplicate noctty path: {name}")
+            if (entry.external_attr >> 16) & 0o170000 == 0o120000:
+                raise ValueError(f"Symlink in noctty archive: {name}")
+            files[name] = hashlib.sha256(upstream.read(entry)).hexdigest()
+    if not {"noctty/noctty.exe", "noctty/noctty.com"}.issubset(files):
+        raise ValueError("Noctty archive lacks executables")
+    return files
+
+
 def archive(root: Path, destination: Path) -> None:
     seen = set()
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as result:
@@ -98,8 +130,13 @@ def archive(root: Path, destination: Path) -> None:
             result.writestr(info, path.read_bytes(), compresslevel=9)
 
 
-def distribution(fonts: Path, backend: Path, scripts: Path, source: str, out: Path) -> None:
+def distribution(fonts: Path, backend: Path, noctty: Path, choices: Path,
+                 scripts: Path, source: str, out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
+    selected = json.loads(choices.read_text(encoding="utf-8"))
+    if selected["noctty"]["fontFamily"] not in {e["family"] for e in json.loads((fonts / "fonts.json").read_text(encoding="utf-8"))}:
+        raise ValueError("Noctty font is not selected by common fonts")
+    noctty_files = noctty_inventory(noctty)
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         shutil.copytree(fonts / "share", root / "share")
@@ -120,9 +157,16 @@ def distribution(fonts: Path, backend: Path, scripts: Path, source: str, out: Pa
         for name in ("win.ps1", "proof.ps1", "README.md"):
             shutil.copyfile(scripts / name, root / name)
         write_json(root / "configuration.dsc.json", configuration(entries))
+        (root / "payload").mkdir()
+        shutil.copyfile(noctty, root / "payload/noctty.zip")
+        write_json(root / "packages.dsc.json", package_configuration(selected["packages"]))
         files = {p.relative_to(root).as_posix(): digest(p) for p in sorted(root.rglob("*")) if p.is_file()}
-        write_json(root / "manifest.json", {"schemaVersion": 1, "source": source,
-                   "backend": executables[0].relative_to(root).as_posix(), "fonts": entries, "files": files})
+        write_json(root / "manifest.json", {"schemaVersion": 2, "source": source,
+                   "backend": executables[0].relative_to(root).as_posix(), "fonts": entries,
+                   "noctty": {"version": selected["noctty"]["version"],
+                              "fontFamily": selected["noctty"]["fontFamily"],
+                              "files": noctty_files},
+                   "packages": selected["packages"], "files": files})
         output = out / "windows-dist.zip"
         archive(root, output)
         (out / "windows-dist.zip.sha256").write_text(digest(output) + "  windows-dist.zip\n", encoding="ascii")
@@ -135,7 +179,7 @@ if __name__ == "__main__":
     font_parser.add_argument("policy", type=Path)
     font_parser.add_argument("out", type=Path)
     dist_parser = sub.add_parser("dist")
-    for argument in ("fonts", "backend", "scripts"):
+    for argument in ("fonts", "backend", "noctty", "choices", "scripts"):
         dist_parser.add_argument(argument, type=Path)
     dist_parser.add_argument("source")
     dist_parser.add_argument("out", type=Path)
@@ -143,4 +187,5 @@ if __name__ == "__main__":
     if args.command == "fonts":
         prepare_fonts(json.loads(args.policy.read_text()), args.out)
     else:
-        distribution(args.fonts, args.backend, args.scripts, args.source, args.out)
+        distribution(args.fonts, args.backend, args.noctty, args.choices,
+                     args.scripts, args.source, args.out)

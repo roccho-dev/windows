@@ -1,4 +1,4 @@
-# Common selection → Windows activation
+# Common selection → Windows recovery
 
 Issue #7 implementation slice. `nix.nix` owns selections and pins; generated
 DSC configuration is not a second editable Spec. No custom DSC resource,
@@ -7,8 +7,8 @@ WinGet catalog, per-product installer, or new top-level directory is added.
 ```text
 flake.lock + common/nix.nix
   ├─ common-fonts          selected TTF bytes and licenses, reusable by Linux
-  └─ windows-dist.zip     same fonts + pinned DSC + generated config + inventory
-       └─ win.ps1         verify → realize files → native DSC registry
+  └─ windows-dist.zip     fonts + pinned noctty + pinned DSC + generated configs
+       └─ win.ps1         verify → realize files → DSC convergence
 ```
 
 ## Build and use
@@ -21,20 +21,31 @@ nix build .#common-fonts --no-write-lock-file
 # result/share/fonts
 ```
 
-On Windows x86_64 with PowerShell 7, verify the ZIP against a checksum from a
+On a clean Windows 11 x64 installation with Windows PowerShell 5.1 and WinGet,
+verify the ZIP against a checksum from a
 trusted successful CI/release, extract into a fresh directory, then run:
 
 ```powershell
-pwsh -NoProfile -File .\win.ps1                 # read-only validation (default)
-pwsh -NoProfile -File .\win.ps1 -Mode Apply     # explicit current-user effect
-pwsh -NoProfile -File .\win.ps1 -Mode Test      # fail on drift
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Validate     # read-only
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Restore      # four selected components
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RestoreTest  # fail on drift
 ```
 
-Apply owns only selected content-addressed TTF files beneath the current user's
+`Restore` converges the selected fonts, the pinned noctty portable ZIP and its
+`font-family = PlemolJP Console NF` configuration, and the pinned WinGet package
+IDs/versions for Chrome Beta and AutoHotkey through native DSC resources. The
+Chrome Beta installer may require elevation. The machine needs a network
+connection and a working WinGet source for those two packages; they are not
+redistributed in the ZIP. Noctty is included because its WinGet package is not
+published. The release ZIP can be downloaded again after a clean install; Nix
+is only needed to build it, not to apply it.
+
+`Apply` and `Test` retain their font-only meaning for the CI proof. They own
+selected content-addressed TTF files beneath the current user's
 `LocalApplicationData\Microsoft\Windows\Fonts` and corresponding HKCU font
-registrations. It does not select application fonts, replace system fonts,
-modify persistent PATH, require elevation, download anything, or remove
-unmanaged fonts. The user directory is a runtime Binding, not common Spec.
+registrations. `Restore` also writes the selected noctty configuration, but
+does not replace Windows-owned UI fonts or restore old registry settings,
+accounts, profiles, or personal app data. The user directory is a runtime Binding, not common Spec.
 DSC discovery is confined to the bundled backend for each invocation.
 
 The ZIP checksum binds transported bytes. The embedded inventory detects
@@ -75,7 +86,7 @@ proven target-owned smoke tests and publication still need composition into the
 final single `ci.yml` with the open OCI stack. Do not discard existing proof to
 claim one workflow prematurely. Existing OCI definitions and #8 are unchanged.
 
-Application/UI selection, Noctty integration, Japanese/Nerd/Emoji rendering,
+Application/UI selection beyond noctty, Japanese/Nerd/Emoji rendering,
 font reload/relogin, Linux profile activation, and real-host
 Spec + Binding → Runtime → Proof/restoration remain unproven. Installing a font
 does not prove an application uses it. Native `nix.exe` is not a prerequisite.
