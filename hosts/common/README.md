@@ -43,8 +43,10 @@ is only needed to build it, not to apply it.
 After installing the dependencies, `Restore` selects the Windows Terminal 1.24+
 OpenConsole console delegate and calls Noctty's `+register-default-terminal` for
 the current user. `RestoreTest` checks the selected delegate, Noctty's COM
-registration and its proxy DLL mappings. This makes Noctty the terminal window
-used for newly launched console applications. Windows Terminal remains installed
+registration, proxy DLL mappings and actual COM activation. A failed activation
+restores the previous delegate selection and fails `Restore`. A successful check
+is still not proof that every newly launched console appears in Noctty; verify
+that behavior on the target host. Windows Terminal remains installed
 as the OpenConsole dependency; removing it would break this default-terminal
 handoff. The generated state is reapplied after a clean install rather than
 backing up old registry data.

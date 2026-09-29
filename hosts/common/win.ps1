@@ -93,6 +93,14 @@ function RegistryDefault([string]$Path) {
     return $key.GetValue('')
 }
 
+function RestoreRegistryString([string]$Path, [string]$Name, [object]$Value) {
+    if ($null -eq $Value) {
+        Remove-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction SilentlyContinue
+    } else {
+        $null = New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType String -Force
+    }
+}
+
 function TestNocttyDefault {
     $startup = Get-Item -LiteralPath $terminalStartup -ErrorAction SilentlyContinue
     if ($null -eq $startup -or
@@ -108,7 +116,12 @@ function TestNocttyDefault {
                        '{6F23DA90-15C5-4203-9DB0-64E73F1B1B00}')) {
         if ((RegistryDefault "$classes\Interface\$iid\ProxyStubClsid32") -ne $nocttyProxy) { return $false }
     }
-    return $true
+    try {
+        $class = [type]::GetTypeFromCLSID([guid]$nocttyTerminal, $true)
+        $instance = [Activator]::CreateInstance($class)
+        $null = [Runtime.InteropServices.Marshal]::ReleaseComObject($instance)
+        return $true
+    } catch { return $false }
 }
 
 try {
@@ -152,9 +165,23 @@ try {
             throw 'Noctty default-terminal handoff requires Windows Terminal 1.24 or newer.'
         }
         $null = New-Item -Path $terminalStartup -Force
-        $null = New-ItemProperty -LiteralPath $terminalStartup -Name DelegationConsole -Value $windowsTerminalConsole -PropertyType String -Force
-        $null = & $nocttyCom +register-default-terminal
-        if ($LASTEXITCODE -ne 0) { throw "Noctty default-terminal registration failed: $LASTEXITCODE" }
+        $startup = Get-Item -LiteralPath $terminalStartup
+        $previousConsole = $startup.GetValue('DelegationConsole')
+        $previousTerminal = $startup.GetValue('DelegationTerminal')
+        $registered = $false
+        try {
+            $null = New-ItemProperty -LiteralPath $terminalStartup -Name DelegationConsole -Value $windowsTerminalConsole -PropertyType String -Force
+            $null = & $nocttyCom +register-default-terminal
+            if ($LASTEXITCODE -ne 0) { throw "Noctty default-terminal registration failed: $LASTEXITCODE" }
+            $registered = $true
+            if (-not (TestNocttyDefault)) { throw 'Noctty COM activation failed after registration.' }
+        } catch {
+            $failure = $_
+            if ($registered) { $null = & $nocttyCom +unregister-default-terminal }
+            RestoreRegistryString $terminalStartup 'DelegationConsole' $previousConsole
+            RestoreRegistryString $terminalStartup 'DelegationTerminal' $previousTerminal
+            throw $failure
+        }
     }
     if ($Mode -ne 'Validate') {
         foreach ($font in $manifest.fonts) {
