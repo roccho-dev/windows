@@ -6,6 +6,8 @@
   "hostPort": 2223,
   "tunnelPort": 14500,
   "volume": "windows-own-home",
+  "workVolume": "windows-own-work",
+  "nixVolume": "windows-own-nix",
   "publicKeyFile": "%USERPROFILE%\\.ssh\\id_ed25519_windows_own_wslc.pub",
   "privateKeyFile": "/work/repos/.auth/ssh/windows-own/id_ed25519",
   "knownHostsFile": "%USERPROFILE%\\.ssh\\known_hosts_windows_own",

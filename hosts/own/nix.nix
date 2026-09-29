@@ -1,8 +1,38 @@
-{ pkgs, spec }:
+# own on the common dev profile (Issue #8-B): home state, work and a writable own /nix are three named volumes.
+# mountLib and nixConf are the flake's generic mountinfo gate and multi-user nix.conf, passed in unchanged.
+{ pkgs, spec, mountLib, nixConf, profile, tag ? "nix" }:
 
+assert spec.nixMount == "/nix";
 let
   home = spec.stateMount;
-  codex = import ./codex.nix { inherit pkgs; };
+  work = spec.workMount;
+  # Written once into a seeded own /nix volume; nothing else may be seeded or run as own's store.
+  marker = "windows-own-nix v1";
+  cert = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+  # set_profile ROOT TARGET: ROOT/var/nix/profiles/own-dev -> TARGET through a new generation link, unless it already
+  # is. Older generations stay as rollback targets and GC roots.
+  profileLib = ''
+    set_profile() {
+      local d="$1/var/nix/profiles" g n=0
+      install -d -m 755 "$d"
+      if [ -L "$d/own-dev" ]; then
+        g=$(readlink "$d/own-dev")
+        [[ $g =~ ^own-dev-[0-9]+-link$ ]] && [ -L "$d/$g" ] || { echo "$d/own-dev is not a generation link" >&2; exit 1; }
+        [ "$(readlink "$d/$g")" != "$2" ] || return 0
+      elif [ -e "$d/own-dev" ]; then
+        echo "$d/own-dev exists and is not a link" >&2; exit 1
+      fi
+      for g in "$d"/own-dev-*-link; do
+        [ -L "$g" ] || continue
+        g=''${g##*/own-dev-}; g=''${g%-link}
+        [ "$g" -le "$n" ] || n=$g
+      done
+      n=$((n + 1))
+      ln -s "$2" "$d/own-dev-$n-link"
+      ln -sfn "own-dev-$n-link" "$d/.own-dev.new"
+      mv -T "$d/.own-dev.new" "$d/own-dev"
+    }
+  '';
   # Squash-merge commit of ops PR #426 (merged 2026-09-26T05:36:11Z into default branch `proposals`; not in `main`).
   opsSrc = pkgs.fetchFromGitHub {
     owner = "roccho-dev";
@@ -25,7 +55,7 @@ let
     PermitRootLogin no
     AllowUsers dev
     UsePAM no
-    SetEnv SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+    SetEnv SSL_CERT_FILE=${cert} NIX_SSL_CERT_FILE=${cert} NIX_REMOTE=daemon
     PidFile /tmp/own-sshd.pid
     Subsystem sftp internal-sftp
   '';
@@ -92,9 +122,38 @@ let
     [ -n "$ws" ] || { echo "profile $1: no page target" >&2; exit 1; }
     exec ${cdpTty}/bin/cdp-tty "$ws"
   '';
+  # PID 1. Fails closed on mounts, holds the /nix root lock for the container's lifetime (a seed takes the same lock),
+  # checks the seeded store, then supervises nix-daemon, sshd and xpra. It runs from the /nix volume, so an unseeded
+  # volume cannot start it at all.
   start = pkgs.writeShellScriptBin "own-start" ''
     set -eu
-    export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.util-linux pkgs.openssh pkgs.xpra ]}:$PATH
+    export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.util-linux pkgs.openssh pkgs.xpra pkgs.nix ]}:$PATH
+    ${mountLib}
+    homevol=''${OWN_HOME_VOLUME:-}
+    workvol=''${OWN_WORK_VOLUME:-}
+    nixvol=''${OWN_NIX_VOLUME:-}
+    volume_name "$homevol" && volume_name "$workvol" && volume_name "$nixvol" ||
+      { echo 'own-mounts: set OWN_HOME_VOLUME, OWN_WORK_VOLUME and OWN_NIX_VOLUME to volume names' >&2; exit 1; }
+    volume_at ${home} "$homevol" rw || { echo "own-mounts: ${home} must be exactly volume $homevol, rw" >&2; exit 1; }
+    volume_at ${work} "$workvol" rw || { echo "own-mounts: ${work} must be exactly volume $workvol, rw" >&2; exit 1; }
+    volume_at /nix "$nixvol" rw || { echo "own-mounts: /nix must be exactly volume $nixvol, rw" >&2; exit 1; }
+    [ "$(volume_count)" = 3 ] || { echo 'own-mounts: exactly three volumes are allowed' >&2; exit 1; }
+    # The lock is on the volume root itself (no lock file); fd 9 stays open in PID 1 and every service it starts.
+    exec 9</nix
+    flock -x -n 9 || { echo "own-nix: $nixvol is in use by another own container or a seed" >&2; exit 1; }
+    roots=$(readlink /etc/own-nix-roots)
+    [ "$(cat /nix/var/own-nix 2>/dev/null)" = '${marker}' ] || { echo 'own-nix: /nix is not a seeded own /nix volume' >&2; exit 1; }
+    [ "$(readlink "/nix/var/nix/gcroots/own/''${roots##*/}")" = "$roots" ] ||
+      { echo "own-nix: this image is not seeded into $nixvol; run own-nix-seed first" >&2; exit 1; }
+    # shellcheck disable=SC2046
+    nix-store --check-validity "$roots" $(cat "$roots") || { echo 'own-nix: seeded paths are not valid' >&2; exit 1; }
+    ${profileLib}
+    set_profile /nix ${profile}
+    echo "own-mounts ok home=$homevol work=$workvol nix=$nixvol"
+    # A new, empty work volume becomes dev's; existing content is never chowned, copied or moved.
+    if [ -z "$(ls -A ${work})" ]; then chown 1000:1000 ${work}; fi
+    NIX_SSL_CERT_FILE=${cert} nix-daemon &
+    nd_pid=$!
     chown 1000:1000 ${home}
     install -d -m 700 -o 1000 -g 1000 ${home}/.ssh ${home}/chromium /tmp/own-runtime
     if [ ! -s ${home}/.ssh/authorized_keys ]; then
@@ -124,28 +183,87 @@ let
     ${pkgs.util-linux}/bin/setpriv --reuid=1000 --regid=1000 --clear-groups ${browser} &
     browser_pid=$!
     # On stop, Chromium gets SIGTERM and time to flush its profiles before the container exits.
-    trap 'kill "$ssh_pid" "$xpra_pid" 2>/dev/null || true; kill -TERM "$browser_pid" 2>/dev/null || true; wait "$browser_pid" 2>/dev/null || true' TERM INT
-    wait -n "$ssh_pid" "$xpra_pid"
+    trap 'kill "$ssh_pid" "$xpra_pid" "$nd_pid" 2>/dev/null || true; kill -TERM "$browser_pid" 2>/dev/null || true; wait "$browser_pid" 2>/dev/null || true' TERM INT
+    wait -n "$ssh_pid" "$xpra_pid" "$nd_pid"
   '';
-in
-{
-  inherit start sshConfig browser;
+  # own-only tools beside the common dev profile (which carries Nix, Git/SSH, gh, Codex, Claude and basic tools).
   tools = pkgs.buildEnv {
     name = "own-tools";
-    paths = (with pkgs; [
-      bash
-      bubblewrap
-      chromium
-      coreutils
-      curl
-      fontconfig
-      gh
-      git
-      openssh
-      ripgrep
-      util-linux
-      xpra
-    ]) ++ [ codex cdpTty view ];
+    paths = (with pkgs; [ bubblewrap chromium curl fontconfig ripgrep util-linux xpra ]) ++ [ cdpTty view ];
     pathsToLink = [ "/bin" ];
+  };
+  # The GC-rooted runtime seeded into the own /nix volume; own-nix-seed is not among them (it runs only against the
+  # image's own store with the volume at /seed).
+  roots = pkgs.writeText "own-nix-roots" (pkgs.lib.concatMapStrings (p: "${p}\n") [ pkgs.cacert profile tools start ]);
+  closure = pkgs.closureInfo { rootPaths = [ roots ]; };
+  # Seed or upgrade an own /nix volume from this image under the volume-root lock, so never while own or another seed
+  # uses it: copy missing store paths (each appears only complete), register them, set the profile, GC root last.
+  seed = pkgs.writeShellScriptBin "own-nix-seed" ''
+    set -eu
+    export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.util-linux pkgs.nix ]}
+    fail() { echo "own-nix-seed: $*" >&2; exit 1; }
+    ${mountLib}
+    nixvol=''${OWN_NIX_VOLUME:-}
+    volume_name "$nixvol" || fail 'set OWN_NIX_VOLUME to a volume name'
+    volume_at /seed "$nixvol" rw || fail "/seed must be exactly volume $nixvol, rw"
+    if mounted /nix; then fail '/nix must be the image store, not a mount'; fi
+    [ "$(volume_count)" = 1 ] || fail 'exactly one volume is allowed'
+    exec 9</seed
+    flock -x -n 9 || fail "$nixvol is in use by a running own container or another seed"
+    if [ -e /seed/var/own-nix ]; then
+      [ "$(cat /seed/var/own-nix)" = '${marker}' ] || fail '/seed has a different marker'
+    elif [ -n "$(ls -A /seed)" ]; then
+      fail '/seed is neither empty nor an own /nix volume'
+    else
+      install -d -m 755 /seed/var
+      printf '%s\n' '${marker}' > /seed/var/own-nix
+    fi
+    install -d -m 1775 -o 0 -g 30000 /seed/store
+    rm -rf /seed/.own-seed-tmp
+    install -d -m 700 /seed/.own-seed-tmp
+    copied=0
+    while read -r p; do
+      b=''${p#/nix/store/}
+      if [ -e "/seed/store/$b" ] || [ -L "/seed/store/$b" ]; then continue; fi
+      cp -a "$p" "/seed/.own-seed-tmp/$b"
+      mv -T "/seed/.own-seed-tmp/$b" "/seed/store/$b"
+      copied=$((copied + 1))
+    done < ${closure}/store-paths
+    rmdir /seed/.own-seed-tmp
+    # Paths are logical /nix/store names; only the database lives under /seed here.
+    nix-store --store 'local?state=/seed/var/nix' --load-db < ${closure}/registration
+    ${profileLib}
+    set_profile /seed ${profile}
+    install -d -m 755 /seed/var/nix/gcroots/own
+    ln -sfn ${roots} /seed/var/nix/gcroots/own/.new
+    mv -T /seed/var/nix/gcroots/own/.new /seed/var/nix/gcroots/own/${baseNameOf roots}
+    echo "own-nix-seed ok volume=$nixvol roots=${roots} copied=$copied"
+  '';
+  config = {
+    Cmd = [ "${start}/bin/own-start" ];
+    Env = [ "HOME=${home}" "PATH=/bin:/usr/bin" "SSL_CERT_FILE=${cert}" ];
+    ExposedPorts."${toString spec.sshPort}/tcp" = {};
+    # No Volumes: an image-declared volume would silently satisfy a missing mount.
+    Labels."org.opencontainers.image.source" = "https://github.com/roccho-dev/windows";
+  };
+in
+{
+  inherit start sshConfig browser tools seed config;
+  image = pkgs.dockerTools.buildLayeredImage {
+    name = spec.imageRepository;
+    inherit tag config;
+    contents = [ pkgs.cacert profile tools start seed ];
+    extraCommands = ''
+      mkdir -p etc/nix .${home} tmp var/empty
+      {
+        printf 'root:x:0:0:root:/root:/bin/sh\nsshd:x:74:74:sshd:/var/empty:/bin/sh\ndev:x:1000:1000:Development user:${home}:/bin/sh\n'
+        for i in 1 2 3 4 5 6 7 8; do printf 'nixbld%s:x:%s:30000:Nix build user:/var/empty:/bin/sh\n' $i $((30000 + i)); done
+      } > etc/passwd
+      printf 'root:x:0:\nsshd:x:74:\ndev:x:1000:\nnixbld:x:30000:nixbld1,nixbld2,nixbld3,nixbld4,nixbld5,nixbld6,nixbld7,nixbld8\n' > etc/group
+      cp ${nixConf} etc/nix/nix.conf
+      ln -s ${roots} etc/own-nix-roots
+      touch etc/profile
+      chmod 1777 tmp
+    '';
   };
 }
