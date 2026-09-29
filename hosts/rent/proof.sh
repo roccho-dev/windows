@@ -110,16 +110,19 @@ EOF
 # packer's output: its checksum verifies, and packages.dsc.json and manifest.json inside the archive carry each
 # edited package version. $1: extra nix options; the rest: versions that must appear.
 build() {
-  dev 'opts=$1; shift
-    cd repo
-    nix build $opts --no-write-lock-file .#windows-dist .#checks.x86_64-linux.windows-dist --out-link ../dist
-    # dist is a store link: work from the repo with absolute paths, never from inside the store.
-    d=/work/repos/proof/dist
-    (cd "$d" && sha256sum -c --strict --quiet windows-dist.zip.sha256)
-    for f in packages.dsc.json manifest.json; do
-      nix shell $opts --inputs-from /work/repos/proof/repo nixpkgs#unzip -c unzip -p "$d/windows-dist.zip" "$f" > "/tmp/$f"
-      for v in "$@"; do grep -qF "\"version\": \"$v\"" "/tmp/$f"; done
-    done' _ "$@"
+  local opts=$1 v f; shift
+  dev 'cd repo; nix build $1 --no-write-lock-file .#windows-dist .#checks.x86_64-linux.windows-dist --out-link ../dist' _ "$opts"
+  # The exact archive and its packer-written checksum leave the container byte for byte; the runner verifies and
+  # reads them with its own tools, so no flake registry, network or test-only package is involved.
+  rm -rf "$evidence/dist" && mkdir "$evidence/dist"
+  for f in windows-dist.zip windows-dist.zip.sha256; do
+    docker exec "$c" /bin/cat "/work/repos/proof/dist/$f" > "$evidence/dist/$f"
+  done
+  (cd "$evidence/dist" && sha256sum -c --strict --quiet windows-dist.zip.sha256) || fail 'archive checksum'
+  for f in packages.dsc.json manifest.json; do
+    unzip -p "$evidence/dist/windows-dist.zip" "$f" > "$evidence/dist/$f" || fail "archive lacks $f"
+    for v in "$@"; do grep -qF "\"version\": \"$v\"" "$evidence/dist/$f" || fail "$f lacks version $v"; done
+  done
 }
 
 # Fresh -> develop, as the dev user through the daemon: a real clone, an uncommitted selection change, the real packer
