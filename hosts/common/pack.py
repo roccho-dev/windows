@@ -106,8 +106,9 @@ def noctty_inventory(archive_path: Path) -> dict[str, str]:
             if (entry.external_attr >> 16) & 0o170000 == 0o120000:
                 raise ValueError(f"Symlink in noctty archive: {name}")
             files[name] = hashlib.sha256(upstream.read(entry)).hexdigest()
-    if not {"noctty/noctty.exe", "noctty/noctty.com"}.issubset(files):
-        raise ValueError("Noctty archive lacks executables")
+    if not {"noctty/noctty.exe", "noctty/noctty.com",
+            "noctty/noctty-terminal-handoff-proxy.dll"}.issubset(files):
+        raise ValueError("Noctty archive lacks default-terminal components")
     return files
 
 
@@ -158,7 +159,8 @@ def distribution(fonts: Path, backend: Path, noctty: Path, cloudflared: Path, ch
         executables = list((root / "backend").rglob("dsc.exe"))
         if len(executables) != 1:
             raise ValueError("Expected exactly one pinned dsc.exe")
-        for name in ("win.ps1", "proof.ps1", "README.md"):
+        for name in ("win.ps1", "proof.ps1", "handoff-proof.ps1", "handoff-evaluate.ps1",
+                     "package-view.ps1", "README.md"):
             shutil.copyfile(scripts / name, root / name)
         write_json(root / "configuration.dsc.json", configuration(entries))
         (root / "payload").mkdir()

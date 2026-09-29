@@ -87,6 +87,7 @@ class CompilerTests(unittest.TestCase):
         with zipfile.ZipFile(noctty, "w") as z:
             z.writestr("noctty/noctty.exe", "fixture application")
             z.writestr("noctty/noctty.com", "fixture console entry")
+            z.writestr("noctty/noctty-terminal-handoff-proxy.dll", "fixture handoff proxy")
         cloudflared = self.root / "cloudflared.exe"
         cloudflared.write_bytes(b"MZ fixture: not the real client")
         choices = self.root / "choices.json"
@@ -95,7 +96,8 @@ class CompilerTests(unittest.TestCase):
                                        "packages": [{"name": "Fixture", "id": "Fixture.App", "version": "1.0"}]}))
         scripts = self.root / "scripts"
         scripts.mkdir(exist_ok=True)
-        for name in ("win.ps1", "proof.ps1", "README.md"):
+        for name in ("win.ps1", "proof.ps1", "handoff-proof.ps1", "handoff-evaluate.ps1",
+                     "package-view.ps1", "README.md"):
             (scripts / name).write_text("fixture")
         return backend, noctty, cloudflared, choices, scripts
 
@@ -116,6 +118,8 @@ class CompilerTests(unittest.TestCase):
             self.assertEqual(manifest["files"]["payload/cloudflared.exe"], pack.digest(cloudflared))
             self.assertEqual(len(manifest["packages"]), 1)
             self.assertEqual(set(manifest["files"]), set(z.namelist()) - {"manifest.json"})
+            for name in ("handoff-proof.ps1", "handoff-evaluate.ps1", "package-view.ps1"):
+                self.assertIn(name, manifest["files"])
             for name, sha in manifest["files"].items():
                 self.assertEqual(pack.hashlib.sha256(z.read(name)).hexdigest(), sha)
             config = json.loads(z.read("configuration.dsc.json"))
