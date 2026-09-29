@@ -164,7 +164,9 @@ try {
         if ($null -eq $terminal -or [version]$terminal.Version -lt [version]'1.24.0.0') {
             throw 'Noctty default-terminal handoff requires Windows Terminal 1.24 or newer.'
         }
-        $null = New-Item -Path $terminalStartup -Force
+        if (-not (Test-Path -LiteralPath $terminalStartup)) {
+            $null = New-Item -Path $terminalStartup
+        }
         $startup = Get-Item -LiteralPath $terminalStartup
         $previousConsole = $startup.GetValue('DelegationConsole')
         $previousTerminal = $startup.GetValue('DelegationTerminal')
