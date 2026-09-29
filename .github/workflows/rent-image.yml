@@ -180,7 +180,7 @@ jobs:
           $global:LASTEXITCODE = 0
       - uses: cachix/install-nix-action@v31
       - name: Build from locked Nix inputs
-        run: nix build .#rent-image --no-write-lock-file --print-build-logs
+        run: nix build .#rent-image .#rent-image-next --no-write-lock-file --print-build-logs
       - name: Load and test tools, mounts, state, restart, and recreate
         shell: bash
         run: |
@@ -188,19 +188,24 @@ jobs:
           image=ghcr.io/roccho-dev/windows-rent:nix
           docker load < result
           key_dir="$(mktemp -d)"
-          trap 'status=$?; [ "$status" -eq 0 ] || docker logs rent-smoke 2>&1 | tail -n 40 || true; docker rm -f rent-smoke rent-refuse >/dev/null 2>&1 || true; docker volume rm rent-smoke-repos rent-smoke-state rent-smoke-home rent-smoke-old rent-smoke-import >/dev/null 2>&1 || true; rm -rf "$key_dir"' EXIT
+          trap 'status=$?; [ "$status" -eq 0 ] || docker logs rent-smoke 2>&1 | tail -n 40 || true; docker rm -f rent-smoke rent-refuse >/dev/null 2>&1 || true; docker volume rm rent-smoke-repos rent-smoke-state rent-smoke-nix rent-smoke-home rent-smoke-old rent-smoke-import >/dev/null 2>&1 || true; rm -rf "$key_dir"' EXIT
           test "$(docker image inspect --format '{{json .Config.Volumes}}' "$image")" = null
           ssh-keygen -q -t ed25519 -N '' -f "$key_dir/key"
           docker volume create rent-smoke-repos
           docker volume create rent-smoke-state
           docker volume create rent-smoke-home
+          docker volume create rent-smoke-nix
+          # rent's own /nix: seeded from this image while no container uses it (hosts/rent/proof.sh proves the lifecycle).
+          docker run --rm -v rent-smoke-nix:/seed -e RENT_NIX_VOLUME=rent-smoke-nix "$image" /bin/rent-nix-seed
           # Existing repos content with a foreign owner; rent-start must never chown it.
           docker run --rm -v rent-smoke-repos:/r "$image" /bin/bash -c 'echo repo > /r/marker && chown 4242:4243 /r/marker'
-          ids=(-e RENT_REPOS_VOLUME=rent-smoke-repos -e RENT_STATE_VOLUME=rent-smoke-state)
+          ids=(-e RENT_REPOS_VOLUME=rent-smoke-repos -e RENT_STATE_VOLUME=rent-smoke-state -e RENT_NIX_VOLUME=rent-smoke-nix)
+          # volume-nocopy: Docker's copy into an empty volume must never stand in for seeding.
+          nixm=(--mount type=volume,source=rent-smoke-nix,target=/nix,volume-nocopy)
           env_args=(-e "RENT_AUTHORIZED_KEY=$(cat "$key_dir/key.pub")" -e RENT_TS_HOSTNAME=rent-ci-smoke)
-          proof='rent-mounts ok repos=rent-smoke-repos state=rent-smoke-state'
+          proof='rent-mounts ok repos=rent-smoke-repos state=rent-smoke-state nix=rent-smoke-nix'
 
-          # Fail closed before any service: exactly the named repos and state volumes, rw, nothing else, no /home/dev mount.
+          # Fail closed before any service: exactly the named repos, state and nix volumes, rw, nothing else, no /home/dev mount.
           refuse() {
             local want=$1; shift
             if timeout 60 docker run --rm --name rent-refuse "$@" "${env_args[@]}" "$image" > "$key_dir/refuse" 2>&1; then
@@ -210,20 +215,24 @@ jobs:
             if grep -qF 'rent-mounts ok' "$key_dir/refuse"; then echo "gate passed despite: $want" >&2; return 1; fi
           }
           bind_dir="$(mktemp -d)"
-          both=(-v rent-smoke-repos:/work/repos -v rent-smoke-state:/var/lib/rent)
-          refuse 'rent-mounts: set RENT_REPOS_VOLUME and RENT_STATE_VOLUME' "${both[@]}"
-          refuse 'rent-mounts: /work/repos must be exactly volume rent-smoke-repos' -v rent-smoke-state:/var/lib/rent "${ids[@]}"
-          refuse 'rent-mounts: /var/lib/rent must be exactly volume rent-smoke-state' -v rent-smoke-repos:/work/repos "${ids[@]}"
+          both=(-v rent-smoke-repos:/work/repos -v rent-smoke-state:/var/lib/rent "${nixm[@]}")
+          refuse 'rent-mounts: set RENT_REPOS_VOLUME, RENT_STATE_VOLUME and RENT_NIX_VOLUME' "${both[@]}"
+          refuse 'rent-mounts: /work/repos must be exactly volume rent-smoke-repos' -v rent-smoke-state:/var/lib/rent "${nixm[@]}" "${ids[@]}"
+          refuse 'rent-mounts: /var/lib/rent must be exactly volume rent-smoke-state' -v rent-smoke-repos:/work/repos "${nixm[@]}" "${ids[@]}"
           refuse 'rent-mounts: /work/repos must be exactly volume rent-smoke-repos' \
-            -v rent-smoke-home:/work/repos -v rent-smoke-state:/var/lib/rent "${ids[@]}"
+            -v rent-smoke-home:/work/repos -v rent-smoke-state:/var/lib/rent "${nixm[@]}" "${ids[@]}"
           refuse 'rent-mounts: /var/lib/rent must be exactly volume rent-smoke-state' \
-            -v rent-smoke-repos:/work/repos -v rent-smoke-home:/var/lib/rent "${ids[@]}"
+            -v rent-smoke-repos:/work/repos -v rent-smoke-home:/var/lib/rent "${nixm[@]}" "${ids[@]}"
           refuse 'rent-mounts: /work/repos must be exactly volume rent-smoke-repos, rw' \
-            -v rent-smoke-repos:/work/repos:ro -v rent-smoke-state:/var/lib/rent "${ids[@]}"
+            -v rent-smoke-repos:/work/repos:ro -v rent-smoke-state:/var/lib/rent "${nixm[@]}" "${ids[@]}"
           refuse 'rent-mounts: /work/repos must be exactly volume rent-smoke-repos' \
-            -v "$bind_dir:/work/repos" -v rent-smoke-state:/var/lib/rent "${ids[@]}"
+            -v "$bind_dir:/work/repos" -v rent-smoke-state:/var/lib/rent "${nixm[@]}" "${ids[@]}"
+          refuse 'rent-mounts: /nix must be exactly volume rent-smoke-nix, rw' -v rent-smoke-repos:/work/repos \
+            -v rent-smoke-state:/var/lib/rent --mount type=volume,source=rent-smoke-nix,target=/nix,volume-nocopy,readonly "${ids[@]}"
+          refuse 'rent-mounts: /nix must be exactly volume rent-smoke-other, rw' "${both[@]}" \
+            -e RENT_REPOS_VOLUME=rent-smoke-repos -e RENT_STATE_VOLUME=rent-smoke-state -e RENT_NIX_VOLUME=rent-smoke-other
           refuse 'rent-mounts: /home/dev must not be a mount' "${both[@]}" -v rent-smoke-home:/home/dev "${ids[@]}"
-          refuse 'rent-mounts: exactly two volumes are allowed' "${both[@]}" -v rent-smoke-home:/extra "${ids[@]}"
+          refuse 'rent-mounts: exactly three volumes are allowed' "${both[@]}" -v rent-smoke-home:/extra "${ids[@]}"
           # A synthetic line in the WSLC mount-root form (no /var/lib/docker prefix), on the mount functions as built into the image.
           docker run --rm "$image" /bin/cat /bin/rent-state-import | sed -n '/^volume_at() {$/,/^volume_name() /p' > "$key_dir/mountlib.sh"
           bash -c 'set -eu; source "$1"; mounts="20 1 0:20 /volumes/dev-home/_data /old ro,relatime - ext4 /dev/sdc rw"
@@ -278,7 +287,7 @@ jobs:
 
           run() {
             docker run -d --name rent-smoke -p 127.0.0.1:2222:2222 \
-              -v rent-smoke-repos:/work/repos -v rent-smoke-state:/var/lib/rent "${ids[@]}" "$@" "$image"
+              -v rent-smoke-repos:/work/repos -v rent-smoke-state:/var/lib/rent "${nixm[@]}" "${ids[@]}" "$@" "$image"
           }
           # The one fixed proof line, from rent-start itself, once per start.
           proven() { test "$(docker logs rent-smoke 2>&1 | grep -cxF "$proof")" = "$1"; }
@@ -319,8 +328,8 @@ jobs:
           machine_key_hash() { jq -r ._machinekey "$key_dir/ts.state" | sha256sum | cut -d' ' -f1; }
           repos_untouched() {
             docker exec rent-smoke /bin/cat /proc/1/mountinfo > "$key_dir/mountinfo"
-            awk '$5 == "/work/repos" { r++ } $5 == "/var/lib/rent" { s++ } $5 == "/home/dev" { h++ }
-              END { exit !(r == 1 && s == 1 && h == 0) }' "$key_dir/mountinfo"
+            awk '$5 == "/work/repos" { r++ } $5 == "/var/lib/rent" { s++ } $5 == "/nix" { n++ } $5 == "/home/dev" { h++ }
+              END { exit !(r == 1 && s == 1 && n == 1 && h == 0) }' "$key_dir/mountinfo"
             test "$(docker exec rent-smoke /bin/stat -c '%u:%g' /work/repos/marker)" = 4242:4243
             test "$(docker exec rent-smoke /bin/cat /work/repos/marker)" = repo
           }
@@ -331,7 +340,9 @@ jobs:
           repos_untouched
           "${ssh_cmd[@]}" 'set -eu
             test "$(id -u):$(id -g)" = 1000:1000
-            if command -v nix-instantiate >/dev/null; then exit 1; fi
+            test "$NIX_REMOTE" = daemon
+            test "$(readlink -f "$(command -v nix)")" = "$(readlink -f /nix/var/nix/profiles/rent-dev/bin/nix)"
+            nix-store -q --hash /nix/var/nix/profiles/rent-dev >/dev/null
             command -v git >/dev/null
             test "$SSL_CERT_FILE" = /etc/ssl/certs/ca-certificates.crt
             test -r "$SSL_CERT_FILE"
@@ -393,6 +404,11 @@ jobs:
           ts_ready
           test "$(machine_key_hash)" = "$machine"
           repos_untouched
+      - name: Prove rent development continues across seed, upgrade, replacement, GC and rollback
+        run: |
+          set -euo pipefail
+          bash hosts/rent/proof.sh result result-1 2>&1 | tee rent-proof.log
+          grep -E '^(image |image-next |repo revision |PASS )' rent-proof.log >> "$GITHUB_STEP_SUMMARY"
       - name: Publish exact image from this repository
         if: inputs.publish
         env:

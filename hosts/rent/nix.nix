@@ -15,7 +15,7 @@ assert builtins.isString certFile;
   PermitRootLogin no
   AllowUsers dev
   UsePAM no
-  SetEnv SSL_CERT_FILE=${certFile} GIT_SSL_CAINFO=${certFile}
+  SetEnv SSL_CERT_FILE=${certFile} GIT_SSL_CAINFO=${certFile} NIX_SSL_CERT_FILE=${certFile} NIX_REMOTE=daemon
   PidFile /tmp/rent-sshd.pid
   Subsystem sftp internal-sftp
 ''
