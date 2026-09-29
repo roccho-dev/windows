@@ -113,9 +113,11 @@ build() {
   dev 'opts=$1; shift
     cd repo
     nix build $opts --no-write-lock-file .#windows-dist .#checks.x86_64-linux.windows-dist --out-link ../dist
-    cd ../dist && sha256sum -c --strict --quiet windows-dist.zip.sha256
+    # dist is a store link: work from the repo with absolute paths, never from inside the store.
+    d=/work/repos/proof/dist
+    (cd "$d" && sha256sum -c --strict --quiet windows-dist.zip.sha256)
     for f in packages.dsc.json manifest.json; do
-      nix shell $opts --inputs-from ../repo nixpkgs#unzip -c unzip -p windows-dist.zip "$f" > "/tmp/$f"
+      nix shell $opts --inputs-from /work/repos/proof/repo nixpkgs#unzip -c unzip -p "$d/windows-dist.zip" "$f" > "/tmp/$f"
       for v in "$@"; do grep -qF "\"version\": \"$v\"" "/tmp/$f"; done
     done' _ "$@"
 }
