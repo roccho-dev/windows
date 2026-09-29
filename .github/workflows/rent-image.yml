@@ -353,7 +353,8 @@ jobs:
           docker run --rm "$real" "$cf" tunnel run --help > "$key_dir/cf-help" 2>&1
           grep -qF -- '--token-file' "$key_dir/cf-help" || { cat "$key_dir/cf-help" >&2; exit 1; }
           nix-store -qR "$(docker run --rm "$real" /bin/readlink /etc/rent-nix-roots)" > "$key_dir/closure"
-          grep -F "$cf" "$key_dir/closure" > /dev/null
+          # nix-store -qR lists store paths, so the exact cloudflared package path (not its executable) must be one line.
+          grep -qxF "${cf%/bin/cloudflared}" "$key_dir/closure" || { echo "cloudflared package ${cf%/bin/cloudflared} not in the runtime closure" >&2; exit 1; }
           if grep -qi tailscale "$key_dir/closure"; then echo 'tailscale in the runtime closure' >&2; exit 1; fi
           if docker run --rm "$real" /bin/grep -qi tailscale /bin/rent-start; then echo 'rent-start mentions tailscale' >&2; exit 1; fi
           # A synthetic token: random, so any appearance in output is a leak. It proves nothing about Cloudflare.
