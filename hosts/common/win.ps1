@@ -142,6 +142,8 @@ if ($Mode -eq 'RentSsh' -or $Mode -eq 'RentSshTest') {
         $state = IncludeState
         if ($state -eq 'bom') { throw "$userConfig starts with a byte order mark; not editing it." }
         if ($state -eq 'elsewhere') { throw "$userConfig has '$include' below its first line; move it to the top by hand." }
+        # Every refusal comes before the first write: a stale backup must not leave a half-installed client behind.
+        if ($state -eq 'missing' -and (Test-Path -LiteralPath $userBackup)) { throw "$userBackup already exists; not overwriting it." }
         if (-not (ClientOk)) {
             $null = New-Item -ItemType Directory -Path $clientDirectory -Force
             Copy-Item -LiteralPath (BundlePath $client.file) -Destination $clientExe -Force
@@ -153,10 +155,7 @@ if ($Mode -eq 'RentSsh' -or $Mode -eq 'RentSshTest') {
         if ($state -ne 'first') {
             # One line before the exact prior bytes; the prior bytes are kept once, beside it, and never overwritten.
             $prior = if ($state -eq 'missing') { [IO.File]::ReadAllBytes($userConfig) } else { [byte[]]@() }
-            if ($state -eq 'missing') {
-                if (Test-Path -LiteralPath $userBackup) { throw "$userBackup already exists; not overwriting it." }
-                [IO.File]::WriteAllBytes($userBackup, $prior)
-            }
+            if ($state -eq 'missing') { [IO.File]::WriteAllBytes($userBackup, $prior) }
             $null = New-Item -ItemType Directory -Path $sshDirectory -Force
             [IO.File]::WriteAllBytes($userConfig, [byte[]]($utf8.GetBytes($include + "`n") + $prior))
         }

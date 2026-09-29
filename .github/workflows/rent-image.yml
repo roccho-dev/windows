@@ -58,6 +58,13 @@ jobs:
             if ((@($Plan.$K) -join "`n") -cne ($Want[$K] -join "`n")) { "$K differs: $(@($Plan.$K) -join ' ')"; exit 1 }
           }
           if ($Plan.readyGate -notlike "*'rent-mounts ok repos=repos state=windows-rent-state nix=windows-rent-nix'*'rent-start ok services=nix-daemon,cloudflared,sshd'*") { 'readyGate differs'; exit 1 }
+          # The candidate takes over exactly the kept rent's loopback port (free only once it is stopped), and exactly one
+          # logon task exists, repointed by name: no second task can start a second rent on the same volumes.
+          if ($Plan.stageRun[5] -cne '--publish' -or $Plan.stageRun[6] -cne '127.0.0.1:2222:2222' -or $Plan.stageRun[6] -cne $Plan.create[6] -or
+              @($Plan.stageRun | Where-Object { $_ -ceq '--publish' }).Count -ne 1) { 'candidate port differs from the kept rent'; exit 1 }
+          $Tasks = @($Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -in 'Register-ScheduledTask', 'New-ScheduledTask' }, $true))
+          if ($Tasks.Count -ne 1 -or $Tasks[0].Extent.Text -notmatch '-TaskName \$TaskName ') { 'logon task is not the one fixed name'; exit 1 }
+          if ($Ast.Extent.Text -notmatch "(?m)^\`$TaskName = 'windows-rent-oci-logon'$") { 'logon task name is not fixed'; exit 1 }
           # No Tailscale and no token anywhere in the runbook: the token is a file in the state volume.
           if ($PlanJson -match '(?i)tailscale|TS_|TUNNEL_TOKEN|--token') { 'the plan still carries Tailscale or a token'; exit 1 }
           # Refusals before any WSLC call.
@@ -75,8 +82,8 @@ jobs:
           $Container = 'windows-rent'; $Candidate = 'windows-rent-cf'; $OldImageSource = 'ghcr.io/roccho-dev/envs-dev@sha256:' + ('1' * 64)
           foreach ($N in $Ast.FindAll({ param($n)
               ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Get-Images', 'Test-Stopped', 'Test-Running',
-                'Get-OldSourceProblem', 'Get-WriterProblem', 'Test-RunningProof', 'Get-StageProblem', 'Get-Container', 'Assert-NoOtherWriter',
-                'Invoke-Seed', 'Wait-Ready', 'Wait-OldRunning', 'Invoke-Revert', 'Complete-Stage') -or
+                'Get-OldSourceProblem', 'Get-WriterProblem', 'Test-RunningProof', 'Get-StageProblem', 'Get-Container', 'Get-Named',
+                'Assert-NoOtherWriter', 'Invoke-Seed', 'Wait-Ready', 'Wait-OldRunning', 'Invoke-Revert', 'Invoke-StageStop', 'Complete-Stage') -or
               ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in '$OldImage', '$Mounts', '$Proof', '$Ready', '$ListArgs', '$SeedArgs') }, $true)) {
             . ([scriptblock]::Create($N.Extent.Text))
           }
@@ -113,6 +120,7 @@ jobs:
           $CandDown = $CandUp.Replace('"Running":true,"Status":"running"', '"Running":false,"Status":"exited"')
           if (Get-StageProblem $OldUp $null) { "stage refused a running kept rent: $(Get-StageProblem $OldUp $null)"; exit 1 }
           foreach ($Bad in @(@($null, $null), @((J $OldDownJson), $null), @((J '{"Name":"windows-rent","State":{"Running":true}}'), $null),
+              @((J $OldUpJson.Replace('"Name":"windows-rent"', '"Name":"other"')), $null),
               @((J ('{"Name":"windows-rent","State":{"Running":true},"Config":{"Image":"' + $Image + '"}}')), $null), @($OldUp, (J $CandDown)))) {
             if (-not (Get-StageProblem $Bad[0] $Bad[1])) { 'stage precondition allowed a bad state'; exit 1 }
           }
@@ -167,6 +175,12 @@ jobs:
             'kept rent back on other image' = @{ Exit = @{ $S = 1 }; Old = { $OldUpJson.Replace($Live, $Other) }; Cand = { $null }
               Calls = @('container list --all -q', $S, 'inspect windows-rent-cf') + $NoBack
               Want = "Stage failed: WSLC seed failed: 1 | revert FAILED: start old exit 0; $NotOk" }
+            'candidate readback names another container' = @{ Old = { $OldUpJson }; Cand = { $CandUp.Replace('"Name":"windows-rent-cf"', '"Name":"windows-rent"') }
+              Calls = $Pre + @('inspect windows-rent-cf', 'inspect windows-rent-cf')
+              Want = 'Stage failed: Inspect of windows-rent-cf returned windows-rent. | revert FAILED: error: Inspect of windows-rent-cf returned windows-rent.' }
+            'kept rent readback names another container' = @{ Exit = @{ $S = 1 }; Old = { $OldUpJson.Replace('"Name":"windows-rent"', '"Name":"other"') }; Cand = { $null }
+              Calls = @('container list --all -q', $S, 'inspect windows-rent-cf', 'start windows-rent', 'inspect windows-rent')
+              Want = 'Stage failed: WSLC seed failed: 1 | revert FAILED: start old exit 0; error: Inspect of windows-rent returned other.' }
             'failed candidate cannot be removed' = @{ Exit = @{ 'remove windows-rent-cf' = 1 }; Old = { $OldUpJson }; Cand = { $CandUp }; Logs = @($Proof)
               Calls = $Pre + @(1..60 | ForEach-Object { $Pair }) + @('inspect windows-rent-cf', 'stop windows-rent-cf', 'remove windows-rent-cf')
               Want = "Stage failed: windows-rent-cf did not stay Running with '$Proof' and '$Ready'. | revert FAILED: stop candidate exit 0; remove candidate exit 1" }
@@ -186,13 +200,40 @@ jobs:
               Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf') + $Back }
             'revert, kept rent not Running' = @{ Old = { $OldDownJson }; Cand = { $CandUp }; Want = "False | stop candidate exit 0; start old exit 0; $NotOk"
               Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf') + $NoBack }
-            'revert, candidate stop fails' = @{ Exit = @{ 'stop windows-rent-cf' = 1 }; Old = { $OldUpJson }; Cand = { $CandUp }; Want = 'False | stop candidate exit 1'
-              Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf') }
+            'revert, candidate stop fails and it still runs' = @{ Exit = @{ 'stop windows-rent-cf' = 1 }; Old = { $OldUpJson }; Cand = { $CandUp }
+              Want = 'False | stop candidate exit 1; candidate not provably stopped'; Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf') }
+            'revert, candidate stop fails but it stopped' = @{ Exit = @{ 'stop windows-rent-cf' = 1 }; Old = { $OldUpJson }
+              Cand = { param($N) if ($N -eq 1) { $CandUp } else { $CandDown } }
+              Want = "True | stop candidate exit 1; candidate provably stopped; start old exit 0; $Ok"
+              Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf') + $Back }
           }
           foreach ($K in $Reverts.Keys) {
             $Case = $Reverts[$K]; $Calls = [System.Collections.Generic.List[string]]::new(); $Steps = [System.Collections.Generic.List[string]]::new()
             $Result = Invoke-Revert $OldUp $Steps $false
             Assert-Case $K "$Result | $($Steps -join '; ')"
+          }
+          # Stopping the kept rent for Stage: a nonzero exit is judged by readback; the kept rent is started again only
+          # when provably stopped with no other writer, and never when its state is unknown.
+          $Stop = 'WSLC stop of windows-rent failed: 1'
+          $Stops = [ordered]@{
+            'stop succeeds' = @{ Old = { $OldUpJson }; Want = 'ok'; Calls = @('stop windows-rent') }
+            'stop fails, still Running' = @{ Exit = @{ 'stop windows-rent' = 1 }; Old = { $OldUpJson }
+              Want = "$Stop; it is still Running; nothing else changed."; Calls = @('stop windows-rent', 'inspect windows-rent') }
+            'stop fails but it stopped' = @{ Exit = @{ 'stop windows-rent' = 1 }; Old = { param($N) if ($N -eq 1) { $OldDownJson } else { $OldUpJson } }
+              Want = "$Stop but it stopped | restore succeeded: start old exit 0"
+              Calls = @('stop windows-rent', 'inspect windows-rent', 'container list --all -q', 'start windows-rent', 'inspect windows-rent', 'inspect windows-rent', 'inspect windows-rent') }
+            'stop fails, stopped, another writer running' = @{ Exit = @{ 'stop windows-rent' = 1 }; Old = { $OldDownJson }; List = 'other'; Other = $OtherRunning | ConvertTo-Json -Compress
+              Want = "$Stop but it stopped | restore FAILED: error: Container other is not provably stopped. Not restoring."
+              Calls = @('stop windows-rent', 'inspect windows-rent', 'container list --all -q', 'inspect other') }
+            'stop fails, state unknown' = @{ Exit = @{ 'stop windows-rent' = 1 }; Old = { '{"Name":"windows-rent","State":{"Running":"unknown"}}' }
+              Want = "$Stop; its state is unknown; not starting anything."; Calls = @('stop windows-rent', 'inspect windows-rent') }
+            'stop fails, readback names another container' = @{ Exit = @{ 'stop windows-rent' = 1 }; Old = { $OldDownJson.Replace('"Name":"windows-rent"', '"Name":"other"') }
+              Want = "$Stop; readback failed (Inspect of windows-rent returned other.); not starting anything."; Calls = @('stop windows-rent', 'inspect windows-rent') }
+          }
+          foreach ($K in $Stops.Keys) {
+            $Case = $Stops[$K]; $Calls = [System.Collections.Generic.List[string]]::new()
+            $Got = try { Invoke-StageStop $OldUp; 'ok' } catch { $_.Exception.Message }
+            Assert-Case $K $Got
           }
           # The fake's last exit code must not become this step's exit code.
           $global:LASTEXITCODE = 0

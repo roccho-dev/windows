@@ -107,6 +107,7 @@ function Test-RunningProof($Item, $Logs) {
 
 # Stage precondition on inspect now: the kept rent Running on readable images other than $Image, no candidate yet.
 function Get-StageProblem($Old, $Existing) {
+    if ($Old -and ([string] $Old.Name).TrimStart('/') -cne $Container) { return "Inspect of $Container returned $($Old.Name)." }
     if (-not (Test-Running $Old)) { return "$Container must exist and be Running to stage beside it." }
     if (-not (Get-Images $Old)) { return "$Container has no readable image." }
     if ((Get-Images $Old) -ccontains $Image) { return "$Container already runs $Image; nothing to stage." }
@@ -121,6 +122,13 @@ function Get-Container([string] $Name) {
     $Items = @($Parsed)
     if ($Items.Count -ne 1) { throw "Expected one container named $Name." }
     return $Items[0]
+}
+
+# Readback of the kept rent or the candidate by name: inspect must return that very container, or nothing.
+function Get-Named([string] $Name) {
+    $Item = Get-Container $Name
+    if ($Item -and ([string] $Item.Name).TrimStart('/') -cne $Name) { throw "Inspect of $Name returned $($Item.Name)." }
+    return $Item
 }
 
 function Assert-OldSourceStopped {
@@ -227,7 +235,7 @@ function Wait-Ready([string] $Name) {
     $Seen = 0
     for ($Second = 0; $Second -lt 60 -or ($Seen -gt 0 -and $Second -lt 70); $Second++) {
         Start-Sleep -Seconds 1
-        if (Test-RunningProof (Get-Container $Name) @(& $Wslc logs $Name 2>$null)) {
+        if (Test-RunningProof (Get-Named $Name) @(& $Wslc logs $Name 2>$null)) {
             if (++$Seen -ge 10) { return $true }
         } elseif ($Seen) { return $false }
     }
@@ -239,7 +247,7 @@ function Wait-OldRunning($Old) {
     $Seen = 0
     for ($Second = 0; $Second -lt 60; $Second++) {
         Start-Sleep -Seconds 1
-        $Now = Get-Container $Container
+        $Now = Get-Named $Container
         if ((Test-Running $Now) -and "$(Get-Images $Now)" -ceq "$(Get-Images $Old)") {
             if (++$Seen -ge 3) { return $true }
         } else { $Seen = 0 }
@@ -250,12 +258,17 @@ function Wait-OldRunning($Old) {
 # Back to the kept rent: stop the candidate (and remove it only when it is a failed Stage's), start the old rent,
 # and prove it Running on its own images. No -f, no -v; no volume is touched. Every step is appended to $Steps.
 function Invoke-Revert($Old, $Steps, [bool] $RemoveCandidate) {
-    $Now = Get-Container $Candidate
+    $Now = Get-Named $Candidate
     if ($Now) {
         if (-not (Test-Stopped $Now)) {
             & $Wslc stop $Candidate | Out-Host
-            $Steps.Add("stop candidate exit $LASTEXITCODE")
-            if ($LASTEXITCODE -ne 0) { return $false }
+            $Code = $LASTEXITCODE
+            $Steps.Add("stop candidate exit $Code")
+            # A failed stop is judged by readback: only a provably stopped candidate lets the kept rent start.
+            if ($Code -ne 0) {
+                if (-not (Test-Stopped (Get-Named $Candidate))) { $Steps.Add('candidate not provably stopped'); return $false }
+                $Steps.Add('candidate provably stopped')
+            }
         }
         if ($RemoveCandidate) {
             & $Wslc remove $Candidate | Out-Host
@@ -269,6 +282,27 @@ function Invoke-Revert($Old, $Steps, [bool] $RemoveCandidate) {
     $Ok = Wait-OldRunning $Old
     $Steps.Add($(if ($Ok) { 'old Running on its images' } else { 'old not Running on its images within 60 s' }))
     return $Ok
+}
+
+# Stop the kept rent for Stage. A nonzero exit is judged by readback: still Running means nothing changed; provably
+# stopped with no other writer means it is started again and proven back; anything unknown is left alone.
+function Invoke-StageStop($Old) {
+    & $Wslc stop $Container | Out-Host
+    $Code = $LASTEXITCODE
+    if ($Code -eq 0) { return }
+    try { $Now = Get-Named $Container }
+    catch { throw "WSLC stop of $Container failed: $Code; readback failed ($($_.Exception.Message)); not starting anything." }
+    if (Test-Running $Now) { throw "WSLC stop of $Container failed: $Code; it is still Running; nothing else changed." }
+    if (-not (Test-Stopped $Now)) { throw "WSLC stop of $Container failed: $Code; its state is unknown; not starting anything." }
+    $Steps = [System.Collections.Generic.List[string]]::new()
+    try {
+        Assert-NoOtherWriter $Container 'restoring'
+        & $Wslc start $Container | Out-Host
+        $Steps.Add("start old exit $LASTEXITCODE")
+        $Ok = ($LASTEXITCODE -eq 0) -and (Wait-OldRunning $Old)
+    } catch { $Ok = $false; $Steps.Add("error: $($_.Exception.Message)") }
+    $Outcome = if ($Ok) { 'succeeded' } else { 'FAILED' }
+    throw "WSLC stop of $Container failed: $Code but it stopped | restore ${Outcome}: $($Steps -join '; ')"
 }
 
 # Stage after the old rent was stopped (kept, never removed): any failure reverts, and Stage still fails.
@@ -289,9 +323,9 @@ function Complete-Stage($Old) {
 }
 
 if ($Step -eq 'Revert') {
-    $Old = Get-Container $Container
+    $Old = Get-Named $Container
     if (-not $Old -or -not (Get-Images $Old)) { throw "Kept rent $Container is missing or has no readable image." }
-    if (-not (Get-Container $Candidate)) { throw "Candidate $Candidate is missing; nothing to revert." }
+    if (-not (Get-Named $Candidate)) { throw "Candidate $Candidate is missing; nothing to revert." }
     # The kept rent must be stopped: only the candidate may be running.
     Assert-NoOtherWriter $Candidate 'reverting'
     $Steps = [System.Collections.Generic.List[string]]::new()
@@ -315,8 +349,8 @@ if ($Step -eq 'Migrate') {
     if ($LASTEXITCODE -ne 0) { throw "Repos volume is missing: $ReposVolume" }
     if ($Step -eq 'Stage') {
         # The kept rent and its images come from inspect now; nothing is taken from a recorded digest.
-        $Old = Get-Container $Container
-        $Problem = Get-StageProblem $Old (Get-Container $Candidate)
+        $Old = Get-Named $Container
+        $Problem = Get-StageProblem $Old (Get-Named $Candidate)
         if ($Problem) { throw $Problem }
         Assert-NoOtherWriter $Container 'staging'
         & $Wslc volume inspect $StateVolume | Out-Null
@@ -350,8 +384,7 @@ if ($Step -eq 'Migrate') {
 }
 
 if ($Step -eq 'Stage') {
-    & $Wslc stop $Container
-    if ($LASTEXITCODE -ne 0) { throw "WSLC stop of $Container failed: $LASTEXITCODE; nothing else changed." }
+    Invoke-StageStop $Old
     Complete-Stage $Old
     Write-Output "Stage succeeded: $Candidate ready; $Container kept stopped. LogonTask still starts $Container until switched."
 } else {

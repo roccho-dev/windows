@@ -80,6 +80,17 @@ foreach ($bad in @(@{ Hostname = 'bad host' }, @{ HostKey = 'ssh-rsa AAAA' }, @{
     MustReject { RunSsh 'RentSsh' $with } 'Invalid*'
 }
 if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($userConfig)) -ne [Convert]::ToBase64String($prior)) { throw 'A refused binding wrote the user config.' }
+# A stale backup is refused before any write: no client, no rent files, both user files byte-identical.
+$clientDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('Programs\cloudflared-' + $manifest.cloudflared.version)
+if (Test-Path -LiteralPath $clientDir) { throw 'Proof requires no installed client yet.' }
+$backup = Join-Path $sshDir 'config.before-windows-rent'
+[IO.File]::WriteAllText($backup, "stale backup`n")
+$stale = [IO.File]::ReadAllBytes($backup)
+MustReject { RunSsh 'RentSsh' } '*config.before-windows-rent already exists; not overwriting it.'
+if ((Test-Path -LiteralPath $clientDir) -or (Test-Path -LiteralPath (Join-Path $sshDir 'windows-rent'))) { throw 'A refused binding installed files.' }
+if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($userConfig)) -ne [Convert]::ToBase64String($prior) -or
+    [Convert]::ToBase64String([IO.File]::ReadAllBytes($backup)) -ne [Convert]::ToBase64String($stale)) { throw 'A refused binding changed the user config or backup.' }
+Remove-Item -LiteralPath $backup
 $ssh = RunSsh 'RentSsh'
 $expected = [Text.Encoding]::UTF8.GetBytes("Include windows-rent/config`n") + $prior
 foreach ($pass in 1, 2) {
