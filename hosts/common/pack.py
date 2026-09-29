@@ -130,10 +130,14 @@ def archive(root: Path, destination: Path) -> None:
             result.writestr(info, path.read_bytes(), compresslevel=9)
 
 
-def distribution(fonts: Path, backend: Path, noctty: Path, choices: Path,
+def distribution(fonts: Path, backend: Path, noctty: Path, cloudflared: Path, choices: Path,
                  scripts: Path, source: str, out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
     selected = json.loads(choices.read_text(encoding="utf-8"))
+    if not selected.get("cloudflared", {}).get("version"):
+        raise ValueError("No cloudflared version selected")
+    if not cloudflared.read_bytes().startswith(b"MZ"):
+        raise ValueError("cloudflared payload is not a Windows executable")
     if selected["noctty"]["fontFamily"] not in {e["family"] for e in json.loads((fonts / "fonts.json").read_text(encoding="utf-8"))}:
         raise ValueError("Noctty font is not selected by common fonts")
     noctty_files = noctty_inventory(noctty)
@@ -159,6 +163,8 @@ def distribution(fonts: Path, backend: Path, noctty: Path, choices: Path,
         write_json(root / "configuration.dsc.json", configuration(entries))
         (root / "payload").mkdir()
         shutil.copyfile(noctty, root / "payload/noctty.zip")
+        # The pinned official client, installed only by the explicit RentSsh mode, never by Restore.
+        shutil.copyfile(cloudflared, root / "payload/cloudflared.exe")
         write_json(root / "packages.dsc.json", package_configuration(selected["packages"]))
         files = {p.relative_to(root).as_posix(): digest(p) for p in sorted(root.rglob("*")) if p.is_file()}
         write_json(root / "manifest.json", {"schemaVersion": 2, "source": source,
@@ -166,6 +172,8 @@ def distribution(fonts: Path, backend: Path, noctty: Path, choices: Path,
                    "noctty": {"version": selected["noctty"]["version"],
                               "fontFamily": selected["noctty"]["fontFamily"],
                               "files": noctty_files},
+                   "cloudflared": {"version": selected["cloudflared"]["version"], "file": "payload/cloudflared.exe",
+                                   "sha256": files["payload/cloudflared.exe"]},
                    "packages": selected["packages"], "files": files})
         output = out / "windows-dist.zip"
         archive(root, output)
@@ -179,7 +187,7 @@ if __name__ == "__main__":
     font_parser.add_argument("policy", type=Path)
     font_parser.add_argument("out", type=Path)
     dist_parser = sub.add_parser("dist")
-    for argument in ("fonts", "backend", "noctty", "choices", "scripts"):
+    for argument in ("fonts", "backend", "noctty", "cloudflared", "choices", "scripts"):
         dist_parser.add_argument(argument, type=Path)
     dist_parser.add_argument("source")
     dist_parser.add_argument("out", type=Path)
@@ -187,5 +195,5 @@ if __name__ == "__main__":
     if args.command == "fonts":
         prepare_fonts(json.loads(args.policy.read_text()), args.out)
     else:
-        distribution(args.fonts, args.backend, args.noctty, args.choices,
+        distribution(args.fonts, args.backend, args.noctty, args.cloudflared, args.choices,
                      args.scripts, args.source, args.out)

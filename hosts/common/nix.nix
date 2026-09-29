@@ -41,11 +41,19 @@ let
     url = "https://github.com/amanthanvi/noctty/releases/download/v${nocttyVersion}/noctty-${nocttyVersion}-windows-x64-portable.zip";
     sha256 = "d776bd0e4507abd3a3d6e4a4b347d089960ad5171d0caeeb783e01dd4b0e15fd";
   };
+  # The Windows OpenSSH ProxyCommand client: the official release of exactly the cloudflared version the rent image
+  # runs (the locked nixpkgs), pinned by hash. A nixpkgs bump fails here until this pin is moved with it.
+  cloudflaredVersion = assert pkgs.cloudflared.version == "2026.6.1"; pkgs.cloudflared.version;
+  cloudflared = pkgs.fetchurl {
+    url = "https://github.com/cloudflare/cloudflared/releases/download/${cloudflaredVersion}/cloudflared-windows-amd64.exe";
+    sha256 = "5253e66f1f493c4e13539749f1aa86fd0c61e3072900fec29a44ba046a6d97e2";
+  };
   windowsChoices = pkgs.writeText "windows-restore-selection.json" (builtins.toJSON {
     noctty = {
       version = nocttyVersion;
       fontFamily = "PlemolJP Console NF";
     };
+    cloudflared.version = cloudflaredVersion;
     packages = [
       { name = "Chromium"; id = "Hibbiki.Chromium"; version = "154.0.8037.58"; }
       { name = "AutoHotkey"; id = "AutoHotkey.AutoHotkey"; version = "2.0.28"; }
@@ -55,7 +63,7 @@ let
     python ${./pack.py} fonts ${policy} "$out"
   '';
   dist = pkgs.runCommand "windows-dist" { nativeBuildInputs = [ python ]; } ''
-    python ${./pack.py} dist ${fonts} ${backend} ${noctty} ${windowsChoices} ${./.} ${pkgs.lib.escapeShellArg source} "$out"
+    python ${./pack.py} dist ${fonts} ${backend} ${noctty} ${cloudflared} ${windowsChoices} ${./.} ${pkgs.lib.escapeShellArg source} "$out"
   '';
 in {
   inherit fonts dist;

@@ -1,6 +1,13 @@
 #requires -Version 5.1
 [CmdletBinding()]
-param([ValidateSet('Validate', 'Test', 'Apply', 'Restore', 'RestoreTest')][string]$Mode = 'Validate')
+param(
+    [ValidateSet('Validate', 'Test', 'Apply', 'Restore', 'RestoreTest', 'RentSsh', 'RentSshTest')][string]$Mode = 'Validate',
+    # RentSsh/RentSshTest only: the live binding, known only after envs and the first rent start. Nothing is guessed.
+    [string]$Alias = 'windows-rent',
+    [string]$Hostname,
+    [string]$HostKey,
+    [string]$Identity
+)
 
 # One activation boundary. Product selection belongs to the built distribution.
 Set-StrictMode -Version Latest
@@ -79,6 +86,91 @@ function TestNoctty {
     return (TestNocttyFiles) -and (Test-Path -LiteralPath $nocttyConfig -PathType Leaf) -and
         ([IO.File]::ReadAllText($nocttyConfig) -ceq $nocttyConfigText) -and
         (Test-Path -LiteralPath $nocttyShortcut -PathType Leaf)
+}
+
+if ($Mode -eq 'RentSsh' -or $Mode -eq 'RentSshTest') {
+    # Windows OpenSSH to the rent through Cloudflare Access: the pinned client as ProxyCommand, strict host checking
+    # against the explicitly bound rent host key. Only RentSsh writes; Restore never touches SSH configuration.
+    if ($Alias -notmatch '^[a-z0-9][a-z0-9-]*$') { throw 'Invalid alias.' }
+    if ($Hostname -notmatch '^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$') { throw 'Invalid hostname.' }
+    if ($HostKey -notmatch '^ssh-ed25519 [A-Za-z0-9+/]+={0,2}$') { throw 'Invalid host key: one ssh-ed25519 public key is required.' }
+    if (-not $Identity -or $Identity -match '["\r\n]' -or -not (Test-Path -LiteralPath $Identity -PathType Leaf)) { throw 'Invalid identity: an existing key file is required.' }
+    $client = $manifest.cloudflared
+    if ($client.version -notmatch '^[0-9.]+$' -or $client.file -ne 'payload/cloudflared.exe' -or
+        -not $inventory.ContainsKey($client.file) -or $manifest.files.($client.file) -ne $client.sha256) {
+        throw 'Invalid cloudflared payload.'
+    }
+    $clientDirectory = Join-Path $localAppData ('Programs\cloudflared-' + $client.version)
+    $clientExe = Join-Path $clientDirectory 'cloudflared.exe'
+    $sshDirectory = Join-Path $env:USERPROFILE '.ssh'
+    $rentDirectory = Join-Path $sshDirectory 'windows-rent'
+    $rentConfig = Join-Path $rentDirectory 'config'
+    $rentKnownHosts = Join-Path $rentDirectory 'known_hosts'
+    $userConfig = Join-Path $sshDirectory 'config'
+    $userBackup = Join-Path $sshDirectory 'config.before-windows-rent'
+    $include = 'Include windows-rent/config'
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    $configText = (@(
+        "Host $Alias",
+        "  HostName $Hostname",
+        '  User dev',
+        "  ProxyCommand `"$clientExe`" access ssh --hostname %h",
+        "  IdentityFile `"$Identity`"",
+        '  IdentitiesOnly yes',
+        "  HostKeyAlias $Alias",
+        '  StrictHostKeyChecking yes',
+        "  UserKnownHostsFile `"$rentKnownHosts`"",
+        '  UpdateHostKeys no') -join "`n") + "`n"
+    $knownText = "$Alias $HostKey`n"
+    function ClientOk {
+        (Test-Path -LiteralPath $clientExe -PathType Leaf) -and (Get-FileHash -LiteralPath $clientExe -Algorithm SHA256).Hash -eq $client.sha256
+    }
+    function TextIs([string]$Path, [string]$Text) {
+        (Test-Path -LiteralPath $Path -PathType Leaf) -and [IO.File]::ReadAllText($Path) -ceq $Text
+    }
+    # The Include must be the first line: an Include after a Host block would only apply inside that block.
+    function IncludeState {
+        if (-not (Test-Path -LiteralPath $userConfig -PathType Leaf)) { return 'absent' }
+        $bytes = [IO.File]::ReadAllBytes($userConfig)
+        if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { return 'bom' }
+        $lines = @([IO.File]::ReadAllText($userConfig) -split "`r?`n")
+        if ($lines[0] -ceq $include) { return 'first' }
+        if (@($lines | Where-Object { $_.Trim() -ceq $include }).Count) { return 'elsewhere' }
+        return 'missing'
+    }
+    if ($Mode -eq 'RentSsh') {
+        $state = IncludeState
+        if ($state -eq 'bom') { throw "$userConfig starts with a byte order mark; not editing it." }
+        if ($state -eq 'elsewhere') { throw "$userConfig has '$include' below its first line; move it to the top by hand." }
+        if (-not (ClientOk)) {
+            $null = New-Item -ItemType Directory -Path $clientDirectory -Force
+            Copy-Item -LiteralPath (BundlePath $client.file) -Destination $clientExe -Force
+            if (-not (ClientOk)) { throw 'cloudflared.exe differs after copy.' }
+        }
+        $null = New-Item -ItemType Directory -Path $rentDirectory -Force
+        if (-not (TextIs $rentConfig $configText)) { [IO.File]::WriteAllText($rentConfig, $configText, $utf8) }
+        if (-not (TextIs $rentKnownHosts $knownText)) { [IO.File]::WriteAllText($rentKnownHosts, $knownText, $utf8) }
+        if ($state -ne 'first') {
+            # One line before the exact prior bytes; the prior bytes are kept once, beside it, and never overwritten.
+            $prior = if ($state -eq 'missing') { [IO.File]::ReadAllBytes($userConfig) } else { [byte[]]@() }
+            if ($state -eq 'missing') {
+                if (Test-Path -LiteralPath $userBackup) { throw "$userBackup already exists; not overwriting it." }
+                [IO.File]::WriteAllBytes($userBackup, $prior)
+            }
+            $null = New-Item -ItemType Directory -Path $sshDirectory -Force
+            [IO.File]::WriteAllBytes($userConfig, [byte[]]($utf8.GetBytes($include + "`n") + $prior))
+        }
+    }
+    $drift = @()
+    if (-not (ClientOk)) { $drift += 'cloudflared.exe' }
+    if (-not (TextIs $rentConfig $configText)) { $drift += $rentConfig }
+    if (-not (TextIs $rentKnownHosts $knownText)) { $drift += $rentKnownHosts }
+    if ((IncludeState) -ne 'first') { $drift += "$userConfig first line" }
+    if ($drift) { throw "RentSsh drift: $($drift -join ', ')" }
+    [ordered]@{ mode = $Mode; source = $manifest.source; alias = $Alias; hostname = $Hostname; cloudflared = $client.version;
+        client = $clientExe; config = $rentConfig; knownHosts = $rentKnownHosts; userConfig = $userConfig;
+        inDesiredState = $true } | ConvertTo-Json -Compress
+    return
 }
 
 try {

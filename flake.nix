@@ -29,7 +29,8 @@
       # repos, never copied or chowned) and /nix (rent's own writable store, seeded from the image) are volumes.
       rentState = "/var/lib/rent";
       rentCert = "/etc/ssl/certs/ca-certificates.crt";
-      rentTsSocket = "/var/run/tailscale/tailscaled.sock";
+      # Fixed Cloudflare tunnel token slot in the state volume; envs places it, the image never carries a token.
+      rentToken = "${rentState}/cloudflared/token";
       # Written once into a seeded rent /nix volume; nothing else may be seeded or run as rent's store.
       rentNixMarker = "windows-rent-nix v1";
       # Multi-user Nix: the daemon (root) owns the store; builds run as nixbld users; dev is an untrusted client.
@@ -151,7 +152,7 @@
       # rent-only tools beside the common dev profile.
       rentTools = pkgs.buildEnv {
         name = "rent-tools";
-        paths = [ pkgs.tailscale stateImport ];
+        paths = [ stateImport ];
         pathsToLink = [ "/bin" ];
       };
       sshConfig = pkgs.writeText "rent-sshd-config" (import ./hosts/rent/nix.nix {
@@ -159,11 +160,12 @@
         sshDir = "${rentState}/ssh";
         certFile = rentCert;
       });
-      # PID 1: fail closed on mounts and the seeded store, lay out state, then supervise nix-daemon, tailscaled and sshd
-      # until any exits or TERM. It runs from the /nix volume, so an unseeded volume cannot start it at all.
-      rentStart = devProfile: pkgs.writeShellScriptBin "rent-start" ''
+      # PID 1: fail closed on mounts, the seeded store and the tunnel token file, lay out state, then supervise nix-daemon,
+      # cloudflared and sshd until any exits or TERM. It runs from the /nix volume, so an unseeded volume cannot start it.
+      # tunnel is the cloudflared package; only the CI-only stub image passes anything else.
+      rentStart = devProfile: tunnel: pkgs.writeShellScriptBin "rent-start" ''
         set -eu
-        export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.openssh pkgs.tailscale pkgs.nix ]}
+        export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.gnugrep pkgs.openssh pkgs.nix ]}
         state=${rentState}
         # One gate before any service: exactly the Binding repos, state and nix volumes, all writable, nothing else.
         ${mountLib}
@@ -189,11 +191,20 @@
         ${profileLib}
         set_profile /nix ${devProfile}
         echo "rent-nix ok roots=$roots profile=$(readlink /nix/var/nix/profiles/rent-dev)"
-        if [ -z "''${RENT_TS_HOSTNAME:-}" ]; then echo 'Set RENT_TS_HOSTNAME' >&2; exit 1; fi
+        # The one tunnel secret slot, placed by envs: checked before any service, never read, printed or hashed here.
+        # Its content is an opaque token that cloudflared alone judges.
+        token=${rentToken}
+        token_fail() { echo "rent-transport: token file $token $1; not starting" >&2; exit 1; }
+        [ -e "$token" ] || [ -L "$token" ] || token_fail 'is missing'
+        [ ! -L "$token" ] && [ -f "$token" ] || token_fail 'must be a regular file'
+        [ "$(stat -c '%u:%g %a' "$token")" = '0:0 600' ] || token_fail 'must be owned 0:0 with mode 600'
+        size=$(stat -c %s "$token")
+        [ "$size" -ge 1 ] && [ "$size" -le 4096 ] || token_fail 'must hold 1 to 4096 bytes'
+        grep -q '[^[:space:]]' "$token" || token_fail 'is blank'
+        echo "rent-transport ok token-file=$token"
 
         dir() { install -d "$3"; chown "$2" "$3"; chmod "$1" "$3"; }
         dir 755 0:0 "$state"
-        dir 700 0:0 "$state/tailscale"
         dir 755 0:0 "$state/ssh"
         dir 755 0:0 "$state/dev"
         dir 700 1000:1000 "$state/dev/codex"
@@ -242,41 +253,32 @@
         # The only store writer while this container runs; dev reaches it through NIX_REMOTE=daemon.
         NIX_SSL_CERT_FILE=${rentCert} nix-daemon &
         nd_pid=$!
-        install -d -m 755 ${builtins.dirOf rentTsSocket}
-        TS_LOGS_DIR="$state/tailscale" tailscaled --tun=userspace-networking \
-          --statedir="$state/tailscale" --socket=${rentTsSocket} &
-        ts_pid=$!
-        up_pid=
         sshd_pid=
+        cf_pid=
         cleanup() {
           trap - TERM INT
-          kill -TERM $up_pid $sshd_pid "$ts_pid" "$nd_pid" 2>/dev/null || true
+          kill -TERM $sshd_pid $cf_pid "$nd_pid" 2>/dev/null || true
           wait || true
         }
         trap 'cleanup; exit 143' TERM INT
-        ready=
-        for _ in $(seq 30); do
-          if tailscale --socket=${rentTsSocket} status --json >/dev/null 2>&1; then ready=1; break; fi
-          kill -0 "$ts_pid" 2>/dev/null || break
-          sleep 1
-        done
-        if [ -z "$ready" ]; then echo 'tailscaled did not become ready' >&2; cleanup; exit 1; fi
-        # Nonblocking; no auth key: on first run this prints the login URL for a later browser login.
-        tailscale --socket=${rentTsSocket} up --ssh --hostname="$RENT_TS_HOSTNAME" &
-        up_pid=$!
+        # The only external route: the token by file (never argv or environment); a critical child like the others,
+        # so a rejected or revoked tunnel stops the container instead of hiding behind a healthy local sshd.
+        ${tunnel}/bin/cloudflared tunnel --no-autoupdate run --token-file "$token" &
+        cf_pid=$!
         ${pkgs.openssh}/bin/sshd -D -e -f ${sshConfig} &
         sshd_pid=$!
+        echo "rent-start ok services=nix-daemon,cloudflared,sshd"
         status=0
-        wait -n "$nd_pid" "$ts_pid" "$sshd_pid" || status=$?
-        echo "rent-start: nix-daemon, tailscaled or sshd exited ($status); stopping" >&2
+        wait -n "$nd_pid" "$cf_pid" "$sshd_pid" || status=$?
+        echo "rent-start: nix-daemon, cloudflared or sshd exited ($status); stopping" >&2
         cleanup
         exit 1
       '';
       # One rent image per dev profile. The runtime paths are the GC-rooted closure seeded into the rent /nix volume;
       # rent-nix-seed is not among them, because it runs only against the image's own store with the volume at /seed.
-      mkRent = { profile, tag }:
+      mkRent = { profile, tag, tunnel ? pkgs.cloudflared }:
         let
-          start = rentStart profile;
+          start = rentStart profile tunnel;
           roots = pkgs.writeText "rent-nix-roots"
             (pkgs.lib.concatMapStrings (p: "${p}\n") [ pkgs.cacert profile rentTools start ]);
           closure = pkgs.closureInfo { rootPaths = [ roots ]; };
@@ -334,7 +336,7 @@
             printf 'root:x:0:\nsshd:x:74:\ndev:x:1000:\nnixbld:x:30000:nixbld1,nixbld2,nixbld3,nixbld4,nixbld5,nixbld6,nixbld7,nixbld8\n' > etc/group
             cp ${rentNixConf} etc/nix/nix.conf
             ln -s ${roots} etc/rent-nix-roots
-            # Default CA path, so TLS works in sessions that do not inherit SSL_CERT_FILE (Tailscale SSH).
+            # Default CA path, so TLS works in sessions that do not inherit SSL_CERT_FILE.
             ln -s ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt .${rentCert}
             chmod 1777 tmp
           '';
@@ -347,6 +349,16 @@
           };
         };
       rentProfile = import ./hosts/profile/nix.nix { inherit pkgs; };
+      # CI only, never published: stands in for cloudflared under the exact argv rent-start uses, so local SSH, state
+      # and #8 continuity can run without Cloudflare. A synthetic token proves nothing about Cloudflare itself.
+      rentTunnelStub = pkgs.writeShellScriptBin "cloudflared" ''
+        [ "$*" = 'tunnel --no-autoupdate run --token-file ${rentToken}' ] || { echo "tunnel stub: unexpected argv" >&2; exit 2; }
+        [ -r ${rentToken} ] || { echo 'tunnel stub: token file unreadable' >&2; exit 3; }
+        echo 'tunnel stub: running (no Cloudflare connection)'
+        # Stay this process, so CI can read the argv rent-start gave it.
+        ${pkgs.coreutils}/bin/sleep infinity &
+        wait $!
+      '';
     in {
       packages.${system} = {
         own-image = pkgs.dockerTools.buildLayeredImage {
@@ -363,10 +375,13 @@
           config = ownConfig;
         };
         rent-image = mkRent { profile = rentProfile; tag = "nix"; };
-        # CI only, never published: the same definition plus one package, to prove seed-on-upgrade and rollback.
+        # CI only, never published: the published definition with the tunnel stub, for local SSH/state/#8 proofs.
+        rent-image-stub = mkRent { profile = rentProfile; tag = "stub"; tunnel = rentTunnelStub; };
+        # CI only, never published: the stub image plus one package, to prove seed-on-upgrade and rollback.
         rent-image-next = mkRent {
           profile = import ./hosts/profile/nix.nix { inherit pkgs; extra = [ pkgs.hello ]; };
           tag = "next";
+          tunnel = rentTunnelStub;
         };
         dev-profile = dev.profile;
         dev-image = dev.image;
