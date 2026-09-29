@@ -43,6 +43,8 @@ jobs:
             revertStop = @($W, 'stop', 'windows-rent-cf')
             revertRemove = @($W, 'remove', 'windows-rent-cf')
             revertStart = @($W, 'start', 'windows-rent')
+            stageTask = @('windows-rent-oci-logon', $W, 'start', 'windows-rent-cf')
+            revertTask = @('windows-rent-oci-logon', $W, 'start', 'windows-rent')
             logonTask = @('windows-rent-oci-logon', $W, 'start', 'windows-rent')
             nixVolumeCreateOnce = @($W, 'volume', 'create', 'windows-rent-nix')
             seedContainerList = @($W, 'container', 'list', '--all', '-q')
@@ -83,8 +85,9 @@ jobs:
           foreach ($N in $Ast.FindAll({ param($n)
               ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Get-Images', 'Test-Stopped', 'Test-Running',
                 'Get-OldSourceProblem', 'Get-WriterProblem', 'Test-RunningProof', 'Get-StageProblem', 'Get-Container', 'Get-Named',
-                'Assert-NoOtherWriter', 'Invoke-Seed', 'Wait-Ready', 'Wait-OldRunning', 'Invoke-Revert', 'Invoke-StageStop', 'Complete-Stage') -or
-              ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in '$OldImage', '$Mounts', '$Proof', '$Ready', '$ListArgs', '$SeedArgs') }, $true)) {
+                'Assert-NoOtherWriter', 'Invoke-Seed', 'Wait-Ready', 'Wait-OldRunning', 'Invoke-Revert', 'Invoke-StageStop', 'Complete-Stage',
+                'Get-TaskTarget', 'Set-TaskTarget', 'Invoke-Stage') -or
+              ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in '$OldImage', '$Mounts', '$Proof', '$Ready', '$ListArgs', '$SeedArgs', '$TaskName') }, $true)) {
             . ([scriptblock]::Create($N.Extent.Text))
           }
           function J($Text) { $Text | ConvertFrom-Json }
@@ -131,8 +134,41 @@ jobs:
               @((J '{"State":{"Running":"true"}}'), @($Proof, $Ready)))) {
             if (Test-RunningProof $Bad[0] $Bad[1]) { 'ready gate passed without proof'; exit 1 }
           }
-          # Stage after the kept rent was stopped, on a fake WSLC: every failure removes only the failed candidate, starts
-          # the kept rent and proves it Running on its images; nothing is forced and no volume is touched.
+          # The one logon task, on mocked ScheduledTasks cmdlets: readback of its target, refusal of anything but one exact
+          # 'wslc start <name>' action, re-registration of the same name only, and a readback that must match.
+          $Wslc = $W
+          $Store = @{ Tasks = @(); Registered = @(); Ignore = $false }
+          function Get-ScheduledTask { $Store.Tasks }
+          function Register-ScheduledTask { param($TaskName, $Action, $Trigger, $Principal, $Settings, [switch] $Force)
+            $Store.Registered += $TaskName
+            if (-not $Store.Ignore) { $Store.Tasks = @([pscustomobject] @{ TaskName = $TaskName; Actions = @($Action) }) } }
+          function New-ScheduledTaskAction { param($Execute, $Argument) [pscustomobject] @{ Execute = $Execute; Arguments = $Argument } }
+          function New-ScheduledTaskTrigger { param([switch] $AtLogOn, $User) [pscustomobject] @{ Delay = $null } }
+          function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) 'principal' }
+          function New-ScheduledTaskSettingsSet { param([switch] $StartWhenAvailable, $RestartCount, $RestartInterval, $ExecutionTimeLimit,
+            $MultipleInstances, [switch] $AllowStartIfOnBatteries, [switch] $DontStopIfGoingOnBatteries) 'settings' }
+          function whoami { 'ci\user' }
+          if ($null -ne (Get-TaskTarget)) { 'an absent task read as present'; exit 1 }
+          Set-TaskTarget 'windows-rent'; if ((Get-TaskTarget) -cne 'windows-rent') { 'task not pointed at the kept rent'; exit 1 }
+          Set-TaskTarget 'windows-rent-cf'; if ((Get-TaskTarget) -cne 'windows-rent-cf') { 'task not handed to the candidate'; exit 1 }
+          if (@($Store.Registered | Sort-Object -Unique) -join ',' -cne 'windows-rent-oci-logon') { 'a second task name was registered'; exit 1 }
+          foreach ($Bad in @(@([pscustomobject] @{ Actions = @(@{ Execute = $W; Arguments = 'start windows-rent' }, @{ Execute = $W; Arguments = 'start x' }) }),
+              @([pscustomobject] @{ Actions = @(@{ Execute = 'C:\other.exe'; Arguments = 'start windows-rent' }) }),
+              @([pscustomobject] @{ Actions = @(@{ Execute = $W; Arguments = 'start windows-rent; stop x' }) }),
+              @([pscustomobject] @{ Actions = @(@{ Execute = $W; Arguments = 'start windows-rent' }) }, [pscustomobject] @{ Actions = @() }))) {
+            $Store.Tasks = $Bad; $Refused = $false
+            try { $null = Get-TaskTarget } catch { $Refused = $true }
+            if (-not $Refused) { 'an ambiguous logon task was interpreted'; exit 1 }
+          }
+          $Store.Tasks = @([pscustomobject] @{ Actions = @(@{ Execute = $W; Arguments = 'start windows-rent' }) }); $Store.Ignore = $true; $Refused = $false
+          try { Set-TaskTarget 'windows-rent-cf' } catch { $Refused = $_.Exception.Message -like "*starts 'windows-rent' after registration, not windows-rent-cf." }
+          if (-not $Refused) { 'a registration without matching readback passed'; exit 1 }
+          # From here the task is a fake too: every handoff is a recorded call, and named targets can be made to fail.
+          function Set-TaskTarget([string] $Name) { $Calls.Add("task -> $Name"); if ($Case.TaskFail -ccontains $Name) { throw "fake task failure for $Name" } }
+
+          # Stage and Revert on a fake WSLC. The candidate is removed only when it is a failed Stage's; the kept rent starts
+          # only after the candidate reads back provably stopped and the task points back at the kept rent; nothing is
+          # forced and no volume is touched.
           function Start-Sleep { }
           $StageArgs = @($Plan.stageRun | Select-Object -Skip 1)
           $Wslc = {
@@ -152,60 +188,103 @@ jobs:
           $S = $SeedArgs -join ' '; $SA = $StageArgs -join ' '
           $Pre = @('container list --all -q', $S, $SA)
           $Pair = @('inspect windows-rent-cf', 'logs windows-rent-cf')
-          $Back = @('start windows-rent', 'inspect windows-rent', 'inspect windows-rent', 'inspect windows-rent')
-          $NoBack = @('start windows-rent') + @(1..60 | ForEach-Object { 'inspect windows-rent' })
-          $Ok = 'old Running on its images'; $NotOk = 'old not Running on its images within 60 s'
+          $Wait60 = @(1..60 | ForEach-Object { $Pair })
+          $Back = @('task -> windows-rent', 'start windows-rent', 'inspect windows-rent', 'inspect windows-rent', 'inspect windows-rent')
+          $NoBack = @('task -> windows-rent', 'start windows-rent') + @(1..60 | ForEach-Object { 'inspect windows-rent' })
+          $Ok = 'task starts windows-rent; start old exit 0; old Running on its images'
+          $NotOk = 'task starts windows-rent; start old exit 0; old not Running on its images within 60 s'
+          $Stopped = 'candidate provably stopped'
+          $Upto61 = { param($N) if ($N -le 61) { $CandUp } else { $CandDown } }
+          $Rejected = "windows-rent-cf did not stay Running with '$Proof' and '$Ready'."
+          function Assert-Case($K, $Got) {
+            if ($Got -cne $Case.Want -or ($Calls -join "`n") -cne ($Case.Calls -join "`n")) { "case '$K' gave: $Got"; $Calls; exit 1 }
+            if (@($Calls) -cmatch '(^| )(-f|-v|--force|--volumes)( |$)|^volume (remove|rm|prune)|^(remove|rm) windows-rent$') { "case '$K' forced, removed a volume or the kept rent"; exit 1 }
+            # Once the candidate may exist, the kept rent starts only after the task was pointed back at it.
+            $List = @($Calls); $Seen = $false; $AtOld = $true
+            foreach ($C in $List) {
+              if ($C -ceq $SA -or $C -ceq 'stop windows-rent-cf' -or $C -ceq 'task -> windows-rent-cf') { $Seen = $true; $AtOld = $false }
+              if ($C -ceq 'task -> windows-rent') { $AtOld = $true }
+              if ($C -ceq 'start windows-rent' -and $Seen -and -not $AtOld) { "case '$K' started the kept rent while the task could start the candidate"; exit 1 }
+            }
+          }
           $Cases = [ordered]@{
             'ready' = @{ Old = { $OldUpJson }; Cand = { $CandUp }; Want = 'ok'; Calls = $Pre + @(1..10 | ForEach-Object { $Pair }) }
             'another container running' = @{ List = 'other'; Other = $OtherRunning | ConvertTo-Json -Compress; Old = { $OldUpJson }; Cand = { $null }
               Calls = @('container list --all -q', 'inspect other', 'inspect windows-rent-cf') + $Back
-              Want = "Stage failed: Container other is not provably stopped. Not seeding. | revert succeeded: start old exit 0; $Ok" }
+              Want = "Stage failed: Container other is not provably stopped. Not seeding. | revert succeeded: $Ok" }
             'seed fails' = @{ Exit = @{ $S = 1 }; Old = { $OldUpJson }; Cand = { $null }; Calls = @('container list --all -q', $S, 'inspect windows-rent-cf') + $Back
-              Want = "Stage failed: WSLC seed failed: 1 | revert succeeded: start old exit 0; $Ok" }
+              Want = "Stage failed: WSLC seed failed: 1 | revert succeeded: $Ok" }
             'candidate run fails' = @{ Exit = @{ $SA = 1 }; Old = { $OldUpJson }; Cand = { $null }; Calls = $Pre + @('inspect windows-rent-cf') + $Back
-              Want = "Stage failed: WSLC run of windows-rent-cf failed: 1 | revert succeeded: start old exit 0; $Ok" }
+              Want = "Stage failed: WSLC run of windows-rent-cf failed: 1 | revert succeeded: $Ok" }
             'tunnel rejected after ready lines' = @{ Old = { $OldUpJson }; Cand = { param($N) if ($N -le 3) { $CandUp } else { $CandDown } }
-              Calls = $Pre + @(1..4 | ForEach-Object { $Pair }) + @('inspect windows-rent-cf', 'remove windows-rent-cf') + $Back
-              Want = "Stage failed: windows-rent-cf did not stay Running with '$Proof' and '$Ready'. | revert succeeded: remove candidate exit 0; start old exit 0; $Ok" }
-            'never ready' = @{ Old = { $OldUpJson }; Cand = { $CandUp }; Logs = @($Proof)
-              Calls = $Pre + @(1..60 | ForEach-Object { $Pair }) + @('inspect windows-rent-cf', 'stop windows-rent-cf', 'remove windows-rent-cf') + $Back
-              Want = "Stage failed: windows-rent-cf did not stay Running with '$Proof' and '$Ready'. | revert succeeded: stop candidate exit 0; remove candidate exit 0; start old exit 0; $Ok" }
+              Calls = $Pre + @(1..4 | ForEach-Object { $Pair }) + @('inspect windows-rent-cf', 'inspect windows-rent-cf', 'remove windows-rent-cf') + $Back
+              Want = "Stage failed: $Rejected | revert succeeded: $Stopped; remove candidate exit 0; $Ok" }
+            'never ready' = @{ Old = { $OldUpJson }; Cand = $Upto61; Logs = @($Proof)
+              Calls = $Pre + $Wait60 + @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf', 'remove windows-rent-cf') + $Back
+              Want = "Stage failed: $Rejected | revert succeeded: stop candidate exit 0; $Stopped; remove candidate exit 0; $Ok" }
+            'stop exits 0 but the candidate keeps running' = @{ Old = { $OldUpJson }; Cand = { $CandUp }; Logs = @($Proof)
+              Calls = $Pre + $Wait60 + @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf')
+              Want = "Stage failed: $Rejected | revert FAILED: stop candidate exit 0; candidate not provably stopped" }
             'kept rent does not come back' = @{ Exit = @{ $S = 1 }; Old = { $OldDownJson }; Cand = { $null }; Calls = @('container list --all -q', $S, 'inspect windows-rent-cf') + $NoBack
-              Want = "Stage failed: WSLC seed failed: 1 | revert FAILED: start old exit 0; $NotOk" }
+              Want = "Stage failed: WSLC seed failed: 1 | revert FAILED: $NotOk" }
             'kept rent back on other image' = @{ Exit = @{ $S = 1 }; Old = { $OldUpJson.Replace($Live, $Other) }; Cand = { $null }
               Calls = @('container list --all -q', $S, 'inspect windows-rent-cf') + $NoBack
-              Want = "Stage failed: WSLC seed failed: 1 | revert FAILED: start old exit 0; $NotOk" }
+              Want = "Stage failed: WSLC seed failed: 1 | revert FAILED: $NotOk" }
             'candidate readback names another container' = @{ Old = { $OldUpJson }; Cand = { $CandUp.Replace('"Name":"windows-rent-cf"', '"Name":"windows-rent"') }
               Calls = $Pre + @('inspect windows-rent-cf', 'inspect windows-rent-cf')
               Want = 'Stage failed: Inspect of windows-rent-cf returned windows-rent. | revert FAILED: error: Inspect of windows-rent-cf returned windows-rent.' }
             'kept rent readback names another container' = @{ Exit = @{ $S = 1 }; Old = { $OldUpJson.Replace('"Name":"windows-rent"', '"Name":"other"') }; Cand = { $null }
-              Calls = @('container list --all -q', $S, 'inspect windows-rent-cf', 'start windows-rent', 'inspect windows-rent')
-              Want = 'Stage failed: WSLC seed failed: 1 | revert FAILED: start old exit 0; error: Inspect of windows-rent returned other.' }
-            'failed candidate cannot be removed' = @{ Exit = @{ 'remove windows-rent-cf' = 1 }; Old = { $OldUpJson }; Cand = { $CandUp }; Logs = @($Proof)
-              Calls = $Pre + @(1..60 | ForEach-Object { $Pair }) + @('inspect windows-rent-cf', 'stop windows-rent-cf', 'remove windows-rent-cf')
-              Want = "Stage failed: windows-rent-cf did not stay Running with '$Proof' and '$Ready'. | revert FAILED: stop candidate exit 0; remove candidate exit 1" }
-          }
-          function Assert-Case($K, $Got) {
-            if ($Got -cne $Case.Want -or ($Calls -join "`n") -cne ($Case.Calls -join "`n")) { "case '$K' gave: $Got"; $Calls; exit 1 }
-            if (@($Calls) -cmatch '(^| )(-f|-v|--force|--volumes)( |$)|^volume (remove|rm|prune)|^(remove|rm) windows-rent$') { "case '$K' forced, removed a volume or the kept rent"; exit 1 }
+              Calls = @('container list --all -q', $S, 'inspect windows-rent-cf', 'task -> windows-rent', 'start windows-rent', 'inspect windows-rent')
+              Want = 'Stage failed: WSLC seed failed: 1 | revert FAILED: task starts windows-rent; start old exit 0; error: Inspect of windows-rent returned other.' }
+            'failed candidate cannot be removed' = @{ Exit = @{ 'remove windows-rent-cf' = 1 }; Old = { $OldUpJson }; Cand = $Upto61; Logs = @($Proof)
+              Calls = $Pre + $Wait60 + @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf', 'remove windows-rent-cf')
+              Want = "Stage failed: $Rejected | revert FAILED: stop candidate exit 0; $Stopped; remove candidate exit 1" }
+            'task cannot be pointed back' = @{ Exit = @{ $S = 1 }; TaskFail = @('windows-rent'); Old = { $OldUpJson }; Cand = { $null }
+              Calls = @('container list --all -q', $S, 'inspect windows-rent-cf', 'task -> windows-rent')
+              Want = 'Stage failed: WSLC seed failed: 1 | revert FAILED: task not restored (fake task failure for windows-rent); not starting windows-rent' }
           }
           foreach ($K in $Cases.Keys) {
             $Case = $Cases[$K]; $Calls = [System.Collections.Generic.List[string]]::new()
             $Got = try { Complete-Stage $OldUp; 'ok' } catch { $_.Exception.Message }
             Assert-Case $K $Got
           }
-          # The Revert step's path after a successful Stage: the candidate is stopped and kept, the kept rent comes back.
+          # The handoff before the candidate exists: the task moves to the candidate while the kept rent still runs, before
+          # its stop; if anything fails before the candidate exists, the task goes back to the kept rent.
+          $Before = 'Stage failed before windows-rent-cf existed'
+          $Stages = [ordered]@{
+            'task handed over before the stop' = @{ Old = { $OldUpJson }; Cand = { $CandUp }; Want = 'ok'
+              Calls = @('task -> windows-rent-cf', 'stop windows-rent') + $Pre + @(1..10 | ForEach-Object { $Pair }) }
+            'task handoff fails' = @{ TaskFail = @('windows-rent-cf'); Old = { $OldUpJson }; Cand = { $null }
+              Calls = @('task -> windows-rent-cf', 'task -> windows-rent'); Want = "${Before}: fake task failure for windows-rent-cf | task starts windows-rent" }
+            'stop fails, kept rent still Running' = @{ Exit = @{ 'stop windows-rent' = 1 }; Old = { $OldUpJson }; Cand = { $null }
+              Calls = @('task -> windows-rent-cf', 'stop windows-rent', 'inspect windows-rent', 'task -> windows-rent')
+              Want = "${Before}: WSLC stop of windows-rent failed: 1; it is still Running; nothing else changed. | task starts windows-rent" }
+            'stop fails and the task cannot go back' = @{ Exit = @{ 'stop windows-rent' = 1 }; TaskFail = @('windows-rent'); Old = { $OldUpJson }; Cand = { $null }
+              Calls = @('task -> windows-rent-cf', 'stop windows-rent', 'inspect windows-rent', 'task -> windows-rent')
+              Want = "${Before}: WSLC stop of windows-rent failed: 1; it is still Running; nothing else changed. | task NOT restored: fake task failure for windows-rent" }
+          }
+          foreach ($K in $Stages.Keys) {
+            $Case = $Stages[$K]; $Calls = [System.Collections.Generic.List[string]]::new()
+            $Got = try { Invoke-Stage $OldUp; 'ok' } catch { $_.Exception.Message }
+            Assert-Case $K $Got
+          }
+          # The Revert step's path after a successful Stage: the candidate is stopped and kept, proven stopped by readback
+          # whatever stop returned, the task points back, and only then the kept rent comes back.
           $Reverts = [ordered]@{
-            'revert keeps the candidate' = @{ Old = { $OldUpJson }; Cand = { $CandUp }; Want = "True | stop candidate exit 0; start old exit 0; $Ok"
-              Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf') + $Back }
-            'revert, kept rent not Running' = @{ Old = { $OldDownJson }; Cand = { $CandUp }; Want = "False | stop candidate exit 0; start old exit 0; $NotOk"
-              Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf') + $NoBack }
-            'revert, candidate stop fails and it still runs' = @{ Exit = @{ 'stop windows-rent-cf' = 1 }; Old = { $OldUpJson }; Cand = { $CandUp }
+            'revert keeps the candidate' = @{ Old = { $OldUpJson }; Cand = { param($N) if ($N -eq 1) { $CandUp } else { $CandDown } }
+              Want = "True | stop candidate exit 0; $Stopped; $Ok"; Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf') + $Back }
+            'revert, stop exits 0 but the candidate keeps running' = @{ Old = { $OldUpJson }; Cand = { $CandUp }
+              Want = 'False | stop candidate exit 0; candidate not provably stopped'; Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf') }
+            'revert, stop fails and the candidate still runs' = @{ Exit = @{ 'stop windows-rent-cf' = 1 }; Old = { $OldUpJson }; Cand = { $CandUp }
               Want = 'False | stop candidate exit 1; candidate not provably stopped'; Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf') }
-            'revert, candidate stop fails but it stopped' = @{ Exit = @{ 'stop windows-rent-cf' = 1 }; Old = { $OldUpJson }
+            'revert, stop fails but the candidate stopped' = @{ Exit = @{ 'stop windows-rent-cf' = 1 }; Old = { $OldUpJson }
               Cand = { param($N) if ($N -eq 1) { $CandUp } else { $CandDown } }
-              Want = "True | stop candidate exit 1; candidate provably stopped; start old exit 0; $Ok"
-              Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf') + $Back }
+              Want = "True | stop candidate exit 1; $Stopped; $Ok"; Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf') + $Back }
+            'revert, kept rent not Running' = @{ Old = { $OldDownJson }; Cand = { param($N) if ($N -eq 1) { $CandUp } else { $CandDown } }
+              Want = "False | stop candidate exit 0; $Stopped; $NotOk"; Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf') + $NoBack }
+            'revert, task cannot be pointed back' = @{ TaskFail = @('windows-rent'); Old = { $OldUpJson }; Cand = { param($N) if ($N -eq 1) { $CandUp } else { $CandDown } }
+              Want = "False | stop candidate exit 0; $Stopped; task not restored (fake task failure for windows-rent); not starting windows-rent"
+              Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf', 'task -> windows-rent') }
           }
           foreach ($K in $Reverts.Keys) {
             $Case = $Reverts[$K]; $Calls = [System.Collections.Generic.List[string]]::new(); $Steps = [System.Collections.Generic.List[string]]::new()

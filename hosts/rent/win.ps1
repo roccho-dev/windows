@@ -175,14 +175,19 @@ if ($Step -eq 'Plan') {
         seed = @($Wslc) + $SeedArgs
         create = @($Wslc) + $RunArgs
         readyGate = "within 60 s: Running with log lines '$Proof' and '$Ready', then Running for 10 consecutive polls"
-        stageAccepts = "$Container exists and is Running (its images read by inspect now), $Candidate absent, every other container stopped; the token file is placed in $StateVolume beforehand"
+        stageAccepts = "$Container exists and is Running (its images read by inspect now), $Candidate absent, every other container stopped, logon task $TaskName exactly '$Wslc start $Container'; the token file is placed in $StateVolume beforehand"
+        # Order: stageTask (while $Container still runs, so a logon can only try the not-yet-existing candidate),
+        # stageStop, seed, stageRun, readyGate. Success leaves the task on the running candidate.
+        stageTask = @($TaskName, $Wslc, 'start', $Candidate)
         stageStop = @($Wslc, 'stop', $Container)
         stageRun = @($Wslc) + $StageArgs
         readyLogs = @($Wslc, 'logs', $Candidate)
-        # Any Stage failure after stageStop: revertStop, revertRemove (the failed candidate only), revertStart, and
-        # Running on its inspected images for 3 consecutive polls. The Revert step does the same but keeps the candidate.
+        # Any Stage failure after stageTask, and the Revert step: revertStop if running, then the candidate provably
+        # stopped by readback whatever stop returned, revertRemove (a failed Stage's candidate only), revertTask read back,
+        # and only then revertStart and Running on its inspected images for 3 consecutive polls.
         revertStop = @($Wslc, 'stop', $Candidate)
         revertRemove = @($Wslc, 'remove', $Candidate)
+        revertTask = @($TaskName, $Wslc, 'start', $Container)
         revertStart = @($Wslc, 'start', $Container)
         logonTask = @($TaskName, $Wslc, 'start', $Container)
         migrateAccepts = "$OldContainer exists, is stopped, and is exactly $OldImageSource (checked before and right before the helper); every other container except $Container is stopped; $Container absent or exactly $OldImage"
@@ -205,15 +210,35 @@ if ($Step -eq 'Pull') {
     exit 0
 }
 
-if ($Step -eq 'LogonTask') {
+# The one logon task: which container it starts, by readback; $null when absent. Anything but exactly one
+# '<wslc> start <name>' action is refused rather than interpreted.
+function Get-TaskTarget {
+    $Tasks = @(Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
+    if ($Tasks.Count -eq 0) { return $null }
+    $Actions = @($Tasks[0].Actions)
+    if ($Tasks.Count -ne 1 -or $Actions.Count -ne 1 -or [string] $Actions[0].Execute -cne $Wslc -or
+        [string] $Actions[0].Arguments -cnotmatch '^start ([a-z0-9][a-z0-9-]+)$') {
+        throw "Logon task $TaskName is not exactly one '$Wslc start <container>' action."
+    }
+    return $Matches[1]
+}
+
+# Point the one logon task at $Name (re-registering the same task, never a second one) and prove it by readback.
+function Set-TaskTarget([string] $Name) {
     $Actor = whoami
-    $Action = New-ScheduledTaskAction -Execute $Wslc -Argument "start $Container"
+    $Action = New-ScheduledTaskAction -Execute $Wslc -Argument "start $Name"
     $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $Actor
     $Trigger.Delay = 'PT30S'
     $Principal = New-ScheduledTaskPrincipal -UserId $Actor -LogonType Interactive -RunLevel Limited
     $Settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Force | Out-Null
-    Get-ScheduledTask -TaskName $TaskName | Select-Object TaskName, State, @{ n = 'Arguments'; e = { $_.Actions.Arguments } }
+    $Now = Get-TaskTarget
+    if ($Now -cne $Name) { throw "Logon task $TaskName starts '$Now' after registration, not $Name." }
+}
+
+if ($Step -eq 'LogonTask') {
+    Set-TaskTarget $Container
+    Write-Output "Logon task $TaskName starts $Container"
     exit 0
 }
 
@@ -262,20 +287,20 @@ function Invoke-Revert($Old, $Steps, [bool] $RemoveCandidate) {
     if ($Now) {
         if (-not (Test-Stopped $Now)) {
             & $Wslc stop $Candidate | Out-Host
-            $Code = $LASTEXITCODE
-            $Steps.Add("stop candidate exit $Code")
-            # A failed stop is judged by readback: only a provably stopped candidate lets the kept rent start.
-            if ($Code -ne 0) {
-                if (-not (Test-Stopped (Get-Named $Candidate))) { $Steps.Add('candidate not provably stopped'); return $false }
-                $Steps.Add('candidate provably stopped')
-            }
+            $Steps.Add("stop candidate exit $LASTEXITCODE")
         }
+        # Whatever stop reported, only a candidate read back as provably stopped lets anything else happen.
+        if (-not (Test-Stopped (Get-Named $Candidate))) { $Steps.Add('candidate not provably stopped'); return $false }
+        $Steps.Add('candidate provably stopped')
         if ($RemoveCandidate) {
             & $Wslc remove $Candidate | Out-Host
             $Steps.Add("remove candidate exit $LASTEXITCODE")
             if ($LASTEXITCODE -ne 0) { return $false }
         }
     }
+    # The logon task goes back first: the kept rent starts only once no logon can start the candidate.
+    try { Set-TaskTarget $Container; $Steps.Add("task starts $Container") }
+    catch { $Steps.Add("task not restored ($($_.Exception.Message)); not starting $Container"); return $false }
     & $Wslc start $Container | Out-Host
     $Steps.Add("start old exit $LASTEXITCODE")
     if ($LASTEXITCODE -ne 0) { return $false }
@@ -305,6 +330,21 @@ function Invoke-StageStop($Old) {
     throw "WSLC stop of $Container failed: $Code but it stopped | restore ${Outcome}: $($Steps -join '; ')"
 }
 
+# Hand the one logon task to the candidate while the kept rent still runs (the candidate does not exist yet, so a logon
+# can start nothing), then stop the kept rent and complete Stage. Before the candidate exists, a failure points the task
+# back at the kept rent; after, Complete-Stage reverts. The task never starts the kept rent while the candidate may run.
+function Invoke-Stage($Old) {
+    $Before = $null
+    try { Set-TaskTarget $Candidate; Invoke-StageStop $Old }
+    catch { $Before = $_.Exception.Message }
+    if ($Before) {
+        try { Set-TaskTarget $Container; $Back = "task starts $Container" }
+        catch { $Back = "task NOT restored: $($_.Exception.Message)" }
+        throw "Stage failed before $Candidate existed: $Before | $Back"
+    }
+    Complete-Stage $Old
+}
+
 # Stage after the old rent was stopped (kept, never removed): any failure reverts, and Stage still fails.
 function Complete-Stage($Old) {
     try {
@@ -326,6 +366,8 @@ if ($Step -eq 'Revert') {
     $Old = Get-Named $Container
     if (-not $Old -or -not (Get-Images $Old)) { throw "Kept rent $Container is missing or has no readable image." }
     if (-not (Get-Named $Candidate)) { throw "Candidate $Candidate is missing; nothing to revert." }
+    $Target = Get-TaskTarget
+    if ($Target -cne $Candidate -and $Target -cne $Container) { throw "Logon task $TaskName starts '$Target', neither $Candidate nor $Container; not reverting." }
     # The kept rent must be stopped: only the candidate may be running.
     Assert-NoOtherWriter $Candidate 'reverting'
     $Steps = [System.Collections.Generic.List[string]]::new()
@@ -352,6 +394,8 @@ if ($Step -eq 'Migrate') {
         $Old = Get-Named $Container
         $Problem = Get-StageProblem $Old (Get-Named $Candidate)
         if ($Problem) { throw $Problem }
+        $Target = Get-TaskTarget
+        if ($Target -cne $Container) { throw "Logon task $TaskName must start exactly $Container before staging; it starts '$Target'. Nothing changed." }
         Assert-NoOtherWriter $Container 'staging'
         & $Wslc volume inspect $StateVolume | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "State volume is missing: $StateVolume" }
@@ -384,9 +428,8 @@ if ($Step -eq 'Migrate') {
 }
 
 if ($Step -eq 'Stage') {
-    Invoke-StageStop $Old
-    Complete-Stage $Old
-    Write-Output "Stage succeeded: $Candidate ready; $Container kept stopped. LogonTask still starts $Container until switched."
+    Invoke-Stage $Old
+    Write-Output "Stage succeeded: $Candidate ready and the logon task starts it; $Container kept stopped. Revert restores $Container."
 } else {
     Invoke-Seed
     & $Wslc @RunArgs
