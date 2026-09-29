@@ -78,8 +78,7 @@ class CompilerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "collision"):
             pack.archive(source, self.root / "test.zip")
 
-    def test_distribution_is_deterministic_and_complete(self):
-        fonts = self.payload()
+    def inputs(self):
         backend = self.root / "dsc.zip"
         with zipfile.ZipFile(backend, "w") as z:
             z.writestr("dsc.exe", "not executable: packaging fixture only")
@@ -89,22 +88,34 @@ class CompilerTests(unittest.TestCase):
             z.writestr("noctty/noctty.exe", "fixture application")
             z.writestr("noctty/noctty.com", "fixture console entry")
             z.writestr("noctty/noctty-terminal-handoff-proxy.dll", "fixture handoff proxy")
+        cloudflared = self.root / "cloudflared.exe"
+        cloudflared.write_bytes(b"MZ fixture: not the real client")
         choices = self.root / "choices.json"
         choices.write_text(json.dumps({"noctty": {"version": "1.0", "fontFamily": "Test Font"},
+                                       "cloudflared": {"version": "2.0"},
                                        "packages": [{"name": "Fixture", "id": "Fixture.App", "version": "1.0"}]}))
         scripts = self.root / "scripts"
-        scripts.mkdir()
+        scripts.mkdir(exist_ok=True)
         for name in ("win.ps1", "proof.ps1", "handoff-proof.ps1", "handoff-evaluate.ps1",
                      "package-view.ps1", "README.md"):
             (scripts / name).write_text("fixture")
+        return backend, noctty, cloudflared, choices, scripts
+
+    def test_distribution_is_deterministic_and_complete(self):
+        fonts = self.payload()
+        backend, noctty, cloudflared, choices, scripts = self.inputs()
         for out in ("one", "two"):
-            pack.distribution(fonts, backend, noctty, choices, scripts, "a" * 40, self.root / out)
+            pack.distribution(fonts, backend, noctty, cloudflared, choices, scripts, "a" * 40, self.root / out)
         first, second = [self.root / out / "windows-dist.zip" for out in ("one", "two")]
         self.assertEqual(first.read_bytes(), second.read_bytes())
         with zipfile.ZipFile(first) as z:
             manifest = json.loads(z.read("manifest.json"))
             self.assertEqual(manifest["source"], "a" * 40)
             self.assertEqual(manifest["noctty"]["version"], "1.0")
+            self.assertEqual(manifest["cloudflared"], {"version": "2.0", "file": "payload/cloudflared.exe",
+                                                       "sha256": pack.digest(cloudflared)})
+            self.assertEqual(z.read("payload/cloudflared.exe"), cloudflared.read_bytes())
+            self.assertEqual(manifest["files"]["payload/cloudflared.exe"], pack.digest(cloudflared))
             self.assertEqual(len(manifest["packages"]), 1)
             self.assertEqual(set(manifest["files"]), set(z.namelist()) - {"manifest.json"})
             for name in ("handoff-proof.ps1", "handoff-evaluate.ps1", "package-view.ps1"):
@@ -121,19 +132,24 @@ class CompilerTests(unittest.TestCase):
 
     def test_backend_zip_traversal_fails(self):
         fonts = self.payload()
-        backend = self.root / "dsc.zip"
+        backend, noctty, cloudflared, choices, scripts = self.inputs()
         with zipfile.ZipFile(backend, "w") as z:
             z.writestr("../dsc.exe", "fixture")
-        noctty = self.root / "noctty.zip"
-        with zipfile.ZipFile(noctty, "w") as z:
-            z.writestr("noctty/noctty.exe", "fixture")
-            z.writestr("noctty/noctty.com", "fixture")
-            z.writestr("noctty/noctty-terminal-handoff-proxy.dll", "fixture")
-        choices = self.root / "choices.json"
-        choices.write_text(json.dumps({"noctty": {"version": "1", "fontFamily": "Test Font"},
-                                       "packages": [{"name": "Fixture", "id": "Fixture.App", "version": "1"}]}))
         with self.assertRaisesRegex(ValueError, "Unsafe"):
-            pack.distribution(fonts, backend, noctty, choices, self.root, "test", self.root / "out")
+            pack.distribution(fonts, backend, noctty, cloudflared, choices, scripts, "test", self.root / "out")
+
+    def test_cloudflared_must_be_selected_and_executable(self):
+        fonts = self.payload()
+        backend, noctty, cloudflared, choices, scripts = self.inputs()
+        cloudflared.write_bytes(b"#!/bin/sh\n")
+        with self.assertRaisesRegex(ValueError, "not a Windows executable"):
+            pack.distribution(fonts, backend, noctty, cloudflared, choices, scripts, "test", self.root / "out")
+        cloudflared.write_bytes(b"MZ fixture")
+        selected = json.loads(choices.read_text())
+        del selected["cloudflared"]
+        choices.write_text(json.dumps(selected))
+        with self.assertRaisesRegex(ValueError, "No cloudflared version"):
+            pack.distribution(fonts, backend, noctty, cloudflared, choices, scripts, "test", self.root / "out")
 
 
 if __name__ == "__main__":

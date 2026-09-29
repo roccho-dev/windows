@@ -2,7 +2,8 @@
 # Linux OCI proof of the rent dev runtime (Issue #8-A): fresh seed -> develop -> replace with an upgraded image ->
 # continue offline -> GC -> roll back and reseed from the retained volume. Disposable resources, synthetic state only,
 # no credentials and no publication. Run from the repository root after
-# nix build .#rent-image .#rent-image-next (result and result-1).
+# nix build .#rent-image .#rent-image-stub .#rent-image-next, with the two CI-only tunnel-stub images (result-1 and
+# result-2): Cloudflare is not part of this proof; the published image's transport is tested in rent-image.yml.
 set -euo pipefail
 base_archive=${1:?usage: proof.sh RENT_IMAGE RENT_IMAGE_NEXT}
 next_archive=${2:?usage: proof.sh RENT_IMAGE RENT_IMAGE_NEXT}
@@ -27,13 +28,16 @@ fail() { echo "FAIL $*" >&2; exit 1; }
 docker load < "$base_archive" >/dev/null
 docker load < "$next_archive" >/dev/null
 # Tags select the just-loaded artifacts once; every run below pins the immutable IDs.
-base=$(docker image inspect ghcr.io/roccho-dev/windows-rent:nix --format '{{.Id}}')
+base=$(docker image inspect ghcr.io/roccho-dev/windows-rent:stub --format '{{.Id}}')
 next=$(docker image inspect ghcr.io/roccho-dev/windows-rent:next --format '{{.Id}}')
 roots() { docker run --rm "$1" /bin/readlink /etc/rent-nix-roots; }
 base_roots=$(roots "$base") next_roots=$(roots "$next")
 [ "$base_roots" != "$next_roots" ] || fail 'the upgrade image has the same runtime closure'
 printf 'image %s\nimage-next %s\nrepo revision %s\n' "$base" "$next" "$repo_rev"
 for v in "$repos" "$state" "$nixv" "$empty"; do docker volume create "$v" >/dev/null; done
+# The token slot, filled as envs would with a synthetic value the stub never sends anywhere.
+docker run --rm -v "$state:/s" "$base" /bin/bash -c \
+  'install -d -m 700 /s/cloudflared && echo ci-synthetic > /s/cloudflared/token && chmod 600 /s/cloudflared/token'
 
 # The counterexample: an empty volume at /nix shadows the image store, so the image cannot even start, and it writes
 # nothing (volume-nocopy: no Docker auto-copy stands in for seeding).
@@ -77,7 +81,7 @@ echo 'PASS seed (empty /nix cannot start; refusals write nothing; fresh, idempot
 start() {
   docker run -d --name "$c" --network "$2" -v "$repos:/work/repos" -v "$state:/var/lib/rent" --mount "$(nixmount "$nixv")" \
     -e "RENT_REPOS_VOLUME=$repos" -e "RENT_STATE_VOLUME=$state" -e "RENT_NIX_VOLUME=$nixv" \
-    -e RENT_TS_HOSTNAME=rent-dev-proof -e 'RENT_AUTHORIZED_KEY=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHJlbnQtZGV2LXByb29mLW5vdC1hLXJlYWwta2V5 proof' \
+    -e 'RENT_AUTHORIZED_KEY=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHJlbnQtZGV2LXByb29mLW5vdC1hLXJlYWwta2V5 proof' \
     "$1" >/dev/null
   for _ in {1..60}; do
     if docker logs "$c" 2>&1 | grep -q '^rent-nix ok ' && docker exec "$c" /bin/test -S /nix/var/nix/daemon-socket/socket 2>/dev/null; then

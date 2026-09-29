@@ -1,12 +1,14 @@
 #Requires -Version 7
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Plan', 'Pull', 'Create', 'Replace', 'Migrate', 'LogonTask')]
+    [ValidateSet('Plan', 'Pull', 'Create', 'Stage', 'Revert', 'Migrate', 'LogonTask')]
     [string] $Step,
 
     [Parameter(Mandatory)]
     [string] $ExpectHost,
 
+    # The running rent: Create makes it; Stage and Revert keep it (stopped or restarted), never remove it; LogonTask
+    # points the one logon task at it.
     [Parameter(Mandatory)]
     [ValidatePattern('^[a-z0-9][a-z0-9-]+$')]
     [string] $Container,
@@ -16,15 +18,16 @@ param(
     [int] $Port,
 
     [string] $Image,
+    # Stage/Revert: the separately named candidate on the same named volumes.
+    [ValidatePattern('^[a-z0-9][a-z0-9-]+$')]
+    [string] $Candidate = 'windows-rent-cf',
     [ValidatePattern('^[a-z0-9][a-z0-9-]+$')]
     [string] $ReposVolume = 'repos',
     [ValidatePattern('^[a-z0-9][a-z0-9-]+$')]
     [string] $StateVolume = 'windows-rent-state',
-    # rent's own writable /nix, seeded from the exact image before every Create/Replace start.
+    # rent's own writable /nix, seeded from the exact image before every Create/Stage start.
     [ValidatePattern('^[a-z0-9][a-z0-9-]+$')]
     [string] $NixVolume = 'windows-rent-nix',
-    [ValidatePattern('^[a-z0-9][a-z0-9-]+$')]
-    [string] $TsHostname = 'pc7337-windows-rent',
     [string] $PublicKeyFile,
     # Migrate only: the old home is mounted read-only into a one-shot --rm helper, never into the rent container.
     [ValidatePattern('^[a-z0-9][a-z0-9-]+$')]
@@ -37,8 +40,6 @@ param(
     # Migrate only: the exact pre-recorded image of the old source container.
     [ValidatePattern('^[^\s"'']+$')]
     [string] $OldImageSource,
-    # Replace only: JSON array holding the pre-recorded argv (no secrets) that recreates the current container.
-    [string] $RollbackArgvFile,
     [switch] $Apply
 )
 
@@ -51,13 +52,16 @@ if ($env:COMPUTERNAME -ine $ExpectHost) {
 $Wslc = 'C:\Program Files\WSL\wslc.exe'
 if ($Step -ne 'Plan' -and -not (Test-Path -LiteralPath $Wslc)) { throw "WSLC is missing: $Wslc" }
 
-# The only pre-state image Replace may remove: the published rent image that kept /home/dev on a volume.
+# Migrate only: the published rent image that kept /home/dev on a volume.
 $OldImage = 'ghcr.io/roccho-dev/windows-rent@sha256:da1393586b2e847c7508038675be8701c185b77be777ef1492689d4c604185ce'
 # Exactly these three distinct named volumes; never the old home volume.
 $Mounts = [ordered]@{ '/work/repos' = $ReposVolume; '/var/lib/rent' = $StateVolume; '/nix' = $NixVolume }
 if (@($Mounts.Values) -ccontains $OldHomeVolume) { throw "The old home volume $OldHomeVolume must not be repos, state or nix." }
 if (@($Mounts.Values | Sort-Object -Unique -CaseSensitive).Count -ne $Mounts.Count) { throw 'The repos, state and nix volumes must be distinct.' }
 if ($OldContainer -ceq $Container) { throw "The old container $OldContainer must not be $Container." }
+if ($Candidate -ceq $Container -or $Candidate -ceq $OldContainer) { throw "The candidate $Candidate must be a new name." }
+# The one logon task; LogonTask repoints it, so a logon never starts a second rent on the same volumes.
+$TaskName = 'windows-rent-oci-logon'
 
 # WSLC inspect is the authority for name, state and image only; mounts are proven inside the container
 # (rent-start and rent-state-import read their own mountinfo).
@@ -68,12 +72,7 @@ function Test-Stopped($Item) {
     return ($Running -is [bool]) -and -not $Running -and ([string] $Item.State.Status) -cne 'running'
 }
 
-# Replace target: exactly $Container on the pre-recorded old image or on this Binding's image.
-function Test-ReplaceableImage($Item) {
-    if (([string] $Item.Name).TrimStart('/') -cne $Container) { return $false }
-    $Images = Get-Images $Item
-    return ($Images -ccontains $OldImage) -or ($Images -ccontains $Image)
-}
+function Test-Running($Item) { return $Item -and $Item.State.Running -is [bool] -and $Item.State.Running }
 
 # Migrate source: why the inspected old runtime is not the stopped, pinned source, or $null.
 function Get-OldSourceProblem($Item) {
@@ -96,22 +95,23 @@ function Get-WriterProblem($Items, [string] $Except = $Container) {
     return $null
 }
 
-# Outcome of Create/Replace: running, and rent-start printed the fixed mount proof.
+# Outcome of Create/Stage: Running, rent-start's mount line and its ready line (printed only after the token file
+# passed and every service was launched), and still Running for 10 consecutive polls: a rejected tunnel stops it.
 $Proof = "rent-mounts ok repos=$ReposVolume state=$StateVolume nix=$NixVolume"
+$Ready = 'rent-start ok services=nix-daemon,cloudflared,sshd'
 function Test-RunningProof($Item, $Logs) {
-    if (-not $Item -or $Item.State.Running -isnot [bool] -or -not $Item.State.Running) { return $false }
-    return @(@($Logs) | ForEach-Object { ([string] $_).TrimEnd() }) -ccontains $Proof
+    if (-not (Test-Running $Item)) { return $false }
+    $Lines = @(@($Logs) | ForEach-Object { ([string] $_).TrimEnd() })
+    return ($Lines -ccontains $Proof) -and ($Lines -ccontains $Ready)
 }
 
-# Rollback: the pre-recorded argv must recreate exactly $Container on its current image, without secrets.
-function Get-RollbackProblem($Argv, $Item) {
-    $Argv = @($Argv)
-    if ($Argv.Count -lt 4 -or @($Argv | Where-Object { $_ -isnot [string] }).Count) { return 'Rollback argv must be a JSON array of strings.' }
-    if ($Argv[0] -cne 'run' -or $Argv -ccontains '--rm') { return 'Rollback argv must be one persistent run.' }
-    $At = [array]::IndexOf([string[]] $Argv, '--name')
-    if ($At -lt 0 -or $At + 1 -ge $Argv.Count -or $Argv[$At + 1] -cne $Container) { return "Rollback argv must name $Container." }
-    if (-not ((Get-Images $Item) -ccontains $Argv[-1])) { return 'Rollback argv must end with the current container image.' }
-    if (@($Argv | Where-Object { $_ -match '(?i)(token|secret|password|credential|private)' }).Count) { return 'Rollback argv must not carry secrets.' }
+# Stage precondition on inspect now: the kept rent Running on readable images other than $Image, no candidate yet.
+function Get-StageProblem($Old, $Existing) {
+    if ($Old -and ([string] $Old.Name).TrimStart('/') -cne $Container) { return "Inspect of $Container returned $($Old.Name)." }
+    if (-not (Test-Running $Old)) { return "$Container must exist and be Running to stage beside it." }
+    if (-not (Get-Images $Old)) { return "$Container has no readable image." }
+    if ((Get-Images $Old) -ccontains $Image) { return "$Container already runs $Image; nothing to stage." }
+    if ($Existing) { return "Candidate $Candidate already exists; not staging." }
     return $null
 }
 
@@ -124,27 +124,39 @@ function Get-Container([string] $Name) {
     return $Items[0]
 }
 
+# Readback of the kept rent or the candidate by name: inspect must return that very container, or nothing.
+function Get-Named([string] $Name) {
+    $Item = Get-Container $Name
+    if ($Item -and ([string] $Item.Name).TrimStart('/') -cne $Name) { throw "Inspect of $Name returned $($Item.Name)." }
+    return $Item
+}
+
 function Assert-OldSourceStopped {
     $Problem = Get-OldSourceProblem (Get-Container $OldContainer)
     if ($Problem) { throw "$Problem Not migrating." }
 }
 
-if ($Step -in @('Plan', 'Pull', 'Create', 'Replace', 'Migrate')) {
+if ($Step -in @('Plan', 'Pull', 'Create', 'Stage', 'Migrate')) {
     if ($Image -cnotmatch '^ghcr\.io/roccho-dev/windows-rent@sha256:[a-f0-9]{64}$') {
         throw 'Provide the CI image by exact GHCR digest.'
     }
 }
 $Key = "<contents of $PublicKeyFile>"
-if ($Step -in @('Create', 'Replace')) {
+if ($Step -in @('Create', 'Stage')) {
     if (-not $PublicKeyFile) { throw 'Provide a public key file.' }
     $Key = (Get-Content -LiteralPath $PublicKeyFile -Raw).Trim()
     if ($Key -notmatch '^ssh-ed25519 [A-Za-z0-9+/=]+(?: .*)?$') { throw 'Expected one ed25519 public key.' }
 }
 
-$RunArgs = @('run', '--name', $Container, '--detach', '--publish', "127.0.0.1:${Port}:2222")
-foreach ($Target in $Mounts.Keys) { $RunArgs += @('--volume', "$($Mounts[$Target]):$Target") }
-$RunArgs += @('--env', "RENT_REPOS_VOLUME=$ReposVolume", '--env', "RENT_STATE_VOLUME=$StateVolume", '--env', "RENT_NIX_VOLUME=$NixVolume",
-    '--env', "RENT_TS_HOSTNAME=$TsHostname", '--env', "RENT_AUTHORIZED_KEY=$Key", '--env', 'TS_FORCE_NOISE_443=1', $Image)
+# The tunnel token is never an argument or environment value: rent-start reads its fixed file in the state volume.
+function Get-RunArgs([string] $Name) {
+    $Argv = @('run', '--name', $Name, '--detach', '--publish', "127.0.0.1:${Port}:2222")
+    foreach ($Target in $Mounts.Keys) { $Argv += @('--volume', "$($Mounts[$Target]):$Target") }
+    return $Argv + @('--env', "RENT_REPOS_VOLUME=$ReposVolume", '--env', "RENT_STATE_VOLUME=$StateVolume",
+        '--env', "RENT_NIX_VOLUME=$NixVolume", '--env', "RENT_AUTHORIZED_KEY=$Key", $Image)
+}
+$RunArgs = Get-RunArgs $Container
+$StageArgs = Get-RunArgs $Candidate
 $MigrateArgs = @('run', '--rm', '--volume', "${OldHomeVolume}:/old:ro", '--volume', "${StateVolume}:/var/lib/rent",
     '--env', "RENT_OLD_VOLUME=$OldHomeVolume", '--env', "RENT_STATE_VOLUME=$StateVolume",
     $Image, '/bin/rent-state-import', $SessionId)
@@ -158,16 +170,26 @@ if ($Step -eq 'Plan') {
         pull = @($Wslc, 'pull', $Image)
         stateVolumeCreateOnce = @($Wslc, 'volume', 'create', $StateVolume)
         nixVolumeCreateOnce = @($Wslc, 'volume', 'create', $NixVolume)
-        seedAccepts = "every container, $Container included, provably stopped (WSLC shows no mounts), right before each seed; before create, and in Replace after replaceStop and before replaceRemove"
+        seedAccepts = "every container, $Container included, provably stopped (WSLC shows no mounts), right before each seed"
         seedContainerList = @($Wslc) + $ListArgs
         seed = @($Wslc) + $SeedArgs
         create = @($Wslc) + $RunArgs
-        replaceAccepts = "$Container on exactly $OldImage or $Image (inspect name and image only), with a pre-recorded rollback argv"
-        replaceStop = @($Wslc, 'stop', $Container)
-        replaceRemove = @($Wslc, 'remove', $Container)
-        postGate = "within 60 s: $Container Running and its log has the line '$Proof'. Any failure after replaceStop rolls back and Replace still fails: rollbackStart if the old container was never removed, else replaceStop and replaceRemove of only the new container, then the -RollbackArgvFile argv"
-        postGateLogs = @($Wslc, 'logs', $Container)
-        rollbackStart = @($Wslc, 'start', $Container)
+        readyGate = "within 60 s: Running with log lines '$Proof' and '$Ready', then Running for 10 consecutive polls"
+        stageAccepts = "$Container exists and is Running (its images read by inspect now), $Candidate absent, every other container stopped, logon task $TaskName exactly '$Wslc start $Container'; the token file is placed in $StateVolume beforehand"
+        # Order: stageTask (while $Container still runs, so a logon can only try the not-yet-existing candidate),
+        # stageStop, seed, stageRun, readyGate. Success leaves the task on the running candidate.
+        stageTask = @($TaskName, $Wslc, 'start', $Candidate)
+        stageStop = @($Wslc, 'stop', $Container)
+        stageRun = @($Wslc) + $StageArgs
+        readyLogs = @($Wslc, 'logs', $Candidate)
+        # Any Stage failure after stageTask, and the Revert step: revertStop if running, then the candidate provably
+        # stopped by readback whatever stop returned, revertRemove (a failed Stage's candidate only), revertTask read back,
+        # and only then revertStart and Running on its inspected images for 3 consecutive polls.
+        revertStop = @($Wslc, 'stop', $Candidate)
+        revertRemove = @($Wslc, 'remove', $Candidate)
+        revertTask = @($TaskName, $Wslc, 'start', $Container)
+        revertStart = @($Wslc, 'start', $Container)
+        logonTask = @($TaskName, $Wslc, 'start', $Container)
         migrateAccepts = "$OldContainer exists, is stopped, and is exactly $OldImageSource (checked before and right before the helper); every other container except $Container is stopped; $Container absent or exactly $OldImage"
         migrateSourceInspect = @($Wslc, 'inspect', $OldContainer)
         migrateContainerList = @($Wslc) + $ListArgs
@@ -188,15 +210,35 @@ if ($Step -eq 'Pull') {
     exit 0
 }
 
-if ($Step -eq 'LogonTask') {
+# The one logon task: which container it starts, by readback; $null when absent. Anything but exactly one
+# '<wslc> start <name>' action is refused rather than interpreted.
+function Get-TaskTarget {
+    $Tasks = @(Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
+    if ($Tasks.Count -eq 0) { return $null }
+    $Actions = @($Tasks[0].Actions)
+    if ($Tasks.Count -ne 1 -or $Actions.Count -ne 1 -or [string] $Actions[0].Execute -cne $Wslc -or
+        [string] $Actions[0].Arguments -cnotmatch '^start ([a-z0-9][a-z0-9-]+)$') {
+        throw "Logon task $TaskName is not exactly one '$Wslc start <container>' action."
+    }
+    return $Matches[1]
+}
+
+# Point the one logon task at $Name (re-registering the same task, never a second one) and prove it by readback.
+function Set-TaskTarget([string] $Name) {
     $Actor = whoami
-    $Action = New-ScheduledTaskAction -Execute $Wslc -Argument "start $Container"
+    $Action = New-ScheduledTaskAction -Execute $Wslc -Argument "start $Name"
     $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $Actor
     $Trigger.Delay = 'PT30S'
     $Principal = New-ScheduledTaskPrincipal -UserId $Actor -LogonType Interactive -RunLevel Limited
     $Settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-    Register-ScheduledTask -TaskName "$Container-oci-logon" -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Force | Out-Null
-    Get-ScheduledTask -TaskName "$Container-oci-logon" | Select-Object TaskName, State
+    Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Force | Out-Null
+    $Now = Get-TaskTarget
+    if ($Now -cne $Name) { throw "Logon task $TaskName starts '$Now' after registration, not $Name." }
+}
+
+if ($Step -eq 'LogonTask') {
+    Set-TaskTarget $Container
+    Write-Output "Logon task $TaskName starts $Container"
     exit 0
 }
 
@@ -214,6 +256,127 @@ function Invoke-Seed {
     if ($LASTEXITCODE -ne 0) { throw "WSLC seed failed: $LASTEXITCODE" }
 }
 
+function Wait-Ready([string] $Name) {
+    $Seen = 0
+    for ($Second = 0; $Second -lt 60 -or ($Seen -gt 0 -and $Second -lt 70); $Second++) {
+        Start-Sleep -Seconds 1
+        if (Test-RunningProof (Get-Named $Name) @(& $Wslc logs $Name 2>$null)) {
+            if (++$Seen -ge 10) { return $true }
+        } elseif ($Seen) { return $false }
+    }
+    return $false
+}
+
+# The kept rent is back only when it is Running on the images inspect showed for it, for 3 consecutive polls.
+function Wait-OldRunning($Old) {
+    $Seen = 0
+    for ($Second = 0; $Second -lt 60; $Second++) {
+        Start-Sleep -Seconds 1
+        $Now = Get-Named $Container
+        if ((Test-Running $Now) -and "$(Get-Images $Now)" -ceq "$(Get-Images $Old)") {
+            if (++$Seen -ge 3) { return $true }
+        } else { $Seen = 0 }
+    }
+    return $false
+}
+
+# Back to the kept rent: stop the candidate (and remove it only when it is a failed Stage's), start the old rent,
+# and prove it Running on its own images. No -f, no -v; no volume is touched. Every step is appended to $Steps.
+function Invoke-Revert($Old, $Steps, [bool] $RemoveCandidate) {
+    $Now = Get-Named $Candidate
+    if ($Now) {
+        if (-not (Test-Stopped $Now)) {
+            & $Wslc stop $Candidate | Out-Host
+            $Steps.Add("stop candidate exit $LASTEXITCODE")
+        }
+        # Whatever stop reported, only a candidate read back as provably stopped lets anything else happen.
+        if (-not (Test-Stopped (Get-Named $Candidate))) { $Steps.Add('candidate not provably stopped'); return $false }
+        $Steps.Add('candidate provably stopped')
+        if ($RemoveCandidate) {
+            & $Wslc remove $Candidate | Out-Host
+            $Steps.Add("remove candidate exit $LASTEXITCODE")
+            if ($LASTEXITCODE -ne 0) { return $false }
+        }
+    }
+    # The logon task goes back first: the kept rent starts only once no logon can start the candidate.
+    try { Set-TaskTarget $Container; $Steps.Add("task starts $Container") }
+    catch { $Steps.Add("task not restored ($($_.Exception.Message)); not starting $Container"); return $false }
+    & $Wslc start $Container | Out-Host
+    $Steps.Add("start old exit $LASTEXITCODE")
+    if ($LASTEXITCODE -ne 0) { return $false }
+    $Ok = Wait-OldRunning $Old
+    $Steps.Add($(if ($Ok) { 'old Running on its images' } else { 'old not Running on its images within 60 s' }))
+    return $Ok
+}
+
+# Stop the kept rent for Stage. A nonzero exit is judged by readback: still Running means nothing changed; provably
+# stopped with no other writer means it is started again and proven back; anything unknown is left alone.
+function Invoke-StageStop($Old) {
+    & $Wslc stop $Container | Out-Host
+    $Code = $LASTEXITCODE
+    if ($Code -eq 0) { return }
+    try { $Now = Get-Named $Container }
+    catch { throw "WSLC stop of $Container failed: $Code; readback failed ($($_.Exception.Message)); not starting anything." }
+    if (Test-Running $Now) { throw "WSLC stop of $Container failed: $Code; it is still Running; nothing else changed." }
+    if (-not (Test-Stopped $Now)) { throw "WSLC stop of $Container failed: $Code; its state is unknown; not starting anything." }
+    $Steps = [System.Collections.Generic.List[string]]::new()
+    try {
+        Assert-NoOtherWriter $Container 'restoring'
+        & $Wslc start $Container | Out-Host
+        $Steps.Add("start old exit $LASTEXITCODE")
+        $Ok = ($LASTEXITCODE -eq 0) -and (Wait-OldRunning $Old)
+    } catch { $Ok = $false; $Steps.Add("error: $($_.Exception.Message)") }
+    $Outcome = if ($Ok) { 'succeeded' } else { 'FAILED' }
+    throw "WSLC stop of $Container failed: $Code but it stopped | restore ${Outcome}: $($Steps -join '; ')"
+}
+
+# Hand the one logon task to the candidate while the kept rent still runs (the candidate does not exist yet, so a logon
+# can start nothing), then stop the kept rent and complete Stage. Before the candidate exists, a failure points the task
+# back at the kept rent; after, Complete-Stage reverts. The task never starts the kept rent while the candidate may run.
+function Invoke-Stage($Old) {
+    $Before = $null
+    try { Set-TaskTarget $Candidate; Invoke-StageStop $Old }
+    catch { $Before = $_.Exception.Message }
+    if ($Before) {
+        try { Set-TaskTarget $Container; $Back = "task starts $Container" }
+        catch { $Back = "task NOT restored: $($_.Exception.Message)" }
+        throw "Stage failed before $Candidate existed: $Before | $Back"
+    }
+    Complete-Stage $Old
+}
+
+# Stage after the old rent was stopped (kept, never removed): any failure reverts, and Stage still fails.
+function Complete-Stage($Old) {
+    try {
+        Invoke-Seed
+        & $Wslc @StageArgs | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "WSLC run of $Candidate failed: $LASTEXITCODE" }
+        if (Wait-Ready $Candidate) { return }
+        throw "$Candidate did not stay Running with '$Proof' and '$Ready'."
+    } catch {
+        $Failure = $_.Exception.Message
+    }
+    $Steps = [System.Collections.Generic.List[string]]::new()
+    try { $Ok = Invoke-Revert $Old $Steps $true } catch { $Ok = $false; $Steps.Add("error: $($_.Exception.Message)") }
+    $Outcome = if ($Ok) { 'succeeded' } else { 'FAILED' }
+    throw "Stage failed: $Failure | revert ${Outcome}: $($Steps -join '; ')"
+}
+
+if ($Step -eq 'Revert') {
+    $Old = Get-Named $Container
+    if (-not $Old -or -not (Get-Images $Old)) { throw "Kept rent $Container is missing or has no readable image." }
+    if (-not (Get-Named $Candidate)) { throw "Candidate $Candidate is missing; nothing to revert." }
+    $Target = Get-TaskTarget
+    if ($Target -cne $Candidate -and $Target -cne $Container) { throw "Logon task $TaskName starts '$Target', neither $Candidate nor $Container; not reverting." }
+    # The kept rent must be stopped: only the candidate may be running.
+    Assert-NoOtherWriter $Candidate 'reverting'
+    $Steps = [System.Collections.Generic.List[string]]::new()
+    try { $Ok = Invoke-Revert $Old $Steps $false } catch { $Ok = $false; $Steps.Add("error: $($_.Exception.Message)") }
+    if (-not $Ok) { throw "Revert FAILED: $($Steps -join '; ')" }
+    Write-Output "Revert succeeded: $($Steps -join '; ')"
+    exit 0
+}
+
 if ($Step -eq 'Migrate') {
     if (-not $OldImageSource) { throw 'Migrate needs -OldImageSource, the pre-recorded image of the old container.' }
     Assert-OldSourceStopped
@@ -223,17 +386,19 @@ if ($Step -eq 'Migrate') {
     $Item = Get-Container $Container
     if ($Item -and -not ((Get-Images $Item) -ccontains $OldImage)) { throw "Container $Container is not the old $OldImage; not migrating." }
 } else {
-    # Create and Replace: repos must already exist (never create an empty one).
+    # Create and Stage: repos must already exist (never create an empty one).
     & $Wslc volume inspect $ReposVolume | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Repos volume is missing: $ReposVolume" }
-    if ($Step -eq 'Replace') {
-        $Item = Get-Container $Container
-        if (-not $Item) { throw "Container to replace is missing: $Container" }
-        if (-not (Test-ReplaceableImage $Item)) { throw "Container $Container is neither exactly $OldImage nor $Image; not replacing." }
-        if (-not $RollbackArgvFile) { throw 'Replace needs -RollbackArgvFile with the pre-recorded argv of the current container.' }
-        $Rollback = @((Get-Content -LiteralPath $RollbackArgvFile -Raw) | ConvertFrom-Json)
-        $Problem = Get-RollbackProblem $Rollback $Item
-        if ($Problem) { throw "$Problem Not replacing." }
+    if ($Step -eq 'Stage') {
+        # The kept rent and its images come from inspect now; nothing is taken from a recorded digest.
+        $Old = Get-Named $Container
+        $Problem = Get-StageProblem $Old (Get-Named $Candidate)
+        if ($Problem) { throw $Problem }
+        $Target = Get-TaskTarget
+        if ($Target -cne $Container) { throw "Logon task $TaskName must start exactly $Container before staging; it starts '$Target'. Nothing changed." }
+        Assert-NoOtherWriter $Container 'staging'
+        & $Wslc volume inspect $StateVolume | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "State volume is missing: $StateVolume" }
     }
 }
 
@@ -262,77 +427,14 @@ if ($Step -eq 'Migrate') {
     exit 0
 }
 
-# Create/Replace outcome: Running and rent-start's fixed mount proof in its log, polled for 60 s.
-function Wait-RunningProof {
-    for ($Second = 0; $Second -lt 60; $Second++) {
-        Start-Sleep -Seconds 1
-        if (Test-RunningProof (Get-Container $Container) @(& $Wslc logs $Container 2>$null)) { return $true }
-    }
-    return $false
-}
-
-# Replace rollback: start the old container if it was never removed; otherwise remove only the partial new
-# container (no -f, no -v) and run only the recorded argv. Every step and exit is appended to $Steps.
-function Invoke-Rollback($Argv, $Old, [bool] $Removed, $Steps) {
-    try {
-        $Now = Get-Container $Container
-        $State = if (-not $Now) { 'absent' } elseif ("$(Get-Images $Now)" -ceq "$(Get-Images $Old)") { 'present, same image' } else { 'present, other image' }
-    } catch { $State = "unknown ($($_.Exception.Message))" }
-    $Steps.Add("inspect: $State")
-    if (-not $Removed -and $State -ne 'absent') {
-        if ($State -eq 'present, other image') { $Steps.Add('not the old container; left untouched'); return $false }
-        & $Wslc start $Container | Out-Host
-        $Steps.Add("start old exit $LASTEXITCODE")
-        if ($LASTEXITCODE -eq 0) { return $true }
-        if ($State -eq 'present, same image') { return $false }
-    } elseif ($Removed -and $State -ne 'absent') {
-        & $Wslc stop $Container | Out-Host
-        $Steps.Add("stop new exit $LASTEXITCODE")
-        & $Wslc remove $Container | Out-Host
-        $Steps.Add("remove new exit $LASTEXITCODE")
-    }
-    & $Wslc @Argv | Out-Host
-    $Steps.Add("recorded argv exit $LASTEXITCODE")
-    return ($LASTEXITCODE -eq 0)
-}
-
-# Replace after a successful stop: one guarded path through the post-gate. Any failure or exception rolls back,
-# and Replace still fails, reporting both outcomes.
-function Complete-Replace($Rollback, $Old) {
-    $Removed = $false
-    try {
-        # The old container is stopped and still present: a seed failure rolls back by starting it.
-        Invoke-Seed
-        # Container only: no -f, no -v; every volume, including the old home volume, is kept.
-        & $Wslc remove $Container | Out-Host
-        if ($LASTEXITCODE -ne 0) { throw "WSLC remove failed: $LASTEXITCODE" }
-        $Removed = $true
-        foreach ($Volume in $Mounts.Values) {
-            & $Wslc volume inspect $Volume | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "Volume lost after remove: $Volume" }
-        }
-        & $Wslc @RunArgs | Out-Host
-        if ($LASTEXITCODE -ne 0) { throw "WSLC run failed: $LASTEXITCODE" }
-        if (Wait-RunningProof) { return }
-        throw "New $Container did not show Running and '$Proof' within 60 s."
-    } catch {
-        $Failure = $_.Exception.Message
-    }
-    $Steps = [System.Collections.Generic.List[string]]::new()
-    try { $Ok = Invoke-Rollback $Rollback $Old $Removed $Steps } catch { $Ok = $false; $Steps.Add("error: $($_.Exception.Message)") }
-    $Outcome = if ($Ok) { 'succeeded' } else { 'FAILED' }
-    throw "Replace failed: $Failure | rollback ${Outcome}: $($Steps -join '; ')"
-}
-
-if ($Step -eq 'Replace') {
-    & $Wslc stop $Container
-    if ($LASTEXITCODE -ne 0) { throw "WSLC stop failed: $LASTEXITCODE" }
-    Complete-Replace $Rollback $Item
+if ($Step -eq 'Stage') {
+    Invoke-Stage $Old
+    Write-Output "Stage succeeded: $Candidate ready and the logon task starts it; $Container kept stopped. Revert restores $Container."
 } else {
     Invoke-Seed
     & $Wslc @RunArgs
     if ($LASTEXITCODE -ne 0) { throw "WSLC run of $Container failed: $LASTEXITCODE" }
-    if (-not (Wait-RunningProof)) { throw "WSLC run of $Container failed its post-gate." }
+    if (-not (Wait-Ready $Container)) { throw "WSLC run of $Container failed its ready gate." }
+    Write-Output $Proof
 }
-Write-Output $Proof
 exit 0

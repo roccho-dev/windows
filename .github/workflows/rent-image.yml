@@ -25,23 +25,30 @@ jobs:
           $Errors = $null
           $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref] $null, [ref] $Errors)
           if ($Errors) { $Errors; exit 1 }
+          if ($Ast.ScriptRequirements.RequiredPSVersion -ne [version] '7.0') { 'win.ps1 must require PowerShell 7'; exit 1 }
           $env:COMPUTERNAME = 'CI-HOST'
           $Image = 'ghcr.io/roccho-dev/windows-rent@sha256:' + ('0' * 64)
           $Base = @{ Step = 'Plan'; ExpectHost = 'CI-HOST'; Container = 'windows-rent'; Port = 2222; Image = $Image; PublicKeyFile = 'ci.pub' }
-          $Plan = (& $Path @Base) | ConvertFrom-Json
+          $PlanJson = (& $Path @Base) -join "`n"
+          $Plan = $PlanJson | ConvertFrom-Json
           $W = 'C:\Program Files\WSL\wslc.exe'
+          $Volumes = @('--volume', 'repos:/work/repos', '--volume', 'windows-rent-state:/var/lib/rent', '--volume', 'windows-rent-nix:/nix',
+            '--env', 'RENT_REPOS_VOLUME=repos', '--env', 'RENT_STATE_VOLUME=windows-rent-state', '--env', 'RENT_NIX_VOLUME=windows-rent-nix',
+            '--env', 'RENT_AUTHORIZED_KEY=<contents of ci.pub>', $Image)
           $Want = [ordered]@{
-            create = @($W, 'run', '--name', 'windows-rent', '--detach', '--publish', '127.0.0.1:2222:2222',
-              '--volume', 'repos:/work/repos', '--volume', 'windows-rent-state:/var/lib/rent', '--volume', 'windows-rent-nix:/nix',
-              '--env', 'RENT_REPOS_VOLUME=repos', '--env', 'RENT_STATE_VOLUME=windows-rent-state', '--env', 'RENT_NIX_VOLUME=windows-rent-nix',
-              '--env', 'RENT_TS_HOSTNAME=pc7337-windows-rent', '--env', 'RENT_AUTHORIZED_KEY=<contents of ci.pub>', '--env', 'TS_FORCE_NOISE_443=1', $Image)
+            create = @($W, 'run', '--name', 'windows-rent', '--detach', '--publish', '127.0.0.1:2222:2222') + $Volumes
+            stageRun = @($W, 'run', '--name', 'windows-rent-cf', '--detach', '--publish', '127.0.0.1:2222:2222') + $Volumes
+            stageStop = @($W, 'stop', 'windows-rent')
+            readyLogs = @($W, 'logs', 'windows-rent-cf')
+            revertStop = @($W, 'stop', 'windows-rent-cf')
+            revertRemove = @($W, 'remove', 'windows-rent-cf')
+            revertStart = @($W, 'start', 'windows-rent')
+            stageTask = @('windows-rent-oci-logon', $W, 'start', 'windows-rent-cf')
+            revertTask = @('windows-rent-oci-logon', $W, 'start', 'windows-rent')
+            logonTask = @('windows-rent-oci-logon', $W, 'start', 'windows-rent')
             nixVolumeCreateOnce = @($W, 'volume', 'create', 'windows-rent-nix')
             seedContainerList = @($W, 'container', 'list', '--all', '-q')
             seed = @($W, 'run', '--rm', '--volume', 'windows-rent-nix:/seed', '--env', 'RENT_NIX_VOLUME=windows-rent-nix', $Image, '/bin/rent-nix-seed')
-            replaceStop = @($W, 'stop', 'windows-rent')
-            replaceRemove = @($W, 'remove', 'windows-rent')
-            postGateLogs = @($W, 'logs', 'windows-rent')
-            rollbackStart = @($W, 'start', 'windows-rent')
             migrate = @($W, 'run', '--rm', '--volume', 'dev-home:/old:ro', '--volume', 'windows-rent-state:/var/lib/rent',
               '--env', 'RENT_OLD_VOLUME=dev-home', '--env', 'RENT_STATE_VOLUME=windows-rent-state',
               $Image, '/bin/rent-state-import', '4eba321e-6ade-4815-930d-dfa58b6fc960')
@@ -49,38 +56,43 @@ jobs:
             migrateSourceInspect = @($W, 'inspect', 'envs-dev-mutable')
             migrateContainerList = @($W, 'container', 'list', '--all', '-q')
           }
-          if ($Plan.postGate -notlike "*'rent-mounts ok repos=repos state=windows-rent-state nix=windows-rent-nix'*") { 'postGate line differs'; exit 1 }
           foreach ($K in $Want.Keys) {
             if ((@($Plan.$K) -join "`n") -cne ($Want[$K] -join "`n")) { "$K differs: $(@($Plan.$K) -join ' ')"; exit 1 }
           }
+          if ($Plan.readyGate -notlike "*'rent-mounts ok repos=repos state=windows-rent-state nix=windows-rent-nix'*'rent-start ok services=nix-daemon,cloudflared,sshd'*") { 'readyGate differs'; exit 1 }
+          # The candidate takes over exactly the kept rent's loopback port (free only once it is stopped), and exactly one
+          # logon task exists, repointed by name: no second task can start a second rent on the same volumes.
+          if ($Plan.stageRun[5] -cne '--publish' -or $Plan.stageRun[6] -cne '127.0.0.1:2222:2222' -or $Plan.stageRun[6] -cne $Plan.create[6] -or
+              @($Plan.stageRun | Where-Object { $_ -ceq '--publish' }).Count -ne 1) { 'candidate port differs from the kept rent'; exit 1 }
+          $Tasks = @($Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -in 'Register-ScheduledTask', 'New-ScheduledTask' }, $true))
+          if ($Tasks.Count -ne 1 -or $Tasks[0].Extent.Text -notmatch '-TaskName \$TaskName ') { 'logon task is not the one fixed name'; exit 1 }
+          if ($Ast.Extent.Text -notmatch "(?m)^\`$TaskName = 'windows-rent-oci-logon'$") { 'logon task name is not fixed'; exit 1 }
+          # No Tailscale and no token anywhere in the runbook: the token is a file in the state volume.
+          if ($PlanJson -match '(?i)tailscale|TS_|TUNNEL_TOKEN|--token') { 'the plan still carries Tailscale or a token'; exit 1 }
           # Refusals before any WSLC call.
           foreach ($Bad in @(@{ OldHomeVolume = 'repos' }, @{ OldHomeVolume = 'windows-rent-state' }, @{ OldHomeVolume = 'windows-rent-nix' },
               @{ NixVolume = 'repos' }, @{ NixVolume = 'windows-rent-state' }, @{ SessionId = 'not-a-session' }, @{ OldContainer = 'windows-rent' },
-              @{ Image = 'ghcr.io/roccho-dev/windows-rent:latest' })) {
+              @{ Candidate = 'windows-rent' }, @{ Candidate = 'envs-dev-mutable' }, @{ Image = 'ghcr.io/roccho-dev/windows-rent:latest' })) {
             $Refused = $false
             $Args2 = $Base.Clone(); foreach ($K in $Bad.Keys) { $Args2[$K] = $Bad[$K] }
             try { & $Path @Args2 | Out-Null } catch { $Refused = $true }
             if (-not $Refused) { "not refused: $($Bad | ConvertTo-Json -Compress)"; exit 1 }
           }
-          # Identity/state/image guards, taken from the script itself, on synthetic inspect JSON (not recorded WSLC output).
-          # Every case reports Mounts=[] as WSLC 2.9.3 was observed to: mounts are never an inspect authority.
+          # Guards and the Stage/Revert path, taken from the script itself, on synthetic inspect JSON (not recorded WSLC
+          # output). Every case reports Mounts=[] as WSLC 2.9.3 was observed to: mounts are never an inspect authority.
           $ReposVolume = 'repos'; $StateVolume = 'windows-rent-state'; $NixVolume = 'windows-rent-nix'; $OldContainer = 'envs-dev-mutable'; $OldHomeVolume = 'dev-home'
-          $Container = 'windows-rent'; $OldImageSource = 'ghcr.io/roccho-dev/envs-dev@sha256:' + ('1' * 64)
+          $Container = 'windows-rent'; $Candidate = 'windows-rent-cf'; $OldImageSource = 'ghcr.io/roccho-dev/envs-dev@sha256:' + ('1' * 64)
           foreach ($N in $Ast.FindAll({ param($n)
-              ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Get-Images', 'Test-Stopped', 'Test-ReplaceableImage', 'Get-OldSourceProblem', 'Get-WriterProblem', 'Test-RunningProof', 'Get-RollbackProblem') -or
-              ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in '$OldImage', '$Mounts', '$Proof', '$ListArgs', '$SeedArgs') }, $true)) {
+              ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Get-Images', 'Test-Stopped', 'Test-Running',
+                'Get-OldSourceProblem', 'Get-WriterProblem', 'Test-RunningProof', 'Get-StageProblem', 'Get-Container', 'Get-Named',
+                'Assert-NoOtherWriter', 'Invoke-Seed', 'Wait-Ready', 'Wait-OldRunning', 'Invoke-Revert', 'Invoke-StageStop', 'Complete-Stage',
+                'Get-TaskTarget', 'Set-TaskTarget', 'Invoke-Stage') -or
+              ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in '$OldImage', '$Mounts', '$Proof', '$Ready', '$ListArgs', '$SeedArgs', '$TaskName') }, $true)) {
             . ([scriptblock]::Create($N.Extent.Text))
           }
           function J($Text) { $Text | ConvertFrom-Json }
           $Other = 'ghcr.io/roccho-dev/windows-rent@sha256:' + ('2' * 64)
-          $Replace = [ordered]@{
-            'old image' = @{ Ok = $true; Item = J ('{"Name":"windows-rent","Image":"sha256:' + ('3' * 64) + '","Config":{"Image":"' + $OldImage + '"},"Mounts":[]}') }
-            'binding image' = @{ Ok = $true; Item = J ('{"Name":"/windows-rent","Image":"' + $Image + '","Mounts":[]}') }
-            'other digest' = @{ Ok = $false; Item = J ('{"Name":"windows-rent","Config":{"Image":"' + $Other + '"},"Mounts":[]}') }
-            'other name' = @{ Ok = $false; Item = J ('{"Name":"envs-dev-mutable","Config":{"Image":"' + $OldImage + '"},"Mounts":[]}') }
-            'no image' = @{ Ok = $false; Item = J '{"Name":"windows-rent","Mounts":[]}' }
-          }
-          foreach ($K in $Replace.Keys) { if ((Test-ReplaceableImage $Replace[$K].Item) -ne $Replace[$K].Ok) { "replace guard wrong for '$K'"; exit 1 } }
+          $Live = 'ghcr.io/roccho-dev/windows-rent@sha256:' + ('d' * 64)
           # Migrate source guard: only an existing, stopped envs-dev-mutable on exactly the pinned source image.
           $Src = '"Config":{"Image":"' + $OldImageSource + '"},"Mounts":[]'
           $Sources = [ordered]@{
@@ -88,129 +100,271 @@ jobs:
             'missing' = @{ Ok = $false; Json = $null }
             'running' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":true,"Status":"running"},' + $Src + '}' }
             'status running' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":false,"Status":"running"},' + $Src + '}' }
-            'no state' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable",' + $Src + '}' }
             'string state' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":"false"},' + $Src + '}' }
-            'wrong container' = @{ Ok = $false; Json = '{"Name":"windows-rent","State":{"Running":false},' + $Src + '}' }
             'wrong image' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":false},"Config":{"Image":"' + $Other + '"},"Mounts":[]}' }
-            'no image' = @{ Ok = $false; Json = '{"Name":"envs-dev-mutable","State":{"Running":false},"Mounts":[]}' }
           }
           foreach ($K in $Sources.Keys) {
             $Item = if ($Sources[$K].Json) { J $Sources[$K].Json } else { $null }
-            $Problem = Get-OldSourceProblem $Item
-            if ([bool] (-not $Problem) -ne $Sources[$K].Ok) { "source guard wrong for '$K': $Problem"; exit 1 }
+            if ([bool] (-not (Get-OldSourceProblem $Item)) -ne $Sources[$K].Ok) { "source guard wrong for '$K'"; exit 1 }
           }
-          # Concurrent-writer guard: every container except the rent container must be provably stopped.
+          # Writer guard: every container except the named one must be provably stopped; '' excepts none.
           $Stopped = J '{"Name":"envs-dev-mutable","State":{"Running":false,"Status":"exited"},"Mounts":[]}'
           $RentRunning = J '{"Name":"windows-rent","State":{"Running":true,"Status":"running"},"Mounts":[]}'
           $OtherRunning = J '{"Name":"other","State":{"Running":true,"Status":"running"},"Mounts":[]}'
           if (Get-WriterProblem @($Stopped, $RentRunning)) { 'writer guard refused a stopped source'; exit 1 }
           if (-not (Get-WriterProblem @($Stopped, $OtherRunning))) { 'writer guard allowed another running container'; exit 1 }
           if (-not (Get-WriterProblem @($Stopped, $null))) { 'writer guard allowed an unreadable container'; exit 1 }
-          # Nix-volume writers: no exception, so even the rent container itself must be stopped.
-          $RentStopped = J '{"Name":"windows-rent","State":{"Running":false,"Status":"exited"},"Mounts":[]}'
-          if (Get-WriterProblem @($Stopped, $RentStopped) '') { 'seed writer guard refused all-stopped containers'; exit 1 }
           if (-not (Get-WriterProblem @($Stopped, $RentRunning) '')) { 'seed writer guard allowed a running rent container'; exit 1 }
-          # Post-gate: running and the exact rent-start proof line, nothing less.
-          $Up = J '{"Name":"windows-rent","State":{"Running":true},"Mounts":[]}'
-          $Down = J '{"Name":"windows-rent","State":{"Running":false},"Mounts":[]}'
-          if (-not (Test-RunningProof $Up @('x', "$Proof`r"))) { 'post-gate refused a proven start'; exit 1 }
-          foreach ($Bad in @(@($Up, @('rent-mounts ok repos=other state=windows-rent-state')), @($Down, @($Proof)), @($null, @($Proof)),
-              @((J '{"State":{"Running":"true"}}'), @($Proof)))) {
-            if (Test-RunningProof $Bad[0] $Bad[1]) { 'post-gate passed without proof'; exit 1 }
+          # Stage preconditions: the kept rent Running on images read now (never a recorded digest), no candidate yet.
+          $OldUpJson = '{"Name":"windows-rent","State":{"Running":true,"Status":"running"},"Image":"sha256:' + ('3' * 64) + '","Config":{"Image":"' + $Live + '"},"Mounts":[]}'
+          $OldDownJson = $OldUpJson.Replace('"Running":true,"Status":"running"', '"Running":false,"Status":"exited"')
+          $OldUp = J $OldUpJson
+          $CandUp = '{"Name":"windows-rent-cf","State":{"Running":true,"Status":"running"},"Config":{"Image":"' + $Image + '"},"Mounts":[]}'
+          $CandDown = $CandUp.Replace('"Running":true,"Status":"running"', '"Running":false,"Status":"exited"')
+          if (Get-StageProblem $OldUp $null) { "stage refused a running kept rent: $(Get-StageProblem $OldUp $null)"; exit 1 }
+          foreach ($Bad in @(@($null, $null), @((J $OldDownJson), $null), @((J '{"Name":"windows-rent","State":{"Running":true}}'), $null),
+              @((J $OldUpJson.Replace('"Name":"windows-rent"', '"Name":"other"')), $null),
+              @((J ('{"Name":"windows-rent","State":{"Running":true},"Config":{"Image":"' + $Image + '"}}')), $null), @($OldUp, (J $CandDown)))) {
+            if (-not (Get-StageProblem $Bad[0] $Bad[1])) { 'stage precondition allowed a bad state'; exit 1 }
           }
-          # Rollback: the pre-recorded argv recreates exactly windows-rent on its current image, without secrets.
-          $Cur = $Replace['old image'].Item
-          $Good = @('run', '--name', 'windows-rent', '--detach', '--publish', '127.0.0.1:2222:2222', '--volume', 'windows-rent-home:/home/dev', $OldImage)
-          if (Get-RollbackProblem $Good $Cur) { "rollback refused: $(Get-RollbackProblem $Good $Cur)"; exit 1 }
-          foreach ($Bad in @(@(), @('run', '--name', 'other', $OldImage, 'x'), @('run', '--rm', '--name', 'windows-rent', $OldImage),
-              @('run', '--name', 'windows-rent', '--detach', $Other), @('run', '--name', 'windows-rent', '--env', 'GH_TOKEN=x', $OldImage),
-              @('create', '--name', 'windows-rent', '--detach', $OldImage))) {
-            if (-not (Get-RollbackProblem $Bad $Cur)) { "rollback allowed: $($Bad -join ' ')"; exit 1 }
+          # Ready gate: Running with both lines, nothing less.
+          $Up = J $CandUp
+          if (-not (Test-RunningProof $Up @('x', "$Proof`r", $Ready))) { 'ready gate refused a proven start'; exit 1 }
+          foreach ($Bad in @(@($Up, @($Proof)), @($Up, @($Ready)), @((J $CandDown), @($Proof, $Ready)), @($null, @($Proof, $Ready)),
+              @((J '{"State":{"Running":"true"}}'), @($Proof, $Ready)))) {
+            if (Test-RunningProof $Bad[0] $Bad[1]) { 'ready gate passed without proof'; exit 1 }
           }
-          # The rollback argv file, parsed by the script's own statement under the PowerShell 7 it requires.
-          if ($Ast.ScriptRequirements.RequiredPSVersion -ne [version] '7.0') { 'win.ps1 must require PowerShell 7'; exit 1 }
-          $ReadRollback = [scriptblock]::Create($Ast.Find({ param($n)
-              $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$Rollback' }, $true).Extent.Text)
-          $GoodJson = ConvertTo-Json -InputObject $Good -Compress
-          $RollbackArgvFile = (New-TemporaryFile).FullName
-          foreach ($Json in @($GoodJson, "[$GoodJson]", "{`"argv`":$GoodJson}", '"run"')) {
-            Set-Content -LiteralPath $RollbackArgvFile -Value $Json
-            . $ReadRollback
-            $Parsed = -not (Get-RollbackProblem $Rollback $Cur) -and ($Rollback -join "`n") -ceq ($Good -join "`n")
-            if ($Parsed -ne ($Json -ceq $GoodJson)) { "rollback file parsed wrong: $Json"; exit 1 }
+          # The one logon task, on mocked ScheduledTasks cmdlets: readback of its target, refusal of anything but one exact
+          # 'wslc start <name>' action, re-registration of the same name only, and a readback that must match.
+          $Wslc = $W
+          $Store = @{ Tasks = @(); Registered = @(); Ignore = $false }
+          function Get-ScheduledTask { $Store.Tasks }
+          function Register-ScheduledTask { param($TaskName, $Action, $Trigger, $Principal, $Settings, [switch] $Force)
+            $Store.Registered += $TaskName
+            if (-not $Store.Ignore) { $Store.Tasks = @([pscustomobject] @{ TaskName = $TaskName; Actions = @($Action) }) } }
+          function New-ScheduledTaskAction { param($Execute, $Argument) [pscustomobject] @{ Execute = $Execute; Arguments = $Argument } }
+          function New-ScheduledTaskTrigger { param([switch] $AtLogOn, $User) [pscustomobject] @{ Delay = $null } }
+          function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) 'principal' }
+          function New-ScheduledTaskSettingsSet { param([switch] $StartWhenAvailable, $RestartCount, $RestartInterval, $ExecutionTimeLimit,
+            $MultipleInstances, [switch] $AllowStartIfOnBatteries, [switch] $DontStopIfGoingOnBatteries) 'settings' }
+          function whoami { 'ci\user' }
+          if ($null -ne (Get-TaskTarget)) { 'an absent task read as present'; exit 1 }
+          Set-TaskTarget 'windows-rent'; if ((Get-TaskTarget) -cne 'windows-rent') { 'task not pointed at the kept rent'; exit 1 }
+          Set-TaskTarget 'windows-rent-cf'; if ((Get-TaskTarget) -cne 'windows-rent-cf') { 'task not handed to the candidate'; exit 1 }
+          if (@($Store.Registered | Sort-Object -Unique) -join ',' -cne 'windows-rent-oci-logon') { 'a second task name was registered'; exit 1 }
+          foreach ($Bad in @(@([pscustomobject] @{ Actions = @(@{ Execute = $W; Arguments = 'start windows-rent' }, @{ Execute = $W; Arguments = 'start x' }) }),
+              @([pscustomobject] @{ Actions = @(@{ Execute = 'C:\other.exe'; Arguments = 'start windows-rent' }) }),
+              @([pscustomobject] @{ Actions = @(@{ Execute = $W; Arguments = 'start windows-rent; stop x' }) }),
+              @([pscustomobject] @{ Actions = @(@{ Execute = $W; Arguments = 'start windows-rent' }) }, [pscustomobject] @{ Actions = @() }))) {
+            $Store.Tasks = $Bad; $Refused = $false
+            try { $null = Get-TaskTarget } catch { $Refused = $true }
+            if (-not $Refused) { 'an ambiguous logon task was interpreted'; exit 1 }
           }
-          # Replace after a successful stop, on a fake WSLC: every failure rolls back with only the recorded argv (never
-          # -f or -v), and Replace still fails, reporting both outcomes.
-          foreach ($N in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-              $n.Name -in 'Get-Container', 'Wait-RunningProof', 'Invoke-Rollback', 'Complete-Replace', 'Assert-NoOtherWriter', 'Invoke-Seed' }, $true)) {
-            . ([scriptblock]::Create($N.Extent.Text))
-          }
+          $Store.Tasks = @([pscustomobject] @{ Actions = @(@{ Execute = $W; Arguments = 'start windows-rent' }) }); $Store.Ignore = $true; $Refused = $false
+          try { Set-TaskTarget 'windows-rent-cf' } catch { $Refused = $_.Exception.Message -like "*starts 'windows-rent' after registration, not windows-rent-cf." }
+          if (-not $Refused) { 'a registration without matching readback passed'; exit 1 }
+          # From here the task is a fake too: every handoff is a recorded call, and named targets can be made to fail.
+          function Set-TaskTarget([string] $Name) { $Calls.Add("task -> $Name"); if ($Case.TaskFail -ccontains $Name) { throw "fake task failure for $Name" } }
+
+          # Stage and Revert on a fake WSLC. The candidate is removed only when it is a failed Stage's; the kept rent starts
+          # only after the candidate reads back provably stopped and the task points back at the kept rent; nothing is
+          # forced and no volume is touched.
           function Start-Sleep { }
-          $RunArgs = @($Plan.create | Select-Object -Skip 1)
-          $NewUp = '{"Name":"windows-rent","State":{"Running":true},"Config":{"Image":"' + $Image + '"},"Mounts":[]}'
-          $OldJson = $Cur | ConvertTo-Json -Compress
+          $StageArgs = @($Plan.stageRun | Select-Object -Skip 1)
           $Wslc = {
             $A = @($args) -join ' '
             $Calls.Add($A)
             $global:LASTEXITCODE = if ($Case.Exit -and $Case.Exit.ContainsKey($A)) { $Case.Exit[$A] } else { 0 }
-            if ($A -ceq 'inspect windows-rent') {
-              $Case.Seen++
-              $Out = & $Case.Inspect $Case.Seen
-              if ($null -eq $Out) { $global:LASTEXITCODE = 1 } else { $Out }
-            } elseif ($A -ceq 'logs windows-rent') { if ($Case.Logs) { $Case.Logs } else { $Proof } }
-            elseif ($A -ceq 'container list --all -q') { $Case.List }
-            elseif ($A -clike 'inspect *') { $Case.Other }
-            else { 'wslc output' }
+            $Out = switch -CaseSensitive ($A) {
+              'inspect windows-rent' { $Case.OldSeen++; & $Case.Old $Case.OldSeen }
+              'inspect windows-rent-cf' { $Case.CandSeen++; & $Case.Cand $Case.CandSeen }
+              'logs windows-rent-cf' { if ($Case.Logs) { $Case.Logs } else { @($Proof, $Ready) } }
+              'container list --all -q' { $Case.List }
+              'inspect other' { $Case.Other }
+              default { 'wslc output' }
+            }
+            if ($A -clike 'inspect *' -and $null -eq $Out) { $global:LASTEXITCODE = 1 } else { $Out }
           }
-          $R = $RunArgs -join ' '; $G = $Good -join ' '; $S = $SeedArgs -join ' '
-          # The seed runs after replaceStop and before replaceRemove, only when every container is provably stopped.
-          $Pre = @('container list --all -q', $S)
-          $Head = $Pre + @('remove windows-rent', 'volume inspect repos', 'volume inspect windows-rent-state', 'volume inspect windows-rent-nix', $R)
-          $Gate = @('inspect windows-rent', 'logs windows-rent')
-          $Clear = @('inspect windows-rent', 'stop windows-rent', 'remove windows-rent', $G)
-          $Restart = @('inspect windows-rent', 'start windows-rent')
-          $Recovery = [ordered]@{
-            'proven' = @{ Inspect = { $NewUp }; Want = 'ok'; Calls = $Head + $Gate }
-            'another container running' = @{ List = 'other'; Other = $OtherRunning | ConvertTo-Json -Compress; Inspect = { $OldJson }
-              Calls = @('container list --all -q', 'inspect other') + $Restart
-              Want = 'Replace failed: Container other is not provably stopped. Not seeding. | rollback succeeded: inspect: present, same image; start old exit 0' }
-            'container list fails' = @{ Exit = @{ 'container list --all -q' = 1 }; Inspect = { $OldJson }; Calls = @('container list --all -q') + $Restart
-              Want = 'Replace failed: Container list is unreadable; not seeding. | rollback succeeded: inspect: present, same image; start old exit 0' }
-            'seed fails' = @{ Exit = @{ $S = 1 }; Inspect = { $OldJson }; Calls = $Pre + $Restart
-              Want = 'Replace failed: WSLC seed failed: 1 | rollback succeeded: inspect: present, same image; start old exit 0' }
-            'remove fails' = @{ Exit = @{ 'remove windows-rent' = 1 }; Inspect = { $OldJson }; Calls = $Pre + @('remove windows-rent') + $Restart
-              Want = 'Replace failed: WSLC remove failed: 1 | rollback succeeded: inspect: present, same image; start old exit 0' }
-            'remove fails, name now other' = @{ Exit = @{ 'remove windows-rent' = 1 }; Inspect = { $NewUp }; Calls = $Pre + @('remove windows-rent', 'inspect windows-rent')
-              Want = 'Replace failed: WSLC remove failed: 1 | rollback FAILED: inspect: present, other image; not the old container; left untouched' }
-            'volume lost after remove' = @{ Exit = @{ 'volume inspect windows-rent-state' = 1 }; Inspect = { $null }; Calls = $Head[0..4] + @('inspect windows-rent', $G)
-              Want = 'Replace failed: Volume lost after remove: windows-rent-state | rollback succeeded: inspect: absent; recorded argv exit 0' }
-            'post-gate inspect throws' = @{ Inspect = { param($I) if ($I -eq 1) { '[{"Name":"a"},{"Name":"b"}]' } else { $NewUp } }; Calls = $Head + @('inspect windows-rent') + $Clear
-              Want = 'Replace failed: Expected one container named windows-rent. | rollback succeeded: inspect: present, other image; stop new exit 0; remove new exit 0; recorded argv exit 0' }
-            'run fails, rollback inspect throws' = @{ Exit = @{ $R = 1 }; Inspect = { 'not json' }; Calls = $Head + $Clear
-              Want = 'Replace failed: WSLC run failed: 1 | rollback succeeded: inspect: unknown (*); stop new exit 0; remove new exit 0; recorded argv exit 0' }
-            'unproven, rollback fails' = @{ Exit = @{ $G = 1 }; Inspect = { $NewUp }; Logs = 'x'; Calls = $Head + @(1..60 | ForEach-Object { $Gate }) + $Clear
-              Want = "Replace failed: New windows-rent did not show Running and '$Proof' within 60 s. | rollback FAILED: inspect: present, other image; stop new exit 0; remove new exit 0; recorded argv exit 1" }
+          $S = $SeedArgs -join ' '; $SA = $StageArgs -join ' '
+          $Pre = @('container list --all -q', $S, $SA)
+          $Pair = @('inspect windows-rent-cf', 'logs windows-rent-cf')
+          $Wait60 = @(1..60 | ForEach-Object { $Pair })
+          $Back = @('task -> windows-rent', 'start windows-rent', 'inspect windows-rent', 'inspect windows-rent', 'inspect windows-rent')
+          $NoBack = @('task -> windows-rent', 'start windows-rent') + @(1..60 | ForEach-Object { 'inspect windows-rent' })
+          $Ok = 'task starts windows-rent; start old exit 0; old Running on its images'
+          $NotOk = 'task starts windows-rent; start old exit 0; old not Running on its images within 60 s'
+          $Stopped = 'candidate provably stopped'
+          $Upto61 = { param($N) if ($N -le 61) { $CandUp } else { $CandDown } }
+          $Rejected = "windows-rent-cf did not stay Running with '$Proof' and '$Ready'."
+          function Assert-Case($K, $Got) {
+            if ($Got -cne $Case.Want -or ($Calls -join "`n") -cne ($Case.Calls -join "`n")) { "case '$K' gave: $Got"; $Calls; exit 1 }
+            if (@($Calls) -cmatch '(^| )(-f|-v|--force|--volumes)( |$)|^volume (remove|rm|prune)|^(remove|rm) windows-rent$') { "case '$K' forced, removed a volume or the kept rent"; exit 1 }
+            # Once the candidate may exist, the kept rent starts only after the task was pointed back at it.
+            $List = @($Calls); $Seen = $false; $AtOld = $true
+            foreach ($C in $List) {
+              if ($C -ceq $SA -or $C -ceq 'stop windows-rent-cf' -or $C -ceq 'task -> windows-rent-cf') { $Seen = $true; $AtOld = $false }
+              if ($C -ceq 'task -> windows-rent') { $AtOld = $true }
+              if ($C -ceq 'start windows-rent' -and $Seen -and -not $AtOld) { "case '$K' started the kept rent while the task could start the candidate"; exit 1 }
+            }
           }
-          foreach ($K in $Recovery.Keys) {
-            $Case = $Recovery[$K]; $Calls = [System.Collections.Generic.List[string]]::new()
-            $Got = try { Complete-Replace $Good $Cur; 'ok' } catch { $_.Exception.Message }
-            if ($Got -notlike $Case.Want -or ($Calls -join "`n") -cne ($Case.Calls -join "`n")) { "recovery '$K' gave: $Got"; $Calls; exit 1 }
-            if (@($Calls) -cmatch '(^| )(-f|-v|--force|--volumes)( |$)|^volume (remove|rm|prune)') { "recovery '$K' used a forbidden flag"; exit 1 }
+          $Cases = [ordered]@{
+            'ready' = @{ Old = { $OldUpJson }; Cand = { $CandUp }; Want = 'ok'; Calls = $Pre + @(1..10 | ForEach-Object { $Pair }) }
+            'another container running' = @{ List = 'other'; Other = $OtherRunning | ConvertTo-Json -Compress; Old = { $OldUpJson }; Cand = { $null }
+              Calls = @('container list --all -q', 'inspect other', 'inspect windows-rent-cf') + $Back
+              Want = "Stage failed: Container other is not provably stopped. Not seeding. | revert succeeded: $Ok" }
+            'seed fails' = @{ Exit = @{ $S = 1 }; Old = { $OldUpJson }; Cand = { $null }; Calls = @('container list --all -q', $S, 'inspect windows-rent-cf') + $Back
+              Want = "Stage failed: WSLC seed failed: 1 | revert succeeded: $Ok" }
+            'candidate run fails' = @{ Exit = @{ $SA = 1 }; Old = { $OldUpJson }; Cand = { $null }; Calls = $Pre + @('inspect windows-rent-cf') + $Back
+              Want = "Stage failed: WSLC run of windows-rent-cf failed: 1 | revert succeeded: $Ok" }
+            'tunnel rejected after ready lines' = @{ Old = { $OldUpJson }; Cand = { param($N) if ($N -le 3) { $CandUp } else { $CandDown } }
+              Calls = $Pre + @(1..4 | ForEach-Object { $Pair }) + @('inspect windows-rent-cf', 'inspect windows-rent-cf', 'remove windows-rent-cf') + $Back
+              Want = "Stage failed: $Rejected | revert succeeded: $Stopped; remove candidate exit 0; $Ok" }
+            'never ready' = @{ Old = { $OldUpJson }; Cand = $Upto61; Logs = @($Proof)
+              Calls = $Pre + $Wait60 + @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf', 'remove windows-rent-cf') + $Back
+              Want = "Stage failed: $Rejected | revert succeeded: stop candidate exit 0; $Stopped; remove candidate exit 0; $Ok" }
+            'stop exits 0 but the candidate keeps running' = @{ Old = { $OldUpJson }; Cand = { $CandUp }; Logs = @($Proof)
+              Calls = $Pre + $Wait60 + @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf')
+              Want = "Stage failed: $Rejected | revert FAILED: stop candidate exit 0; candidate not provably stopped" }
+            'kept rent does not come back' = @{ Exit = @{ $S = 1 }; Old = { $OldDownJson }; Cand = { $null }; Calls = @('container list --all -q', $S, 'inspect windows-rent-cf') + $NoBack
+              Want = "Stage failed: WSLC seed failed: 1 | revert FAILED: $NotOk" }
+            'kept rent back on other image' = @{ Exit = @{ $S = 1 }; Old = { $OldUpJson.Replace($Live, $Other) }; Cand = { $null }
+              Calls = @('container list --all -q', $S, 'inspect windows-rent-cf') + $NoBack
+              Want = "Stage failed: WSLC seed failed: 1 | revert FAILED: $NotOk" }
+            'candidate readback names another container' = @{ Old = { $OldUpJson }; Cand = { $CandUp.Replace('"Name":"windows-rent-cf"', '"Name":"windows-rent"') }
+              Calls = $Pre + @('inspect windows-rent-cf', 'inspect windows-rent-cf')
+              Want = 'Stage failed: Inspect of windows-rent-cf returned windows-rent. | revert FAILED: error: Inspect of windows-rent-cf returned windows-rent.' }
+            'kept rent readback names another container' = @{ Exit = @{ $S = 1 }; Old = { $OldUpJson.Replace('"Name":"windows-rent"', '"Name":"other"') }; Cand = { $null }
+              Calls = @('container list --all -q', $S, 'inspect windows-rent-cf', 'task -> windows-rent', 'start windows-rent', 'inspect windows-rent')
+              Want = 'Stage failed: WSLC seed failed: 1 | revert FAILED: task starts windows-rent; start old exit 0; error: Inspect of windows-rent returned other.' }
+            'failed candidate cannot be removed' = @{ Exit = @{ 'remove windows-rent-cf' = 1 }; Old = { $OldUpJson }; Cand = $Upto61; Logs = @($Proof)
+              Calls = $Pre + $Wait60 + @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf', 'remove windows-rent-cf')
+              Want = "Stage failed: $Rejected | revert FAILED: stop candidate exit 0; $Stopped; remove candidate exit 1" }
+            'task cannot be pointed back' = @{ Exit = @{ $S = 1 }; TaskFail = @('windows-rent'); Old = { $OldUpJson }; Cand = { $null }
+              Calls = @('container list --all -q', $S, 'inspect windows-rent-cf', 'task -> windows-rent')
+              Want = 'Stage failed: WSLC seed failed: 1 | revert FAILED: task not restored (fake task failure for windows-rent); not starting windows-rent' }
+          }
+          foreach ($K in $Cases.Keys) {
+            $Case = $Cases[$K]; $Calls = [System.Collections.Generic.List[string]]::new()
+            $Got = try { Complete-Stage $OldUp; 'ok' } catch { $_.Exception.Message }
+            Assert-Case $K $Got
+          }
+          # The handoff before the candidate exists: the task moves to the candidate while the kept rent still runs, before
+          # its stop; if anything fails before the candidate exists, the task goes back to the kept rent.
+          $Before = 'Stage failed before windows-rent-cf existed'
+          $Stages = [ordered]@{
+            'task handed over before the stop' = @{ Old = { $OldUpJson }; Cand = { $CandUp }; Want = 'ok'
+              Calls = @('task -> windows-rent-cf', 'stop windows-rent') + $Pre + @(1..10 | ForEach-Object { $Pair }) }
+            'task handoff fails' = @{ TaskFail = @('windows-rent-cf'); Old = { $OldUpJson }; Cand = { $null }
+              Calls = @('task -> windows-rent-cf', 'task -> windows-rent'); Want = "${Before}: fake task failure for windows-rent-cf | task starts windows-rent" }
+            'stop fails, kept rent still Running' = @{ Exit = @{ 'stop windows-rent' = 1 }; Old = { $OldUpJson }; Cand = { $null }
+              Calls = @('task -> windows-rent-cf', 'stop windows-rent', 'inspect windows-rent', 'task -> windows-rent')
+              Want = "${Before}: WSLC stop of windows-rent failed: 1; it is still Running; nothing else changed. | task starts windows-rent" }
+            'stop fails and the task cannot go back' = @{ Exit = @{ 'stop windows-rent' = 1 }; TaskFail = @('windows-rent'); Old = { $OldUpJson }; Cand = { $null }
+              Calls = @('task -> windows-rent-cf', 'stop windows-rent', 'inspect windows-rent', 'task -> windows-rent')
+              Want = "${Before}: WSLC stop of windows-rent failed: 1; it is still Running; nothing else changed. | task NOT restored: fake task failure for windows-rent" }
+          }
+          foreach ($K in $Stages.Keys) {
+            $Case = $Stages[$K]; $Calls = [System.Collections.Generic.List[string]]::new()
+            $Got = try { Invoke-Stage $OldUp; 'ok' } catch { $_.Exception.Message }
+            Assert-Case $K $Got
+          }
+          # The Revert step's path after a successful Stage: the candidate is stopped and kept, proven stopped by readback
+          # whatever stop returned, the task points back, and only then the kept rent comes back.
+          $Reverts = [ordered]@{
+            'revert keeps the candidate' = @{ Old = { $OldUpJson }; Cand = { param($N) if ($N -eq 1) { $CandUp } else { $CandDown } }
+              Want = "True | stop candidate exit 0; $Stopped; $Ok"; Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf') + $Back }
+            'revert, stop exits 0 but the candidate keeps running' = @{ Old = { $OldUpJson }; Cand = { $CandUp }
+              Want = 'False | stop candidate exit 0; candidate not provably stopped'; Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf') }
+            'revert, stop fails and the candidate still runs' = @{ Exit = @{ 'stop windows-rent-cf' = 1 }; Old = { $OldUpJson }; Cand = { $CandUp }
+              Want = 'False | stop candidate exit 1; candidate not provably stopped'; Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf') }
+            'revert, stop fails but the candidate stopped' = @{ Exit = @{ 'stop windows-rent-cf' = 1 }; Old = { $OldUpJson }
+              Cand = { param($N) if ($N -eq 1) { $CandUp } else { $CandDown } }
+              Want = "True | stop candidate exit 1; $Stopped; $Ok"; Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf') + $Back }
+            'revert, kept rent not Running' = @{ Old = { $OldDownJson }; Cand = { param($N) if ($N -eq 1) { $CandUp } else { $CandDown } }
+              Want = "False | stop candidate exit 0; $Stopped; $NotOk"; Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf') + $NoBack }
+            'revert, task cannot be pointed back' = @{ TaskFail = @('windows-rent'); Old = { $OldUpJson }; Cand = { param($N) if ($N -eq 1) { $CandUp } else { $CandDown } }
+              Want = "False | stop candidate exit 0; $Stopped; task not restored (fake task failure for windows-rent); not starting windows-rent"
+              Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf', 'task -> windows-rent') }
+          }
+          foreach ($K in $Reverts.Keys) {
+            $Case = $Reverts[$K]; $Calls = [System.Collections.Generic.List[string]]::new(); $Steps = [System.Collections.Generic.List[string]]::new()
+            $Result = Invoke-Revert $OldUp $Steps $false
+            Assert-Case $K "$Result | $($Steps -join '; ')"
+          }
+          # Stopping the kept rent for Stage: a nonzero exit is judged by readback; the kept rent is started again only
+          # when provably stopped with no other writer, and never when its state is unknown.
+          $Stop = 'WSLC stop of windows-rent failed: 1'
+          $Stops = [ordered]@{
+            'stop succeeds' = @{ Old = { $OldUpJson }; Want = 'ok'; Calls = @('stop windows-rent') }
+            'stop fails, still Running' = @{ Exit = @{ 'stop windows-rent' = 1 }; Old = { $OldUpJson }
+              Want = "$Stop; it is still Running; nothing else changed."; Calls = @('stop windows-rent', 'inspect windows-rent') }
+            'stop fails but it stopped' = @{ Exit = @{ 'stop windows-rent' = 1 }; Old = { param($N) if ($N -eq 1) { $OldDownJson } else { $OldUpJson } }
+              Want = "$Stop but it stopped | restore succeeded: start old exit 0"
+              Calls = @('stop windows-rent', 'inspect windows-rent', 'container list --all -q', 'start windows-rent', 'inspect windows-rent', 'inspect windows-rent', 'inspect windows-rent') }
+            'stop fails, stopped, another writer running' = @{ Exit = @{ 'stop windows-rent' = 1 }; Old = { $OldDownJson }; List = 'other'; Other = $OtherRunning | ConvertTo-Json -Compress
+              Want = "$Stop but it stopped | restore FAILED: error: Container other is not provably stopped. Not restoring."
+              Calls = @('stop windows-rent', 'inspect windows-rent', 'container list --all -q', 'inspect other') }
+            'stop fails, state unknown' = @{ Exit = @{ 'stop windows-rent' = 1 }; Old = { '{"Name":"windows-rent","State":{"Running":"unknown"}}' }
+              Want = "$Stop; its state is unknown; not starting anything."; Calls = @('stop windows-rent', 'inspect windows-rent') }
+            'stop fails, readback names another container' = @{ Exit = @{ 'stop windows-rent' = 1 }; Old = { $OldDownJson.Replace('"Name":"windows-rent"', '"Name":"other"') }
+              Want = "$Stop; readback failed (Inspect of windows-rent returned other.); not starting anything."; Calls = @('stop windows-rent', 'inspect windows-rent') }
+          }
+          foreach ($K in $Stops.Keys) {
+            $Case = $Stops[$K]; $Calls = [System.Collections.Generic.List[string]]::new()
+            $Got = try { Invoke-StageStop $OldUp; 'ok' } catch { $_.Exception.Message }
+            Assert-Case $K $Got
           }
           # The fake's last exit code must not become this step's exit code.
           $global:LASTEXITCODE = 0
       - uses: cachix/install-nix-action@v31
       - name: Build from locked Nix inputs
-        run: nix build .#rent-image .#rent-image-next --no-write-lock-file --print-build-logs
+        run: |
+          set -euo pipefail
+          # result: the published image; result-1: its CI-only tunnel-stub twin; result-2: the stub twin plus one package.
+          nix build .#rent-image .#rent-image-stub .#rent-image-next --no-write-lock-file --print-build-logs
+          test -e result && test -e result-1 && test -e result-2
       - name: Load and test tools, mounts, state, restart, and recreate
         shell: bash
         run: |
-          set -euo pipefail
-          image=ghcr.io/roccho-dev/windows-rent:nix
+          set -Eeuo pipefail
+          # Name the failing line and command text (unexpanded, so no variable value such as the token is printed).
+          trap 'echo "rent smoke: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
+          # The stub image is the published definition with a CI-only tunnel stand-in (same argv, no Cloudflare); the
+          # published image itself is exercised below for everything the stub replaces.
+          image=ghcr.io/roccho-dev/windows-rent:stub
+          real=ghcr.io/roccho-dev/windows-rent:nix
           docker load < result
+          docker load < result-1
           key_dir="$(mktemp -d)"
-          trap 'status=$?; [ "$status" -eq 0 ] || docker logs rent-smoke 2>&1 | tail -n 40 || true; docker rm -f rent-smoke rent-refuse >/dev/null 2>&1 || true; docker volume rm rent-smoke-repos rent-smoke-state rent-smoke-nix rent-smoke-home rent-smoke-old rent-smoke-import >/dev/null 2>&1 || true; rm -rf "$key_dir"' EXIT
+          trap 'status=$?; [ "$status" -eq 0 ] || { docker logs rent-smoke 2>&1 | tail -n 40; docker logs rent-cand 2>&1 | tail -n 40; } || true; docker rm -f rent-smoke rent-refuse rent-cand >/dev/null 2>&1 || true; docker volume rm rent-smoke-repos rent-smoke-state rent-smoke-nix rent-smoke-home rent-smoke-old rent-smoke-import >/dev/null 2>&1 || true; rm -rf "$key_dir"' EXIT
           test "$(docker image inspect --format '{{json .Config.Volumes}}' "$image")" = null
+          test "$(docker image inspect --format '{{json .Config.Volumes}}' "$real")" = null
+          # The stub image differs from the published one only in the cloudflared store path rent-start runs.
+          start_text() { docker run --rm "$1" /bin/cat /bin/rent-start | sed -E 's#/nix/store/[a-z0-9]{32}-cloudflared[^/]*/bin/cloudflared#CLOUDFLARED#g'; }
+          start_text "$real" > "$key_dir/start-real"
+          start_text "$image" > "$key_dir/start-stub"
+          diff "$key_dir/start-real" "$key_dir/start-stub"
+          grep -qF 'CLOUDFLARED tunnel --no-autoupdate run --token-file "$token"' "$key_dir/start-real"
+          # Published image: pinned cloudflared that reads the token by file, and no Tailscale in its runtime closure.
+          # Outputs go to files first: a grep -q that stops reading early must not fail its writer under pipefail.
+          cf=$(docker run --rm "$real" /bin/grep -oE -m1 '/nix/store/[a-z0-9]{32}-cloudflared-[^/]+/bin/cloudflared' /bin/rent-start)
+          docker run --rm "$real" "$cf" --version > "$key_dir/cf-version" 2>&1
+          grep -qE '^cloudflared version 2026\.6\.1( |$)' "$key_dir/cf-version" || { cat "$key_dir/cf-version" >&2; exit 1; }
+          docker run --rm "$real" "$cf" tunnel run --help > "$key_dir/cf-help" 2>&1
+          grep -qF -- '--token-file' "$key_dir/cf-help" || { cat "$key_dir/cf-help" >&2; exit 1; }
+          nix-store -qR "$(docker run --rm "$real" /bin/readlink /etc/rent-nix-roots)" > "$key_dir/closure"
+          # nix-store -qR lists store paths, so the exact cloudflared package path (not its executable) must be one line.
+          grep -qxF "${cf%/bin/cloudflared}" "$key_dir/closure" || { echo "cloudflared package ${cf%/bin/cloudflared} not in the runtime closure" >&2; exit 1; }
+          if grep -qi tailscale "$key_dir/closure"; then echo 'tailscale in the runtime closure' >&2; exit 1; fi
+          if docker run --rm "$real" /bin/grep -qi tailscale /bin/rent-start; then echo 'rent-start mentions tailscale' >&2; exit 1; fi
+          # A synthetic token: random, so any appearance in output is a leak. It proves nothing about Cloudflare.
+          tok="ci-synthetic-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          # slot VOLUME MODE OWNER CONTENT-COMMAND: (re)place the token slot as envs would, through a one-shot container.
+          slot() {
+            docker run --rm -v "$1:/s" -e "TOK=$tok" "$image" /bin/bash -c "set -eu
+              rm -rf /s/cloudflared/token; install -d -m 700 -o 0 -g 0 /s/cloudflared; $4
+              if [ -e /s/cloudflared/token ] && [ ! -L /s/cloudflared/token ]; then chmod $2 /s/cloudflared/token; chown $3 /s/cloudflared/token; fi"
+          }
           ssh-keygen -q -t ed25519 -N '' -f "$key_dir/key"
           docker volume create rent-smoke-repos
           docker volume create rent-smoke-state
@@ -223,7 +377,7 @@ jobs:
           ids=(-e RENT_REPOS_VOLUME=rent-smoke-repos -e RENT_STATE_VOLUME=rent-smoke-state -e RENT_NIX_VOLUME=rent-smoke-nix)
           # volume-nocopy: Docker's copy into an empty volume must never stand in for seeding.
           nixm=(--mount type=volume,source=rent-smoke-nix,target=/nix,volume-nocopy)
-          env_args=(-e "RENT_AUTHORIZED_KEY=$(cat "$key_dir/key.pub")" -e RENT_TS_HOSTNAME=rent-ci-smoke)
+          env_args=(-e "RENT_AUTHORIZED_KEY=$(cat "$key_dir/key.pub")")
           proof='rent-mounts ok repos=rent-smoke-repos state=rent-smoke-state nix=rent-smoke-nix'
 
           # Fail closed before any service: exactly the named repos, state and nix volumes, rw, nothing else, no /home/dev mount.
@@ -310,8 +464,29 @@ jobs:
             docker run -d --name rent-smoke -p 127.0.0.1:2222:2222 \
               -v rent-smoke-repos:/work/repos -v rent-smoke-state:/var/lib/rent "${nixm[@]}" "${ids[@]}" "$@" "$image"
           }
-          # The one fixed proof line, from rent-start itself, once per start.
-          proven() { test "$(docker logs rent-smoke 2>&1 | grep -cxF "$proof")" = "$1"; }
+          # The fixed proof lines, from rent-start itself, once per start.
+          proven() {
+            docker logs rent-smoke > "$key_dir/logs" 2>&1
+            test "$(grep -cxF "$proof" "$key_dir/logs")" = "$1"
+            test "$(grep -cxF 'rent-transport ok token-file=/var/lib/rent/cloudflared/token' "$key_dir/logs")" = "$1"
+            test "$(grep -cxF 'rent-start ok services=nix-daemon,cloudflared,sshd' "$key_dir/logs")" = "$1"
+          }
+          # The stub runs under exactly the argv rent-start gives cloudflared; the token is in no argv, environment or log.
+          tunnel_up() {
+            for attempt in {1..30}; do
+              if docker exec rent-smoke /bin/bash -c 'for p in /proc/[0-9]*; do tr "\0" " " < $p/cmdline; echo; done' > "$key_dir/cmdlines" 2>/dev/null &&
+                grep -qE '/bin/cloudflared tunnel --no-autoupdate run --token-file /var/lib/rent/cloudflared/token $' "$key_dir/cmdlines"; then break; fi
+              sleep 1
+            done
+            grep -qE '/bin/cloudflared tunnel --no-autoupdate run --token-file /var/lib/rent/cloudflared/token $' "$key_dir/cmdlines"
+            docker exec rent-smoke /bin/bash -c 'cat /proc/[0-9]*/environ /proc/[0-9]*/cmdline 2>/dev/null' > "$key_dir/procs" || true
+            { docker logs rent-smoke 2>&1; docker inspect rent-smoke; cat "$key_dir/procs"; } > "$key_dir/visible"
+            if grep -qF "$tok" "$key_dir/visible"; then echo 'token visible outside its file' >&2; exit 1; fi
+            if docker exec rent-smoke /bin/bash -c 'test -e /bin/tailscale || test -e /bin/tailscaled || test -e /var/lib/rent/tailscale'; then
+              echo 'tailscale present' >&2; exit 1
+            fi
+          }
+          slot rent-smoke-state 600 0:0 'printf "%s\n" "$TOK" > /s/cloudflared/token'
           run "${env_args[@]}"
           for attempt in {1..30}; do
             if docker exec rent-smoke /bin/cat /var/lib/rent/ssh/ssh_host_ed25519_key.pub > "$key_dir/host.pub" 2>/dev/null; then break; fi
@@ -330,23 +505,6 @@ jobs:
             done
             test "$(cat "$key_dir/answer")" = dev
           }
-          # Userspace tailscaled without auth: NeedsLogin, with up --ssh --hostname applied and a machine key in state.
-          ts_ready() {
-            for attempt in {1..60}; do
-              docker exec rent-smoke /bin/tailscale status --json > "$key_dir/ts.json" 2>/dev/null || true
-              docker exec rent-smoke /bin/tailscale debug prefs > "$key_dir/prefs.json" 2>/dev/null || true
-              docker exec rent-smoke /bin/cat /var/lib/rent/tailscale/tailscaled.state > "$key_dir/ts.state" 2>/dev/null || true
-              if jq -e '.BackendState == "NeedsLogin"' "$key_dir/ts.json" >/dev/null 2>&1 &&
-                jq -e '.RunSSH == true and .WantRunning == true and .Hostname == "rent-ci-smoke"' "$key_dir/prefs.json" >/dev/null 2>&1 &&
-                jq -e 'has("_machinekey")' "$key_dir/ts.state" >/dev/null 2>&1; then
-                return 0
-              fi
-              sleep 1
-            done
-            jq -c '{BackendState}' "$key_dir/ts.json" >&2 || true
-            return 1
-          }
-          machine_key_hash() { jq -r ._machinekey "$key_dir/ts.state" | sha256sum | cut -d' ' -f1; }
           repos_untouched() {
             docker exec rent-smoke /bin/cat /proc/1/mountinfo > "$key_dir/mountinfo"
             awk '$5 == "/work/repos" { r++ } $5 == "/var/lib/rent" { s++ } $5 == "/nix" { n++ } $5 == "/home/dev" { h++ }
@@ -373,13 +531,12 @@ jobs:
           "${ssh_cmd[@]}" gh --version > "$key_dir/gh"
           grep -qE '^gh version 2\.96\.0( |$)' "$key_dir/gh"
           test "$("${ssh_cmd[@]}" codex --version)" = 'codex-cli 0.157.1'
-          "${ssh_cmd[@]}" tailscale version > "$key_dir/tailscale"
-          grep -qE '^1\.98\.[0-9]+$' "$key_dir/tailscale"
+          if "${ssh_cmd[@]}" 'command -v tailscale || command -v tailscaled'; then echo 'tailscale reachable to dev' >&2; exit 1; fi
           test "$("${ssh_cmd[@]}" claude --version)" = '2.1.283 (Claude Code)'
-          docker exec rent-smoke /bin/stat -c '%a %u %n' /home/dev /var/lib/rent/tailscale /var/lib/rent/ssh \
+          docker exec rent-smoke /bin/stat -c '%a %u %n' /home/dev /var/lib/rent/cloudflared /var/lib/rent/cloudflared/token /var/lib/rent/ssh \
             /var/lib/rent/ssh/ssh_host_ed25519_key /var/lib/rent/ssh/authorized_keys \
             /var/lib/rent/dev/codex /var/lib/rent/dev/gh /var/lib/rent/dev/claude /var/lib/rent/dev/claude.json > "$key_dir/modes"
-          printf '%s\n' '700 1000 /home/dev' '700 0 /var/lib/rent/tailscale' '755 0 /var/lib/rent/ssh' \
+          printf '%s\n' '700 1000 /home/dev' '700 0 /var/lib/rent/cloudflared' '600 0 /var/lib/rent/cloudflared/token' '755 0 /var/lib/rent/ssh' \
             '600 0 /var/lib/rent/ssh/ssh_host_ed25519_key' '644 0 /var/lib/rent/ssh/authorized_keys' \
             '700 1000 /var/lib/rent/dev/codex' '700 1000 /var/lib/rent/dev/gh' \
             '700 1000 /var/lib/rent/dev/claude' '600 1000 /var/lib/rent/dev/claude.json' | diff - "$key_dir/modes"
@@ -395,8 +552,7 @@ jobs:
           test "$(docker exec rent-smoke /bin/stat -c %s /var/lib/rent/dev/claude.json)" -gt 3
           claude_config() { docker exec rent-smoke /bin/sha256sum /var/lib/rent/dev/claude.json | cut -d' ' -f1; }
           config="$(claude_config)"
-          ts_ready
-          machine="$(machine_key_hash)"
+          tunnel_up
           "${ssh_cmd[@]}" 'echo codex > ~/.codex/ci-marker && echo claude > ~/.claude/ci-marker && echo home > ~/home-marker'
           markers='test "$(cat ~/.codex/ci-marker)" = codex && test "$(cat ~/.claude/ci-marker)" = claude'
 
@@ -410,25 +566,69 @@ jobs:
           proven 2
           "${ssh_cmd[@]}" "$markers"' && test "$(cat ~/home-marker)" = home'
           test "$(claude_config)" = "$config"
-          ts_ready
-          test "$(machine_key_hash)" = "$machine"
+          tunnel_up
           repos_untouched
 
           # Recreate on the same volumes without the key env: state and host key remain, the plain home does not.
           docker stop -t 30 rent-smoke
           docker rm rent-smoke
-          run -e RENT_TS_HOSTNAME=rent-ci-smoke
+          run
           ssh_ready
           proven 1
           "${ssh_cmd[@]}" "$markers"' && test ! -e ~/home-marker'
           test "$(claude_config)" = "$config"
-          ts_ready
-          test "$(machine_key_hash)" = "$machine"
+          tunnel_up
           repos_untouched
+
+          # A failed switch as Stage meets it: the kept rent stops (kept, not removed), the candidate (the published image,
+          # whose real cloudflared rejects the synthetic token) passes every local gate and then stops, and the kept rent
+          # comes back with its state. This is not Cloudflare evidence: no connection is ever authenticated here.
+          docker stop -t 30 rent-smoke
+          docker run --rm -v rent-smoke-nix:/seed -e RENT_NIX_VOLUME=rent-smoke-nix "$real" /bin/rent-nix-seed
+          docker run -d --name rent-cand -p 127.0.0.1:2222:2222 -v rent-smoke-repos:/work/repos -v rent-smoke-state:/var/lib/rent \
+            "${nixm[@]}" "${ids[@]}" "$real" > /dev/null
+          for attempt in {1..120}; do
+            test "$(docker inspect --format '{{.State.Running}}' rent-cand)" = false && break
+            sleep 1
+          done
+          test "$(docker inspect --format '{{.State.Running}}' rent-cand)" = false
+          docker logs rent-cand > "$key_dir/cand" 2>&1
+          grep -qxF 'rent-transport ok token-file=/var/lib/rent/cloudflared/token' "$key_dir/cand"
+          grep -qxF 'rent-start ok services=nix-daemon,cloudflared,sshd' "$key_dir/cand"
+          grep -qF 'rent-start: nix-daemon, cloudflared or sshd exited' "$key_dir/cand"
+          { cat "$key_dir/cand"; docker inspect rent-cand; } > "$key_dir/cand-visible"
+          if grep -qF "$tok" "$key_dir/cand-visible"; then echo 'token visible from the rejected candidate' >&2; exit 1; fi
+          docker rm rent-cand > /dev/null
+          docker start rent-smoke
+          ssh_ready
+          "${ssh_cmd[@]}" "$markers"
+          test "$(claude_config)" = "$config"
+          tunnel_up
+          repos_untouched
+          docker stop -t 30 rent-smoke
+
+          # Token gate on the published image: a missing or wrong slot starts no service and prints no token.
+          gate() {
+            local want=$1; shift
+            slot rent-smoke-state "$@"
+            if timeout 60 docker run --rm --name rent-refuse -v rent-smoke-repos:/work/repos -v rent-smoke-state:/var/lib/rent \
+              "${nixm[@]}" "${ids[@]}" "$real" > "$key_dir/gate" 2>&1; then echo "started despite: $want" >&2; exit 1; fi
+            grep -qF "rent-transport: token file /var/lib/rent/cloudflared/token $want; not starting" "$key_dir/gate" || { cat "$key_dir/gate" >&2; exit 1; }
+            if grep -qE 'rent-transport ok|rent-start ok|tunnel|sshd' "$key_dir/gate"; then echo "a service started despite: $want" >&2; exit 1; fi
+            if grep -qF "$tok" "$key_dir/gate"; then echo "token printed for: $want" >&2; exit 1; fi
+          }
+          gate 'is missing' 600 0:0 ':'
+          gate 'must be a regular file' 600 0:0 'ln -s /etc/hostname /s/cloudflared/token'
+          gate 'must be a regular file' 600 0:0 'mkdir /s/cloudflared/token'
+          gate 'must be owned 0:0 with mode 600' 644 0:0 'printf "%s\n" "$TOK" > /s/cloudflared/token'
+          gate 'must be owned 0:0 with mode 600' 600 1000:1000 'printf "%s\n" "$TOK" > /s/cloudflared/token'
+          gate 'must hold 1 to 4096 bytes' 600 0:0 ': > /s/cloudflared/token'
+          gate 'must hold 1 to 4096 bytes' 600 0:0 'head -c 4097 /dev/zero | tr "\0" x > /s/cloudflared/token'
+          gate 'is blank' 600 0:0 'printf "  \n\t\n" > /s/cloudflared/token'
       - name: Prove rent development continues across seed, upgrade, replacement, GC and rollback
         run: |
           set -euo pipefail
-          bash hosts/rent/proof.sh result result-1 2>&1 | tee rent-proof.log
+          bash hosts/rent/proof.sh result-1 result-2 2>&1 | tee rent-proof.log
           grep -E '^(image |image-next |repo revision |PASS )' rent-proof.log >> "$GITHUB_STEP_SUMMARY"
       - name: Publish exact image from this repository
         if: inputs.publish

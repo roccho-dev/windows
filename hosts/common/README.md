@@ -166,6 +166,29 @@ acceptance, not to this handoff verdict.
 Chromium does not update itself. Refresh the pinned version in `nix.nix`, build
 and prove a new release in CI, then reapply it to receive updates.
 
+### Rent SSH client (#14)
+
+The ZIP also carries the official `cloudflared-windows-amd64.exe` of exactly the
+version the rent image runs, pinned by SHA-256 in `nix.nix`. `Restore` does not
+install it and never touches SSH configuration. The explicit mode does, with the
+live binding that exists only after envs creates the Access hostname and the
+rent first generates its host key:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RentSsh `
+  -Hostname <Access hostname> -HostKey '<ssh-ed25519 key from the rent state volume>' -Identity <private key path>
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RentSshTest <same arguments>  # fail on drift
+```
+
+It installs the client under `LocalAppData\Programs\cloudflared-<version>`,
+writes `%USERPROFILE%\.ssh\windows-rent\{config,known_hosts}` (host `windows-rent`,
+`ProxyCommand ... access ssh`, `HostKeyAlias`, `StrictHostKeyChecking yes`), and
+makes `Include windows-rent/config` the first line of `%USERPROFILE%\.ssh\config`
+so Windows OpenSSH and Codex Remote SSH resolve the alias. The prior bytes of that
+file stay below the line and are kept once as `config.before-windows-rent`; it
+refuses a byte-order mark, an Include elsewhere, or an existing backup. Access
+credentials are never written here.
+
 `Apply` and `Test` retain their font-only meaning for the CI proof. They own
 selected content-addressed TTF files beneath the current user's
 `LocalApplicationData\Microsoft\Windows\Fonts` and corresponding HKCU font

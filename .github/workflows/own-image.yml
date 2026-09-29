@@ -36,13 +36,6 @@ jobs:
           printf 'source %s\ndrvPath %s\nworkflow blob %s\n' "$sha" "$drv" "$(git rev-parse HEAD:.github/workflows/own-image.yml)" >> "$GITHUB_STEP_SUMMARY"
       - name: Evaluate flake checks
         run: nix flake check --no-write-lock-file --print-build-logs
-      - name: rent is unchanged by own adoption (same drvPaths as the #19 head)
-        run: |
-          set -euo pipefail
-          base=github:roccho-dev/windows/21b31e13381e3022797a40471ee7867ed0680c4d
-          for p in rent-image rent-image-next; do
-            test "$(nix eval --raw ".#$p.drvPath" --no-write-lock-file)" = "$(nix eval --raw "$base#$p.drvPath")"
-          done
       - name: Plan and fake-WSLC Replace of the own Windows script (no WSLC, no live effect)
         shell: pwsh
         run: |
