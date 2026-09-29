@@ -47,7 +47,6 @@ let
       fontFamily = "PlemolJP Console NF";
     };
     packages = [
-      { name = "Windows Terminal"; id = "Microsoft.WindowsTerminal"; version = "1.24.11911.0"; }
       { name = "Chromium"; id = "Hibbiki.Chromium"; version = "154.0.8037.58"; }
       { name = "AutoHotkey"; id = "AutoHotkey.AutoHotkey"; version = "2.0.28"; }
     ];

@@ -27,29 +27,75 @@ trusted successful CI/release, extract into a fresh directory, then run:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Validate     # read-only
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Restore      # fonts, Noctty, and three packages
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Restore      # fonts, Noctty, and two packages
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RestoreTest  # fail on drift
 ```
 
 `Restore` converges the selected fonts, the pinned noctty portable ZIP and its
 `font-family = PlemolJP Console NF` configuration, and the pinned WinGet package
-IDs/versions for Windows Terminal, Chromium and AutoHotkey through native DSC resources. The
+IDs/versions for Chromium and AutoHotkey. The
 selected Chromium WinGet manifest offers a current-user installer. The machine
-needs a network connection and a working WinGet source for those three packages;
-they are not redistributed in the ZIP. Noctty is included because its WinGet
+needs a network connection and a working WinGet source for those two packages;
+they are not redistributed in the ZIP. Windows Terminal is OS/Store-owned and is
+not installed or pinned: `Restore` and `RestoreTest` only assert version 1.24 or
+newer, because its OpenConsole is Noctty's console half. Noctty is included because its WinGet
 package is not published. The release ZIP can be downloaded again after a clean install; Nix
 is only needed to build it, not to apply it.
 
 After installing the dependencies, `Restore` selects the Windows Terminal 1.24+
 OpenConsole console delegate and calls Noctty's `+register-default-terminal` for
-the current user. `RestoreTest` checks the selected delegate, Noctty's COM
-registration, proxy DLL mappings and actual COM activation. A failed activation
-restores the previous delegate selection and fails `Restore`. A successful check
-is still not proof that every newly launched console appears in Noctty; verify
-that behavior on the target host. Windows Terminal remains installed
+the current user. `Restore` then checks the registration and one COM activation;
+a failure restores the previous delegate selection and fails `Restore`.
+`RestoreTest` checks only registry state (delegate pair, COM class and proxy DLL
+mappings) for the default terminal; it does not launch a console or the Noctty
+COM server, though it still runs the DSC and WinGet resource tests. Every mode reports `registrationState`
+(`registered` or `unregistered`) and `handoffProof = "unproven"`:
+registration and COM activation are not evidence that a new console opens in
+Noctty, and `inDesiredState` never includes handoff. Windows Terminal remains installed
 as the OpenConsole dependency; removing it would break this default-terminal
 handoff. The generated state is reapplied after a clean install rather than
 backing up old registry data.
+
+Before its first change to `HKCU\Console\%%Startup`, `Restore` writes the prior
+`DelegationConsole`/`DelegationTerminal` values once to
+`LocalApplicationData\windows-iac\provenance\default-terminal.json`. The record
+is never replaced; an unreadable record fails `Restore`, and
+`priorSelectsNoctty = true` marks a record taken when Noctty was already
+selected, whose true original is unknown. **Rollback from this record is not
+implemented yet**: no mode reads it, and Noctty's `+unregister-default-terminal`
+effect on COM/Interface keys is unverified. Until then, restore the recorded
+pair by hand and keep the record.
+
+### Default-terminal handoff proof (host only)
+
+`handoff-proof.ps1` is the only producer of `handoffProof = "proven"`. It
+refuses to run on CI runners or elevated, never changes the registration, and
+writes each evidence file once, refusing to overwrite it. Launch no other
+console during a trace. Its verdict rule lives in `handoff-evaluate.ps1`, which
+has no effects; `proof.ps1` checks each verdict there with synthetic evidence,
+and those synthetic cases are not an observed handoff.
+
+```powershell
+# elevated shell: record the console host provider
+logman start noctty-handoff -p "{fe1ff234-1f09-50a8-d38d-c44fab43e818}" 0xffffffffffffffff 5 -o "$env:TEMP\noctty-handoff.etl" -ets
+# unelevated shell: RestoreTest, then one probe console (or -Launcher Manual for Win+R)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\handoff-proof.ps1 -Phase Probe -Launcher ShellExecute
+# elevated shell
+logman stop noctty-handoff -ets
+# unelevated shell: combine the probe record with the stopped trace
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\handoff-proof.ps1 -Phase Finalize -Evidence <probe.json> -TraceFile "$env:TEMP\noctty-handoff.etl"
+```
+
+The probe starts `cmd.exe` titled with a random nonce and records which process
+owns the window carrying that title, and any new `WindowsTerminal.exe` host.
+`Finalize` decodes the stopped trace with `tracerpt` and reads the single
+`SrvInit_ReceiveHandoff` `TerminalClsid` in the probe's time window. The result
+is `proven` only when the window belongs to this distribution's portable
+`noctty.exe`, no new Windows Terminal host started, and that CLSID is Noctty's
+`{33368C6F-D328-410C-B225-26DC9F12C728}`. Contrary evidence is `failed`; missing
+or ambiguous evidence (no window, no or several events, untraceable provider) is
+`unproven`. Acceptance repeats this three times each with `ShellExecute` and
+`Manual` (Win+R), and again after a coordinated reboot.
 
 Chromium does not update itself. Refresh the pinned version in `nix.nix`, build
 and prove a new release in CI, then reapply it to receive updates.
@@ -61,7 +107,10 @@ registrations. `Restore` also writes the selected noctty configuration and
 default-terminal registration, but
 does not replace Windows-owned UI fonts or restore old registry settings,
 accounts, profiles, or personal app data. The user directory is a runtime Binding, not common Spec.
-DSC discovery is confined to the bundled backend for each invocation.
+Each invocation puts the bundled backend first on `PATH` and in
+`DSC_RESOURCE_PATH`, but discovery is not confined to the bundle: the
+`Microsoft.WinGet/Package` resource is not bundled and is resolved from the
+machine's App Installer/WinGet installation.
 
 The ZIP checksum binds transported bytes. The embedded inventory detects
 post-extraction corruption, not publisher authenticity. The manifest records
@@ -88,11 +137,15 @@ fixtures. It is not native Windows evidence.
 exact source identity, repairs damaged bytes seeded before registration,
 applies twice with zero changes on the second apply, independently reads actual
 registry values, rejects and repairs registry drift, and rejects package
-corruption. Negative controls must fail for their expected reason.
+corruption. It also requires every `win.ps1` answer to report
+`handoffProof = "unproven"` and `handoff-proof.ps1` to refuse the runner, so CI
+never claims a real default-terminal handoff. Negative controls must fail for
+their expected reason.
 
 The workflow builds, transports, invokes target-owned proof, and gates release.
-Actions are commit-pinned. Windows proof and main-only publication consume the
-same artifact ID and ZIP checksum; publication never rebuilds. PRs cannot publish.
+Actions are commit-pinned. Windows proof and publication, which runs only for
+pushes to the trusted default branch `proposals`, consume the same artifact ID
+and ZIP checksum; publication never rebuilds. PRs cannot publish.
 
 ## Remaining acceptance
 
@@ -100,6 +153,9 @@ This is **not the whole of #7**. Existing own/rent image workflows remain; their
 proven target-owned smoke tests and publication still need composition into the
 final single `ci.yml` with the open OCI stack. Do not discard existing proof to
 claim one workflow prematurely. Existing OCI definitions and #8 are unchanged.
+
+`%LOCALAPPDATA%\windows-iac\provenance\default-terminal.json` is new per-user
+state written by `Restore`; no current uninstall or rollback path removes it.
 
 Application/UI selection beyond noctty, Japanese/Nerd/Emoji rendering,
 font reload/relogin, Linux profile activation, and real-host

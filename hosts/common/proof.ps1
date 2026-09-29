@@ -19,6 +19,54 @@ function MustReject([scriptblock]$Action, [string]$Pattern) {
 }
 $validated = Run 'Validate'
 if ($validated.source -ne $ExpectedSource -or $ExpectedSource -notmatch '^[0-9a-f]{40}$') { throw 'Source mismatch.' }
+# No win.ps1 mode may claim a real default-terminal handoff, and the host-only
+# handoff proof must refuse to run on a runner.
+function MustNotClaimHandoff($Answer) {
+    if ($Answer.handoffProof -ne 'unproven' -or $Answer.registrationState -notin @('registered', 'unregistered')) {
+        throw 'win.ps1 claimed or omitted default-terminal handoff state.'
+    }
+}
+MustNotClaimHandoff $validated
+MustReject { & (Join-Path $PSScriptRoot 'handoff-proof.ps1') -Phase Probe } 'Handoff proof is host-only*'
+
+# The handoff evaluator is pure, so synthetic evidence exercises each verdict.
+# A synthetic 'proven' tests the rule only; it is not an observed handoff.
+. (Join-Path $PSScriptRoot 'handoff-evaluate.ps1')
+$noctty = '{33368C6F-D328-410C-B225-26DC9F12C728}'
+$terminal = '{E12CFF52-A866-4C77-9A90-F570A7AA2C6B}'
+$start = [DateTime]::UtcNow
+$at = $start.AddSeconds(3)
+$handoffCases = 0
+function ProbeRecord([hashtable]$Change = @{}) {
+    $record = [ordered]@{ startedUtc = $start.ToString('o'); endedUtc = $start.AddSeconds(10).ToString('o')
+        registrationState = 'registered'; windowOwnedByNoctty = $true; newTerminalHosts = @()
+        failures = @(); handoffProof = 'unproven' }
+    foreach ($key in $Change.Keys) { $record[$key] = $Change[$key] }
+    [pscustomobject]$record
+}
+function Row([string]$Name, [DateTime]$Time, [string]$Clsid, [string]$Stamp) {
+    # tracerpt-style XML; ETW timestamps may carry nine fractional digits.
+    if (-not $Stamp) { $Stamp = $Time.ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff", [Globalization.CultureInfo]::InvariantCulture) + '00Z' }
+    "<Event><System><TimeCreated SystemTime=`"$Stamp`"/></System><RenderingInfo><Task>$Name</Task></RenderingInfo>" +
+        "<EventData><Data Name=`"TerminalClsid`">$Clsid</Data></EventData></Event>"
+}
+function MustJudge([string]$Expected, $Record, [string[]]$Rows) {
+    $document = [xml]('<Events>' + ($Rows -join '') + '</Events>')
+    $verdict = Get-HandoffVerdict $Record @(Get-HandoffEvents $document) $noctty
+    if ($verdict.handoffProof -ne $Expected) { throw "Handoff evaluator returned $($verdict.handoffProof), expected $Expected." }
+    $script:handoffCases++
+}
+MustJudge 'proven' (ProbeRecord) @((Row 'SrvInit_ReceiveHandoff' $at $noctty), (Row 'SrvInit_ReceiveHandoff_OpenedPipes' $at $terminal))
+MustJudge 'failed' (ProbeRecord) @(Row 'SrvInit_ReceiveHandoff' $at $terminal)
+MustJudge 'unproven' (ProbeRecord) @()
+MustJudge 'unproven' (ProbeRecord) @((Row 'SrvInit_ReceiveHandoff' $at $noctty), (Row 'SrvInit_ReceiveHandoff' $at $noctty))
+MustJudge 'unproven' (ProbeRecord) @(Row 'SrvInit_ReceiveHandoff' ($start.AddMinutes(-5)) $noctty)
+MustJudge 'unproven' (ProbeRecord) @(Row 'SrvInit_ReceiveHandoff' $at $noctty 'not-a-time')
+MustJudge 'unproven' (ProbeRecord @{ windowOwnedByNoctty = $false }) @(Row 'SrvInit_ReceiveHandoff' $at $noctty)
+MustJudge 'unproven' (ProbeRecord @{ registrationState = 'unregistered' }) @(Row 'SrvInit_ReceiveHandoff' $at $noctty)
+MustJudge 'failed' (ProbeRecord @{ newTerminalHosts = @(@{ pid = 1 }) }) @(Row 'SrvInit_ReceiveHandoff' $at $noctty)
+MustJudge 'failed' (ProbeRecord @{ failures = @('Probe window is owned by WindowsTerminal.exe.'); handoffProof = 'failed' }) @(
+    Row 'SrvInit_ReceiveHandoff' $at $noctty)
 $manifest = Get-Content (Join-Path $PSScriptRoot 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
 $config = Get-Content (Join-Path $PSScriptRoot 'configuration.dsc.json') -Raw -Encoding utf8 | ConvertFrom-Json
 
@@ -33,7 +81,8 @@ $first = Run 'Apply'
 if ($first.copied -lt 1) { throw 'Preexisting corruption was not repaired.' }
 $second = Run 'Apply'
 if ($second.copied -ne 0 -or $second.changedProperties -ne 0) { throw 'Second apply changed state.' }
-$null = Run 'Test'
+MustNotClaimHandoff $first
+MustNotClaimHandoff (Run 'Test')
 
 # Independent provider readback uses the generated declaration, not a second Spec.
 for ($i = 0; $i -lt $manifest.fonts.Count; $i++) {
@@ -63,4 +112,5 @@ $null = Run 'Test'
 [ordered]@{ source = $ExpectedSource; proof = 'PASS'; fonts = $first.fonts;
     secondApplyChanges = 0; preexistingCorruptionRepaired = $true;
     registryDriftRejected = $true; corruptionRejected = $true;
-    scope = 'current-user file and registry convergence; not rendering or real-host UX' } | ConvertTo-Json
+    winReportsHandoffUnproven = $true; handoffProbeRefusedOnRunner = $true; handoffEvaluatorCases = $handoffCases;
+    scope = 'current-user file and registry convergence; not rendering, default-terminal handoff, or real-host UX' } | ConvertTo-Json

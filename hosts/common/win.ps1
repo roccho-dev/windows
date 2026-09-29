@@ -54,6 +54,7 @@ $terminalStartup = 'HKCU:\Console\%%Startup'
 $windowsTerminalConsole = '{2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}'
 $nocttyTerminal = '{33368C6F-D328-410C-B225-26DC9F12C728}'
 $nocttyProxy = '{1D349824-21FB-46C7-ACF3-746EDC991D52}'
+$terminalProvenance = Join-Path $localAppData 'windows-iac\provenance\default-terminal.json'
 $oldPath, $oldResources, $oldFontDirectory = $env:PATH, $env:DSC_RESOURCE_PATH, $env:WINDOWS_IAC_FONT_DIR
 $copied, $changed = 0, 0
 
@@ -101,7 +102,10 @@ function RestoreRegistryString([string]$Path, [string]$Name, [object]$Value) {
     }
 }
 
-function TestNocttyDefault {
+# Registration only: the registry state that selects Noctty. It is not evidence
+# that a new console is handed off to Noctty; only handoff-proof.ps1 on a real
+# interactive host can produce that evidence.
+function TestNocttyRegistration {
     $startup = Get-Item -LiteralPath $terminalStartup -ErrorAction SilentlyContinue
     if ($null -eq $startup -or
         $startup.GetValue('DelegationConsole') -ne $windowsTerminalConsole -or
@@ -116,6 +120,45 @@ function TestNocttyDefault {
                        '{6F23DA90-15C5-4203-9DB0-64E73F1B1B00}')) {
         if ((RegistryDefault "$classes\Interface\$iid\ProxyStubClsid32") -ne $nocttyProxy) { return $false }
     }
+    return $true
+}
+
+# Windows Terminal is OS/Store-owned and not installed here; its OpenConsole is
+# Noctty's console half, so only a minimum version is asserted.
+function TestTerminalPackage {
+    $terminal = Get-AppxPackage -Name Microsoft.WindowsTerminal | Select-Object -First 1
+    return $null -ne $terminal -and [version]$terminal.Version -ge [version]'1.24.0.0'
+}
+
+# Write-once record of the terminal selection before this distribution first
+# changed it, for a later rollback. An existing record is never replaced, and an
+# unreadable one stops Restore rather than risk losing the original selection.
+function RecordPriorTerminal([object]$Console, [object]$Terminal) {
+    if (Test-Path -LiteralPath $terminalProvenance) {
+        try { $prior = Get-Content -LiteralPath $terminalProvenance -Raw -Encoding utf8 | ConvertFrom-Json }
+        catch { $prior = $null }
+        if ($null -eq $prior -or $prior.schema -ne 1 -or $prior.key -ne 'HKCU\Console\%%Startup') {
+            throw "Unreadable default-terminal provenance: $terminalProvenance"
+        }
+        return
+    }
+    $json = [ordered]@{ schema = 1; key = 'HKCU\Console\%%Startup'; recordedUtc = [DateTime]::UtcNow.ToString('o')
+        source = $manifest.source; priorDelegationConsole = $Console; priorDelegationTerminal = $Terminal
+        # True when Noctty was already selected, so the true original is unknown.
+        priorSelectsNoctty = ($Terminal -eq $nocttyTerminal)
+        written = [ordered]@{ DelegationConsole = $windowsTerminalConsole; DelegationTerminal = $nocttyTerminal } } |
+        ConvertTo-Json
+    $null = New-Item -ItemType Directory -Path (Split-Path -Parent $terminalProvenance) -Force
+    $temporary = $terminalProvenance + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    try {
+        [IO.File]::WriteAllText($temporary, $json, [Text.UTF8Encoding]::new($false))
+        [IO.File]::Move($temporary, $terminalProvenance)  # fails rather than overwrite
+    } finally { Remove-Item -LiteralPath $temporary -ErrorAction SilentlyContinue }
+}
+
+# Starts the Noctty COM server, so only Restore calls it, right after registering,
+# to reject an unusable registration. Activation still does not prove handoff.
+function TestNocttyActivation {
     try {
         $class = [type]::GetTypeFromCLSID([guid]$nocttyTerminal, $true)
         $instance = [Activator]::CreateInstance($class)
@@ -160,23 +203,22 @@ try {
         $shortcut.WorkingDirectory = Join-Path $nocttyDirectory 'noctty'
         $shortcut.Save()
         $null = InvokeDsc 'set' $packagesConfiguration @($manifest.packages).Count
-        $terminal = Get-AppxPackage -Name Microsoft.WindowsTerminal | Select-Object -First 1
-        if ($null -eq $terminal -or [version]$terminal.Version -lt [version]'1.24.0.0') {
-            throw 'Noctty default-terminal handoff requires Windows Terminal 1.24 or newer.'
-        }
+        if (-not (TestTerminalPackage)) { throw 'Noctty default-terminal handoff requires Windows Terminal 1.24 or newer.' }
         if (-not (Test-Path -LiteralPath $terminalStartup)) {
             $null = New-Item -Path $terminalStartup
         }
         $startup = Get-Item -LiteralPath $terminalStartup
         $previousConsole = $startup.GetValue('DelegationConsole')
         $previousTerminal = $startup.GetValue('DelegationTerminal')
+        RecordPriorTerminal $previousConsole $previousTerminal
         $registered = $false
         try {
             $null = New-ItemProperty -LiteralPath $terminalStartup -Name DelegationConsole -Value $windowsTerminalConsole -PropertyType String -Force
             $null = & $nocttyCom +register-default-terminal
             if ($LASTEXITCODE -ne 0) { throw "Noctty default-terminal registration failed: $LASTEXITCODE" }
             $registered = $true
-            if (-not (TestNocttyDefault)) { throw 'Noctty COM activation failed after registration.' }
+            if (-not (TestNocttyRegistration)) { throw 'Noctty default-terminal registration is incomplete.' }
+            if (-not (TestNocttyActivation)) { throw 'Noctty COM activation failed after registration.' }
         } catch {
             $failure = $_
             if ($registered) { $null = & $nocttyCom +unregister-default-terminal }
@@ -201,16 +243,21 @@ try {
     }
     if ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest') {
         if (-not (TestNoctty)) { throw 'Noctty files or font configuration drift.' }
-        if (-not (TestNocttyDefault)) { throw 'Noctty default-terminal registration drift.' }
+        if (-not (TestTerminalPackage)) { throw 'Windows Terminal 1.24 or newer is missing.' }
+        if (-not (TestNocttyRegistration)) { throw 'Noctty default-terminal registration drift.' }
         $apps = InvokeDsc 'test' $packagesConfiguration @($manifest.packages).Count
         foreach ($item in $apps.results) {
             if ($item.result.inDesiredState -ne $true) { throw "Package drift: $($item.name)" }
         }
     }
+    # inDesiredState covers the declared state this mode tested. Handoff is never
+    # part of it: this script does not launch or observe a console.
     [ordered]@{ mode = $Mode; source = $manifest.source; fontDirectory = $fontDirectory;
         fonts = @($manifest.fonts).Count; copied = $copied; changedProperties = $changed;
         noctty = $manifest.noctty.version; packages = @($manifest.packages).Count;
-        inDesiredState = ($Mode -ne 'Validate') } | ConvertTo-Json -Compress
+        inDesiredState = ($Mode -ne 'Validate');
+        registrationState = $(if (TestNocttyRegistration) { 'registered' } else { 'unregistered' });
+        handoffProof = 'unproven' } | ConvertTo-Json -Compress
 }
 finally {
     $env:PATH, $env:DSC_RESOURCE_PATH, $env:WINDOWS_IAC_FONT_DIR = $oldPath, $oldResources, $oldFontDirectory
