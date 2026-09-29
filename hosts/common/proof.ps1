@@ -122,9 +122,29 @@ if ((Compare-TerminalSelection (& $pair $wtConsole $noctty) (& $pair $wtConsole 
 $handoffCases++
 # The package-context reader is shared by win.ps1; loading it only defines functions.
 . (Join-Path $PSScriptRoot 'package-view.ps1')
-foreach ($name in 'Get-HkcuTerminalSelection', 'Test-PackageTerminalSelection') {
+foreach ($name in 'Get-HkcuTerminalSelection', 'Test-PackageTerminalSelection', 'Get-PackageReaderScript') {
     if (-not (Get-Command $name -CommandType Function -ErrorAction SilentlyContinue)) { throw "package-view.ps1 lacks $name." }
 }
+$handoffCases++
+# The generated reader parses, and on this runner (outside any package) writes
+# exactly one complete {console, terminal} answer; it only reads the registry.
+$readerErrors = $null
+$null = [Management.Automation.Language.Parser]::ParseInput((Get-PackageReaderScript), [ref]$null, [ref]$readerErrors)
+if (@($readerErrors).Count) { throw 'The generated package reader does not parse.' }
+$readerDir = Join-Path ([IO.Path]::GetTempPath()) ('reader-' + [guid]::NewGuid().ToString('N'))
+$null = New-Item -ItemType Directory -Path $readerDir
+try {
+    $readerScript = Join-Path $readerDir 'view.ps1'
+    $readerAnswer = Join-Path $readerDir 'view.json'
+    [IO.File]::WriteAllText($readerScript, (Get-PackageReaderScript), [Text.UTF8Encoding]::new($true))
+    & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -NoProfile -NonInteractive `
+        -ExecutionPolicy Bypass -File $readerScript -Out $readerAnswer
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $readerAnswer) -or (Test-Path -LiteralPath "$readerAnswer.partial")) {
+        throw 'The generated package reader did not write one complete answer.'
+    }
+    $read = Get-Content -LiteralPath $readerAnswer -Raw | ConvertFrom-Json
+    if ((@($read.PSObject.Properties.Name) -join ',') -ne 'console,terminal') { throw 'The package reader answer has the wrong shape.' }
+} finally { Remove-Item -LiteralPath $readerDir -Recurse -Force }
 $handoffCases++
 $manifest = Get-Content (Join-Path $PSScriptRoot 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
 $config = Get-Content (Join-Path $PSScriptRoot 'configuration.dsc.json') -Raw -Encoding utf8 | ConvertFrom-Json

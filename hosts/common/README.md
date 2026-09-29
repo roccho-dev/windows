@@ -49,9 +49,10 @@ and the delegate pair as read from inside the Windows Terminal package (below);
 any failure restores the previous delegate selection and fails `Restore`.
 `RestoreTest` checks registry state (delegate pair, COM class and proxy DLL
 mappings) and the same package-context pair, and fails if that pair differs or
-cannot be read; it writes no registry value. It does not launch a console or
-the Noctty COM server, but it starts `wscript.exe` inside the Windows Terminal
-package and still runs the DSC and WinGet resource tests. Every mode reports `registrationState`
+cannot be read; it writes no registry value. It does not start the Noctty COM
+server or open a window, but it starts a Windows PowerShell reader under a
+headless `conhost.exe` inside the Windows Terminal package (below) and still
+runs the DSC and WinGet resource tests. Every mode reports `registrationState`
 (`registered` or `unregistered`) and `handoffProof = "unproven"`:
 registration and COM activation are not evidence that a new console opens in
 Noctty, and `inDesiredState` never includes handoff. Windows Terminal remains installed
@@ -73,7 +74,9 @@ virtualized, which only the host handoff proof (for COM and `noctty.exe`) and
 later typography evidence can show. If `%%Startup` was already correct, a match
 does not prove this run's file and font writes reached the real user profile.
 The package-context reader needs Windows
-PowerShell 5.1 (Appx module), Windows Terminal and Windows Script Host.
+PowerShell 5.1 (Appx module for `Invoke-CommandInDesktopPackage`) and Windows
+Terminal; it does not use Windows Script Host, which on the development host
+had no `.js` script engine.
 `Apply` and `Test` are font-only CI proof modes and do not run this check.
 
 Before its first change to `HKCU\Console\%%Startup`, `Restore` writes the prior
@@ -108,20 +111,28 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\handoff-proof.ps1 -Pha
 
 Before launching, the probe also reads the `%%Startup` pair from inside the
 Windows Terminal package (`package-view.ps1`, shared with `win.ps1`:
-`Invoke-CommandInDesktopPackage` running a
-`wscript.exe` script, which creates no console; the script only reads the
-registry, though side effects of Windows Script Host itself are not ruled out).
+`Invoke-CommandInDesktopPackage` running `conhost.exe --headless` hosting a
+generated Windows PowerShell 5.1 script with `-NoProfile -NonInteractive`; the
+script only reads the registry, and `-ExecutionPolicy Bypass` applies to that
+process alone). The explicit headless conhost is the reader's own console
+server: on the development host a Console.Host ETW trace of this launch had no
+`ConsoleHandoffSessionStarted`, `SrvInit_ReceiveHandoff` or
+`DelegateToTerminalSucceeded`, while launching `powershell.exe -WindowStyle
+Hidden` directly was handed off to Windows Terminal. The reader therefore opens
+no window and adds no handoff to the probe's trace. This relies on Windows'
+`conhost.exe --headless` behavior; if it changes, the comparison fails closed.
+PowerShell itself may write startup caches inside the Windows Terminal package.
 Its script and answer live in a new `%USERPROFILE%\noctty-package-view-<guid>`
 directory, outside AppData (which the package may redirect), OneDrive and the
 bundle. The probe waits up to `-TimeoutSeconds` for the answer and then up to
-`-TimeoutSeconds` more for any `wscript.exe` whose command line names that
-directory to exit, so it can take twice the timeout. It then deletes only its
+`-TimeoutSeconds` more for any `conhost.exe` or `powershell.exe` whose command
+line names that directory to exit, so it can take twice the timeout. It then deletes only its
 known files and the empty directory, never recursively, and records the scratch
-path and cleanup result; a still-running script host leaves the directory in
-place. Waiting assumes WMI reports the packaged `wscript.exe` command line
+path and cleanup result; a still-running reader leaves the directory in
+place. Waiting assumes WMI reports the packaged reader's command line
 (unverified); if not, a late writer can only make the non-recursive delete fail
-and be recorded as `kept`. With no answer, the record notes that a script host
-may still start later; it then finds no directory and cannot write.
+and be recorded as `kept`. With no answer, the record notes that a reader may
+still start later; it then finds no directory and cannot write.
 OpenConsole runs in that package, which reads the durable user hive; a
 differing pair means this process's own HKCU is probably virtualized (see
 above). HKCU is read before and after the package view; a change in between
