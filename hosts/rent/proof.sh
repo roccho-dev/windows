@@ -94,9 +94,11 @@ dev() {
 }
 root() { docker exec "$c" /bin/bash -euc "$@"; }
 boundaries() {
+  # PID 1's mountinfo, parsed on the runner (the image ships no awk; the dev profile stays small).
+  docker exec "$c" /bin/cat /proc/1/mountinfo |
+    awk '$5 == "/work/repos" { r++ } $5 == "/var/lib/rent" { s++ } $5 == "/nix" { n++ } $5 == "/home/dev" { h++ } $4 ~ /\/volumes\/.*\/_data$/ { v++ }
+      END { exit !(r == 1 && s == 1 && n == 1 && h == 0 && v == 3) }' || fail 'mounts are not exactly repos, state and nix'
   root "$(cat <<'EOF'
-awk '$5 == "/work/repos" { r++ } $5 == "/var/lib/rent" { s++ } $5 == "/nix" { n++ } $5 == "/home/dev" { h++ } $4 ~ /\/volumes\/.*\/_data$/ { v++ }
-  END { exit !(r == 1 && s == 1 && n == 1 && h == 0 && v == 3) }' /proc/1/mountinfo
 test "$(stat -c '%a %u %g' /nix/store)" = '1775 0 30000'
 test "$(stat -c %u /nix/var/nix/profiles/rent-dev)" = 0
 test "$(cat /work/repos/marker)" = repo
