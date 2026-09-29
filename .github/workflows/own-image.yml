@@ -52,6 +52,8 @@ jobs:
           $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref] $null, [ref] $Errors)
           if ($Errors) { $Errors; exit 1 }
           $env:COMPUTERNAME = 'CI-HOST'
+          # Test setup only: Linux has no C: drive, so the script's fixed WSLC path is rooted in an existing directory.
+          $env:ProgramFiles = $env:RUNNER_TEMP
           $Binding = (New-TemporaryFile).FullName
           $B = Get-Content hosts/own/bindings/G6I3.json -Raw | ConvertFrom-Json
           $B.expectHost = 'CI-HOST'
@@ -93,10 +95,23 @@ jobs:
           $RunArgs = @($Plan.create | Select-Object -Skip 1); $SeedArgs = @($Plan.seed | Select-Object -Skip 1)
           $OldImage = 'ghcr.io/roccho-dev/windows-own@sha256:' + ('1' * 64)
           $Old = [pscustomobject] @{ Name = 'windows-own'; Config = [pscustomobject] @{ Image = $OldImage } }
-          $Good = @('run', '--name', 'windows-own', '--detach', '--volume', 'windows-own-home:/home/dev', $OldImage)
-          if (Get-RollbackProblem $Good $Old) { 'good rollback argv refused'; exit 1 }
+          $Pre = @('run', '--name', 'windows-own', '--detach', '--publish', '127.0.0.1:2223:2223', '--shm-size', '1G')
+          $Good = $Pre + @('--volume', 'windows-own-home:/home/dev', $OldImage)
+          $Three = $Pre + @('--volume', 'windows-own-home:/home/dev', '--volume', 'windows-own-work:/work/repos', '--volume', 'windows-own-nix:/nix', $OldImage)
+          foreach ($Ok in @(, $Good) + @(, $Three)) { if (Get-RollbackProblem $Ok $Old) { "good rollback argv refused: $(Get-RollbackProblem $Ok $Old)"; exit 1 } }
+          $H = @('--volume', 'windows-own-home:/home/dev')
           foreach ($Bad in @(@('run', '--rm', '--name', 'windows-own', $OldImage), @('run', '--name', 'other', '--detach', $OldImage),
-              @('run', '--name', 'windows-own', '--detach', $Image), @('run', '--name', 'windows-own', '--env', 'GH_TOKEN=x', $OldImage))) {
+              @('run', '--name', 'windows-own', '--detach', $Image), ($Pre + $H + @('--env', 'GH_TOKEN=x', $OldImage)),
+              # Not the exact old target: SSH port, home volume, an extra or partial volume set, or other flag forms.
+              (@('run', '--name', 'windows-own', '--detach', '--publish', '127.0.0.1:2224:2223') + $H + @($OldImage)),
+              (@('run', '--name', 'windows-own', '--detach') + $H + @($OldImage)),
+              ($Pre + @('--publish', '127.0.0.1:14500:14500') + $H + @($OldImage)),
+              ($Pre + @('--volume', 'other-home:/home/dev', $OldImage)),
+              ($Pre + @('--volume', 'windows-own-home:/root', $OldImage)),
+              ($Pre + $H + @('--volume', 'extra:/extra', $OldImage)),
+              ($Pre + $H + @('--volume', 'windows-own-nix:/nix', $OldImage)),
+              ($Pre + @('-v', 'windows-own-home:/home/dev', $OldImage)),
+              (@('run', '--name', 'windows-own', '-p', '127.0.0.1:2223:2223') + $H + @($OldImage)))) {
             if (-not (Get-RollbackProblem $Bad $Old)) { "bad rollback argv allowed: $($Bad -join ' ')"; exit 1 }
           }
           $NewUp = '{"Name":"windows-own","State":{"Running":true}}'

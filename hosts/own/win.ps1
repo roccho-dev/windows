@@ -192,6 +192,24 @@ function Get-RollbackProblem($Argv, $Item) {
     $At = [array]::IndexOf([string[]] $Argv, '--name')
     if ($At -lt 0 -or $At + 1 -ge $Argv.Count -or $Argv[$At + 1] -cne $Site.container) { return "Rollback argv must name $($Site.container)." }
     if (-not ((Get-Images $Item) -ccontains $Argv[-1])) { return 'Rollback argv must end with the current container image.' }
+    # The exact old target: its SSH publish and its home volume (plus work and nix only if it already had all three).
+    if (@($Argv | Where-Object { $_ -cin '-p', '-v', '--mount' -or $_ -clike '--publish=*' -or $_ -clike '--volume=*' -or $_ -clike '--mount=*' }).Count) {
+        return 'Rollback argv must use only --publish and --volume forms.'
+    }
+    $Publish = @(); $Mounted = @()
+    for ($I = 0; $I -lt $Argv.Count - 1; $I++) {
+        if ($Argv[$I] -ceq '--publish') { $Publish += $Argv[$I + 1] }
+        if ($Argv[$I] -ceq '--volume') { $Mounted += $Argv[$I + 1] }
+    }
+    if ($Publish.Count -ne 1 -or $Publish[0] -cne "$($Spec.publishAddress):$($Site.hostPort):$($Spec.sshPort)") {
+        return 'Rollback argv must publish exactly the old SSH port.'
+    }
+    $HomeOnly = "$($Site.volume):$($Spec.stateMount)"
+    $All = @($Volumes.Keys | ForEach-Object { "$($Volumes[$_]):$_" }) | Sort-Object -CaseSensitive
+    $Got = @($Mounted | Sort-Object -CaseSensitive)
+    if (($Got -join "`n") -cne $HomeOnly -and ($Got -join "`n") -cne ($All -join "`n")) {
+        return 'Rollback argv must mount exactly the home volume, or exactly the home, work and nix volumes.'
+    }
     if (@($Argv | Where-Object { $_ -match '(?i)(token|secret|password|credential|private)' }).Count) { return 'Rollback argv must not carry secrets.' }
     return $null
 }
