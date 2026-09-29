@@ -40,7 +40,7 @@ $handoffCases = 0
 function ProbeRecord([hashtable]$Change = @{}) {
     $record = [ordered]@{ startedUtc = $start.ToString('o'); endedUtc = $start.AddSeconds(10).ToString('o')
         registrationState = 'registered'; windowOwnedByNoctty = $true; newTerminalHosts = @()
-        failures = @(); handoffProof = 'unproven' }
+        failures = @(); gaps = @(); handoffProof = 'unproven' }
     foreach ($key in $Change.Keys) { $record[$key] = $Change[$key] }
     [pscustomobject]$record
 }
@@ -50,9 +50,9 @@ function Row([string]$Name, [DateTime]$Time, [string]$Clsid, [string]$Stamp) {
     "<Event><System><TimeCreated SystemTime=`"$Stamp`"/></System><RenderingInfo><Task>$Name</Task></RenderingInfo>" +
         "<EventData><Data Name=`"TerminalClsid`">$Clsid</Data></EventData></Event>"
 }
-function MustJudge([string]$Expected, $Record, [string[]]$Rows) {
+function MustJudge([string]$Expected, $Record, [string[]]$Rows, [TimeZoneInfo]$Zone = [TimeZoneInfo]::Local) {
     $document = [xml]('<Events>' + ($Rows -join '') + '</Events>')
-    $verdict = Get-HandoffVerdict $Record @(Get-HandoffEvents $document) $noctty
+    $verdict = Get-HandoffVerdict $Record @(Get-HandoffEvents $document $Zone) $noctty
     if ($verdict.handoffProof -ne $Expected) { throw "Handoff evaluator returned $($verdict.handoffProof), expected $Expected." }
     $script:handoffCases++
 }
@@ -67,6 +67,53 @@ MustJudge 'unproven' (ProbeRecord @{ registrationState = 'unregistered' }) @(Row
 MustJudge 'failed' (ProbeRecord @{ newTerminalHosts = @(@{ pid = 1 }) }) @(Row 'SrvInit_ReceiveHandoff' $at $noctty)
 MustJudge 'failed' (ProbeRecord @{ failures = @('Probe window is owned by WindowsTerminal.exe.'); handoffProof = 'failed' }) @(
     Row 'SrvInit_ReceiveHandoff' $at $noctty)
+# A probe gap such as an unanswered package view keeps the verdict unproven;
+# only the probe's own ETW placeholder is resolved by the trace.
+MustJudge 'unproven' (ProbeRecord @{ gaps = @('The Windows Terminal package view did not answer in time.') }) @(
+    Row 'SrvInit_ReceiveHandoff' $at $noctty)
+MustJudge 'proven' (ProbeRecord @{ gaps = @('Console host ETW has not been evaluated; run -Phase Finalize.') }) @(
+    Row 'SrvInit_ReceiveHandoff' $at $noctty)
+
+# tracerpt prints the local wall clock with an untrustworthy numeric offset
+# (observed: 14:38:39.792622000+08:59 in Asia/Tokyo for 05:38:39.792622Z).
+$tokyo = [TimeZoneInfo]::FindSystemTimeZoneById('Tokyo Standard Time')
+$expected = [DateTime]::SpecifyKind([DateTime]::new(2026, 9, 29, 5, 38, 39).AddTicks(7926220), [DateTimeKind]::Utc)
+if ((ConvertFrom-TracerptTime '2026-09-29T14:38:39.792622000+08:59' $tokyo) -ne $expected -or
+    (ConvertFrom-TracerptTime '2026-09-29T05:38:39.7926220Z' $tokyo) -ne $expected -or
+    $null -ne (ConvertFrom-TracerptTime '2026-09-29T14:38:39.792622000' $tokyo)) {
+    throw 'tracerpt timestamps are not converted as local wall clock (offset) or UTC (Z).'
+}
+$handoffCases++
+# The same shape built from this runner's local wall clock, with a wrong offset,
+# must still land inside the probe window.
+$localStamp = [TimeZoneInfo]::ConvertTimeFromUtc($at, [TimeZoneInfo]::Local).ToString(
+    "yyyy-MM-dd'T'HH:mm:ss.fffffff", [Globalization.CultureInfo]::InvariantCulture) + '00+08:59'
+MustJudge 'proven' (ProbeRecord) @(Row 'SrvInit_ReceiveHandoff' $at $noctty $localStamp)
+# Finalize reads the stamp in the probe's recorded zone, not the evaluator's:
+# a Tokyo wall clock is proven in Tokyo and misplaced by nine hours in UTC.
+$tokyoStamp = [TimeZoneInfo]::ConvertTimeFromUtc($at, $tokyo).ToString(
+    "yyyy-MM-dd'T'HH:mm:ss.fffffff", [Globalization.CultureInfo]::InvariantCulture) + '00+08:59'
+MustJudge 'proven' (ProbeRecord) @(Row 'SrvInit_ReceiveHandoff' $at $noctty $tokyoStamp) $tokyo
+MustJudge 'unproven' (ProbeRecord) @(Row 'SrvInit_ReceiveHandoff' $at $noctty $tokyoStamp) ([TimeZoneInfo]::Utc)
+
+# The HKCU and Windows Terminal package views of the selection.
+$pair = { param($Console, $Terminal) [pscustomobject]@{ console = $Console; terminal = $Terminal } }
+$wtConsole = '{2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}'
+function MustCompare([string]$Expected, $Hkcu, $Package, [string]$Note) {
+    $result = Compare-TerminalSelection $Hkcu $Package $Note
+    $contrary = [bool]$result.failure
+    if ($result.state -ne $Expected -or $contrary -ne ($Expected -eq 'mismatch') -or
+        [bool]$result.gap -ne ($Expected -in @('invalid', 'unavailable'))) {
+        throw "Selection comparison returned $($result.state), expected $Expected."
+    }
+    $script:handoffCases++
+}
+MustCompare 'match' (& $pair $wtConsole $noctty) (& $pair $wtConsole.ToLowerInvariant() $noctty.ToLowerInvariant()) ''
+MustCompare 'mismatch' (& $pair $wtConsole $noctty) (& $pair $wtConsole $terminal) ''
+MustCompare 'invalid' (& $pair $wtConsole $noctty) (& $pair $wtConsole $null) ''
+MustCompare 'invalid' (& $pair $wtConsole $noctty) (& $pair $wtConsole 'not-a-guid') ''
+MustCompare 'invalid' (& $pair $wtConsole $noctty) $null ''
+MustCompare 'unavailable' (& $pair $wtConsole $noctty) $null 'The Windows Terminal package view did not answer in time.'
 $manifest = Get-Content (Join-Path $PSScriptRoot 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
 $config = Get-Content (Join-Path $PSScriptRoot 'configuration.dsc.json') -Raw -Encoding utf8 | ConvertFrom-Json
 

@@ -86,10 +86,36 @@ logman stop noctty-handoff -ets
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\handoff-proof.ps1 -Phase Finalize -Evidence <probe.json> -TraceFile "$env:TEMP\noctty-handoff.etl"
 ```
 
-The probe starts `cmd.exe` titled with a random nonce and records which process
-owns the window carrying that title, and any new `WindowsTerminal.exe` host.
+Before launching, the probe also reads the `%%Startup` pair from inside the
+Windows Terminal package (`Invoke-CommandInDesktopPackage` running a
+`wscript.exe` script, which creates no console; the script only reads the
+registry, though side effects of Windows Script Host itself are not ruled out).
+Its script and answer live in a new `%USERPROFILE%\noctty-package-view-<guid>`
+directory, outside AppData (which the package may redirect), OneDrive and the
+bundle. The probe waits up to `-TimeoutSeconds` for the answer and then up to
+`-TimeoutSeconds` more for any `wscript.exe` whose command line names that
+directory to exit, so it can take twice the timeout. It then deletes only its
+known files and the empty directory, never recursively, and records the scratch
+path and cleanup result; a still-running script host leaves the directory in
+place. Waiting assumes WMI reports the packaged `wscript.exe` command line
+(unverified); if not, a late writer can only make the non-recursive delete fail
+and be recorded as `kept`. With no answer, the record notes that a script host
+may still start later; it then finds no directory and cannot write.
+OpenConsole runs in that package, and a process there has been observed to read
+a different pair than HKCU shows; where that package value comes from is
+unverified. HKCU is read before and after the package view; a change in between
+makes the comparison `unproven`. The comparison
+(`Compare-TerminalSelection` in `handoff-evaluate.ps1`) treats a valid,
+differing package pair as `failed`, and no, late, or malformed answer as
+`unproven`. The probe repairs nothing. It records the local time zone,
+which `Finalize` uses to read tracerpt's wall clock. It then starts `cmd.exe` titled with a random
+nonce and records which process owns the window carrying that title, and any
+new `WindowsTerminal.exe` host.
 `Finalize` decodes the stopped trace with `tracerpt` and reads the single
-`SrvInit_ReceiveHandoff` `TerminalClsid` in the probe's time window. The result
+`SrvInit_ReceiveHandoff` `TerminalClsid` in the probe's time window. tracerpt
+prints `TimeCreated` as the local wall clock with an untrustworthy numeric
+offset (seen: `+08:59` in Asia/Tokyo), so such stamps are read as local time;
+`Z` stamps are UTC and stamps with neither are unparseable. The result
 is `proven` only when the window belongs to this distribution's portable
 `noctty.exe`, no new Windows Terminal host started, and that CLSID is Noctty's
 `{33368C6F-D328-410C-B225-26DC9F12C728}`. Contrary evidence is `failed`; missing

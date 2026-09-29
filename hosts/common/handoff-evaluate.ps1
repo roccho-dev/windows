@@ -3,25 +3,70 @@
 # A 'proven' verdict is only as good as the host observations passed in; CI
 # never supplies real ones, so CI never claims an actual handoff.
 
+# UTC time of a tracerpt TimeCreated/SystemTime, or $null when unparseable.
+# A trailing Z is UTC. A numeric offset is not trusted: tracerpt has printed the
+# local wall clock with a wrong offset (14:38:39.792622000+08:59 in Asia/Tokyo
+# for 05:38:39Z), so the wall clock is converted from $Zone and the offset dropped.
+# A stamp with neither is ambiguous and yields $null.
+function ConvertFrom-TracerptTime([string]$Stamp, [TimeZoneInfo]$Zone = [TimeZoneInfo]::Local) {
+    if ($Stamp -notmatch '^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})$') { return $null }
+    $fraction = if ($Matches[2]) { ($Matches[2] + '0000000').Substring(0, 8) } else { '.0000000' }
+    $wall = [DateTime]::MinValue
+    if (-not [DateTime]::TryParseExact($Matches[1] + $fraction, "yyyy-MM-dd'T'HH:mm:ss.fffffff",
+            [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$wall)) {
+        return $null
+    }
+    if ($Matches[3] -eq 'Z') { return [DateTime]::SpecifyKind($wall, [DateTimeKind]::Utc) }
+    try { return [TimeZoneInfo]::ConvertTimeToUtc([DateTime]::SpecifyKind($wall, [DateTimeKind]::Unspecified), $Zone) }
+    catch { return $null }  # a wall clock skipped by a daylight-saving change
+}
+
 # SrvInit_ReceiveHandoff events from a tracerpt XML report, each with its UTC
 # time ($null when unparseable) and the TerminalClsid values it carries.
-function Get-HandoffEvents([Xml.XmlDocument]$Document) {
+function Get-HandoffEvents([Xml.XmlDocument]$Document, [TimeZoneInfo]$Zone = [TimeZoneInfo]::Local) {
     foreach ($event in $Document.GetElementsByTagName('Event')) {
         $text = $event.OuterXml
         # Exactly the OpenConsole receive event, not SrvInit_ReceiveHandoff_OpenedPipes and similar.
         if ($text -notmatch '(?<![A-Za-z_])SrvInit_ReceiveHandoff(?![A-Za-z_])') { continue }
         $created = @($event.GetElementsByTagName('TimeCreated'))
         $stamp = if ($created.Count) { $created[0].GetAttribute('SystemTime') } else { '' }
-        $stamp = $stamp -replace '(\.\d{7})\d+', '$1'  # ETW may carry more than .NET's 7 digits
-        $time = [DateTime]::MinValue
-        $dated = [DateTime]::TryParse($stamp, [Globalization.CultureInfo]::InvariantCulture,
-            [Globalization.DateTimeStyles]::AdjustToUniversal, [ref]$time)
+        $time = ConvertFrom-TracerptTime $stamp $Zone
         [pscustomobject]@{
-            time = $(if ($dated) { $time } else { $null })
+            time = $time
             clsids = @([regex]::Matches($text, 'TerminalClsid[^{]{0,200}(\{[0-9A-Fa-f-]{36}\})') |
                 ForEach-Object { $_.Groups[1].Value.ToUpperInvariant() })
         }
     }
+}
+
+# Compares the HKCU default-terminal pair with the pair read inside the Windows
+# Terminal package, where OpenConsole runs. $Note is set when the package view
+# could not be read, or HKCU changed around it. A valid, differing package pair
+# is contrary evidence; anything unread or malformed is only a gap. Where a
+# differing package value comes from is not determined here.
+function Compare-TerminalSelection($Hkcu, $Package, [string]$Note) {
+    $guid = '^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}$'
+    if ($Note) { return [ordered]@{ state = 'unavailable'; failure = $null; gap = $Note } }
+    $read = {
+        param($Pair, [string]$Name)
+        if ($null -eq $Pair) { return '' }
+        if ($Pair -is [Collections.IDictionary]) { return [string]$Pair[$Name] }
+        $property = $Pair.PSObject.Properties[$Name]
+        if ($null -eq $property) { return '' }
+        return [string]$property.Value
+    }
+    $hc, $ht = (& $read $Hkcu 'console'), (& $read $Hkcu 'terminal')
+    $pc, $pt = (& $read $Package 'console'), (& $read $Package 'terminal')
+    if ($hc -notmatch $guid -or $ht -notmatch $guid -or $pc -notmatch $guid -or $pt -notmatch $guid) {
+        return [ordered]@{ state = 'invalid'; failure = $null
+            gap = 'The HKCU or Windows Terminal package view of the terminal selection is incomplete.' }
+    }
+    if ($pc -ne $hc -or $pt -ne $ht) {  # GUID text; -ne is case-insensitive
+        return [ordered]@{ state = 'mismatch'; gap = $null
+            failure = ("Inside the Windows Terminal package the selection reads $pc/$pt, not the HKCU $hc/$ht; " +
+                'the source of the package value is unverified.') }
+    }
+    [ordered]@{ state = 'match'; failure = $null; gap = $null }
 }
 
 # Verdict for one probe record and the events of a trace spanning it. Contrary
@@ -37,7 +82,8 @@ function Get-HandoffVerdict($Record, $Events, [string]$ExpectedTerminal) {
         $clsids += @($event.clsids)
     }
     $failures = @($Record.failures | Where-Object { $_ })
-    $gaps = @()
+    # Probe gaps (window, package view) stay gaps; only its ETW placeholder is resolved here.
+    $gaps = @($Record.gaps | Where-Object { $_ -and $_ -notlike 'Console host ETW has not been evaluated*' })
     if ($Record.handoffProof -ne 'unproven' -and $failures.Count -eq 0) { $failures += 'The probe did not end unproven.' }
     if ($Record.registrationState -ne 'registered') { $gaps += 'Noctty was not registered at probe time.' }
     if ($Record.windowOwnedByNoctty -ne $true) { $gaps += 'The probe window was not observed in the bundled Noctty.' }
