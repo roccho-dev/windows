@@ -25,22 +25,43 @@
         Volumes.${ownSpec.stateMount} = {};
         Labels."org.opencontainers.image.source" = "https://github.com/roccho-dev/windows";
       };
-      # rent: tools live in the image; /home/dev is fresh per container; only /var/lib/rent (state) and
-      # /work/repos (existing repos, never copied or chowned) are volumes.
+      # rent: tools live in the image; /home/dev is fresh per container; /var/lib/rent (state), /work/repos (existing
+      # repos, never copied or chowned) and /nix (rent's own writable store, seeded from the image) are volumes.
       rentState = "/var/lib/rent";
       rentCert = "/etc/ssl/certs/ca-certificates.crt";
       rentTsSocket = "/var/run/tailscale/tailscaled.sock";
-      # Official Claude Code native build, pinned to platforms.linux-x64 of
-      # https://downloads.claude.ai/claude-code-releases/2.1.283/manifest.json (size 241556664).
-      claudeVersion = "2.1.283";
-      claudeBin = pkgs.fetchurl {
-        url = "https://downloads.claude.ai/claude-code-releases/${claudeVersion}/linux-x64/claude";
-        sha256 = "1859583ce32920595c61ef868bee52e1b1594f7486db209935e01f1e5e804ae2";
-      };
-      # The glibc build runs through the pinned glibc loader, as the fixed W runtime runs it; updates are off.
-      claude = pkgs.writeShellScriptBin "claude" ''
-        export DISABLE_AUTOUPDATER=1
-        exec ${pkgs.glibc}/lib/ld-linux-x86-64.so.2 --library-path ${pkgs.glibc}/lib ${claudeBin} "$@"
+      # Written once into a seeded rent /nix volume; nothing else may be seeded or run as rent's store.
+      rentNixMarker = "windows-rent-nix v1";
+      # Multi-user Nix: the daemon (root) owns the store; builds run as nixbld users; dev is an untrusted client.
+      rentNixConf = pkgs.writeText "rent-nix.conf" ''
+        experimental-features = nix-command flakes
+        build-users-group = nixbld
+        sandbox = false
+        trusted-users = root
+      '';
+      # set_profile ROOT TARGET: make ROOT/var/nix/profiles/rent-dev point at TARGET through a new generation link,
+      # unless it already does. Older generations stay as rollback targets and GC roots.
+      profileLib = ''
+        set_profile() {
+          local d="$1/var/nix/profiles" g n=0
+          install -d -m 755 "$d"
+          if [ -L "$d/rent-dev" ]; then
+            g=$(readlink "$d/rent-dev")
+            [[ $g =~ ^rent-dev-[0-9]+-link$ ]] && [ -L "$d/$g" ] || { echo "$d/rent-dev is not a generation link" >&2; exit 1; }
+            [ "$(readlink "$d/$g")" != "$2" ] || return 0
+          elif [ -e "$d/rent-dev" ]; then
+            echo "$d/rent-dev exists and is not a link" >&2; exit 1
+          fi
+          for g in "$d"/rent-dev-*-link; do
+            [ -L "$g" ] || continue
+            g=''${g##*/rent-dev-}; g=''${g%-link}
+            [ "$g" -le "$n" ] || n=$g
+          done
+          n=$((n + 1))
+          ln -s "$2" "$d/rent-dev-$n-link"
+          ln -sfn "rent-dev-$n-link" "$d/.rent-dev.new"
+          mv -T "$d/.rent-dev.new" "$d/rent-dev"
+        }
       '';
       # The one mount authority: this container's own /proc/self/mountinfo, read within 10 s. A named volume is a
       # mount whose root ends in /volumes/<name>/_data, as WSLC and Docker both report; WSLC inspect Mounts is not used.
@@ -127,10 +148,10 @@
           echo "imported $dst ($(du -sb "$dst" | cut -f1) bytes)"
         done
       '';
-      devTools = pkgs.buildEnv {
-        name = "rent-dev-tools";
-        paths = (with pkgs; [ coreutils git openssh gh tailscale ])
-          ++ [ (import ./hosts/own/codex.nix { inherit pkgs; }) claude stateImport ];
+      # rent-only tools beside the common dev profile.
+      rentTools = pkgs.buildEnv {
+        name = "rent-tools";
+        paths = [ pkgs.tailscale stateImport ];
         pathsToLink = [ "/bin" ];
       };
       sshConfig = pkgs.writeText "rent-sshd-config" (import ./hosts/rent/nix.nix {
@@ -138,22 +159,36 @@
         sshDir = "${rentState}/ssh";
         certFile = rentCert;
       });
-      # PID 1: fail closed on mounts, lay out state, then supervise tailscaled and sshd until either exits or TERM.
-      rentStart = pkgs.writeShellScriptBin "rent-start" ''
+      # PID 1: fail closed on mounts and the seeded store, lay out state, then supervise nix-daemon, tailscaled and sshd
+      # until any exits or TERM. It runs from the /nix volume, so an unseeded volume cannot start it at all.
+      rentStart = devProfile: pkgs.writeShellScriptBin "rent-start" ''
         set -eu
-        export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.openssh pkgs.tailscale ]}
+        export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.openssh pkgs.tailscale pkgs.nix ]}
         state=${rentState}
-        # One gate before any service: exactly the Binding repos and state volumes, both writable, nothing else.
+        # One gate before any service: exactly the Binding repos, state and nix volumes, all writable, nothing else.
         ${mountLib}
         repos=''${RENT_REPOS_VOLUME:-}
         statevol=''${RENT_STATE_VOLUME:-}
-        volume_name "$repos" && volume_name "$statevol" ||
-          { echo 'rent-mounts: set RENT_REPOS_VOLUME and RENT_STATE_VOLUME to volume names' >&2; exit 1; }
+        nixvol=''${RENT_NIX_VOLUME:-}
+        volume_name "$repos" && volume_name "$statevol" && volume_name "$nixvol" ||
+          { echo 'rent-mounts: set RENT_REPOS_VOLUME, RENT_STATE_VOLUME and RENT_NIX_VOLUME to volume names' >&2; exit 1; }
         volume_at /work/repos "$repos" rw || { echo "rent-mounts: /work/repos must be exactly volume $repos, rw" >&2; exit 1; }
         volume_at "$state" "$statevol" rw || { echo "rent-mounts: $state must be exactly volume $statevol, rw" >&2; exit 1; }
+        volume_at /nix "$nixvol" rw || { echo "rent-mounts: /nix must be exactly volume $nixvol, rw" >&2; exit 1; }
         if mounted /home/dev; then echo 'rent-mounts: /home/dev must not be a mount' >&2; exit 1; fi
-        [ "$(volume_count)" = 2 ] || { echo 'rent-mounts: exactly two volumes are allowed' >&2; exit 1; }
-        echo "rent-mounts ok repos=$repos state=$statevol"
+        [ "$(volume_count)" = 3 ] || { echo 'rent-mounts: exactly three volumes are allowed' >&2; exit 1; }
+        echo "rent-mounts ok repos=$repos state=$statevol nix=$nixvol"
+        # This image's runtime closure must be seeded completely: marker, GC root last, every path valid in the DB.
+        roots=$(readlink /etc/rent-nix-roots)
+        [ "$(cat /nix/var/rent-nix 2>/dev/null)" = '${rentNixMarker}' ] ||
+          { echo "rent-nix: /nix is not a seeded rent /nix volume" >&2; exit 1; }
+        [ "$(readlink "/nix/var/nix/gcroots/rent/''${roots##*/}")" = "$roots" ] ||
+          { echo "rent-nix: this image is not seeded into $nixvol; run rent-nix-seed first" >&2; exit 1; }
+        # shellcheck disable=SC2046
+        nix-store --check-validity "$roots" $(cat "$roots") || { echo 'rent-nix: seeded paths are not valid' >&2; exit 1; }
+        ${profileLib}
+        set_profile /nix ${devProfile}
+        echo "rent-nix ok roots=$roots profile=$(readlink /nix/var/nix/profiles/rent-dev)"
         if [ -z "''${RENT_TS_HOSTNAME:-}" ]; then echo 'Set RENT_TS_HOSTNAME' >&2; exit 1; fi
 
         dir() { install -d "$3"; chown "$2" "$3"; chmod "$1" "$3"; }
@@ -204,6 +239,9 @@
         fi
         chmod 600 "$state/ssh/ssh_host_ed25519_key"
 
+        # The only store writer while this container runs; dev reaches it through NIX_REMOTE=daemon.
+        NIX_SSL_CERT_FILE=${rentCert} nix-daemon &
+        nd_pid=$!
         install -d -m 755 ${builtins.dirOf rentTsSocket}
         TS_LOGS_DIR="$state/tailscale" tailscaled --tun=userspace-networking \
           --statedir="$state/tailscale" --socket=${rentTsSocket} &
@@ -212,7 +250,7 @@
         sshd_pid=
         cleanup() {
           trap - TERM INT
-          kill -TERM $up_pid $sshd_pid "$ts_pid" 2>/dev/null || true
+          kill -TERM $up_pid $sshd_pid "$ts_pid" "$nd_pid" 2>/dev/null || true
           wait || true
         }
         trap 'cleanup; exit 143' TERM INT
@@ -229,11 +267,86 @@
         ${pkgs.openssh}/bin/sshd -D -e -f ${sshConfig} &
         sshd_pid=$!
         status=0
-        wait -n "$ts_pid" "$sshd_pid" || status=$?
-        echo "rent-start: tailscaled or sshd exited ($status); stopping" >&2
+        wait -n "$nd_pid" "$ts_pid" "$sshd_pid" || status=$?
+        echo "rent-start: nix-daemon, tailscaled or sshd exited ($status); stopping" >&2
         cleanup
         exit 1
       '';
+      # One rent image per dev profile. The runtime paths are the GC-rooted closure seeded into the rent /nix volume;
+      # rent-nix-seed is not among them, because it runs only against the image's own store with the volume at /seed.
+      mkRent = { profile, tag }:
+        let
+          start = rentStart profile;
+          roots = pkgs.writeText "rent-nix-roots"
+            (pkgs.lib.concatMapStrings (p: "${p}\n") [ pkgs.cacert profile rentTools start ]);
+          closure = pkgs.closureInfo { rootPaths = [ roots ]; };
+          # Seed or upgrade a rent /nix volume from this image, while no container uses it: copy missing store paths
+          # (each appears only complete), register the closure, set the rent-dev profile, then the GC root, last.
+          seed = pkgs.writeShellScriptBin "rent-nix-seed" ''
+            set -eu
+            export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.nix ]}
+            fail() { echo "rent-nix-seed: $*" >&2; exit 1; }
+            ${mountLib}
+            nixvol=''${RENT_NIX_VOLUME:-}
+            volume_name "$nixvol" || fail 'set RENT_NIX_VOLUME to a volume name'
+            volume_at /seed "$nixvol" rw || fail "/seed must be exactly volume $nixvol, rw"
+            if mounted /nix; then fail '/nix must be the image store, not a mount'; fi
+            [ "$(volume_count)" = 1 ] || fail 'exactly one volume is allowed'
+            if [ -e /seed/var/rent-nix ]; then
+              [ "$(cat /seed/var/rent-nix)" = '${rentNixMarker}' ] || fail '/seed has a different marker'
+            elif [ -n "$(ls -A /seed)" ]; then
+              fail '/seed is neither empty nor a rent /nix volume'
+            else
+              install -d -m 755 /seed/var
+              printf '%s\n' '${rentNixMarker}' > /seed/var/rent-nix
+            fi
+            install -d -m 1775 -o 0 -g 30000 /seed/store
+            rm -rf /seed/.rent-seed-tmp
+            install -d -m 700 /seed/.rent-seed-tmp
+            copied=0
+            while read -r p; do
+              b=''${p#/nix/store/}
+              if [ -e "/seed/store/$b" ] || [ -L "/seed/store/$b" ]; then continue; fi
+              cp -a "$p" "/seed/.rent-seed-tmp/$b"
+              mv -T "/seed/.rent-seed-tmp/$b" "/seed/store/$b"
+              copied=$((copied + 1))
+            done < ${closure}/store-paths
+            rmdir /seed/.rent-seed-tmp
+            # Paths are logical /nix/store names; only the database lives under /seed here.
+            nix-store --store 'local?state=/seed/var/nix' --load-db < ${closure}/registration
+            ${profileLib}
+            set_profile /seed ${profile}
+            install -d -m 755 /seed/var/nix/gcroots/rent
+            ln -sfn ${roots} /seed/var/nix/gcroots/rent/.new
+            mv -T /seed/var/nix/gcroots/rent/.new /seed/var/nix/gcroots/rent/${baseNameOf roots}
+            echo "rent-nix-seed ok volume=$nixvol roots=${roots} copied=$copied"
+          '';
+        in pkgs.dockerTools.buildLayeredImage {
+          name = "ghcr.io/roccho-dev/windows-rent";
+          inherit tag;
+          contents = [ pkgs.cacert profile rentTools start seed ];
+          extraCommands = ''
+            mkdir -p etc/ssl/certs etc/nix home/dev tmp var/empty
+            {
+              printf 'root:x:0:0:root:/root:/bin/sh\nsshd:x:74:74:sshd:/var/empty:/bin/sh\ndev:x:1000:1000:Development user:/home/dev:/bin/sh\n'
+              for i in 1 2 3 4 5 6 7 8; do printf 'nixbld%s:x:%s:30000:Nix build user:/var/empty:/bin/sh\n' $i $((30000 + i)); done
+            } > etc/passwd
+            printf 'root:x:0:\nsshd:x:74:\ndev:x:1000:\nnixbld:x:30000:nixbld1,nixbld2,nixbld3,nixbld4,nixbld5,nixbld6,nixbld7,nixbld8\n' > etc/group
+            cp ${rentNixConf} etc/nix/nix.conf
+            ln -s ${roots} etc/rent-nix-roots
+            # Default CA path, so TLS works in sessions that do not inherit SSL_CERT_FILE (Tailscale SSH).
+            ln -s ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt .${rentCert}
+            chmod 1777 tmp
+          '';
+          # No Volumes: an image-declared volume would silently satisfy a missing mount.
+          config = {
+            Cmd = [ "${start}/bin/rent-start" ];
+            Env = [ "HOME=/home/dev" "PATH=/bin:/usr/bin" "SSL_CERT_FILE=${rentCert}" ];
+            ExposedPorts."2222/tcp" = {};
+            Labels."org.opencontainers.image.source" = "https://github.com/roccho-dev/windows";
+          };
+        };
+      rentProfile = import ./hosts/profile/nix.nix { inherit pkgs; };
     in {
       packages.${system} = {
         own-image = pkgs.dockerTools.buildLayeredImage {
@@ -249,25 +362,11 @@
           '';
           config = ownConfig;
         };
-        rent-image = pkgs.dockerTools.buildLayeredImage {
-          name = "ghcr.io/roccho-dev/windows-rent";
-          tag = "nix";
-          contents = [ pkgs.bash pkgs.cacert devTools rentStart ];
-          extraCommands = ''
-            mkdir -p etc/ssl/certs home/dev tmp var/empty
-            printf 'root:x:0:0:root:/root:/bin/sh\nsshd:x:74:74:sshd:/var/empty:/bin/sh\ndev:x:1000:1000:Development user:/home/dev:/bin/sh\n' > etc/passwd
-            printf 'root:x:0:\nsshd:x:74:\ndev:x:1000:\n' > etc/group
-            # Default CA path, so TLS works in sessions that do not inherit SSL_CERT_FILE (Tailscale SSH).
-            ln -s ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt .${rentCert}
-            chmod 1777 tmp
-          '';
-          # No Volumes: an image-declared volume would silently satisfy a missing mount.
-          config = {
-            Cmd = [ "${rentStart}/bin/rent-start" ];
-            Env = [ "HOME=/home/dev" "PATH=/bin:/usr/bin" "SSL_CERT_FILE=${rentCert}" ];
-            ExposedPorts."2222/tcp" = {};
-            Labels."org.opencontainers.image.source" = "https://github.com/roccho-dev/windows";
-          };
+        rent-image = mkRent { profile = rentProfile; tag = "nix"; };
+        # CI only, never published: the same definition plus one package, to prove seed-on-upgrade and rollback.
+        rent-image-next = mkRent {
+          profile = import ./hosts/profile/nix.nix { inherit pkgs; extra = [ pkgs.hello ]; };
+          tag = "next";
         };
         dev-profile = dev.profile;
         dev-image = dev.image;
