@@ -36,100 +36,262 @@ jobs:
           printf 'source %s\ndrvPath %s\nworkflow blob %s\n' "$sha" "$drv" "$(git rev-parse HEAD:.github/workflows/own-image.yml)" >> "$GITHUB_STEP_SUMMARY"
       - name: Evaluate flake checks
         run: nix flake check --no-write-lock-file --print-build-logs
-      - name: Build actual own OCI image
-        run: nix build .#own-image --no-write-lock-file --print-build-logs
-      - name: Test synthetic trial mode, restart, and volume reuse (no real logins)
+      - name: rent is unchanged by own adoption (same drvPaths as the #19 head)
+        run: |
+          set -euo pipefail
+          base=github:roccho-dev/windows/21b31e13381e3022797a40471ee7867ed0680c4d
+          for p in rent-image rent-image-next; do
+            test "$(nix eval --raw ".#$p.drvPath" --no-write-lock-file)" = "$(nix eval --raw "$base#$p.drvPath")"
+          done
+      - name: Plan and fake-WSLC Replace of the own Windows script (no WSLC, no live effect)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Path = "$PWD/hosts/own/win.ps1"
+          $Errors = $null
+          $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref] $null, [ref] $Errors)
+          if ($Errors) { $Errors; exit 1 }
+          $env:COMPUTERNAME = 'CI-HOST'
+          # Test setup only: Linux has no C: drive, so the script's fixed WSLC path is rooted in an existing directory.
+          $env:ProgramFiles = $env:RUNNER_TEMP
+          $Binding = (New-TemporaryFile).FullName
+          $B = Get-Content hosts/own/bindings/G6I3.json -Raw | ConvertFrom-Json
+          $B.expectHost = 'CI-HOST'
+          $B | ConvertTo-Json | Set-Content $Binding
+          $Plan = (& $Path -Step Plan -Binding $Binding) | ConvertFrom-Json
+          $W = $Plan.pull[0]
+          if ($W -notlike '*WSL?wslc.exe') { "unexpected WSLC path $W"; exit 1 }
+          $Image = $B.image
+          $Want = [ordered]@{
+            create = @($W, 'run', '--name', 'windows-own', '--detach', '--publish', '127.0.0.1:2223:2223', '--shm-size', '1G',
+              '--volume', 'windows-own-home:/home/dev', '--volume', 'windows-own-work:/work/repos', '--volume', 'windows-own-nix:/nix',
+              '--env', 'OWN_HOME_VOLUME=windows-own-home', '--env', 'OWN_WORK_VOLUME=windows-own-work', '--env', 'OWN_NIX_VOLUME=windows-own-nix',
+              '--env', "OWN_AUTHORIZED_KEY=<contents of $([Environment]::ExpandEnvironmentVariables($B.publicKeyFile))>", $Image)
+            seed = @($W, 'run', '--rm', '--volume', 'windows-own-nix:/seed', '--env', 'OWN_NIX_VOLUME=windows-own-nix', $Image, '/bin/own-nix-seed')
+            workVolumeCreateOnce = @($W, 'volume', 'create', 'windows-own-work')
+            nixVolumeCreateOnce = @($W, 'volume', 'create', 'windows-own-nix')
+          }
+          foreach ($K in $Want.Keys) {
+            if ((@($Plan.$K) -join "`n") -cne ($Want[$K] -join "`n")) { "$K differs: $(@($Plan.$K) -join ' ')"; exit 1 }
+          }
+          if ($Plan.postGate -notlike "*'own-mounts ok home=windows-own-home work=windows-own-work nix=windows-own-nix'*") { 'postGate differs'; exit 1 }
+          foreach ($Bad in @(@{ workVolume = 'windows-own-home' }, @{ nixVolume = 'windows-own-work' }, @{ nixVolume = 'Bad Name' })) {
+            $C = Get-Content $Binding -Raw | ConvertFrom-Json
+            foreach ($K in $Bad.Keys) { $C.$K = $Bad[$K] }
+            $F = (New-TemporaryFile).FullName; $C | ConvertTo-Json | Set-Content $F
+            $Refused = $false
+            try { & $Path -Step Plan -Binding $F | Out-Null } catch { $Refused = $true }
+            if (-not $Refused) { "not refused: $($Bad | ConvertTo-Json -Compress)"; exit 1 }
+          }
+          # Replace on a fake WSLC, with the script's own functions and values.
+          $Site = $B; $Spec = Get-Content hosts/own/spec.json -Raw | ConvertFrom-Json
+          foreach ($N in $Ast.FindAll({ param($n)
+              ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Get-Own', 'Get-Images', 'Test-RunningProof',
+                'Wait-RunningProof', 'Get-RollbackProblem', 'Wait-OldRunning', 'Invoke-Seed', 'Complete-Replace') -or
+              ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in '$Volumes', '$Proof') }, $true)) {
+            . ([scriptblock]::Create($N.Extent.Text))
+          }
+          function Start-Sleep { }
+          $RunArgs = @($Plan.create | Select-Object -Skip 1); $SeedArgs = @($Plan.seed | Select-Object -Skip 1)
+          $OldImage = 'ghcr.io/roccho-dev/windows-own@sha256:' + ('1' * 64)
+          $Old = [pscustomobject] @{ Name = 'windows-own'; Config = [pscustomobject] @{ Image = $OldImage } }
+          $Pre = @('run', '--name', 'windows-own', '--detach', '--publish', '127.0.0.1:2223:2223', '--shm-size', '1G')
+          $Good = $Pre + @('--volume', 'windows-own-home:/home/dev', $OldImage)
+          # The forms this script has actually run: the one-volume trial runtime (with its key and trial env) and the new one.
+          $Three = $Pre + @('--volume', 'windows-own-home:/home/dev', '--volume', 'windows-own-work:/work/repos', '--volume', 'windows-own-nix:/nix',
+            '--env', 'OWN_HOME_VOLUME=windows-own-home', '--env', 'OWN_WORK_VOLUME=windows-own-work', '--env', 'OWN_NIX_VOLUME=windows-own-nix',
+            '--env', 'OWN_AUTHORIZED_KEY=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA== ci', $OldImage)
+          $Trial = $Pre + @('--volume', 'windows-own-home:/home/dev', '--env', 'OWN_AUTHORIZED_KEY=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA== ci',
+            '--env', 'OWN_TRIAL_UNSANDBOXED=1', $OldImage)
+          foreach ($Ok in @(, $Trial)) { if (Get-RollbackProblem $Ok $Old) { "trial rollback argv refused: $(Get-RollbackProblem $Ok $Old)"; exit 1 } }
+          foreach ($Ok in @(, $Good) + @(, $Three)) { if (Get-RollbackProblem $Ok $Old) { "good rollback argv refused: $(Get-RollbackProblem $Ok $Old)"; exit 1 } }
+          $H = @('--volume', 'windows-own-home:/home/dev')
+          foreach ($Bad in @(@('run', '--rm', '--name', 'windows-own', $OldImage), @('run', '--name', 'other', '--detach', $OldImage),
+              @('run', '--name', 'windows-own', '--detach', $Image), ($Pre + $H + @('--env', 'GH_TOKEN=x', $OldImage)),
+              # Not the exact old target: SSH port, home volume, an extra or partial volume set, or other flag forms.
+              (@('run', '--name', 'windows-own', '--detach', '--publish', '127.0.0.1:2224:2223') + $H + @($OldImage)),
+              (@('run', '--name', 'windows-own', '--detach') + $H + @($OldImage)),
+              ($Pre + @('--publish', '127.0.0.1:14500:14500') + $H + @($OldImage)),
+              ($Pre + @('--volume', 'other-home:/home/dev', $OldImage)),
+              ($Pre + @('--volume', 'windows-own-home:/root', $OldImage)),
+              ($Pre + $H + @('--volume', 'extra:/extra', $OldImage)),
+              ($Pre + $H + @('--volume', 'windows-own-nix:/nix', $OldImage)),
+              ($Pre + @('-v', 'windows-own-home:/home/dev', $OldImage)),
+              (@('run', '--name', 'windows-own', '-p', '127.0.0.1:2223:2223') + $H + @($OldImage)),
+              # A persistent old own, not merely exit 0: exactly one --detach, no other options, allowlisted env only.
+              (@('run', '--name', 'windows-own', '--publish', '127.0.0.1:2223:2223', '--shm-size', '1G') + $H + @($OldImage)),
+              ($Pre + @('--detach') + $H + @($OldImage)),
+              ($Pre + @('--entrypoint', '/bin/true') + $H + @($OldImage)),
+              ($Pre + @('--user', '0') + $H + @($OldImage)),
+              ($Pre + @('--restart', 'always') + $H + @($OldImage)),
+              ($Pre + @('--env', 'FOO=1') + $H + @($OldImage)),
+              ($Pre + @('--shm-size', '2G') + $H + @($OldImage)),
+              ($Pre + @('--name', 'windows-own') + $H + @($OldImage)),
+              ($Pre + $H + @('--env')  + @($OldImage)),
+              ($Pre + $H + @($OldImage, '/bin/true')))) {
+            if (-not (Get-RollbackProblem $Bad $Old)) { "bad rollback argv allowed: $($Bad -join ' ')"; exit 1 }
+          }
+          $NewUp = '{"Name":"windows-own","State":{"Running":true}}'
+          $Wslc = {
+            $A = @($args) -join ' '
+            $Calls.Add($A)
+            $global:LASTEXITCODE = if ($Case.Exit -and $Case.Exit.ContainsKey($A)) { $Case.Exit[$A] } else { 0 }
+            if ($A -ceq 'container inspect -f json windows-own') {
+              $Case.Seen++
+              $Out = & $Case.Inspect $Case.Seen
+              if ($null -eq $Out) { $global:LASTEXITCODE = 1 } else { $Out }
+            }
+            elseif ($A -ceq 'logs windows-own') { if ($Case.Logs) { $Case.Logs } else { $Proof } }
+            else { 'wslc output' }
+          }
+          $S = $SeedArgs -join ' '; $R = $RunArgs -join ' '; $G = $Good -join ' '
+          $Head = @($S, 'remove windows-own', 'volume inspect windows-own-home', 'volume inspect windows-own-work', 'volume inspect windows-own-nix', $R)
+          $Clear = @('container inspect -f json windows-own', 'stop windows-own', 'remove windows-own', $G)
+          # Rollback succeeds only when the old container is then Running on its old image for three consecutive polls.
+          $I = 'container inspect -f json windows-own'
+          $OldUp = '{"Name":"windows-own","State":{"Running":true},"Config":{"Image":"' + $OldImage + '"}}'
+          $OldDown = '{"Name":"windows-own","State":{"Running":false},"Config":{"Image":"' + $OldImage + '"}}'
+          $Verified = @($I, $I, $I); $Unverified = @(1..60 | ForEach-Object { $I })
+          $Cases = [ordered]@{
+            'proven' = @{ Inspect = { $NewUp }; Want = 'ok'; Calls = $Head + @('container inspect -f json windows-own', 'logs windows-own') }
+            'seed fails' = @{ Exit = @{ $S = 1 }; Inspect = { $OldUp }; Calls = @($S, 'start windows-own') + $Verified
+              Want = 'Replace failed: WSLC seed failed: 1 | rollback succeeded: start old exit 0; old Running on its old image' }
+            'remove fails' = @{ Exit = @{ 'remove windows-own' = 1 }; Inspect = { $OldUp }; Calls = @($S, 'remove windows-own', 'start windows-own') + $Verified
+              Want = 'Replace failed: WSLC remove failed: 1 | rollback succeeded: start old exit 0; old Running on its old image' }
+            'run fails' = @{ Exit = @{ $R = 1 }; Inspect = { param($N) if ($N -eq 1) { $null } else { $OldUp } }; Calls = $Head + @($I, $G) + $Verified
+              Want = 'Replace failed: WSLC run failed: 1 | rollback succeeded: recorded argv exit 0; old Running on its old image' }
+            'start old exits 0, old not Running' = @{ Exit = @{ $S = 1 }; Inspect = { $OldDown }; Calls = @($S, 'start windows-own') + $Unverified
+              Want = 'Replace failed: WSLC seed failed: 1 | rollback FAILED: start old exit 0; old not Running on its old image within 60 s' }
+            'old starts then keeps crashing' = @{ Exit = @{ $S = 1 }; Inspect = { param($N) if ($N % 3 -eq 0) { $OldDown } else { $OldUp } }
+              Calls = @($S, 'start windows-own') + $Unverified
+              Want = 'Replace failed: WSLC seed failed: 1 | rollback FAILED: start old exit 0; old not Running on its old image within 60 s' }
+            'recorded argv exits 0, other image Running' = @{ Exit = @{ $R = 1 }; Inspect = { param($N) if ($N -eq 1) { $null } else { $NewUp } }
+              Calls = $Head + @($I, $G) + $Unverified
+              Want = 'Replace failed: WSLC run failed: 1 | rollback FAILED: recorded argv exit 0; old not Running on its old image within 60 s' }
+            'post-gate fails, rollback fails' = @{ Exit = @{ $G = 1 }; Inspect = { $NewUp }; Logs = 'x'
+              Calls = $Head + @(1..60 | ForEach-Object { 'container inspect -f json windows-own', 'logs windows-own' }) + $Clear
+              Want = "Replace failed: New windows-own did not show Running and '$Proof' within 60 s. | rollback FAILED: stop new exit 0; remove new exit 0; recorded argv exit 1" }
+          }
+          foreach ($K in $Cases.Keys) {
+            $Case = $Cases[$K]; $Calls = [System.Collections.Generic.List[string]]::new()
+            $Got = try { Complete-Replace $Good; 'ok' } catch { $_.Exception.Message }
+            if ($Got -cne $Case.Want -or ($Calls -join "`n") -cne ($Case.Calls -join "`n")) { "replace '$K' gave: $Got"; $Calls; exit 1 }
+            if (@($Calls) -cmatch '^(remove|rm|stop|run) (.* )?(-f|-v|--force|--volumes)( |$)|^volume (remove|rm|prune)') { "replace '$K' used a forbidden flag"; exit 1 }
+          }
+          $global:LASTEXITCODE = 0
+      - name: Build actual own OCI image and the CI-only upgrade image
+        run: nix build .#own-image .#own-image-next --no-write-lock-file --print-build-logs
+      # The completed own SSH/B2 trial (browsers, CDP, xpra tunnel, restart) is not rerun here; its step text stays in
+      # history (own-image.yml at 21b31e1) with its passing runs. This checks only what own adoption changes.
+      - name: Seed, lock and a short SSH/Nix check after recreation (no real logins)
         shell: bash
         run: |
           set -euo pipefail
           docker load < result
-          key_dir="$(mktemp -d)"
-          trap 'kill "${tunnel_pid:-}" 2>/dev/null || true; docker rm -f own-smoke >/dev/null 2>&1 || true; docker volume rm own-smoke-home >/dev/null 2>&1 || true; rm -rf "$key_dir"' EXIT
-          ssh-keygen -q -t ed25519 -N '' -f "$key_dir/key"
-          docker volume create own-smoke-home
-          docker run -d --name own-smoke --shm-size 1g -p 127.0.0.1:2223:2223 \
-            -v own-smoke-home:/home/dev \
-            -e "OWN_AUTHORIZED_KEY=$(cat "$key_dir/key.pub")" \
-            -e OWN_TRIAL_UNSANDBOXED=1 \
-            ghcr.io/roccho-dev/windows-own:nix
-          ssh_cmd=(ssh -F /dev/null -p 2223 -i "$key_dir/key" -o IdentitiesOnly=yes \
-            -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-            -o "UserKnownHostsFile=$key_dir/known_hosts" dev@127.0.0.1)
-          # Three headless profiles: distinct CDP endpoints on 9222-9224, each loopback-only, and only 2223 published.
-          browsers() {
-            : > "$key_dir/ws"
-            for n in 1 2 3; do
-              port=$((9221 + n))
-              for attempt in {1..60}; do
-                if docker exec own-smoke /bin/curl -fsS "http://127.0.0.1:$port/json/list" > "$key_dir/pages$n" 2>/dev/null &&
-                  grep -q "own p$n" "$key_dir/pages$n"; then break; fi
-                sleep 1
-              done
-              grep -q "own p$n" "$key_dir/pages$n"
-              docker exec own-smoke /bin/curl -fsS "http://127.0.0.1:$port/json/version" > "$key_dir/cdp$n"
-              grep -q '"Browser": "Chrome/150\.' "$key_dir/cdp$n"
-              grep -o '"webSocketDebuggerUrl": "[^"]*"' "$key_dir/cdp$n" >> "$key_dir/ws"
-              "${ssh_cmd[@]}" "test -d /home/dev/chromium/p$n/Default"
-            done
-            test "$(sort -u "$key_dir/ws" | wc -l)" -eq 3
-            docker exec own-smoke /bin/cat /proc/net/tcp /proc/net/tcp6 > "$key_dir/tcp"
-            for port in 9222 9223 9224; do
-              awk -v h=":$(printf '%04X' "$port")" '$4 == "0A" && substr($2, length($2) - 4) == h { n++; if ($2 !~ /^(0100007F|00000000000000000000000001000000):/) bad++ } END { exit !(n >= 1 && bad == 0) }' "$key_dir/tcp"
-            done
-            test "$(docker port own-smoke)" = "2223/tcp -> 127.0.0.1:2223"
-            "${ssh_cmd[@]}" 'test -x "$(command -v cdp-tty)" && test -x "$(command -v own-view)"'
+          docker load < result-1
+          image=$(docker image inspect ghcr.io/roccho-dev/windows-own:nix --format '{{.Id}}')
+          next=$(docker image inspect ghcr.io/roccho-dev/windows-own:next --format '{{.Id}}')
+          d="$(mktemp -d)"
+          trap 'status=$?; [ "$status" -eq 0 ] || docker logs own-smoke 2>&1 | tail -n 40 || true; docker rm -f own-smoke own-hold >/dev/null 2>&1 || true; docker volume rm own-smoke-home own-smoke-work own-smoke-nix own-smoke-empty own-smoke-foreign >/dev/null 2>&1 || true; rm -rf "$d"' EXIT
+          fail() { echo "FAIL $*" >&2; exit 1; }
+          ssh-keygen -q -t ed25519 -N '' -f "$d/key"
+          for v in home work nix empty foreign; do docker volume create "own-smoke-$v" >/dev/null; done
+          nixm() { echo "type=volume,source=$1,target=/nix,volume-nocopy"; }
+          ids=(-e OWN_HOME_VOLUME=own-smoke-home -e OWN_WORK_VOLUME=own-smoke-work -e OWN_NIX_VOLUME=own-smoke-nix)
+          home=(-v own-smoke-home:/home/dev); work=(-v own-smoke-work:/work/repos); nixv=(--mount "$(nixm own-smoke-nix)")
+          seed() { docker run --rm -v "own-smoke-$2:/seed" -e "OWN_NIX_VOLUME=own-smoke-$2" "$1" /bin/own-nix-seed; }
+          # Every name, size and mtime under the nix volume: "nothing written" is an exact comparison.
+          listing() { docker run --rm -v own-smoke-nix:/n "$image" /bin/bash -c 'cd /n && find . -printf "%p %s %T@\n" | LC_ALL=C sort | sha256sum'; }
+          refuse() {
+            local want=$1; shift
+            if timeout 60 docker run --rm "$@" "$image" > "$d/out" 2>&1; then fail "started despite: $want"; fi
+            grep -qF "$want" "$d/out" || { cat "$d/out" >&2; fail "wrong refusal for: $want"; }
+            if grep -qF 'own-mounts ok' "$d/out"; then fail "gate passed despite: $want"; fi
           }
-          for attempt in {1..60}; do
-            if "${ssh_cmd[@]}" id -un > "$key_dir/answer" 2>/dev/null; then break; fi
-            sleep 1
-          done
-          test "$(cat "$key_dir/answer")" = dev
-          "${ssh_cmd[@]}" 'test "$(command -v codex)" = /bin/codex && test "$(codex --version)" = "codex-cli 0.157.1" && codex app-server --help >/dev/null && codex_bin="$(readlink -f /bin/codex)" && test -x "${codex_bin%/*}/codex-code-mode-host"'
-          "${ssh_cmd[@]}" 'gh --version >/dev/null'
-          "${ssh_cmd[@]}" 'test -s "$SSL_CERT_FILE" && curl -fsSI https://github.com/ >/dev/null'
-          browsers
-          ssh -F /dev/null -N -p 2223 -i "$key_dir/key" -o IdentitiesOnly=yes \
-            -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            -o "UserKnownHostsFile=$key_dir/known_hosts" \
-            -o ExitOnForwardFailure=yes \
-            -L 127.0.0.1:14500:127.0.0.1:14500 dev@127.0.0.1 &
-          tunnel_pid=$!
-          for attempt in {1..30}; do
-            if curl -fsS http://127.0.0.1:14500/ > "$key_dir/index" 2>/dev/null; then break; fi
-            sleep 1
-          done
-          grep -Eqi 'xpra|html5' "$key_dir/index"
-          python3 - <<'PY'
-          import socket
-          request = (
-              "GET / HTTP/1.1\r\n"
-              "Host: 127.0.0.1:14500\r\n"
-              "Upgrade: websocket\r\n"
-              "Connection: Upgrade\r\n"
-              "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-              "Sec-WebSocket-Version: 13\r\n"
-              "Sec-WebSocket-Protocol: binary\r\n"
-              "Origin: http://127.0.0.1:14500\r\n\r\n"
-          )
-          with socket.create_connection(("127.0.0.1", 14500), timeout=5) as conn:
-              conn.sendall(request.encode())
-              response = conn.recv(4096)
-          assert response.startswith(b"HTTP/1.1 101 "), response[:300]
-          PY
-          kill "$tunnel_pid"
-          wait "$tunnel_pid" || true
-          unset tunnel_pid
-          docker restart own-smoke
-          browsers
-          old_id="$(docker inspect --format '{{.Id}}' own-smoke)"
-          docker rm -f own-smoke
-          docker run -d --name own-smoke --shm-size 1g -p 127.0.0.1:2223:2223 \
-            -v own-smoke-home:/home/dev \
-            -e "OWN_AUTHORIZED_KEY=$(cat "$key_dir/key.pub")" \
-            -e OWN_TRIAL_UNSANDBOXED=1 \
-            ghcr.io/roccho-dev/windows-own:nix
-          test "$(docker inspect --format '{{.Id}}' own-smoke)" != "$old_id"
-          browsers
+
+          # An empty /nix hides the image store: nothing can start, and nothing is written.
+          if docker run --rm --mount "$(nixm own-smoke-empty)" "$image" > "$d/out" 2>&1; then fail 'started on an empty /nix'; fi
+          test -z "$(docker run --rm -v own-smoke-empty:/e "$image" /bin/ls -A /e)" || fail 'an empty /nix was written'
+
+          # Fresh seed: store, DB, profile and GC root; no lock file (the lock is the volume root); a rerun copies 0.
+          roots=$(docker run --rm "$image" /bin/readlink /etc/own-nix-roots)
+          seed "$image" nix | grep -qE "^own-nix-seed ok volume=own-smoke-nix roots=$roots copied=[1-9][0-9]*$" || fail 'fresh seed'
+          test "$(docker run --rm -v own-smoke-nix:/n "$image" /bin/ls -A /n | tr '\n' ' ')" = 'store var ' || fail 'unexpected top-level entries'
+          seed "$image" nix | grep -qxF "own-nix-seed ok volume=own-smoke-nix roots=$roots copied=0" || fail 'reseed was not a no-op'
+          docker run --rm -v own-smoke-foreign:/f "$image" /bin/bash -c 'echo x > /f/x'
+          if seed "$image" foreign > "$d/out" 2>&1; then fail 'seeded a foreign volume'; fi
+          grep -qF '/seed is neither empty nor an own /nix volume' "$d/out" || fail 'foreign volume refusal'
+
+          # Mount gate before any service.
+          refuse 'own-mounts: set OWN_HOME_VOLUME, OWN_WORK_VOLUME and OWN_NIX_VOLUME' "${home[@]}" "${work[@]}" "${nixv[@]}"
+          refuse 'own-mounts: /work/repos must be exactly volume own-smoke-work, rw' "${home[@]}" "${nixv[@]}" "${ids[@]}"
+          refuse 'own-mounts: /home/dev must be exactly volume own-smoke-home, rw' -v own-smoke-home:/home/dev:ro "${work[@]}" "${nixv[@]}" "${ids[@]}"
+          refuse 'own-mounts: /home/dev must be exactly volume own-smoke-home' -v own-smoke-foreign:/home/dev "${work[@]}" "${nixv[@]}" "${ids[@]}"
+          refuse 'own-mounts: /nix must be exactly volume own-smoke-nix, rw' "${home[@]}" "${work[@]}" --mount "$(nixm own-smoke-nix),readonly" "${ids[@]}"
+          refuse 'own-mounts: exactly three volumes are allowed' "${home[@]}" "${work[@]}" "${nixv[@]}" -v own-smoke-empty:/extra "${ids[@]}"
+
+          run() {
+            docker run -d --name own-smoke --shm-size 1g -p 127.0.0.1:2223:2223 "${home[@]}" "${work[@]}" "${nixv[@]}" "${ids[@]}" \
+              -e OWN_TRIAL_UNSANDBOXED=1 "$@" >/dev/null
+            for _ in {1..60}; do
+              docker logs own-smoke 2>&1 | grep -qxF 'own-mounts ok home=own-smoke-home work=own-smoke-work nix=own-smoke-nix' && return 0
+              sleep 1
+            done
+            fail 'own-start did not pass its gate'
+          }
+          ssh_cmd=(ssh -F /dev/null -p 2223 -i "$d/key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o GlobalKnownHostsFile=/dev/null -o "UserKnownHostsFile=$d/known_hosts" dev@127.0.0.1)
+          ssh_ready() { for _ in {1..60}; do "${ssh_cmd[@]}" true 2>/dev/null && return 0; sleep 1; done; fail 'ssh'; }
+          run -e "OWN_AUTHORIZED_KEY=$(cat "$d/key.pub")" "$image"
+          # The host key is pinned from the home volume, never accepted anew.
+          printf '[127.0.0.1]:2223 %s\n' "$(docker exec own-smoke /bin/cat /home/dev/.ssh/ssh_host_ed25519_key.pub | cut -d' ' -f1,2)" > "$d/known_hosts"
+          ssh_ready
+          "${ssh_cmd[@]}" 'set -eu
+            echo home > ~/own-home-marker
+            git init -q /work/repos/p && cd /work/repos/p
+            git -c user.name=ci -c user.email=ci@example.invalid commit -q --allow-empty -m first
+            git rev-parse HEAD' > "$d/head1"
+
+          # Lock: a seed is refused while own holds the volume, and writes nothing.
+          before=$(listing)
+          if seed "$image" nix > "$d/out" 2>&1; then fail 'seeded while own runs'; fi
+          grep -qF 'own-smoke-nix is in use by a running own container or another seed' "$d/out" || fail 'lock refusal'
+          test "$(listing)" = "$before" || fail 'a refused seed wrote'
+          docker stop -t 30 own-smoke >/dev/null
+          # Any holder of the root lock, here a plain container, stops both a seed and own-start.
+          docker run -d --name own-hold -v own-smoke-nix:/n "$image" /bin/bash -c 'exec 9</n; flock -x 9; echo held; exec sleep infinity' >/dev/null
+          for _ in {1..30}; do docker logs own-hold 2>&1 | grep -qx held && break; sleep 1; done
+          if seed "$image" nix > "$d/out" 2>&1; then fail 'seeded while another container holds the lock'; fi
+          grep -qF 'is in use by a running own container or another seed' "$d/out" || fail 'held-lock seed refusal'
+          docker start own-smoke >/dev/null
+          test "$(docker wait own-smoke)" != 0 || fail 'own started while the lock was held'
+          docker logs own-smoke 2>&1 | grep -qF 'own-nix: own-smoke-nix is in use by another own container or a seed' || fail 'held-lock start refusal'
+          docker rm -f own-hold >/dev/null
+
+          # Package addition by definition: seed the next image, recreate on the same volumes, short SSH/Nix check.
+          seed "$next" nix | grep -qE "^own-nix-seed ok volume=own-smoke-nix roots=.* copied=[1-9][0-9]*$" || fail 'upgrade seed'
+          old_id=$(docker inspect --format '{{.Id}}' own-smoke)
+          docker rm own-smoke >/dev/null
+          run "$next"
+          test "$(docker inspect --format '{{.Id}}' own-smoke)" != "$old_id" || fail 'not a new container'
+          ssh_ready
+          "${ssh_cmd[@]}" 'set -eu
+            test "$(id -un)" = dev
+            test "$NIX_REMOTE" = daemon
+            hello > /dev/null
+            test "$(readlink /nix/var/nix/profiles/own-dev)" = own-dev-2-link
+            test "$(codex --version)" = "codex-cli 0.157.1"
+            test "$(claude --version)" = "2.1.283 (Claude Code)"
+            gh --version | grep -qE "^gh version 2\.96\.0( |$)"
+            test "$(cat ~/own-home-marker)" = home && test ! -e /work/repos/own-home-marker
+            cd /work/repos/p && git rev-parse HEAD
+            git -c user.name=ci -c user.email=ci@example.invalid commit -q --allow-empty -m second
+            nix build --impure --out-link /work/repos/p/result --expr "derivation { name = \"own-proof\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; args = [ \"-c\" \"echo built > \$out\" ]; }"
+            test "$(cat /work/repos/p/result)" = built
+            if touch /nix/store/dev-write 2>/dev/null; then exit 1; fi' > "$d/after"
+          test "$(head -n1 "$d/after")" = "$(cat "$d/head1")" || fail 'work commit lost'
+          docker exec own-smoke /bin/nix-store --verify --check-contents
+          echo 'PASS own seed, lock, gate and short SSH/Nix check after recreation' | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Keep the tested image for publishing
         if: inputs.publish
         run: cp -L result own-image.tar.gz

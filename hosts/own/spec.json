@@ -6,6 +6,8 @@
   "cdpPort": 9222,
   "publishAddress": "127.0.0.1",
   "stateMount": "/home/dev",
+  "workMount": "/work/repos",
+  "nixMount": "/nix",
   "shmSize": "1G",
   "authorizedKeyEnv": "OWN_AUTHORIZED_KEY",
   "syntheticTrialEnv": "OWN_TRIAL_UNSANDBOXED"

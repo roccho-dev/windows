@@ -8,23 +8,19 @@
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
       ownSpec = builtins.fromJSON (builtins.readFile ./hosts/own/spec.json);
-      own = import ./hosts/own/nix.nix { inherit pkgs; spec = ownSpec; };
+      # own on the same common dev profile as rent; the generic mountLib and multi-user nix.conf are shared, unchanged.
+      ownFor = { profile, tag }: import ./hosts/own/nix.nix {
+        inherit pkgs profile tag mountLib;
+        spec = ownSpec;
+        nixConf = rentNixConf;
+      };
+      own = ownFor { profile = import ./hosts/profile/nix.nix { inherit pkgs; }; tag = "nix"; };
       dev = import ./oci/dev/nix.nix { inherit pkgs; };
       common = import ./hosts/common/nix.nix {
         inherit pkgs;
         source = self.rev or "uncommitted";
       };
-      ownConfig = {
-        Cmd = [ "${own.start}/bin/own-start" ];
-        Env = [
-          "HOME=${ownSpec.stateMount}"
-          "PATH=/bin:/usr/bin"
-          "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-        ];
-        ExposedPorts."${toString ownSpec.sshPort}/tcp" = {};
-        Volumes.${ownSpec.stateMount} = {};
-        Labels."org.opencontainers.image.source" = "https://github.com/roccho-dev/windows";
-      };
+      ownConfig = own.config;
       # rent: tools live in the image; /home/dev is fresh per container; /var/lib/rent (state), /work/repos (existing
       # repos, never copied or chowned) and /nix (rent's own writable store, seeded from the image) are volumes.
       rentState = "/var/lib/rent";
@@ -349,19 +345,12 @@
       rentProfile = import ./hosts/profile/nix.nix { inherit pkgs; };
     in {
       packages.${system} = {
-        own-image = pkgs.dockerTools.buildLayeredImage {
-          name = ownSpec.imageRepository;
-          tag = "nix";
-          contents = [ pkgs.bash pkgs.cacert own.tools own.start ];
-          extraCommands = ''
-            mkdir -p etc .${ownSpec.stateMount} tmp var/empty
-            printf 'root:x:0:0:root:/root:/bin/sh\nsshd:x:74:74:sshd:/var/empty:/bin/sh\ndev:x:1000:1000:Development user:${ownSpec.stateMount}:/bin/sh\n' > etc/passwd
-            printf 'root:x:0:\nsshd:x:74:\ndev:x:1000:\n' > etc/group
-            touch etc/profile
-            chmod 1777 tmp
-          '';
-          config = ownConfig;
-        };
+        own-image = own.image;
+        # CI only, never published: the same own definition plus one profile package, to prove seed-on-upgrade.
+        own-image-next = (ownFor {
+          profile = import ./hosts/profile/nix.nix { inherit pkgs; extra = [ pkgs.hello ]; };
+          tag = "next";
+        }).image;
         rent-image = mkRent { profile = rentProfile; tag = "nix"; };
         # CI only, never published: the same definition plus one package, to prove seed-on-upgrade and rollback.
         rent-image-next = mkRent {
@@ -384,7 +373,12 @@
           set -eu
           port=$(jq -r .sshPort <<<"$spec"); mount=$(jq -r .stateMount <<<"$spec")
           jq -e --arg p "$port/tcp" --arg m "$mount" \
-            '(.ExposedPorts | has($p)) and (.Volumes | has($m)) and (.Env | index("HOME=" + $m))' <<<"$config"
+            '(.ExposedPorts | has($p)) and (has("Volumes") | not) and (.Env | index("HOME=" + $m))' <<<"$config"
+          # The three mounts own-start gates on: home state, work and the own /nix.
+          for m in "$mount" "$(jq -r .workMount <<<"$spec")" "$(jq -r .nixMount <<<"$spec")"; do
+            grep -qF "volume_at $m " ${own.start}/bin/own-start
+          done
+          grep -qF 'exactly three volumes are allowed' ${own.start}/bin/own-start
           grep -qx "Port $port" ${own.sshConfig}
           grep -qF "HostKey $mount/.ssh/" ${own.sshConfig}
           grep -qF "$(jq -r .authorizedKeyEnv <<<"$spec")" ${own.start}/bin/own-start
