@@ -27,18 +27,27 @@ trusted successful CI/release, extract into a fresh directory, then run:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Validate     # read-only
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Restore      # four selected components
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Restore      # fonts, Noctty, and three packages
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RestoreTest  # fail on drift
 ```
 
 `Restore` converges the selected fonts, the pinned noctty portable ZIP and its
 `font-family = PlemolJP Console NF` configuration, and the pinned WinGet package
-IDs/versions for Chromium and AutoHotkey through native DSC resources. The
+IDs/versions for Windows Terminal, Chromium and AutoHotkey through native DSC resources. The
 selected Chromium WinGet manifest offers a current-user installer. The machine
-needs a network connection and a working WinGet source for those two packages;
+needs a network connection and a working WinGet source for those three packages;
 they are not redistributed in the ZIP. Noctty is included because its WinGet
 package is not published. The release ZIP can be downloaded again after a clean install; Nix
 is only needed to build it, not to apply it.
+
+After installing the dependencies, `Restore` selects the Windows Terminal 1.24+
+OpenConsole console delegate and calls Noctty's `+register-default-terminal` for
+the current user. `RestoreTest` checks the selected delegate, Noctty's COM
+registration and its proxy DLL mappings. This makes Noctty the terminal window
+used for newly launched console applications. Windows Terminal remains installed
+as the OpenConsole dependency; removing it would break this default-terminal
+handoff. The generated state is reapplied after a clean install rather than
+backing up old registry data.
 
 Chromium does not update itself. Refresh the pinned version in `nix.nix`, build
 and prove a new release in CI, then reapply it to receive updates.
@@ -46,7 +55,8 @@ and prove a new release in CI, then reapply it to receive updates.
 `Apply` and `Test` retain their font-only meaning for the CI proof. They own
 selected content-addressed TTF files beneath the current user's
 `LocalApplicationData\Microsoft\Windows\Fonts` and corresponding HKCU font
-registrations. `Restore` also writes the selected noctty configuration, but
+registrations. `Restore` also writes the selected noctty configuration and
+default-terminal registration, but
 does not replace Windows-owned UI fonts or restore old registry settings,
 accounts, profiles, or personal app data. The user directory is a runtime Binding, not common Spec.
 DSC discovery is confined to the bundled backend for each invocation.

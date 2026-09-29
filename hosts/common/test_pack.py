@@ -88,6 +88,7 @@ class CompilerTests(unittest.TestCase):
         with zipfile.ZipFile(noctty, "w") as z:
             z.writestr("noctty/noctty.exe", "fixture application")
             z.writestr("noctty/noctty.com", "fixture console entry")
+            z.writestr("noctty/noctty-terminal-handoff-proxy.dll", "fixture handoff proxy")
         choices = self.root / "choices.json"
         choices.write_text(json.dumps({"noctty": {"version": "1.0", "fontFamily": "Test Font"},
                                        "packages": [{"name": "Fixture", "id": "Fixture.App", "version": "1.0"}]}))
@@ -124,6 +125,7 @@ class CompilerTests(unittest.TestCase):
         with zipfile.ZipFile(noctty, "w") as z:
             z.writestr("noctty/noctty.exe", "fixture")
             z.writestr("noctty/noctty.com", "fixture")
+            z.writestr("noctty/noctty-terminal-handoff-proxy.dll", "fixture")
         choices = self.root / "choices.json"
         choices.write_text(json.dumps({"noctty": {"version": "1", "fontFamily": "Test Font"},
                                        "packages": [{"name": "Fixture", "id": "Fixture.App", "version": "1"}]}))

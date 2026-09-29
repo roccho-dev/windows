@@ -45,9 +45,15 @@ $packagesConfiguration = BundlePath 'packages.dsc.json'
 $fontDirectory = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Microsoft\Windows\Fonts'
 $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
 $nocttyDirectory = Join-Path $localAppData ('Programs\noctty-' + $manifest.noctty.version)
+$nocttyExe = Join-Path $nocttyDirectory 'noctty\noctty.exe'
+$nocttyCom = Join-Path $nocttyDirectory 'noctty\noctty.com'
 $nocttyConfig = Join-Path $localAppData 'noctty\config.ghostty'
 $nocttyShortcut = Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs\noctty.lnk'
 $nocttyConfigText = 'font-family = ' + $manifest.noctty.fontFamily + "`n"
+$terminalStartup = 'HKCU:\Console\%%Startup'
+$windowsTerminalConsole = '{2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}'
+$nocttyTerminal = '{33368C6F-D328-410C-B225-26DC9F12C728}'
+$nocttyProxy = '{1D349824-21FB-46C7-ACF3-746EDC991D52}'
 $oldPath, $oldResources, $oldFontDirectory = $env:PATH, $env:DSC_RESOURCE_PATH, $env:WINDOWS_IAC_FONT_DIR
 $copied, $changed = 0, 0
 
@@ -79,6 +85,30 @@ function TestNoctty {
     return (TestNocttyFiles) -and (Test-Path -LiteralPath $nocttyConfig -PathType Leaf) -and
         ([IO.File]::ReadAllText($nocttyConfig) -ceq $nocttyConfigText) -and
         (Test-Path -LiteralPath $nocttyShortcut -PathType Leaf)
+}
+
+function RegistryDefault([string]$Path) {
+    $key = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+    if ($null -eq $key) { return $null }
+    return $key.GetValue('')
+}
+
+function TestNocttyDefault {
+    $startup = Get-Item -LiteralPath $terminalStartup -ErrorAction SilentlyContinue
+    if ($null -eq $startup -or
+        $startup.GetValue('DelegationConsole') -ne $windowsTerminalConsole -or
+        $startup.GetValue('DelegationTerminal') -ne $nocttyTerminal) { return $false }
+    $classes = 'HKCU:\Software\Classes'
+    if ((RegistryDefault "$classes\CLSID\$nocttyTerminal\LocalServer32") -ne ('"' + $nocttyExe + '"') -or
+        (RegistryDefault "$classes\CLSID\$nocttyProxy\InprocServer32") -ne (Join-Path (Split-Path -Parent $nocttyExe) 'noctty-terminal-handoff-proxy.dll')) {
+        return $false
+    }
+    foreach ($iid in @('{59D55CCE-FC8A-48B4-ACE8-0A9286C6557F}',
+                       '{AA6B364F-4A50-4176-9002-0AE755E7B5EF}',
+                       '{6F23DA90-15C5-4203-9DB0-64E73F1B1B00}')) {
+        if ((RegistryDefault "$classes\Interface\$iid\ProxyStubClsid32") -ne $nocttyProxy) { return $false }
+    }
+    return $true
 }
 
 try {
@@ -113,10 +143,18 @@ try {
         [IO.File]::WriteAllText($nocttyConfig, $nocttyConfigText, [Text.UTF8Encoding]::new($false))
         $null = New-Item -ItemType Directory -Path (Split-Path -Parent $nocttyShortcut) -Force
         $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($nocttyShortcut)
-        $shortcut.TargetPath = Join-Path $nocttyDirectory 'noctty\noctty.exe'
+        $shortcut.TargetPath = $nocttyExe
         $shortcut.WorkingDirectory = Join-Path $nocttyDirectory 'noctty'
         $shortcut.Save()
         $null = InvokeDsc 'set' $packagesConfiguration @($manifest.packages).Count
+        $terminal = Get-AppxPackage -Name Microsoft.WindowsTerminal | Select-Object -First 1
+        if ($null -eq $terminal -or [version]$terminal.Version -lt [version]'1.24.0.0') {
+            throw 'Noctty default-terminal handoff requires Windows Terminal 1.24 or newer.'
+        }
+        $null = New-Item -Path $terminalStartup -Force
+        $null = New-ItemProperty -LiteralPath $terminalStartup -Name DelegationConsole -Value $windowsTerminalConsole -PropertyType String -Force
+        $null = & $nocttyCom +register-default-terminal
+        if ($LASTEXITCODE -ne 0) { throw "Noctty default-terminal registration failed: $LASTEXITCODE" }
     }
     if ($Mode -ne 'Validate') {
         foreach ($font in $manifest.fonts) {
@@ -134,6 +172,7 @@ try {
     }
     if ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest') {
         if (-not (TestNoctty)) { throw 'Noctty files or font configuration drift.' }
+        if (-not (TestNocttyDefault)) { throw 'Noctty default-terminal registration drift.' }
         $apps = InvokeDsc 'test' $packagesConfiguration @($manifest.packages).Count
         foreach ($item in $apps.results) {
             if ($item.result.inDesiredState -ne $true) { throw "Package drift: $($item.name)" }
