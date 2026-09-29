@@ -120,6 +120,31 @@ if ((Compare-TerminalSelection (& $pair $wtConsole $noctty) (& $pair $wtConsole 
     throw 'Selection mismatch does not name a virtualized local HKCU.'
 }
 $handoffCases++
+# Package pins: Restore skips the WinGet `set` only when PackagesSatisfied. The
+# base answer is the shape the Microsoft.WinGet/Package test returned on the
+# development host; each variation must make it unsatisfied.
+$observed = '{"hadErrors":false,"results":[{"name":"Chromium","result":{"inDesiredState":true,' +
+    '"desiredState":{"acceptAgreements":true,"id":"Hibbiki.Chromium","installMode":"silent","source":"winget","version":"154.0.8037.58"},' +
+    '"actualState":{"_exist":true,"_inDesiredState":true,"id":"Hibbiki.Chromium","source":"winget","useLatest":true,"version":"154.0.8037.58"},' +
+    '"differingProperties":[]}},{"name":"AutoHotkey","result":{"inDesiredState":true,' +
+    '"desiredState":{"id":"AutoHotkey.AutoHotkey","version":"2.0.28"},' +
+    '"actualState":{"_exist":true,"id":"AutoHotkey.AutoHotkey","version":"2.0.28"},"differingProperties":[]}}]}'
+function MustPin([bool]$Expected, [string]$Case, [scriptblock]$Change) {
+    $answer = $observed | ConvertFrom-Json
+    if ($Change) { & $Change $answer }
+    if ((PackagesSatisfied $answer) -ne $Expected) { throw "PackagesSatisfied is wrong for: $Case" }
+    $script:handoffCases++
+}
+MustPin $true 'observed pinned packages' $null
+MustPin $false 'newer installed version' { param($a) $a.results[0].result.actualState.version = '155.0.8100.10' }
+MustPin $false 'test not in desired state' { param($a) $a.results[1].result.inDesiredState = $false }
+MustPin $false 'differing property listed' { param($a) $a.results[0].result.differingProperties = @('version') }
+MustPin $false 'package absent' { param($a) $a.results[1].result.actualState._exist = $false }
+MustPin $false 'no installed version reported' { param($a) $a.results[0].result.actualState.PSObject.Properties.Remove('version') }
+MustPin $false 'no pinned version' { param($a) $a.results[0].result.desiredState.PSObject.Properties.Remove('version') }
+MustPin $false 'DSC reported errors' { param($a) $a.hadErrors = $true }
+MustPin $false 'no results' { param($a) $a.results = @() }
+
 # The package-context reader is shared by win.ps1; loading it only defines functions.
 . (Join-Path $PSScriptRoot 'package-view.ps1')
 foreach ($name in 'Get-HkcuTerminalSelection', 'Test-PackageTerminalSelection', 'Get-PackageReaderScript') {

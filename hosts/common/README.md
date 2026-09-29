@@ -36,7 +36,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RestoreT
 IDs/versions for Chromium and AutoHotkey. The
 selected Chromium WinGet manifest offers a current-user installer. The machine
 needs a network connection and a working WinGet source for those two packages;
-they are not redistributed in the ZIP. Windows Terminal is OS/Store-owned and is
+they are not redistributed in the ZIP. `Restore` runs the package DSC `test`
+first and skips `set` only when every package is installed at exactly its pinned
+version (`inDesiredState`, matching `actualState.version`, no differing
+properties); then no installer runs, so an open browser and its profile are left
+alone. The output reports `packagesSet` as `skipped`, `applied` or `notRun`, and
+`RestoreTest` fails on the same version drift. Windows Terminal is OS/Store-owned and is
 not installed or pinned: `Restore` and `RestoreTest` only assert version 1.24 or
 newer, because its OpenConsole is Noctty's console half. Noctty is included because its WinGet
 package is not published. The release ZIP can be downloaded again after a clean install; Nix

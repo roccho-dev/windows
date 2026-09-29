@@ -40,7 +40,8 @@ foreach ($file in Get-ChildItem -LiteralPath $root -Recurse -Force) {
 }
 $exe = BundlePath $manifest.backend
 if (-not $inventory.ContainsKey($manifest.backend)) { throw 'Unlisted backend.' }
-# Function definitions only: the pure selection comparison and the package-context reader.
+# Function definitions only: the pure evaluators (selection comparison, package
+# pins) and the package-context reader.
 . (BundlePath 'handoff-evaluate.ps1')
 . (BundlePath 'package-view.ps1')
 # Restore is per-user. An elevated token may belong to another account, and
@@ -67,7 +68,7 @@ $nocttyTerminal = '{33368C6F-D328-410C-B225-26DC9F12C728}'
 $nocttyProxy = '{1D349824-21FB-46C7-ACF3-746EDC991D52}'
 $terminalProvenance = Join-Path $localAppData 'windows-iac\provenance\default-terminal.json'
 $oldPath, $oldResources, $oldFontDirectory = $env:PATH, $env:DSC_RESOURCE_PATH, $env:WINDOWS_IAC_FONT_DIR
-$copied, $changed = 0, 0
+$copied, $changed, $packagesSet = 0, 0, 'notRun'
 
 function InvokeDsc([string]$Operation, [string]$Document, [int]$Count) {
     $raw = & $exe --ignore-settings-file config $Operation --file $Document --output-format json
@@ -225,7 +226,14 @@ try {
         $shortcut.TargetPath = $nocttyExe
         $shortcut.WorkingDirectory = Join-Path $nocttyDirectory 'noctty'
         $shortcut.Save()
-        $null = InvokeDsc 'set' $packagesConfiguration @($manifest.packages).Count
+        # Test first: when every package is already exactly pinned, no installer runs,
+        # so running applications (e.g. a browser) and their state are left alone.
+        if (PackagesSatisfied (InvokeDsc 'test' $packagesConfiguration @($manifest.packages).Count)) {
+            $packagesSet = 'skipped'
+        } else {
+            $null = InvokeDsc 'set' $packagesConfiguration @($manifest.packages).Count
+            $packagesSet = 'applied'
+        }
         if (-not (TestTerminalPackage)) { throw 'Noctty default-terminal handoff requires Windows Terminal 1.24 or newer.' }
         if (-not (Test-Path -LiteralPath $terminalStartup)) {
             $null = New-Item -Path $terminalStartup
@@ -275,6 +283,7 @@ try {
         foreach ($item in $apps.results) {
             if ($item.result.inDesiredState -ne $true) { throw "Package drift: $($item.name)" }
         }
+        if (-not (PackagesSatisfied $apps)) { throw 'Package drift: an installed version differs from its pin.' }
     }
     # inDesiredState covers the declared state this mode tested. Handoff is never
     # part of it: this script does not launch or observe a console.
@@ -283,7 +292,7 @@ try {
         noctty = $manifest.noctty.version; packages = @($manifest.packages).Count;
         inDesiredState = ($Mode -ne 'Validate');
         registrationState = $(if (TestNocttyRegistration) { 'registered' } else { 'unregistered' });
-        handoffProof = 'unproven' } | ConvertTo-Json -Compress
+        handoffProof = 'unproven'; packagesSet = $packagesSet } | ConvertTo-Json -Compress
 }
 finally {
     $env:PATH, $env:DSC_RESOURCE_PATH, $env:WINDOWS_IAC_FONT_DIR = $oldPath, $oldResources, $oldFontDirectory
