@@ -88,12 +88,14 @@ class CompilerTests(unittest.TestCase):
         with zipfile.ZipFile(noctty, "w") as z:
             z.writestr("noctty/noctty.exe", "fixture application")
             z.writestr("noctty/noctty.com", "fixture console entry")
+            z.writestr("noctty/noctty-terminal-handoff-proxy.dll", "fixture handoff proxy")
         choices = self.root / "choices.json"
         choices.write_text(json.dumps({"noctty": {"version": "1.0", "fontFamily": "Test Font"},
                                        "packages": [{"name": "Fixture", "id": "Fixture.App", "version": "1.0"}]}))
         scripts = self.root / "scripts"
         scripts.mkdir()
-        for name in ("win.ps1", "proof.ps1", "README.md"):
+        for name in ("win.ps1", "proof.ps1", "handoff-proof.ps1", "handoff-evaluate.ps1",
+                     "package-view.ps1", "README.md"):
             (scripts / name).write_text("fixture")
         for out in ("one", "two"):
             pack.distribution(fonts, backend, noctty, choices, scripts, "a" * 40, self.root / out)
@@ -105,6 +107,8 @@ class CompilerTests(unittest.TestCase):
             self.assertEqual(manifest["noctty"]["version"], "1.0")
             self.assertEqual(len(manifest["packages"]), 1)
             self.assertEqual(set(manifest["files"]), set(z.namelist()) - {"manifest.json"})
+            for name in ("handoff-proof.ps1", "handoff-evaluate.ps1", "package-view.ps1"):
+                self.assertIn(name, manifest["files"])
             for name, sha in manifest["files"].items():
                 self.assertEqual(pack.hashlib.sha256(z.read(name)).hexdigest(), sha)
             config = json.loads(z.read("configuration.dsc.json"))
@@ -124,6 +128,7 @@ class CompilerTests(unittest.TestCase):
         with zipfile.ZipFile(noctty, "w") as z:
             z.writestr("noctty/noctty.exe", "fixture")
             z.writestr("noctty/noctty.com", "fixture")
+            z.writestr("noctty/noctty-terminal-handoff-proxy.dll", "fixture")
         choices = self.root / "choices.json"
         choices.write_text(json.dumps({"noctty": {"version": "1", "fontFamily": "Test Font"},
                                        "packages": [{"name": "Fixture", "id": "Fixture.App", "version": "1"}]}))
