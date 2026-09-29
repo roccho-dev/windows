@@ -114,6 +114,18 @@ MustCompare 'invalid' (& $pair $wtConsole $noctty) (& $pair $wtConsole $null) ''
 MustCompare 'invalid' (& $pair $wtConsole $noctty) (& $pair $wtConsole 'not-a-guid') ''
 MustCompare 'invalid' (& $pair $wtConsole $noctty) $null ''
 MustCompare 'unavailable' (& $pair $wtConsole $noctty) $null 'The Windows Terminal package view did not answer in time.'
+# A mismatch names the likely cause observed on a real host: this process's own
+# HKCU virtualized by an app's registry silo.
+if ((Compare-TerminalSelection (& $pair $wtConsole $noctty) (& $pair $wtConsole $terminal) '').failure -notlike '*may be virtualized*') {
+    throw 'Selection mismatch does not name a virtualized local HKCU.'
+}
+$handoffCases++
+# The package-context reader is shared by win.ps1; loading it only defines functions.
+. (Join-Path $PSScriptRoot 'package-view.ps1')
+foreach ($name in 'Get-HkcuTerminalSelection', 'Test-PackageTerminalSelection') {
+    if (-not (Get-Command $name -CommandType Function -ErrorAction SilentlyContinue)) { throw "package-view.ps1 lacks $name." }
+}
+$handoffCases++
 $manifest = Get-Content (Join-Path $PSScriptRoot 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
 $config = Get-Content (Join-Path $PSScriptRoot 'configuration.dsc.json') -Raw -Encoding utf8 | ConvertFrom-Json
 

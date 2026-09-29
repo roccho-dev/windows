@@ -63,8 +63,9 @@ function Compare-TerminalSelection($Hkcu, $Package, [string]$Note) {
     }
     if ($pc -ne $hc -or $pt -ne $ht) {  # GUID text; -ne is case-insensitive
         return [ordered]@{ state = 'mismatch'; gap = $null
-            failure = ("Inside the Windows Terminal package the selection reads $pc/$pt, not the HKCU $hc/$ht; " +
-                'the source of the package value is unverified.') }
+            failure = ("Inside the Windows Terminal package the selection reads $pc/$pt, not this process's HKCU $hc/$ht; " +
+                "this process's HKCU may be virtualized (e.g. an app's registry silo such as an agent sandbox). " +
+                'Run from an Explorer-launched, unelevated shell.') }
     }
     [ordered]@{ state = 'match'; failure = $null; gap = $null }
 }

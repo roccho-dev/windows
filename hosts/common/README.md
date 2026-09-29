@@ -44,17 +44,37 @@ is only needed to build it, not to apply it.
 
 After installing the dependencies, `Restore` selects the Windows Terminal 1.24+
 OpenConsole console delegate and calls Noctty's `+register-default-terminal` for
-the current user. `Restore` then checks the registration and one COM activation;
-a failure restores the previous delegate selection and fails `Restore`.
-`RestoreTest` checks only registry state (delegate pair, COM class and proxy DLL
-mappings) for the default terminal; it does not launch a console or the Noctty
-COM server, though it still runs the DSC and WinGet resource tests. Every mode reports `registrationState`
+the current user. `Restore` then checks the registration, one COM activation,
+and the delegate pair as read from inside the Windows Terminal package (below);
+any failure restores the previous delegate selection and fails `Restore`.
+`RestoreTest` checks registry state (delegate pair, COM class and proxy DLL
+mappings) and the same package-context pair, and fails if that pair differs or
+cannot be read; it writes no registry value. It does not launch a console or
+the Noctty COM server, but it starts `wscript.exe` inside the Windows Terminal
+package and still runs the DSC and WinGet resource tests. Every mode reports `registrationState`
 (`registered` or `unregistered`) and `handoffProof = "unproven"`:
 registration and COM activation are not evidence that a new console opens in
 Noctty, and `inDesiredState` never includes handoff. Windows Terminal remains installed
 as the OpenConsole dependency; removing it would break this default-terminal
 handoff. The generated state is reapplied after a clean install rather than
 backing up old registry data.
+
+**Run `Restore`, `RestoreTest` and the handoff proof from an unelevated shell
+launched from Explorer (Start menu) as the user being restored.** `Restore`
+refuses an elevated token. A process inside another app's registry silo, such
+as an agent sandbox, can read and write a local `HKCU` that the rest of the
+system never sees: on the development host, ETW showed such a shell's
+`DelegationTerminal` write land in `\REGISTRY\WC\Silo…` while the Windows
+Terminal package read the durable `\REGISTRY\USER\<SID>` hive. The
+package-context pair check makes `Restore`/`RestoreTest` fail rather than report
+success there. It covers only `%%Startup`, the key OpenConsole reads; COM keys,
+Noctty files, fonts and the Noctty config written from such a shell may also be
+virtualized, which only the host handoff proof (for COM and `noctty.exe`) and
+later typography evidence can show. If `%%Startup` was already correct, a match
+does not prove this run's file and font writes reached the real user profile.
+The package-context reader needs Windows
+PowerShell 5.1 (Appx module), Windows Terminal and Windows Script Host.
+`Apply` and `Test` are font-only CI proof modes and do not run this check.
 
 Before its first change to `HKCU\Console\%%Startup`, `Restore` writes the prior
 `DelegationConsole`/`DelegationTerminal` values once to
@@ -87,7 +107,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\handoff-proof.ps1 -Pha
 ```
 
 Before launching, the probe also reads the `%%Startup` pair from inside the
-Windows Terminal package (`Invoke-CommandInDesktopPackage` running a
+Windows Terminal package (`package-view.ps1`, shared with `win.ps1`:
+`Invoke-CommandInDesktopPackage` running a
 `wscript.exe` script, which creates no console; the script only reads the
 registry, though side effects of Windows Script Host itself are not ruled out).
 Its script and answer live in a new `%USERPROFILE%\noctty-package-view-<guid>`
@@ -101,9 +122,9 @@ place. Waiting assumes WMI reports the packaged `wscript.exe` command line
 (unverified); if not, a late writer can only make the non-recursive delete fail
 and be recorded as `kept`. With no answer, the record notes that a script host
 may still start later; it then finds no directory and cannot write.
-OpenConsole runs in that package, and a process there has been observed to read
-a different pair than HKCU shows; where that package value comes from is
-unverified. HKCU is read before and after the package view; a change in between
+OpenConsole runs in that package, which reads the durable user hive; a
+differing pair means this process's own HKCU is probably virtualized (see
+above). HKCU is read before and after the package view; a change in between
 makes the comparison `unproven`. The comparison
 (`Compare-TerminalSelection` in `handoff-evaluate.ps1`) treats a valid,
 differing package pair as `failed`, and no, late, or malformed answer as
@@ -121,7 +142,10 @@ is `proven` only when the window belongs to this distribution's portable
 `{33368C6F-D328-410C-B225-26DC9F12C728}`. Contrary evidence is `failed`; missing
 or ambiguous evidence (no window, no or several events, untraceable provider) is
 `unproven`. Acceptance repeats this three times each with `ShellExecute` and
-`Manual` (Win+R), and again after a coordinated reboot.
+`Manual` (Win+R), and again after a coordinated reboot. As supporting evidence
+only, read the real `LocalApplicationData\noctty\config.ghostty` from the same
+Explorer-launched shell; its `font-family` belongs to the separate typography
+acceptance, not to this handoff verdict.
 
 Chromium does not update itself. Refresh the pinned version in `nix.nix`, build
 and prove a new release in CI, then reapply it to receive updates.

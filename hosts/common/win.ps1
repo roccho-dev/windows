@@ -40,6 +40,17 @@ foreach ($file in Get-ChildItem -LiteralPath $root -Recurse -Force) {
 }
 $exe = BundlePath $manifest.backend
 if (-not $inventory.ContainsKey($manifest.backend)) { throw 'Unlisted backend.' }
+# Function definitions only: the pure selection comparison and the package-context reader.
+. (BundlePath 'handoff-evaluate.ps1')
+. (BundlePath 'package-view.ps1')
+# Restore is per-user. An elevated token may belong to another account, and
+# elevated COM ignores per-user classes, so its activation check could start a
+# machine-wide Noctty instead of this user's registration.
+if ($Mode -eq 'Restore' -and
+    ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'Run Restore unelevated, from an Explorer-launched shell of the user being restored.'
+}
 $configuration = BundlePath 'configuration.dsc.json'
 $packagesConfiguration = BundlePath 'packages.dsc.json'
 $fontDirectory = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Microsoft\Windows\Fonts'
@@ -156,6 +167,18 @@ function RecordPriorTerminal([object]$Console, [object]$Terminal) {
     } finally { Remove-Item -LiteralPath $temporary -ErrorAction SilentlyContinue }
 }
 
+# OpenConsole reads the selection inside the Windows Terminal package. A process
+# in an app's registry silo (e.g. an agent sandbox) can see and write a local
+# HKCU that the package, and so the handoff, never sees. Unavailable or differing
+# views fail; nothing here writes the registry.
+function AssertActualSelection {
+    $view = Test-PackageTerminalSelection
+    if ($view.state -ne 'match') {
+        throw ("The default-terminal selection is not confirmed from the Windows Terminal package ($($view.state)): " +
+            "$($view.failure)$($view.gap) Scratch cleanup: $($view.cleanup)")
+    }
+}
+
 # Starts the Noctty COM server, so only Restore calls it, right after registering,
 # to reject an unusable registration. Activation still does not prove handoff.
 function TestNocttyActivation {
@@ -219,6 +242,8 @@ try {
             $registered = $true
             if (-not (TestNocttyRegistration)) { throw 'Noctty default-terminal registration is incomplete.' }
             if (-not (TestNocttyActivation)) { throw 'Noctty COM activation failed after registration.' }
+            # Before success: a registration the package cannot see is rolled back below.
+            AssertActualSelection
         } catch {
             $failure = $_
             if ($registered) { $null = & $nocttyCom +unregister-default-terminal }
@@ -245,6 +270,7 @@ try {
         if (-not (TestNoctty)) { throw 'Noctty files or font configuration drift.' }
         if (-not (TestTerminalPackage)) { throw 'Windows Terminal 1.24 or newer is missing.' }
         if (-not (TestNocttyRegistration)) { throw 'Noctty default-terminal registration drift.' }
+        if ($Mode -eq 'RestoreTest') { AssertActualSelection }  # Restore checked it before success
         $apps = InvokeDsc 'test' $packagesConfiguration @($manifest.packages).Count
         foreach ($item in $apps.results) {
             if ($item.result.inDesiredState -ne $true) { throw "Package drift: $($item.name)" }

@@ -155,7 +155,8 @@ def distribution(fonts: Path, backend: Path, noctty: Path, choices: Path,
         executables = list((root / "backend").rglob("dsc.exe"))
         if len(executables) != 1:
             raise ValueError("Expected exactly one pinned dsc.exe")
-        for name in ("win.ps1", "proof.ps1", "handoff-proof.ps1", "handoff-evaluate.ps1", "README.md"):
+        for name in ("win.ps1", "proof.ps1", "handoff-proof.ps1", "handoff-evaluate.ps1",
+                     "package-view.ps1", "README.md"):
             shutil.copyfile(scripts / name, root / name)
         write_json(root / "configuration.dsc.json", configuration(entries))
         (root / "payload").mkdir()
