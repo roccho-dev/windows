@@ -192,15 +192,27 @@ function Get-RollbackProblem($Argv, $Item) {
     $At = [array]::IndexOf([string[]] $Argv, '--name')
     if ($At -lt 0 -or $At + 1 -ge $Argv.Count -or $Argv[$At + 1] -cne $Site.container) { return "Rollback argv must name $($Site.container)." }
     if (-not ((Get-Images $Item) -ccontains $Argv[-1])) { return 'Rollback argv must end with the current container image.' }
+    # Strictly the forms this script has run: 'run', exactly one --detach, then only --name, --publish, --shm-size,
+    # --volume and allowlisted --env options, each with one value, then the image. Anything else (--entrypoint, --user,
+    # --restart, --rm, short or '=' forms, a trailing command) is refused before own is stopped.
+    $EnvNames = @('OWN_AUTHORIZED_KEY', 'OWN_TRIAL_UNSANDBOXED', 'OWN_HOME_VOLUME', 'OWN_WORK_VOLUME', 'OWN_NIX_VOLUME')
+    $Detach = 0; $Names = 0; $Publish = @(); $Mounted = @()
+    for ($I = 1; $I -lt $Argv.Count - 1; $I++) {
+        $Token = $Argv[$I]
+        if ($Token -ceq '--detach') { $Detach++; continue }
+        if ($Token -cnotin '--name', '--publish', '--shm-size', '--volume', '--env') { return "Rollback argv has unsupported token '$Token'." }
+        if ($I + 1 -ge $Argv.Count - 1) { return "Rollback argv option $Token has no value." }
+        $Value = $Argv[++$I]
+        switch -CaseSensitive ($Token) {
+            '--name' { $Names++ }
+            '--publish' { $Publish += $Value }
+            '--volume' { $Mounted += $Value }
+            '--shm-size' { if ($Value -cne $Spec.shmSize) { return "Rollback argv must keep --shm-size $($Spec.shmSize)." } }
+            '--env' { if ($Value.Split('=')[0] -cnotin $EnvNames) { return "Rollback argv has unsupported --env $($Value.Split('=')[0])." } }
+        }
+    }
+    if ($Detach -ne 1 -or $Names -ne 1) { return 'Rollback argv must have exactly one --detach and one --name.' }
     # The exact old target: its SSH publish and its home volume (plus work and nix only if it already had all three).
-    if (@($Argv | Where-Object { $_ -cin '-p', '-v', '--mount' -or $_ -clike '--publish=*' -or $_ -clike '--volume=*' -or $_ -clike '--mount=*' }).Count) {
-        return 'Rollback argv must use only --publish and --volume forms.'
-    }
-    $Publish = @(); $Mounted = @()
-    for ($I = 0; $I -lt $Argv.Count - 1; $I++) {
-        if ($Argv[$I] -ceq '--publish') { $Publish += $Argv[$I + 1] }
-        if ($Argv[$I] -ceq '--volume') { $Mounted += $Argv[$I + 1] }
-    }
     if ($Publish.Count -ne 1 -or $Publish[0] -cne "$($Spec.publishAddress):$($Site.hostPort):$($Spec.sshPort)") {
         return 'Rollback argv must publish exactly the old SSH port.'
     }
@@ -212,6 +224,20 @@ function Get-RollbackProblem($Argv, $Item) {
     }
     if (@($Argv | Where-Object { $_ -match '(?i)(token|secret|password|credential|private)' }).Count) { return 'Rollback argv must not carry secrets.' }
     return $null
+}
+
+# Rollback outcome: the container is Running on the old image for three consecutive polls within 60 s. The old image
+# prints no own-mounts line, so Running and the image are the proof, never a WSLC exit code alone.
+function Wait-OldRunning([string] $OldImage) {
+    $Seen = 0
+    for ($Second = 0; $Second -lt 60; $Second++) {
+        Start-Sleep -Seconds 1
+        $Now = Get-Own
+        if ($Now -and $Now.State.Running -is [bool] -and $Now.State.Running -and ((Get-Images $Now) -ccontains $OldImage)) {
+            if (++$Seen -ge 3) { return $true }
+        } else { $Seen = 0 }
+    }
+    return $false
 }
 
 function Invoke-Seed {
@@ -255,6 +281,10 @@ function Complete-Replace($Rollback) {
             & $Wslc @Rollback | Out-Host
             $Steps.Add("recorded argv exit $LASTEXITCODE")
             $Ok = $LASTEXITCODE -eq 0
+        }
+        if ($Ok) {
+            $Ok = Wait-OldRunning $Rollback[-1]
+            $Steps.Add($(if ($Ok) { 'old Running on its old image' } else { 'old not Running on its old image within 60 s' }))
         }
     } catch { $Ok = $false; $Steps.Add("error: $($_.Exception.Message)") }
     $Outcome = if ($Ok) { 'succeeded' } else { 'FAILED' }

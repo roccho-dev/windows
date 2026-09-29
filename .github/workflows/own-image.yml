@@ -87,7 +87,7 @@ jobs:
           $Site = $B; $Spec = Get-Content hosts/own/spec.json -Raw | ConvertFrom-Json
           foreach ($N in $Ast.FindAll({ param($n)
               ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Get-Own', 'Get-Images', 'Test-RunningProof',
-                'Wait-RunningProof', 'Get-RollbackProblem', 'Invoke-Seed', 'Complete-Replace') -or
+                'Wait-RunningProof', 'Get-RollbackProblem', 'Wait-OldRunning', 'Invoke-Seed', 'Complete-Replace') -or
               ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in '$Volumes', '$Proof') }, $true)) {
             . ([scriptblock]::Create($N.Extent.Text))
           }
@@ -97,7 +97,13 @@ jobs:
           $Old = [pscustomobject] @{ Name = 'windows-own'; Config = [pscustomobject] @{ Image = $OldImage } }
           $Pre = @('run', '--name', 'windows-own', '--detach', '--publish', '127.0.0.1:2223:2223', '--shm-size', '1G')
           $Good = $Pre + @('--volume', 'windows-own-home:/home/dev', $OldImage)
-          $Three = $Pre + @('--volume', 'windows-own-home:/home/dev', '--volume', 'windows-own-work:/work/repos', '--volume', 'windows-own-nix:/nix', $OldImage)
+          # The forms this script has actually run: the one-volume trial runtime (with its key and trial env) and the new one.
+          $Three = $Pre + @('--volume', 'windows-own-home:/home/dev', '--volume', 'windows-own-work:/work/repos', '--volume', 'windows-own-nix:/nix',
+            '--env', 'OWN_HOME_VOLUME=windows-own-home', '--env', 'OWN_WORK_VOLUME=windows-own-work', '--env', 'OWN_NIX_VOLUME=windows-own-nix',
+            '--env', 'OWN_AUTHORIZED_KEY=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA== ci', $OldImage)
+          $Trial = $Pre + @('--volume', 'windows-own-home:/home/dev', '--env', 'OWN_AUTHORIZED_KEY=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA== ci',
+            '--env', 'OWN_TRIAL_UNSANDBOXED=1', $OldImage)
+          foreach ($Ok in @(, $Trial)) { if (Get-RollbackProblem $Ok $Old) { "trial rollback argv refused: $(Get-RollbackProblem $Ok $Old)"; exit 1 } }
           foreach ($Ok in @(, $Good) + @(, $Three)) { if (Get-RollbackProblem $Ok $Old) { "good rollback argv refused: $(Get-RollbackProblem $Ok $Old)"; exit 1 } }
           $H = @('--volume', 'windows-own-home:/home/dev')
           foreach ($Bad in @(@('run', '--rm', '--name', 'windows-own', $OldImage), @('run', '--name', 'other', '--detach', $OldImage),
@@ -111,7 +117,18 @@ jobs:
               ($Pre + $H + @('--volume', 'extra:/extra', $OldImage)),
               ($Pre + $H + @('--volume', 'windows-own-nix:/nix', $OldImage)),
               ($Pre + @('-v', 'windows-own-home:/home/dev', $OldImage)),
-              (@('run', '--name', 'windows-own', '-p', '127.0.0.1:2223:2223') + $H + @($OldImage)))) {
+              (@('run', '--name', 'windows-own', '-p', '127.0.0.1:2223:2223') + $H + @($OldImage)),
+              # A persistent old own, not merely exit 0: exactly one --detach, no other options, allowlisted env only.
+              (@('run', '--name', 'windows-own', '--publish', '127.0.0.1:2223:2223', '--shm-size', '1G') + $H + @($OldImage)),
+              ($Pre + @('--detach') + $H + @($OldImage)),
+              ($Pre + @('--entrypoint', '/bin/true') + $H + @($OldImage)),
+              ($Pre + @('--user', '0') + $H + @($OldImage)),
+              ($Pre + @('--restart', 'always') + $H + @($OldImage)),
+              ($Pre + @('--env', 'FOO=1') + $H + @($OldImage)),
+              ($Pre + @('--shm-size', '2G') + $H + @($OldImage)),
+              ($Pre + @('--name', 'windows-own') + $H + @($OldImage)),
+              ($Pre + $H + @('--env')  + @($OldImage)),
+              ($Pre + $H + @($OldImage, '/bin/true')))) {
             if (-not (Get-RollbackProblem $Bad $Old)) { "bad rollback argv allowed: $($Bad -join ' ')"; exit 1 }
           }
           $NewUp = '{"Name":"windows-own","State":{"Running":true}}'
@@ -119,21 +136,38 @@ jobs:
             $A = @($args) -join ' '
             $Calls.Add($A)
             $global:LASTEXITCODE = if ($Case.Exit -and $Case.Exit.ContainsKey($A)) { $Case.Exit[$A] } else { 0 }
-            if ($A -ceq 'container inspect -f json windows-own') { $Out = & $Case.Inspect; if ($null -eq $Out) { $global:LASTEXITCODE = 1 } else { $Out } }
+            if ($A -ceq 'container inspect -f json windows-own') {
+              $Case.Seen++
+              $Out = & $Case.Inspect $Case.Seen
+              if ($null -eq $Out) { $global:LASTEXITCODE = 1 } else { $Out }
+            }
             elseif ($A -ceq 'logs windows-own') { if ($Case.Logs) { $Case.Logs } else { $Proof } }
             else { 'wslc output' }
           }
           $S = $SeedArgs -join ' '; $R = $RunArgs -join ' '; $G = $Good -join ' '
           $Head = @($S, 'remove windows-own', 'volume inspect windows-own-home', 'volume inspect windows-own-work', 'volume inspect windows-own-nix', $R)
           $Clear = @('container inspect -f json windows-own', 'stop windows-own', 'remove windows-own', $G)
+          # Rollback succeeds only when the old container is then Running on its old image for three consecutive polls.
+          $I = 'container inspect -f json windows-own'
+          $OldUp = '{"Name":"windows-own","State":{"Running":true},"Config":{"Image":"' + $OldImage + '"}}'
+          $OldDown = '{"Name":"windows-own","State":{"Running":false},"Config":{"Image":"' + $OldImage + '"}}'
+          $Verified = @($I, $I, $I); $Unverified = @(1..60 | ForEach-Object { $I })
           $Cases = [ordered]@{
             'proven' = @{ Inspect = { $NewUp }; Want = 'ok'; Calls = $Head + @('container inspect -f json windows-own', 'logs windows-own') }
-            'seed fails' = @{ Exit = @{ $S = 1 }; Inspect = { $NewUp }; Calls = @($S, 'start windows-own')
-              Want = 'Replace failed: WSLC seed failed: 1 | rollback succeeded: start old exit 0' }
-            'remove fails' = @{ Exit = @{ 'remove windows-own' = 1 }; Inspect = { $NewUp }; Calls = @($S, 'remove windows-own', 'start windows-own')
-              Want = 'Replace failed: WSLC remove failed: 1 | rollback succeeded: start old exit 0' }
-            'run fails' = @{ Exit = @{ $R = 1 }; Inspect = { $null }; Calls = $Head + @('container inspect -f json windows-own', $G)
-              Want = 'Replace failed: WSLC run failed: 1 | rollback succeeded: recorded argv exit 0' }
+            'seed fails' = @{ Exit = @{ $S = 1 }; Inspect = { $OldUp }; Calls = @($S, 'start windows-own') + $Verified
+              Want = 'Replace failed: WSLC seed failed: 1 | rollback succeeded: start old exit 0; old Running on its old image' }
+            'remove fails' = @{ Exit = @{ 'remove windows-own' = 1 }; Inspect = { $OldUp }; Calls = @($S, 'remove windows-own', 'start windows-own') + $Verified
+              Want = 'Replace failed: WSLC remove failed: 1 | rollback succeeded: start old exit 0; old Running on its old image' }
+            'run fails' = @{ Exit = @{ $R = 1 }; Inspect = { param($N) if ($N -eq 1) { $null } else { $OldUp } }; Calls = $Head + @($I, $G) + $Verified
+              Want = 'Replace failed: WSLC run failed: 1 | rollback succeeded: recorded argv exit 0; old Running on its old image' }
+            'start old exits 0, old not Running' = @{ Exit = @{ $S = 1 }; Inspect = { $OldDown }; Calls = @($S, 'start windows-own') + $Unverified
+              Want = 'Replace failed: WSLC seed failed: 1 | rollback FAILED: start old exit 0; old not Running on its old image within 60 s' }
+            'old starts then keeps crashing' = @{ Exit = @{ $S = 1 }; Inspect = { param($N) if ($N % 3 -eq 0) { $OldDown } else { $OldUp } }
+              Calls = @($S, 'start windows-own') + $Unverified
+              Want = 'Replace failed: WSLC seed failed: 1 | rollback FAILED: start old exit 0; old not Running on its old image within 60 s' }
+            'recorded argv exits 0, other image Running' = @{ Exit = @{ $R = 1 }; Inspect = { param($N) if ($N -eq 1) { $null } else { $NewUp } }
+              Calls = $Head + @($I, $G) + $Unverified
+              Want = 'Replace failed: WSLC run failed: 1 | rollback FAILED: recorded argv exit 0; old not Running on its old image within 60 s' }
             'post-gate fails, rollback fails' = @{ Exit = @{ $G = 1 }; Inspect = { $NewUp }; Logs = 'x'
               Calls = $Head + @(1..60 | ForEach-Object { 'container inspect -f json windows-own', 'logs windows-own' }) + $Clear
               Want = "Replace failed: New windows-own did not show Running and '$Proof' within 60 s. | rollback FAILED: stop new exit 0; remove new exit 0; recorded argv exit 1" }
