@@ -6,7 +6,7 @@
 set -euo pipefail
 base_archive=${1:?usage: proof.sh RENT_IMAGE RENT_IMAGE_NEXT}
 next_archive=${2:?usage: proof.sh RENT_IMAGE RENT_IMAGE_NEXT}
-# A real repository and its real check: this repository at the merged #17 commit, windows-dist unittests.
+# A real repository, its real packer and check: this repository at the merged #17 commit.
 repo=https://github.com/roccho-dev/windows
 repo_rev=4712d1eb8959de4e24775dc3c33ca7d614637177
 p="rent-dev-proof-$$"
@@ -104,14 +104,22 @@ EOF
 )"
   dev 'if touch /nix/store/dev-write 2>/dev/null || ln -sfn /tmp /nix/var/nix/profiles/rent-dev 2>/dev/null; then exit 1; fi'
 }
-check() {
-  # $1: the uncommitted test name that the real check must run; $2: extra nix options.
-  dev "set -o pipefail; cd repo; nix build $2 --no-write-lock-file --print-build-logs .#checks.x86_64-linux.windows-dist \
-    --out-link /work/repos/proof/check 2>&1 | tee /work/repos/proof/check-$1.log" > /dev/null
-  dev "grep -qE '$1 .*\\.\\.\\. ok\$' /work/repos/proof/check-$1.log"
+# Build the real distribution and the repository's own check from the uncommitted tree. The evidence is the real
+# packer's output: its checksum verifies, and packages.dsc.json and manifest.json inside the archive carry each
+# edited package version. $1: extra nix options; the rest: versions that must appear.
+build() {
+  dev 'opts=$1; shift
+    cd repo
+    nix build $opts --no-write-lock-file .#windows-dist .#checks.x86_64-linux.windows-dist --out-link ../dist
+    cd ../dist && sha256sum -c --strict --quiet windows-dist.zip.sha256
+    for f in packages.dsc.json manifest.json; do
+      nix shell $opts --inputs-from ../repo nixpkgs#unzip -c unzip -p windows-dist.zip "$f" > "/tmp/$f"
+      for v in "$@"; do grep -qF "\"version\": \"$v\"" "/tmp/$f"; done
+    done' _ "$@"
 }
 
-# Fresh -> develop, as the dev user through the daemon: a real clone, an uncommitted edit, the real check building it.
+# Fresh -> develop, as the dev user through the daemon: a real clone, an uncommitted selection change, the real packer
+# and the repository's check building it.
 start "$base" bridge
 first=$(docker inspect "$c" --format '{{.Id}}')
 root 'install -d -o 1000 -g 1000 /work/repos/proof'
@@ -125,14 +133,17 @@ dev 'test "$(readlink -f "$(command -v nix)")" = "$(readlink -f /nix/var/nix/pro
   git fetch -q --depth 1 origin '"$repo_rev"'
   git checkout -q --detach FETCH_HEAD
   test "$(git rev-parse HEAD)" = '"$repo_rev"'
-  printf "\n\nclass RentProof(unittest.TestCase):\n    def test_rent_fresh_edit(self):\n        pass\n" >> hosts/common/test_pack.py
+  # A real selection change: the AutoHotkey version the Windows packer ships; the committed tree does not have it.
+  sed -i "s/\"2\.0\.28\"/\"2.0.28-rent-fresh\"/" hosts/common/nix.nix
+  test "$(git diff --numstat)" = "$(printf "1\t1\thosts/common/nix.nix")"
+  if git grep -q rent-fresh HEAD; then exit 1; fi
   printf "untracked work\n" > untracked-proof
   mkdir -p ~/.codex ~/.claude
   echo codex-session > ~/.codex/proof && echo claude-session > ~/.claude/proof
   echo disposable > ~/home-proof'
-check test_rent_fresh_edit ''
-dev 'cd repo; git diff --binary | sha256sum > ../work.diff.sha256; readlink ../check > ../check.path; cat ../check.path'
-echo 'PASS fresh -> develop (real clone, uncommitted edit run by the real check, through the daemon)'
+build '' 2.0.28-rent-fresh
+dev 'cd repo; git diff --binary | sha256sum > ../work.diff.sha256; readlink ../dist > ../dist.path; cat ../dist.path'
+echo 'PASS fresh -> develop (real clone; the real packer ships the uncommitted edit; the repo check passes; via the daemon)'
 
 # Replace with the upgraded image: stop, remove the container only, seed the new closure while nothing runs, start.
 docker stop -t 30 "$c" >/dev/null
@@ -152,18 +163,18 @@ dev 'test ! -e ~/home-proof
   test "$(git rev-parse HEAD)" = '"$repo_rev"'
   test "$(cat untracked-proof)" = "untracked work"
   git diff --binary | sha256sum | cmp - ../work.diff.sha256
-  test "$(readlink ../check)" = "$(cat ../check.path)" && test -e ../check
-  printf "\n\nclass RentProofContinued(unittest.TestCase):\n    def test_rent_continued_edit(self):\n        pass\n" >> hosts/common/test_pack.py
+  test "$(readlink ../dist)" = "$(cat ../dist.path)" && test -e ../dist/windows-dist.zip
+  sed -i "s/\"154\.0\.8037\.58\"/\"154.0.8037.58-rent-continued\"/" hosts/common/nix.nix
   git diff --binary | sha256sum > ../work2.diff.sha256'
-check test_rent_continued_edit '--offline'
+build --offline 2.0.28-rent-fresh 154.0.8037.58-rent-continued
 for r in "$base_roots" "$next_roots"; do test "$(root "readlink /nix/var/nix/gcroots/rent/${r##*/}")" = "$r"; done
-echo 'PASS replace -> continue (upgraded image, retained auth/session/work/store/profile, disposable HOME, offline check)'
+echo 'PASS replace -> continue (upgraded image, retained auth/session/work/store/profile, disposable HOME, offline rebuild with both edits)'
 
 # GC keeps every seeded runtime, the profile generations and the developer's out-link; the store verifies.
 root 'NIX_REMOTE=daemon nix-store --gc > /dev/null
   for r in '"$base_roots $next_roots"'; do nix-store --check-validity "$r" $(cat "$r"); done
   nix-store --check-validity "$(readlink -f /nix/var/nix/profiles/rent-dev-1-link)" "$(readlink -f /nix/var/nix/profiles/rent-dev-2-link)" \
-    "$(readlink /work/repos/proof/check)"
+    "$(readlink /work/repos/proof/dist)" "$(readlink /work/repos/proof/dist-1)"
   nix-store --verify --check-contents'
 echo 'PASS gc (seeded runtimes, profile generations and work roots survive; store verifies)'
 
@@ -179,5 +190,5 @@ dev 'if command -v hello >/dev/null; then exit 1; fi
   test "$(cat ~/.codex/proof)" = codex-session
   cd repo && test "$(cat untracked-proof)" = "untracked work"
   git diff --binary | sha256sum | cmp - ../work2.diff.sha256
-  nix-store --check-validity "$(readlink ../check)"'
+  nix-store --check-validity "$(readlink ../dist)" "$(readlink ../dist-1)"'
 echo 'PASS rollback (old image on the retained volume, its own profile, retained work and results)'

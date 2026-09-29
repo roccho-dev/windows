@@ -20,6 +20,9 @@ param(
     [string] $ReposVolume = 'repos',
     [ValidatePattern('^[a-z0-9][a-z0-9-]+$')]
     [string] $StateVolume = 'windows-rent-state',
+    # rent's own writable /nix, seeded from the exact image before every Create/Replace start.
+    [ValidatePattern('^[a-z0-9][a-z0-9-]+$')]
+    [string] $NixVolume = 'windows-rent-nix',
     [ValidatePattern('^[a-z0-9][a-z0-9-]+$')]
     [string] $TsHostname = 'pc7337-windows-rent',
     [string] $PublicKeyFile,
@@ -50,9 +53,10 @@ if ($Step -ne 'Plan' -and -not (Test-Path -LiteralPath $Wslc)) { throw "WSLC is 
 
 # The only pre-state image Replace may remove: the published rent image that kept /home/dev on a volume.
 $OldImage = 'ghcr.io/roccho-dev/windows-rent@sha256:da1393586b2e847c7508038675be8701c185b77be777ef1492689d4c604185ce'
-# Exactly these two named volumes; never the old home volume.
-$Mounts = [ordered]@{ '/work/repos' = $ReposVolume; '/var/lib/rent' = $StateVolume }
-if (@($Mounts.Values) -ccontains $OldHomeVolume) { throw "The old home volume $OldHomeVolume must not be repos or state." }
+# Exactly these three distinct named volumes; never the old home volume.
+$Mounts = [ordered]@{ '/work/repos' = $ReposVolume; '/var/lib/rent' = $StateVolume; '/nix' = $NixVolume }
+if (@($Mounts.Values) -ccontains $OldHomeVolume) { throw "The old home volume $OldHomeVolume must not be repos, state or nix." }
+if (@($Mounts.Values | Sort-Object -Unique -CaseSensitive).Count -ne $Mounts.Count) { throw 'The repos, state and nix volumes must be distinct.' }
 if ($OldContainer -ceq $Container) { throw "The old container $OldContainer must not be $Container." }
 
 # WSLC inspect is the authority for name, state and image only; mounts are proven inside the container
@@ -81,18 +85,19 @@ function Get-OldSourceProblem($Item) {
     return $null
 }
 
-# Possible concurrent writers of the old home: any container other than $Container that is not provably stopped.
-function Get-WriterProblem($Items) {
+# Possible concurrent writers: any container other than $Except that is not provably stopped. WSLC shows no mounts,
+# so every container counts: for the old home all but $Container, for the nix volume all ($Except '').
+function Get-WriterProblem($Items, [string] $Except = $Container) {
     foreach ($Item in @($Items)) {
         $Name = ([string] $Item.Name).TrimStart('/')
-        if ($Name -ceq $Container) { continue }
+        if ($Except -and $Name -ceq $Except) { continue }
         if (-not (Test-Stopped $Item)) { return "Container $Name is not provably stopped." }
     }
     return $null
 }
 
 # Outcome of Create/Replace: running, and rent-start printed the fixed mount proof.
-$Proof = "rent-mounts ok repos=$ReposVolume state=$StateVolume"
+$Proof = "rent-mounts ok repos=$ReposVolume state=$StateVolume nix=$NixVolume"
 function Test-RunningProof($Item, $Logs) {
     if (-not $Item -or $Item.State.Running -isnot [bool] -or -not $Item.State.Running) { return $false }
     return @(@($Logs) | ForEach-Object { ([string] $_).TrimEnd() }) -ccontains $Proof
@@ -138,18 +143,24 @@ if ($Step -in @('Create', 'Replace')) {
 
 $RunArgs = @('run', '--name', $Container, '--detach', '--publish', "127.0.0.1:${Port}:2222")
 foreach ($Target in $Mounts.Keys) { $RunArgs += @('--volume', "$($Mounts[$Target]):$Target") }
-$RunArgs += @('--env', "RENT_REPOS_VOLUME=$ReposVolume", '--env', "RENT_STATE_VOLUME=$StateVolume",
+$RunArgs += @('--env', "RENT_REPOS_VOLUME=$ReposVolume", '--env', "RENT_STATE_VOLUME=$StateVolume", '--env', "RENT_NIX_VOLUME=$NixVolume",
     '--env', "RENT_TS_HOSTNAME=$TsHostname", '--env', "RENT_AUTHORIZED_KEY=$Key", '--env', 'TS_FORCE_NOISE_443=1', $Image)
 $MigrateArgs = @('run', '--rm', '--volume', "${OldHomeVolume}:/old:ro", '--volume', "${StateVolume}:/var/lib/rent",
     '--env', "RENT_OLD_VOLUME=$OldHomeVolume", '--env', "RENT_STATE_VOLUME=$StateVolume",
     $Image, '/bin/rent-state-import', $SessionId)
 $ListArgs = @('container', 'list', '--all', '-q')
+# One-shot helper from exactly $Image: the nix volume at /seed, the image's own /nix beneath it; removed by --rm.
+$SeedArgs = @('run', '--rm', '--volume', "${NixVolume}:/seed", '--env', "RENT_NIX_VOLUME=$NixVolume", $Image, '/bin/rent-nix-seed')
 
 if ($Step -eq 'Plan') {
     # Exact argv for every live step; touches nothing.
     [ordered]@{
         pull = @($Wslc, 'pull', $Image)
         stateVolumeCreateOnce = @($Wslc, 'volume', 'create', $StateVolume)
+        nixVolumeCreateOnce = @($Wslc, 'volume', 'create', $NixVolume)
+        seedAccepts = "every container, $Container included, provably stopped (WSLC shows no mounts), right before each seed; before create, and in Replace after replaceStop and before replaceRemove"
+        seedContainerList = @($Wslc) + $ListArgs
+        seed = @($Wslc) + $SeedArgs
         create = @($Wslc) + $RunArgs
         replaceAccepts = "$Container on exactly $OldImage or $Image (inspect name and image only), with a pre-recorded rollback argv"
         replaceStop = @($Wslc, 'stop', $Container)
@@ -189,11 +200,18 @@ if ($Step -eq 'LogonTask') {
     exit 0
 }
 
-function Assert-NoOtherWriter {
+function Assert-NoOtherWriter([string] $Except = $Container, [string] $Action = 'migrating') {
     $Ids = @(& $Wslc @ListArgs | Where-Object { $_ })
-    if ($LASTEXITCODE -ne 0 -or $Ids.Count -gt 64) { throw 'Container list is unreadable; not migrating.' }
-    $Problem = Get-WriterProblem @($Ids | ForEach-Object { Get-Container $_ })
-    if ($Problem) { throw "$Problem Not migrating." }
+    if ($LASTEXITCODE -ne 0 -or $Ids.Count -gt 64) { throw "Container list is unreadable; not $Action." }
+    $Problem = Get-WriterProblem @($Ids | ForEach-Object { Get-Container $_ }) $Except
+    if ($Problem) { throw "$Problem Not $Action." }
+}
+
+# Seed the nix volume from exactly $Image while no container at all can write it; rent-nix-seed proves its own mounts.
+function Invoke-Seed {
+    Assert-NoOtherWriter '' 'seeding'
+    & $Wslc @SeedArgs | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "WSLC seed failed: $LASTEXITCODE" }
 }
 
 if ($Step -eq 'Migrate') {
@@ -223,6 +241,13 @@ if ($Step -eq 'Migrate') {
 if ($LASTEXITCODE -ne 0) {
     & $Wslc volume create $StateVolume
     if ($LASTEXITCODE -ne 0) { throw "WSLC volume create failed: $LASTEXITCODE" }
+}
+if ($Step -ne 'Migrate') {
+    & $Wslc volume inspect $NixVolume | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        & $Wslc volume create $NixVolume
+        if ($LASTEXITCODE -ne 0) { throw "WSLC volume create failed: $LASTEXITCODE" }
+    }
 }
 
 if ($Step -eq 'Migrate') {
@@ -276,6 +301,8 @@ function Invoke-Rollback($Argv, $Old, [bool] $Removed, $Steps) {
 function Complete-Replace($Rollback, $Old) {
     $Removed = $false
     try {
+        # The old container is stopped and still present: a seed failure rolls back by starting it.
+        Invoke-Seed
         # Container only: no -f, no -v; every volume, including the old home volume, is kept.
         & $Wslc remove $Container | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "WSLC remove failed: $LASTEXITCODE" }
@@ -302,6 +329,7 @@ if ($Step -eq 'Replace') {
     if ($LASTEXITCODE -ne 0) { throw "WSLC stop failed: $LASTEXITCODE" }
     Complete-Replace $Rollback $Item
 } else {
+    Invoke-Seed
     & $Wslc @RunArgs
     if ($LASTEXITCODE -ne 0) { throw "WSLC run of $Container failed: $LASTEXITCODE" }
     if (-not (Wait-RunningProof)) { throw "WSLC run of $Container failed its post-gate." }
