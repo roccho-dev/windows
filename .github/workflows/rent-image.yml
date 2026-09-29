@@ -326,7 +326,9 @@ jobs:
       - name: Load and test tools, mounts, state, restart, and recreate
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          # Name the failing line and command text (unexpanded, so no variable value such as the token is printed).
+          trap 'echo "rent smoke: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
           # The stub image is the published definition with a CI-only tunnel stand-in (same argv, no Cloudflare); the
           # published image itself is exercised below for everything the stub replaces.
           image=ghcr.io/roccho-dev/windows-rent:stub
@@ -339,12 +341,17 @@ jobs:
           test "$(docker image inspect --format '{{json .Config.Volumes}}' "$real")" = null
           # The stub image differs from the published one only in the cloudflared store path rent-start runs.
           start_text() { docker run --rm "$1" /bin/cat /bin/rent-start | sed -E 's#/nix/store/[a-z0-9]{32}-cloudflared[^/]*/bin/cloudflared#CLOUDFLARED#g'; }
-          diff <(start_text "$real") <(start_text "$image")
-          grep -qF 'CLOUDFLARED tunnel --no-autoupdate run --token-file "$token"' <(start_text "$real")
+          start_text "$real" > "$key_dir/start-real"
+          start_text "$image" > "$key_dir/start-stub"
+          diff "$key_dir/start-real" "$key_dir/start-stub"
+          grep -qF 'CLOUDFLARED tunnel --no-autoupdate run --token-file "$token"' "$key_dir/start-real"
           # Published image: pinned cloudflared that reads the token by file, and no Tailscale in its runtime closure.
+          # Outputs go to files first: a grep -q that stops reading early must not fail its writer under pipefail.
           cf=$(docker run --rm "$real" /bin/grep -oE -m1 '/nix/store/[a-z0-9]{32}-cloudflared-[^/]+/bin/cloudflared' /bin/rent-start)
-          docker run --rm "$real" "$cf" --version | grep -qE '^cloudflared version 2026\.6\.1( |$)'
-          docker run --rm "$real" "$cf" tunnel run --help | grep -qF -- '--token-file'
+          docker run --rm "$real" "$cf" --version > "$key_dir/cf-version" 2>&1
+          grep -qE '^cloudflared version 2026\.6\.1( |$)' "$key_dir/cf-version" || { cat "$key_dir/cf-version" >&2; exit 1; }
+          docker run --rm "$real" "$cf" tunnel run --help > "$key_dir/cf-help" 2>&1
+          grep -qF -- '--token-file' "$key_dir/cf-help" || { cat "$key_dir/cf-help" >&2; exit 1; }
           nix-store -qR "$(docker run --rm "$real" /bin/readlink /etc/rent-nix-roots)" > "$key_dir/closure"
           grep -F "$cf" "$key_dir/closure" > /dev/null
           if grep -qi tailscale "$key_dir/closure"; then echo 'tailscale in the runtime closure' >&2; exit 1; fi
@@ -588,7 +595,8 @@ jobs:
           grep -qxF 'rent-transport ok token-file=/var/lib/rent/cloudflared/token' "$key_dir/cand"
           grep -qxF 'rent-start ok services=nix-daemon,cloudflared,sshd' "$key_dir/cand"
           grep -qF 'rent-start: nix-daemon, cloudflared or sshd exited' "$key_dir/cand"
-          if { cat "$key_dir/cand"; docker inspect rent-cand; } | grep -qF "$tok"; then echo 'token visible from the rejected candidate' >&2; exit 1; fi
+          { cat "$key_dir/cand"; docker inspect rent-cand; } > "$key_dir/cand-visible"
+          if grep -qF "$tok" "$key_dir/cand-visible"; then echo 'token visible from the rejected candidate' >&2; exit 1; fi
           docker rm rent-cand > /dev/null
           docker start rent-smoke
           ssh_ready
