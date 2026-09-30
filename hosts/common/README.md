@@ -38,16 +38,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Uninstal
 
 `Restore` converges the selected fonts and the pinned noctty portable ZIP, its
 `font-family = PlemolJP Console NF` configuration and its default-terminal
-registration (all owned through the effect ledger below), and checks the locked packages (Chromium and AutoHotkey). A
-package is `preexisting` whenever an HKCU or HKLM (64- or 32-bit) Uninstall entry
-has its declared key name, or its DisplayName and Publisher, wherever that entry
-points; it is `preexisting-match` only when DisplayVersion and the ProductVersion
-of the entry's own InstallLocation executable equal the lock, and is never
-written. Declared protected data (the Chromium `User Data` profile) without an
-entry is `preexisting-drift`, never absent. An absent package stops `Restore`
-before any download or effect: **clean package install is disabled** until the
-ledger covers it. `RestoreTest` fails on any package that is not
-`preexisting-match`. Windows Terminal is OS/Store-owned and is not installed or
+registration (all owned through the effect ledger below), and the locked packages
+(Chromium and AutoHotkey; see "Locked packages" below). Windows Terminal is OS/Store-owned and is not installed or
 pinned: `Restore` and `RestoreTest` only assert version 1.24 or newer, because its
 OpenConsole is Noctty's console half. The release ZIP can be downloaded again
 after a clean install; Nix is only needed to build it, not to apply it.
@@ -304,6 +296,41 @@ and provenance directories, which are state rather than effects) and
 `notInLedger` (an existing shortcut, the default-terminal record and RentSsh).
 `Apply` and `Uninstall` may run elevated on a disposable runner; `Restore` may not.
 
+### Locked packages
+
+`Restore` covers every lock in `nix.nix`; `Apply` covers only those named by
+`-Mode Apply -Packages AutoHotkey,Chromium` (exact lock names) and none otherwise.
+After recovery and before any effect, each package is classified: the effect
+ledger decides ownership of its tree `%LOCALAPPDATA%\Programs\<name>-<version>`
+(one `tree-extracted` effect whose intent names the package); an HKCU or HKLM
+(64- or 32-bit) Uninstall entry with its declared key, or DisplayName and
+Publisher, is never taken over (`preexisting-match` when DisplayVersion and the
+ProductVersion of that entry's own executable equal the lock, else
+`preexisting-drift`), and beside an owned tree it is a conflict, reported as drift;
+an unrecorded tree is `preexisting-match` only when it is exactly the pinned
+inventory; declared protected data (the Chromium `User Data` profile) is someone
+else's, `preexisting-drift`, unless the ledger shows this package was once
+installed and committed here (R1). Only `absent` installs. An indeterminate or
+owned-drift package, too little space (asset + `unpackedSize` + 64 MiB) or a path
+at the Windows PowerShell 5.1 limits stops the run before any effect.
+
+An install writes its intent first, then downloads the locked URL with the inbox
+`curl.exe` (HTTPS only, redirects too, bounded time) to the one file the intent
+implies (`<staging>.asset`), checks size, SHA-256 and SHA-1 while holding it open
+against writers, checks the `tar -tf` listing against the pinned inventory, extracts
+with the inbox `tar.exe` into the staging directory, deletes the asset, requires the
+staging tree to be exactly the inventory, renames it into place and commits. An
+interrupted install is recovered: the asset and the inventory-named staging files
+are removed and the intent voided; anything else there stops recovery and is kept.
+Once the selected version is owned and exact, owned trees of its other versions are
+removed the Uninstall way (a tree in use, or one another effect refers to, is kept
+and reported). `Uninstall` refuses, before removing anything, while a package's
+executable is in use; it never removes protected data, and never App Paths or an
+external install. **Limits now:** a clean install from a 7z asset (Chromium) is
+refused before any effect until its own CI proof; nothing registers App Paths yet,
+so an owned Chromium would not be launchable by name (required before PR-A is done);
+a read-only file in an extracted tree would make `Uninstall` fail (recorded, not hidden).
+
 **Torn record.** A power loss can tear only the highest-seq record, and every mode
 that reads the ledger then stops. Remove that one file by hand only if it is the
 highest `<seq>.json` **and** does not parse as JSON; then rerun, and recovery
@@ -356,6 +383,13 @@ primitives also run in a Windows PowerShell 5.1 child on synthetic targets. The
 G4 gate measures the vendor's own registration against the six values. A
 `Restore` rollback after a failed activation or package check is not exercised
 on CI (`Restore` refuses the elevated runner, whose Windows Terminal is 1.23).
+For packages (A23-A27, AutoHotkey downloaded once, Chromium never) it checks the
+`-Packages` contract, the Chromium 7z refusal and R1 before any effect, an external
+entry never taken over (alone or beside the owned tree), a clean AutoHotkey install
+owned exactly with no asset or staging left and a second Apply writing nothing,
+an owned older version collected, interrupted installs recovered (asset and
+staging removed; foreign staging content kept), and `Uninstall` refusing while the
+executable is in use, then removing the tree but not the profile.
 It also requires every `win.ps1` answer to report
 `handoffProof = "unproven"` and `handoff-proof.ps1` to refuse the runner, so CI
 never claims a real default-terminal handoff. Negative controls must fail for
@@ -374,8 +408,8 @@ final single `ci.yml` with the open OCI stack. Do not discard existing proof to
 claim one workflow prematurely. Existing OCI definitions and #8 are unchanged.
 
 `%LOCALAPPDATA%\windows-iac\provenance\default-terminal.json` is per-user state;
-rollback reads it and nothing removes it. Clean package installs join the ledger
-in a later slice (S-A2), so a clean `Restore` still stops at the package gate and
+rollback reads it and nothing removes it. A clean Chromium install is not enabled
+yet (its 7z extraction awaits its own CI proof), so a clean `Restore` still stops at the package gate and
 `Restore`/`Uninstall` as a whole is not complete.
 
 **Required on a VM before the native registration is accepted (unproven here):**

@@ -691,13 +691,25 @@ function Get-StagingCleanupSteps($Record, $Observed) {
 # (Get-EffectAttempt: a malformed record, a repeated seq, a commit describing another effect, a
 # void after a commit), nor any ledger in which two records share a seq. Only then is protected
 # data (a browser profile) taken as ours; the first install happens only while it is absent.
+# One pass groups the records by id (ordinal); only an id holding an intent that names $Package
+# can prove it, so only those ids are validated, however much else the ledger holds.
 function Test-PackageHistory($Records, [string]$Package, [string]$Programs) {
     if (-not $Package -or -not $Programs) { return $false }
     $all = @($Records | Where-Object { $null -ne $_ })
     $seqs = @($all | ForEach-Object { [string](Get-Field $_ 'seq') })
     if (@($seqs | Sort-Object -Unique).Count -ne $seqs.Count) { return $false }
-    foreach ($id in @($all | ForEach-Object { [string](Get-Field $_ 'id') } | Sort-Object -Unique -CaseSensitive)) {
-        $group = @($all | Where-Object { [string](Get-Field $_ 'id') -ceq $id })
+    $groups = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $candidates = [Collections.Generic.List[string]]::new()
+    foreach ($record in $all) {
+        $id, $named = [string](Get-Field $record 'id'), (Get-Field $record 'package')
+        if (-not $groups.ContainsKey($id)) { $groups[$id] = [Collections.Generic.List[object]]::new() }
+        $groups[$id].Add($record)
+        if ((Get-Field $record 'phase') -ceq 'intent' -and $named -is [string] -and $named -ceq $Package -and -not $candidates.Contains($id)) {
+            $candidates.Add($id)
+        }
+    }
+    foreach ($id in $candidates) {
+        $group = @($groups[$id])
         if ((Get-EffectAttempt $group).problem) { continue }
         # Valid as a whole, so every attempt starts with an intent and its commits describe that intent's effect.
         $intent = $null

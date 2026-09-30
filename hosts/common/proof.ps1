@@ -464,6 +464,26 @@ $repeated = @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit'));
 $shared = @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit')) + @(PackageRecords 2 'autohotkey-2.0.28' 'AutoHotkey' @('intent'))
 Must (@($malformed, $changed, $repeated, $shared | Where-Object { Hist $_ }).Count -eq 0 -and
     (Hist $malformed[0..1])) 'R1 history must be valid as a whole'
+# P3: only an id holding an intent that names the package is validated. Other packages' histories, trees without a
+# package and invalid unrelated ids neither prove nor hide it; a seq shared with any record still voids the ledger.
+$noise = @(PackageRecords 101 'autohotkey-2.0.28' 'AutoHotkey' @('intent', 'commit', 'undone')) +
+    @(PackageRecords 104 'noctty-1.3.131' $null @('intent', 'commit')) + @(PackageRecords 106 'chromium-155' $null @('intent', 'commit')) +
+    @(PackageRecords 108 'autohotkey-2.0.27' 'AutoHotkey' @('intent', 'commit', 'void'))   # void after commit: invalid
+$chromium = @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit'))
+$retried = @(PackageRecords 1 'chromium-154' $null @('intent', 'void')) + @(PackageRecords 3 'chromium-154' 'Chromium' @('intent', 'commit'))
+$collides = @($noise | ForEach-Object { $_.Clone() }); $collides[0].seq = 2
+$script:validateAttempt, $script:attemptsValidated = ${function:Get-EffectAttempt}, 0
+try {
+    ${function:Get-EffectAttempt} = { $script:attemptsValidated++; & $script:validateAttempt @args }
+    $withNoise = Hist ($noise + $chromium)
+    $validated = $script:attemptsValidated
+    Must ($withNoise -and $validated -eq 1 -and (Hist ($chromium + $noise)) -and (Hist ($noise + $retried)) -and -not (Hist $noise) -and
+        -not (Hist ($noise + @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'void')))) -and -not (Hist ($collides + $chromium)) -and
+        (Hist $noise 'AutoHotkey') -and -not (Hist $noise[3..9] 'AutoHotkey')) "P3: R1 amid unrelated ledger noise ($validated validated)"
+    # The R1 guard it feeds: protected data (a synced profile) beside noise alone is foreign, never installed over.
+    $guard = Get-PackageClass 'absent' 0 @() $true (Hist $noise)
+    Must ($guard.class -ceq 'preexisting-drift' -and -not $guard.install -and (Get-PackageClass 'absent' 0 @() $true (Hist ($noise + $chromium))).install) 'P3: the R1 protected-data guard'
+} finally { ${function:Get-EffectAttempt} = $script:validateAttempt }
 # D-c: the asset file is derived from a valid package intent's staging directory, beside it, and nothing else.
 function AssetIntent([string]$Target, $Package, [string]$Temp) {
     $r = PureRecord 1 intent tree-extracted $Target $absent $pkgDesired $null $null
@@ -582,6 +602,11 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
     $programsHere = Join-Path $Scratch 'Programs'
     Must ((Test-PackageHistory $records[0..1] 'Chromium' $programsHere) -and -not (Test-PackageHistory $records 'Chromium' $programsHere) -and
         -not (Test-PackageHistory $records[0..1] 'Chromium' (Join-Path $Scratch 'Other')) -and -not (Test-PackageHistory $records[0..1] 'Chromium' '')) 'R1 package history in this edition'
+    # P3 here too: a malformed record of another id is not validated; one sharing a seq still voids the ledger.
+    $noise = @{ ledger = 'effects'; schema = 2; seq = 9; phase = 'intent'; id = 'noise'; package = 'AutoHotkey' }
+    Must ((Test-PackageHistory (@($noise) + $records[0..1]) 'Chromium' $programsHere) -and
+        -not (Test-PackageHistory (@($noise) + $records[0..1]) 'AutoHotkey' $programsHere) -and
+        -not (Test-PackageHistory (@(@{ ledger = 'effects'; schema = 1; seq = 2; phase = 'intent'; id = 'noise' }) + $records[0..1]) 'Chromium' $programsHere)) 'P3 in this edition'
     # S2-2b1 package primitives (clean install stays disabled). The class table: the ledger keeps ownership; an
     # external Uninstall entry is never taken over and beside an owned tree is a conflict; R1 for protected data.
     function PClass($Tree, $Entries = 0, $Problems = @(), $Protected = $false, $History = $false) {
@@ -968,7 +993,7 @@ function IsFontRecord($Record) {
 function Craft([hashtable]$Fields) {
     $seq = 1 + [long](@(Ledger | ForEach-Object { [long]$_.seq }) + 0 | Measure-Object -Maximum).Maximum
     $entry = [ordered]@{ ledger = 'effects'; schema = 1; seq = $seq }
-    foreach ($k in 'phase', 'id', 'kind', 'target', 'name', 'prior', 'desired', 'observed', 'temp') { if ($Fields.ContainsKey($k)) { $entry[$k] = $Fields[$k] } }
+    foreach ($k in 'phase', 'id', 'kind', 'target', 'name', 'prior', 'desired', 'observed', 'temp', 'package') { if ($Fields.ContainsKey($k)) { $entry[$k] = $Fields[$k] } }
     $stream = [IO.FileStream]::new((Join-Path $ledgerDir ('{0:D8}.json' -f $seq)), [IO.FileMode]::CreateNew)
     try { $bytes = [Text.Encoding]::UTF8.GetBytes(($entry | ConvertTo-Json -Depth 8 -Compress)); $stream.Write($bytes, 0, $bytes.Length) }
     finally { $stream.Dispose() }
@@ -1689,6 +1714,110 @@ if ($final.ownedOpen -ne 0 -or $final.changedAfterClose -ne 0) { throw 'Uninstal
 AssertEmpty
 if (-not (Test-Path -LiteralPath $foreignTemp)) { throw 'A temporary file no intent named was removed.' }
 [IO.File]::Delete($foreignTemp)
+
+# ---- A23-A27: locked packages through the effect ledger. AutoHotkey (3 MB ZIP) is downloaded once;
+# Chromium never is: its 7z clean install stays disabled until its own CI proof. The proof's own stand-ins
+# (an Uninstall entry, a profile, crafted records) are removed again one entry at a time.
+$ahk = @($manifest.packages | Where-Object { $_.name -ceq 'AutoHotkey' })[0]
+$chromium = @($manifest.packages | Where-Object { $_.name -ceq 'Chromium' })[0]
+$programsDir = Join-Path $realLocal 'Programs'
+$ahkTree, $chromiumTree = (Join-Path $realLocal $ahk.directory.Replace('/', '\')), (Join-Path $realLocal $chromium.directory.Replace('/', '\'))
+$ahkId, $chromiumId = ('tree-extracted:' + $ahkTree.ToUpperInvariant()), ('tree-extracted:' + $chromiumTree.ToUpperInvariant())
+$ahkKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\' + $ahk.existing.uninstallKey
+$chromiumProfile = Join-Path $realLocal $chromium.protected[0].Replace('/', '\')
+function ApplyPackages([string]$Names) { Win51 @('-Mode', 'Apply', '-Packages', $Names) }
+function AhkExact {
+    $files = @($ahk.files.PSObject.Properties)
+    (Test-Path -LiteralPath $ahkTree) -and @(Get-ChildItem -LiteralPath $ahkTree -Recurse -Force -File).Count -eq $files.Count -and
+        -not @($files | Where-Object { (Get-FileHash -LiteralPath (Join-Path $ahkTree $_.Name.Replace('/', '\'))).Hash -ne $_.Value }).Count
+}
+function ExternalEntry {  # an AutoHotkey Uninstall entry the proof owns, whose executable is missing
+    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($ahkKey)
+    try { foreach ($pair in @(@('DisplayName', $ahk.existing.displayName), @('Publisher', $ahk.existing.publisher), @('DisplayVersion', $ahk.version),
+            @('InstallLocation', (Join-Path $realLocal 'proof-external-autohotkey')))) { $key.SetValue($pair[0], $pair[1]) } } finally { $key.Close() }
+}
+if ((Test-Path -LiteralPath $ahkTree) -or (Test-Path -LiteralPath $chromiumTree) -or (KeyExists $ahkKey) -or (Test-Path -LiteralPath (Split-Path -Parent $chromiumProfile))) {
+    throw 'Proof requires no AutoHotkey or Chromium on this runner yet.'
+}
+# A24: -Packages is Apply-only and names locks exactly, once each; Chromium's 7z clean install is refused
+# before any record or download; a profile without this package's history is someone else's (R1).
+MustReject { Win51 @('-Mode', 'Test', '-Packages', 'AutoHotkey') } '-Packages is only for -Mode Apply*'
+foreach ($bad in 'autohotkey', 'AutoHotkey,AutoHotkey', 'Nope') { MustReject { ApplyPackages $bad } 'Unknown or repeated package*' }
+$count = @(Ledger).Count
+MustReject { ApplyPackages 'Chromium' } '*clean install from a 7z asset is not enabled yet*'
+Must (@(Ledger).Count -eq $count -and -not (Test-Path -LiteralPath $chromiumTree)) 'A24: a Chromium clean install is refused before any effect'
+$null = New-Item -ItemType Directory -Path $chromiumProfile -Force
+[IO.File]::WriteAllText("$chromiumProfile\proof.txt", 'someone else''s profile')
+$mark = LastSeq
+MustReject { ApplyPackages 'Chromium' } '*Chromium preexisting-drift*protected data*'
+Must ((NewRecords $mark @($chromiumId)) -eq 0 -and -not (Test-Path -LiteralPath $chromiumTree)) 'A24: a profile without history blocks Chromium (R1)'
+# An external AutoHotkey entry is never taken over: nothing is installed.
+ExternalEntry
+$mark = LastSeq
+MustReject { ApplyPackages 'AutoHotkey' } '*AutoHotkey preexisting-drift*'
+Must ((NewRecords $mark @($ahkId)) -eq 0 -and -not (Test-Path -LiteralPath $ahkTree)) 'A24: an external AutoHotkey install is never taken over'
+[Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($ahkKey, $false)
+# A23: a clean AutoHotkey install: one intent naming the package, one commit, the tree exactly the pinned
+# inventory, no asset or staging left; a second Apply writes nothing for it.
+$mark = LastSeq
+$installed = ApplyPackages 'AutoHotkey'
+$ahkRecords = @(Ledger | Where-Object { $_.id -ceq $ahkId -and [long]$_.seq -gt $mark })
+Must (@($installed.packages | Where-Object { $_.name -ceq 'AutoHotkey' })[0].class -ceq 'owned-match' -and (@($ahkRecords | ForEach-Object { $_.phase }) -join ',') -ceq 'intent,commit' -and
+    $ahkRecords[0].package -ceq 'AutoHotkey' -and (AhkExact) -and
+    -not @(Get-ChildItem -LiteralPath $programsDir -Force | Where-Object { $_.Name -like "$(Split-Path -Leaf $ahkTree).*" }).Count) 'A23: AutoHotkey is installed and owned exactly'
+$mark = LastSeq
+$null = ApplyPackages 'AutoHotkey'
+Must ((NewRecords $mark @($ahkId)) -eq 0) 'A23: a second Apply writes nothing for AutoHotkey'
+# An external entry appearing beside the owned tree is a conflict: reported, nothing written or removed.
+ExternalEntry
+$mark = LastSeq
+MustReject { ApplyPackages 'AutoHotkey' } '*AutoHotkey owned-match*external install*'
+Must ((NewRecords $mark @($ahkId)) -eq 0 -and (AhkExact)) 'A24: an external entry beside the owned tree is a conflict'
+[Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($ahkKey, $false)
+# A26: an owned older version is collected once the selected version is owned and exact.
+$oldTree = Join-Path $programsDir 'autohotkey-2.0.1'
+$null = New-Item -ItemType Directory -Path $oldTree
+[IO.File]::WriteAllText("$oldTree\old.txt", 'an older version')
+$oldId, $oldDesired = ('tree-extracted:' + $oldTree.ToUpperInvariant()), @{ exists = $true; files = @{ 'old.txt' = (Get-FileHash -LiteralPath "$oldTree\old.txt").Hash.ToLowerInvariant() } }
+Craft @{ phase = 'intent'; id = $oldId; kind = 'tree-extracted'; target = $oldTree; prior = $absent; desired = $oldDesired; package = 'AutoHotkey' }
+Craft @{ phase = 'commit'; id = $oldId; kind = 'tree-extracted'; target = $oldTree; prior = $absent; desired = $oldDesired; observed = $oldDesired }
+$null = ApplyPackages 'AutoHotkey'
+Must ((Phases $oldId) -ceq 'intent,commit,undone' -and -not (Test-Path -LiteralPath $oldTree) -and (AhkExact)) 'A26: an owned older version is collected'
+# A25: interrupted package attempts: recovery removes the derived asset and a partial staging and voids the
+# intent; a file the inventory does not name keeps the staging directory and the intent open until it is gone.
+function CrashIntent([string]$Leaf, [string]$Foreign) {
+    $target = Join-Path $programsDir $Leaf
+    $staging = "$target.$([guid]::NewGuid().ToString('N')).staging"
+    $id = 'tree-extracted:' + $target.ToUpperInvariant()
+    Craft @{ phase = 'intent'; id = $id; kind = 'tree-extracted'; target = $target; prior = $absent; temp = $staging; package = 'AutoHotkey'
+        desired = @{ exists = $true; files = @{ 'AutoHotkey64.exe' = ('a' * 64) } } }
+    [IO.File]::WriteAllText("$staging.asset", 'a partial download')
+    $null = New-Item -ItemType Directory -Path $staging
+    [IO.File]::WriteAllText("$staging\AutoHotkey64.exe", 'partial')
+    if ($Foreign) { [IO.File]::WriteAllText("$staging\$Foreign", 'not in the inventory') }
+    [pscustomobject]@{ id = $id; staging = $staging }
+}
+$crash = CrashIntent 'autohotkey-9.9'
+$null = Run 'Apply'
+Must ((Phases $crash.id) -ceq 'intent,void' -and -not (Test-Path -LiteralPath "$($crash.staging).asset") -and -not (Test-Path -LiteralPath $crash.staging)) 'A25: an interrupted install is voided with its asset and staging'
+$crash = CrashIntent 'autohotkey-9.8' 'foreign.txt'
+MustReject { Run 'Apply' } '*is kept*'
+Must ((Phases $crash.id) -ceq 'intent' -and (Test-Path -LiteralPath "$($crash.staging)\foreign.txt") -and -not (Test-Path -LiteralPath "$($crash.staging).asset")) 'A25: foreign staging content is kept'
+[IO.File]::Delete("$($crash.staging)\foreign.txt")
+$null = Run 'Apply'
+Must ((Phases $crash.id) -ceq 'intent,void' -and -not (Test-Path -LiteralPath $crash.staging)) 'A25: recovery completes once the foreign file is gone'
+# A27: Uninstall leaves everything alone while a package executable is in use; closed, it removes every owned
+# effect, the package tree too, and never the protected profile.
+$count = @(Ledger).Count
+$handle = [IO.File]::Open((Join-Path $ahkTree $ahk.executable.Replace('/', '\')), 'Open', 'Read', 'Read')
+try { MustReject { RunUninstall -Apply } '*is in use*' } finally { $handle.Dispose() }
+Must (@(Ledger).Count -eq $count -and (AhkExact)) 'A27: an in-use package stops Uninstall before any removal'
+$gone = RunUninstall -Apply
+Must ($gone.ownedOpen -eq 0 -and -not (Test-Path -LiteralPath $ahkTree) -and (Test-Path -LiteralPath "$chromiumProfile\proof.txt")) 'A27: Uninstall removes the package tree, never the profile'
+AssertEmpty
+[IO.File]::Delete("$chromiumProfile\proof.txt")
+[IO.Directory]::Delete($chromiumProfile, $false)
+[IO.Directory]::Delete((Split-Path -Parent $chromiumProfile), $false)
 
 # A malformed attempt (void after commit) is reported by the dry run and refused by -Apply; nothing changes.
 $badBytes = Bytes 'proof: malformed attempt'

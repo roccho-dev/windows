@@ -8,7 +8,10 @@ param(
     [string]$HostKey,
     [string]$Identity,
     # Uninstall only: without it Uninstall is a dry run that reads and writes nothing.
-    [switch]$Apply
+    [switch]$Apply,
+    # Apply only: the locked packages (exact names) to converge; Apply converges none without it,
+    # Restore always all. With -File, pass them as one comma-separated argument.
+    [string[]]$Packages
 )
 
 # The native Windows activation adapter. Product selection belongs to the built distribution (Nix).
@@ -98,6 +101,15 @@ function AssertPackageShape($Package) {
 }
 
 foreach ($package in $manifest.packages) { AssertPackageShape $package }
+$packageNames = @($Packages | ForEach-Object { ([string]$_).Split(',') } | ForEach-Object { $_.Trim() })
+if ($PSBoundParameters.ContainsKey('Packages')) {
+    if ($Mode -ne 'Apply') { throw '-Packages is only for -Mode Apply; Restore converges every locked package.' }
+    $locked = @($manifest.packages | ForEach-Object { $_.name })
+    if (-not $packageNames.Count -or @($packageNames | Sort-Object -Unique -CaseSensitive).Count -ne $packageNames.Count -or
+        @($packageNames | Where-Object { $locked -cnotcontains $_ }).Count) {
+        throw "Unknown or repeated package in -Packages: $($packageNames -join ', ') (locked: $($locked -join ', '))"
+    }
+}
 $packageDirectories = @($manifest.packages | ForEach-Object { $_.directory })
 if (@($packageDirectories | Sort-Object -Unique).Count -ne $packageDirectories.Count) { throw 'Duplicate package directory.' }
 $protectedPaths = @($manifest.packages | ForEach-Object { @($_.protected) })
@@ -159,41 +171,6 @@ function ExistingProblems($Entry, $Package) {
     if ($productVersion.Trim() -cne $Package.version) { "$executable ProductVersion is '$productVersion'" }
 }
 
-# Read-only class of one package: preexisting-match or preexisting-drift whenever
-# an Uninstall entry may be this product (never absent then, and nothing is
-# written); indeterminate when the owned directory exists without one, since only
-# the effect ledger can show who made it; preexisting-drift when any declared
-# protected data exists without one (e.g. a profile left by a portable or removed
-# install, which an installed build would open); otherwise absent.
-function ClassifyPackage($Package) {
-    $entries = @(FindUninstallEntries $Package.existing)
-    if ($entries.Count) {
-        $problems = @(foreach ($entry in $entries) {
-            foreach ($problem in @(ExistingProblems $entry $Package)) { "$($entry.view)\$($entry.key): $problem" }
-        })
-        if ($problems.Count) { return New-EffectClass 'preexisting-drift' $null ($problems -join '; ') }
-        return New-EffectClass 'preexisting-match' $null $null
-    }
-    $target = Join-Path $localAppData $Package.directory.Replace('/', '\')
-    if (Test-Path -LiteralPath $target) {
-        return New-EffectClass 'indeterminate' $null "$target exists without an Uninstall entry; its owner is unknown without the effect ledger."
-    }
-    $present = @(@($Package.protected) | Where-Object { Test-Path -LiteralPath (Join-Path $localAppData $_.Replace('/', '\')) })
-    if ($present.Count) {
-        return New-EffectClass 'preexisting-drift' $null "protected data exists without an Uninstall entry: $($present -join ', ')"
-    }
-    return New-EffectClass 'absent' $null $null
-}
-
-# The clean-install gate. Installing creates an owned tree that only the effect
-# ledger can later prove ownership of and remove without recursive deletion, and
-# the fetch and extraction path awaits native adapter evidence; neither exists yet.
-# So an absent package stops Restore before any download or other effect.
-function InstallPackages($Packages) {
-    $names = @($Packages | ForEach-Object { "$($_.name) $($_.version)" }) -join ', '
-    throw ("Clean install of $names is disabled until the effect ledger is integrated; nothing was downloaded " +
-        'or changed. Install it by hand, or wait for the ledger slice.')
-}
 # Restore is per-user. An elevated token may belong to another account, and
 # elevated COM ignores per-user classes, so its activation check could start a
 # machine-wide Noctty instead of this user's registration.
@@ -1285,6 +1262,164 @@ function TreeReferenceProblems($Steps) {
     }
 }
 
+# ---- Locked packages: one owned tree per package through the effect ledger ----------
+$script:packageDrift = @()
+
+# The owned effect of one locked package: its tree Programs\<name>-<version> with the pinned inventory.
+function PackageEffect($Package) {
+    $target = Join-Path $localAppData $Package.directory.Replace('/', '\')
+    $files = @{}
+    foreach ($entry in $Package.files.PSObject.Properties) { $files[$entry.Name] = ([string]$entry.Value).ToLowerInvariant() }
+    [ordered]@{ id = 'tree-extracted:' + $target.ToUpperInvariant(); kind = 'tree-extracted'; target = $target
+        prior = [ordered]@{ exists = $false }; desired = [ordered]@{ exists = $true; files = $files } }
+}
+
+# Read-only class of one package after recovery (Get-PackageClass): the ledger decides ownership
+# of its tree; an Uninstall entry that may be this product (HKCU or HKLM, either view) is never
+# taken over and, beside an owned tree, is a conflict; an unrecorded tree is preexisting (A2);
+# protected data without this package's install history (R1) is someone else's. An attempt left
+# unrecovered (a read-only mode) is indeterminate.
+function ClassifyPackage($Package) {
+    $effect = PackageEffect $Package
+    $entries = @(FindUninstallEntries $Package.existing)
+    $problems = @(foreach ($entry in $entries) { foreach ($problem in @(ExistingProblems $entry $Package)) { "$($entry.view)\$($entry.key): $problem" } })
+    $tree = Get-EffectClass $null (ObserveTree $effect.target) $effect.kind $effect.desired (AttemptOf $effect.id)
+    $treeClass = if ($tree.resolution) { 'indeterminate' } else { $tree.class }
+    $present = @(@($Package.protected) | Where-Object { Test-Path -LiteralPath (Join-Path $localAppData $_.Replace('/', '\')) })
+    # R1 history matters only when protected data exists; it reads the whole ledger once, so only then.
+    $history = if ($present.Count) { Test-PackageHistory $script:ledgerRecords $Package.name (Join-Path $localAppData 'Programs') } else { $false }
+    $class = Get-PackageClass $treeClass $entries.Count $problems ($present.Count -gt 0) $history
+    $reason = if ($class.conflict) { "an external install is registered beside the owned tree, sharing its data ($(@($entries | ForEach-Object { "$($_.view)\$($_.key)" }) -join ', '))" }
+        elseif ($class.class -ceq 'preexisting-drift' -and $entries.Count) { $problems -join '; ' }
+        elseif ($class.class -ceq 'preexisting-drift' -and $treeClass -ceq 'preexisting-drift') { "$($effect.target) exists without this ledger and differs from the pinned inventory; it is never overwritten" }
+        elseif ($class.class -ceq 'preexisting-drift') { "protected data exists without this package's install history: $($present -join ', ')" }
+        elseif ($class.class -ceq 'owned-drift') { "the owned $($effect.target) differs from the pinned inventory; Uninstall removes it, then it can be installed again" }
+        elseif ($class.class -ceq 'indeterminate') { $(if ($tree.reason) { $tree.reason } else { 'an interrupted attempt is not recovered yet' }) }
+    [pscustomobject]@{ package = $Package; effect = $effect; class = $class.class; install = $class.install; converged = $class.converged
+        conflict = $class.conflict; reason = $reason }
+}
+
+# The packages this run converges or checks: every lock for Restore and RestoreTest, those named by -Packages for Apply.
+function SelectedPackages {
+    if ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest') { return @($manifest.packages) }
+    @($manifest.packages | Where-Object { $packageNames -ccontains $_.name })
+}
+
+# Runs an inbox program ($Exe, an absolute path) with its arguments quoted for Windows (Join-NativeArguments)
+# and no shell, reading stdout and stderr asynchronously. A run past $Seconds is killed and waited for; a
+# nonzero exit fails with the end of its stderr. Returns stdout.
+function Invoke-Native([string]$Exe, [string[]]$Arguments, [int]$Seconds) {
+    $info = [Diagnostics.ProcessStartInfo]::new($Exe, (Join-NativeArguments $Arguments))
+    $info.UseShellExecute, $info.RedirectStandardOutput, $info.RedirectStandardError, $info.CreateNoWindow = $false, $true, $true, $true
+    $name = [IO.Path]::GetFileName($Exe)
+    $process = [Diagnostics.Process]::Start($info)
+    try {
+        $out, $err = $process.StandardOutput.ReadToEndAsync(), $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($Seconds * 1000)) { $process.Kill(); $process.WaitForExit(); throw "$name did not finish within $Seconds s." }
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) { throw "$name exited $($process.ExitCode): $((@($err.Result -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -Last 3) -join ' | ')" }
+        return $out.Result
+    } finally { $process.Dispose() }
+}
+
+# True when the package's executable in $Tree is in use: an exclusive read/write open fails with a
+# sharing or lock violation, as while it runs (a mapped image refuses writers) or another handle holds
+# it; Uninstall and collection then leave that tree alone. Any other failure (read-only, access denied)
+# is not "in use" and stops the run with its real reason; a missing executable is not in use.
+function PackageInUse($Package, [string]$Tree) {
+    $exe = Join-Path $Tree $Package.executable.Replace('/', '\')
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { return $false }
+    try { [IO.File]::Open($exe, 'Open', 'ReadWrite', 'None').Dispose(); return $false }
+    catch {
+        $failure = $_.Exception.GetBaseException()
+        if ($failure -is [IO.IOException] -and ($failure.HResult -band 0xFFFF) -in @(32, 33)) { return $true }  # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+        throw "Cannot tell whether $exe is in use: $($failure.Message)"
+    }
+}
+
+# Before any effect: an indeterminate or owned-drift package stops the run, a clean install is refused
+# where its extraction is not proven yet (only ZIP until the 7z proof), and every install must fit its
+# volume and path limits (Get-PackageSpaceProblem), the earlier installs' space reserved.
+function PreflightPackages($States) {
+    $blocked = @(foreach ($state in $States) {
+        $label = "$($state.package.name) $($state.package.version)"
+        if ($state.class -cin @('indeterminate', 'owned-drift')) { "${label}: $($state.reason)" }
+        elseif ($state.install -and $state.package.format -cne 'zip') {
+            "${label}: clean install from a $($state.package.format) asset is not enabled yet (its extraction awaits CI proof); install it by hand"
+        }
+    })
+    if ($blocked.Count) { throw "Packages stop the run before any effect: $($blocked -join '; ')" }
+    $reserved = @{}
+    foreach ($state in @($States | Where-Object { $_.install })) {
+        $volume = [IO.Path]::GetPathRoot($state.effect.target)
+        $free = [long]([IO.DriveInfo]::new($volume).AvailableFreeSpace) - [long]$reserved[$volume]
+        $problem = Get-PackageSpaceProblem $state.package $state.effect.target $free
+        if ($problem) { throw "$($state.package.name) cannot be installed; nothing was changed: $problem" }
+        $reserved[$volume] = [long]$reserved[$volume] + [long]$state.package.size + [long]$state.package.unpackedSize + 64MB
+    }
+}
+
+# Installs one absent package: intent (package, staging) -> curl to the derived <staging>.asset (HTTPS
+# only, redirects too) -> length, SHA-256 and SHA-1 checked under a handle that keeps writers out until
+# extraction ends -> the `tar -tf` listing checked against the inventory -> `tar -xf` into staging -> the
+# asset deleted -> staging exactly the inventory (no reparse point, extra or missing file) -> one
+# same-volume rename -> commit. A failure is recovered at once when it can be (asset and staging removed).
+function InstallPackage($State) {
+    $package, $effect = $State.package, $State.effect
+    $programs = Join-Path $localAppData 'Programs'
+    SharedDirectory $programs
+    $problem = Get-PackageSpaceProblem $package $effect.target ([long]([IO.DriveInfo]::new([IO.Path]::GetPathRoot($effect.target)).AvailableFreeSpace))
+    if ($problem) { throw "$($package.name) cannot be installed: $problem" }
+    if ((ObserveTree $effect.target).exists) { throw "Refusing to create $($effect.target): it exists." }
+    $staging = $effect.target + '.' + [guid]::NewGuid().ToString('N') + '.staging'
+    WriteRecord 'intent' $effect $null $staging $package.name
+    $asset = Get-PackageAssetPath @(RecordsOf $effect.id)[-1] $programs
+    Recovering $effect {
+        $curl, $tar = (Join-Path $env:SystemRoot 'System32\curl.exe'), (Join-Path $env:SystemRoot 'System32\tar.exe')
+        # -q first: no .curlrc (the user's curl configuration) can change this download.
+        $null = Invoke-Native $curl @('-q', '--fail', '--silent', '--show-error', '--location', '--proto', '=https', '--proto-redir', '=https',
+            '--max-time', '600', '--output', $asset, $package.url) 660
+        $stream = [IO.File]::Open($asset, 'Open', 'Read', 'Read')
+        try {
+            $sha256 = -join ([Security.Cryptography.SHA256]::Create().ComputeHash($stream) | ForEach-Object { $_.ToString('x2') })
+            $sha1 = ''
+            if ($null -ne (Get-Field $package 'sha1')) { $stream.Position = 0; $sha1 = -join ([Security.Cryptography.SHA1]::Create().ComputeHash($stream) | ForEach-Object { $_.ToString('x2') }) }
+            $problem = Get-AssetProblem $package $stream.Length $sha256 $sha1
+            if ($problem) { throw "The downloaded $($package.name) asset is not the lock: $problem" }
+            $listing = @(ConvertFrom-TarListing ((Invoke-Native $tar @('-tf', $asset) 600) -split "`n") $package.files)
+            $problem = Get-ZipEntryProblem $listing $package.files
+            if ($problem) { throw "The $($package.name) archive is not the pinned inventory: $problem" }
+            $null = [IO.Directory]::CreateDirectory($staging)
+            $null = Invoke-Native $tar @('-xf', $asset, '-C', $staging) 600
+        } finally { $stream.Dispose() }
+        [IO.File]::Delete($asset)
+        if (-not (Test-EffectStateEqual 'tree-extracted' $effect.desired (ObserveTree $staging))) { throw "Staged $staging differs from the inventory." }
+        [IO.Directory]::Move($staging, $effect.target)
+        WriteRecord 'commit' $effect (ObserveTree $effect.target)
+        $script:copied++
+    }
+}
+
+# Once the selected version of a package is owned and exact: removes the owned trees of its other
+# versions through the same plan as Uninstall (file by file, D1-resumable), each only when its
+# executable is not in use and nothing else refers to it; anything kept stays owned and is reported.
+function CollectPackageGarbage($State) {
+    $programs = Join-Path $localAppData 'Programs'
+    foreach ($id in @(LedgerIds)) {
+        $first = @(RecordsOf $id)[0]
+        $target = [string](Get-Field $first 'target')
+        if ($id -ceq $State.effect.id -or (Get-Field $first 'kind') -cne 'tree-extracted' -or -not (Test-PackageTarget $target $State.package.name $programs) -or
+            -not @(OpenAttempt $id).Count) { continue }
+        if (PackageInUse $State.package $target) { $script:packageDrift += "$target is in use; kept"; continue }
+        $observations = @{}
+        $observations[$id] = Observe $first
+        $plan = Get-UninstallPlan @(RecordsOf $id) $observations
+        $problems = @($plan.refused | ForEach-Object { $_.reason }) + @(if ($plan.ok) { TreeReferenceProblems @(OrderedSteps $plan) })
+        if ($problems.Count) { $script:packageDrift += "$target cannot be collected: $($problems -join '; ')"; continue }
+        UndoOwnedSteps @(OrderedSteps $plan)
+    }
+}
+
 # Not $Identity: that is the RentSsh key-file parameter, a [string] in the same
 # script scope (variable names ignore case), which would flatten this record.
 function RunIdentity {
@@ -1330,6 +1465,15 @@ function Uninstall {
         $contents, $alsoRemoved = @{}, @{ ('HKCU\' + $startupSubkey) = @($legacy.steps | Where-Object { $null -eq $_.value } | ForEach-Object { $_.name }) }
         foreach ($step in @($steps | Where-Object { $_.action -ceq 'delete-empty-key' })) { $contents[$step.key] = ObserveKeyContent ($step.key -replace '^HKCU\\', '') }
         $refused += @(Get-ForeignKeyContent $steps $contents $alsoRemoved) + @(TreeReferenceProblems $steps)
+        # A package tree whose executable runs (an exclusive read/write open fails) is not touched, so a
+        # running browser never loses half its files; a partly removed tree still resumes (D1).
+        $programs = Join-Path $localAppData 'Programs'
+        foreach ($tree in @($steps | Where-Object { $_.kind -ceq 'tree-extracted' } | ForEach-Object { $_.id } | Sort-Object -Unique -CaseSensitive)) {
+            $target = [string](Get-Field @(RecordsOf $tree)[0] 'target')
+            foreach ($package in @($manifest.packages | Where-Object { Test-PackageTarget $target $_.name $programs })) {
+                if (PackageInUse $package $target) { $refused += "${tree}: $($package.executable) is in use; close $($package.name) first" }
+            }
+        }
     }
     if ($Apply -and -not $refused.Count) {
         if ($legacy.action -ceq 'restore') { RestoreLegacy $legacy }
@@ -1349,7 +1493,7 @@ function Uninstall {
     }
     $answer = [ordered]@{ mode = $Mode; apply = [bool]$Apply; source = $manifest.source; identity = $script:runIdentity
         ledgerFound = $found; siloCheck = 'notPerformed'
-        scope = 'owned fonts and Noctty effects visible to this process, and the default-terminal selection this distribution wrote; packages and RentSsh are not in the ledger yet'
+        scope = 'owned fonts, Noctty and package trees visible to this process, and the default-terminal selection this distribution wrote; protected package data (a browser profile) and RentSsh are not in the ledger'
         planned = @($steps | ForEach-Object { StepText $_ })
         resolutions = @($plan.resolutions | ForEach-Object { "$($_.id): $($_.resolution)" }); resumed = @($plan.resumed)
         defaultTerminal = $legacy.action
@@ -1367,17 +1511,10 @@ function Uninstall {
 $script:runIdentity = RunIdentity
 try {
     if ($Mode -eq 'Uninstall') { Uninstall; return }
-    # Packages are read, never downloaded or extracted, outside Restore; Validate,
-    # Test and Apply do not read the machine for them at all.
-    if ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest') {
-        $packageStates = @(foreach ($package in $manifest.packages) {
-            [pscustomobject]@{ package = $package; state = (ClassifyPackage $package) }
-        })
-    }
-    if ($Mode -eq 'Restore') {
-        # Before any Restore effect: an unknown package owner stops.
-        $unknown = @($packageStates | Where-Object { $_.state.class -ceq 'indeterminate' })
-        if ($unknown.Count) { throw "Package state unknown: $(@($unknown | ForEach-Object { $_.state.reason }) -join '; ')" }
+    # RestoreTest reads the ledger without the lock or recovery; an unrecovered attempt reads as indeterminate.
+    if ($Mode -eq 'RestoreTest') {
+        $null = ReadLedger
+        $packageStates = @(SelectedPackages | ForEach-Object { ClassifyPackage $_ })
     }
     $ledgerFound, $nocttyPlan = $false, $null
     if ($Mode -eq 'Apply' -or $Mode -eq 'Restore') {
@@ -1389,15 +1526,18 @@ try {
         $null = ReadLedger
         RecoverLedger
         $nocttyPlan = PlanNoctty -Restore:($Mode -eq 'Restore')
-        # Packages only after every refusal the plan can make: a clean install (fetch and verify
-        # every asset, then extract) runs here or not at all; it is disabled until S-A2.
-        $absent = @($packageStates | Where-Object { $_.state.class -ceq 'absent' } | ForEach-Object { $_.package })
-        if ($absent.Count) { InstallPackages $absent }
+        # Packages (all for Restore, those named by -Packages for Apply), classified after recovery;
+        # every package refusal comes before the first effect, then installs, then old versions go.
+        $packageStates = @(SelectedPackages | ForEach-Object { ClassifyPackage $_ })
+        PreflightPackages $packageStates
+        foreach ($state in @($packageStates | Where-Object { $_.install })) { InstallPackage $state }
+        foreach ($state in @($packageStates | Where-Object { $_.install -or $_.class -ceq 'owned-match' })) { CollectPackageGarbage $state }
         ConvergeFonts
         if ($script:fontDrift.Count) { throw "Font drift: $($script:fontDrift -join '; ')" }
         ApplyNoctty $nocttyPlan
         SelectNoctty -Check:($Mode -eq 'Restore')
         if ($script:nocttyDrift.Count) { throw "Noctty drift: $($script:nocttyDrift -join '; ')" }
+        $packageStates = @(SelectedPackages | ForEach-Object { ClassifyPackage $_ })  # as they are now, for the verdict
     }
     if ($Mode -ne 'Validate') { AssertFonts }
     if ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest') {
@@ -1405,12 +1545,11 @@ try {
         if (-not (TestTerminalPackage)) { throw 'Windows Terminal 1.24 or newer is missing.' }
         if (-not (TestNocttyRegistration)) { throw 'Noctty default-terminal registration drift.' }
         if ($Mode -eq 'RestoreTest') { AssertActualSelection }  # Restore checked it before success
-        # A preexisting install is never written; one that is not exactly the locked
-        # version fails as that package's drift, after Restore's other effects.
-        $drift = @($packageStates | Where-Object { $_.state.class -cne 'preexisting-match' } |
-            ForEach-Object { "$($_.package.name) $($_.state.class): $($_.state.reason)" })
-        if ($drift.Count) { throw "Package drift: $($drift -join '; ')" }
     }
+    # Every package this run covered is owned-match or preexisting-match, with no external install beside
+    # an owned tree; anything else (never written) and any old version kept fails as package drift.
+    $drift = @(@($packageStates | Where-Object { -not $_.converged } | ForEach-Object { "$($_.package.name) $($_.class): $($_.reason)" }) + $script:packageDrift)
+    if ($drift.Count) { throw "Package drift: $($drift -join '; ')" }
     # inDesiredState covers the declared state this mode tested. Handoff is never
     # part of it: this script does not launch or observe a console.
     [ordered]@{ mode = $Mode; source = $manifest.source; fontDirectory = $fontDirectory; identity = $script:runIdentity
@@ -1424,7 +1563,7 @@ try {
             $name = $_.name
             $state = @($packageStates | Where-Object { $_.package.name -ceq $name })
             [ordered]@{ name = $name; version = $_.version
-                class = $(if ($state.Count) { $state[0].state.class } else { 'notEvaluated' }) } });
+                class = $(if ($state.Count) { $state[0].class } else { 'notEvaluated' }) } });
         inDesiredState = ($Mode -ne 'Validate');
         registrationState = $(if (TestNocttyRegistration) { 'registered' } else { 'unregistered' });
         handoffProof = 'unproven' } | ConvertTo-Json -Compress -Depth 4
