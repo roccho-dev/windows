@@ -577,6 +577,135 @@ try {
     Say "HKCU\$startupPath restore: $restore"
 }
 
+# ---- S2-0 package measurement (G1, G5, G6, G7): printed evidence only; nothing here fails the proof ----
+# Each locked package is fetched from its exact locked HTTPS URL with inbox curl.exe, checked
+# against the locked size, sha256 and sha1, listed and extracted with inbox tar.exe, and the
+# extracted tree compared with the pinned inventory; every native call runs through the
+# Process API with a deadline. Scratch stays in a fresh RUNNER_TEMP directory. Counts and
+# at most five names per difference are printed. Starting Chromium or AutoHotkey (G3) and
+# the policy templates (not in the lock, so no pinned hash) are the next step.
+# The whole measurement shares one 300-second budget so it cannot push the required job past
+# its timeout: each step's deadline is what the budget has left (a step that cannot get its
+# minimum is skipped, and says so), and the hash walk stops when the budget is spent.
+$s20 = [ordered]@{ status = 'not run' }
+$s20Budget, $s20Clock = 300, [Diagnostics.Stopwatch]::StartNew()
+function S20([string]$Line) { Write-Host "S2-0 $Line" }
+function Left([int]$Least, [string]$Step) {
+    $left = [int]($s20Budget - $s20Clock.Elapsed.TotalSeconds)
+    if ($left -lt $Least) { throw "$Step skipped: $left s of the $s20Budget s budget left, $Least s needed" }
+    $left
+}
+function Few($Names) { $all = @($Names); "$($all.Count)$(if ($all.Count) { ' (' + ((@($all | Select-Object -First 5)) -join ', ') + $(if ($all.Count -gt 5) { ', ...' }) + ')' })" }
+function Tail([string]$Text) { ((@($Text -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -Last 3) -join ' | ') -replace '(.{300}).+', '$1...' }
+# A native command with a deadline: exit code, seconds, sampled peak working set, and its output.
+function Bounded([string]$Exe, [string[]]$Arguments, [int]$Seconds) {
+    $info = [Diagnostics.ProcessStartInfo]::new($Exe)
+    foreach ($argument in $Arguments) { $info.ArgumentList.Add($argument) }
+    $info.UseShellExecute, $info.RedirectStandardOutput, $info.RedirectStandardError, $info.CreateNoWindow = $false, $true, $true, $true
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $process = [Diagnostics.Process]::Start($info)
+    $out, $err = $process.StandardOutput.ReadToEndAsync(), $process.StandardError.ReadToEndAsync()
+    $peak, $exit = 0L, $null
+    while (-not $process.WaitForExit(250)) {
+        try { $process.Refresh(); $peak = [Math]::Max($peak, $process.PeakWorkingSet64) } catch { }
+        if ($clock.Elapsed.TotalSeconds -gt $Seconds) { $process.Kill($true); $process.WaitForExit(); $exit = "timeout after $Seconds s"; break }
+    }
+    if (-not $exit) { $process.WaitForExit(); $exit = $process.ExitCode }
+    [pscustomobject]@{ exit = $exit; seconds = [Math]::Round($clock.Elapsed.TotalSeconds, 1)
+        peakMB = $(if ($peak) { [Math]::Round($peak / 1MB) } else { 'n/a' }); stdout = $out.Result; stderr = $err.Result }
+}
+try {
+    $curl, $tar = (Join-Path $env:SystemRoot 'System32\curl.exe'), (Join-Path $env:SystemRoot 'System32\tar.exe')
+    $s20Dir = Join-Path $env:RUNNER_TEMP ('s2-0-' + [guid]::NewGuid().ToString('N'))  # fresh, never deleted
+    $null = New-Item -ItemType Directory -Path $s20Dir
+    $s20Clock.Restart()
+    foreach ($package in @($manifest.packages | Sort-Object size)) {  # the small AutoHotkey zip first
+        $facts = [ordered]@{ evidence = 'incomplete' }
+        try {
+            $dir = Join-Path $s20Dir $package.name
+            $asset, $tree = (Join-Path $dir "asset.$($package.format)"), (Join-Path $dir 'tree')
+            $null = New-Item -ItemType Directory -Path $dir, $tree
+            $limit = [Math]::Min($(if ($package.size -gt 100MB) { 180 } else { 60 }), (Left 60 'download') - 10)
+            $get = Bounded $curl @('--fail', '--silent', '--show-error', '--location', '--proto', '=https', '--proto-redir', '=https',
+                '--max-time', "$limit", '--output', $asset, $package.url) ($limit + 10)
+            $facts.download = "exit $($get.exit), $($get.seconds) s, peak $($get.peakMB) MB"
+            if ($get.exit -ne 0) { throw "download failed: $(Tail $get.stderr)" }
+            $null = Left 15 'verification'
+            $bytes = (Get-Item -LiteralPath $asset).Length
+            $sha256 = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash
+            $sha1 = Get-Field $package 'sha1'
+            $sha1Ok = $null -eq $sha1 -or (Get-FileHash -LiteralPath $asset -Algorithm SHA1).Hash -eq $sha1
+            if ($bytes -ne $package.size -or $sha256 -ne $package.sha256 -or -not $sha1Ok) {
+                $facts.verify = "MISMATCH: $bytes bytes (locked $($package.size)), sha256 $sha256, sha1 $(if ($sha1Ok) { 'match' } else { 'differs' })"
+                throw 'the asset differs from the lock; nothing else is read'
+            }
+            $facts.verify = "size, sha256$(if ($sha1) { ', sha1' }) match the lock"
+            $files = @{}
+            foreach ($entry in $package.files.PSObject.Properties) { $files[$entry.Name] = $entry.Value }
+            $parents = @{}
+            foreach ($name in $files.Keys) { $parts = $name.Split('/'); for ($i = 1; $i -lt $parts.Count; $i++) { $parents[$parts[0..($i - 1)] -join '/'] = $true } }
+            $list = Bounded $tar @('-tf', $asset) ([Math]::Min(120, (Left 20 'listing')))
+            $listed = @($list.stdout -split "`r?`n" | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('/') })
+            $facts.list = "exit $($list.exit), $($list.seconds) s, $($listed.Count) entries, outside the inventory $(Few @($listed | Where-Object { -not $files.ContainsKey($_) -and -not $parents.ContainsKey($_) })), inventory files not listed $(Few @($files.Keys | Where-Object { $listed -notcontains $_ }))"
+            if ($list.exit -ne 0) { throw "tar could not list: $(Tail $list.stderr)" }
+            $extract = Bounded $tar @('-xf', $asset, '-C', $tree) ([Math]::Min(240, (Left 60 'extraction')))
+            $facts.extract = "exit $($extract.exit), $($extract.seconds) s, peak $($extract.peakMB) MB"
+            if ($extract.exit -ne 0) { throw "tar could not extract: $(Tail $extract.stderr)" }
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            $found, $changed, $reparse, $spent = @{}, @(), @(), $false
+            foreach ($item in @(Get-ChildItem -LiteralPath $tree -Recurse -Force)) {
+                if ($s20Clock.Elapsed.TotalSeconds -gt $s20Budget) { $spent = $true; break }
+                $relative = $item.FullName.Substring($tree.Length + 1).Replace('\', '/')
+                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { $reparse += $relative; continue }
+                if ($item.PSIsContainer) { if (-not $parents.ContainsKey($relative)) { $changed += "$relative/" }; continue }
+                $found[$relative] = $true
+                if (-not $files.ContainsKey($relative) -or (Get-FileHash -LiteralPath $item.FullName).Hash -ne $files[$relative]) { $changed += $relative }
+            }
+            if ($spent) {
+                $facts.inventory = "INCOMPLETE: budget spent after $($found.Count) of $($files.Count) pinned files (so far extra or changed $(Few $changed))"
+                throw 'the inventory comparison did not finish'
+            }
+            $missing = @($files.Keys | Where-Object { -not $found.ContainsKey($_) })
+            $exact = -not $missing.Count -and -not $changed.Count -and -not $reparse.Count
+            $facts.inventory = "$(if ($exact) { 'exact' } else { 'DIFFERS' }): $($files.Count) pinned files, missing $(Few $missing), extra or changed $(Few $changed), reparse points $(Few $reparse), compared in $([Math]::Round($clock.Elapsed.TotalSeconds, 1)) s"
+            $facts.executable = "$($package.executable) $(if (Test-Path -LiteralPath (Join-Path $tree $package.executable.Replace('/', '\')) -PathType Leaf) { 'present' } else { 'MISSING' })"
+            # G7: the rename Restore will do right after extraction (same volume).
+            try { [IO.Directory]::Move($tree, (Join-Path $dir 'moved')); $facts.move = 'renamed right after extraction' }
+            catch { $facts.move = "rename failed: $($_.Exception.Message)" }
+            if ($exact -and $facts.move -like 'renamed*') { $facts.evidence = 'complete' }
+        } catch { $facts.error = ($_.Exception.Message -replace '(.{300}).+', '$1...') }
+        $s20[$package.name] = @($facts.GetEnumerator() | ForEach-Object { "$($_.Key): $($_.Value)" }) -join '; '
+        S20 "$($package.name) $($package.version): $($s20[$package.name])"
+    }
+    # G5: existing Chrome-like Uninstall entries on this runner versus the Hibbiki identity (read-only).
+    $chromium = @($manifest.packages | Where-Object { $_.name -ceq 'Chromium' })[0]
+    $seen = @(foreach ($view in @(@('HKCU', 'CurrentUser', 'Default'), @('HKLM', 'LocalMachine', 'Registry64'), @('HKLM32', 'LocalMachine', 'Registry32'))) {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($view[1], $view[2])
+        try {
+            $uninstall = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
+            if ($null -eq $uninstall) { continue }
+            try {
+                foreach ($key in $uninstall.GetSubKeyNames()) {
+                    $entry = $uninstall.OpenSubKey($key)
+                    if ($null -eq $entry) { continue }
+                    try {
+                        $display, $publisher = [string]$entry.GetValue('DisplayName'), [string]$entry.GetValue('Publisher')
+                        if ($key -notlike '*chrom*' -and $display -notlike '*chrom*') { continue }
+                        $isHibbiki = $key -eq $chromium.existing.uninstallKey -or ($display -ceq $chromium.existing.displayName -and $publisher -ceq $chromium.existing.publisher)
+                        "$($view[0])\$key '$display' by '$publisher' $([string]$entry.GetValue('DisplayVersion')): $(if ($isHibbiki) { 'MATCHES the Hibbiki identity' } else { 'not the Hibbiki identity' })"
+                    } finally { $entry.Close() }
+                }
+            } finally { $uninstall.Close() }
+        } finally { $base.Close() }
+    })
+    $s20.chromeEntries = if ($seen.Count) { $seen -join ' | ' } else { 'none' }
+    S20 "G5 Chrome-like Uninstall entries: $($s20.chromeEntries)"
+    $s20.status = "measured (see each package); $([Math]::Round($s20Clock.Elapsed.TotalSeconds)) s of the $s20Budget s budget"
+} catch {
+    $s20.status = "measurement error: $($_.Exception.Message -replace '(.{300}).+', '$1...')"
+    S20 $s20.status
+}
+
 foreach ($font in $fonts) {
     if ((Test-Path -LiteralPath (FontPath $font)) -or $null -ne (FontValue (ValueName $font))) { throw 'Proof requires a fresh disposable font target.' }
 }
@@ -826,5 +955,5 @@ $null = RunSsh 'RentSshTest'
     uninstallEmptiedOwnedFonts = $true;
     rentSsh = "cloudflared $($manifest.cloudflared.version) client, strict config, Include preserved and idempotent, drift repaired"
     winReportsHandoffUnproven = $true; handoffProbeRefusedOnRunner = $true; handoffEvaluatorCases = $handoffCases;
-    g4Measurement = $g4;
+    g4Measurement = $g4; s20Measurement = $s20;
     scope = 'current-user owned fonts, registry and SSH-client convergence; not Restore/Uninstall of Noctty, the default terminal or packages, rendering, default-terminal handoff, real-host UX or a Cloudflare connection' } | ConvertTo-Json
