@@ -535,16 +535,19 @@ function NocttyEffects {
 # A tree exactly as it is, never following a reparse point: files maps each regular file's
 # '/'-path to its sha256, and other lists every reparse point, unsafe or case-repeated name and
 # directory with no file beneath it, so any of them makes the tree differ from an inventory.
-function ObserveTree([string]$Path) {
+# -Entries lists every entry instead, as { path; directory; reparse } (Get-StagingCleanupSteps).
+function ObserveTree([string]$Path, [switch]$Entries) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-    if ($null -eq $item) { return [ordered]@{ exists = $false } }
+    if ($null -eq $item) { if ($Entries) { return } else { return [ordered]@{ exists = $false } } }
     if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Not a plain directory: $Path" }
-    $files, $other, $directories, $parents = @{}, @(), @(), @{}
+    $files, $other, $directories, $parents, $listed = @{}, @(), @(), @{}, @()
     $pending = [Collections.Generic.Stack[IO.DirectoryInfo]]::new()
     $pending.Push($item)
     while ($pending.Count) {
         foreach ($entry in $pending.Pop().GetFileSystemInfos()) {
             $relative = $entry.FullName.Substring($item.FullName.Length + 1).Replace('\', '/')
+            $listed += [ordered]@{ path = $relative; directory = $entry -is [IO.DirectoryInfo]
+                reparse = [bool]($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) }
             if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $files.ContainsKey($relative) -or
                 @($relative.Split('/') | Where-Object { -not (Test-PathSegment $_) }).Count) { $other += $relative }
             elseif ($entry -is [IO.DirectoryInfo]) { $directories += $relative; $pending.Push($entry) }
@@ -555,6 +558,7 @@ function ObserveTree([string]$Path) {
             }
         }
     }
+    if ($Entries) { return $listed }
     $other += @($directories | Where-Object { -not $parents.ContainsKey($_) } | ForEach-Object { "$_/" })
     [ordered]@{ exists = $true; files = $files; other = $other }
 }
@@ -585,13 +589,14 @@ function ObserveNoctty($Effect) {
     throw "$kind $target is not a selected Noctty effect."
 }
 
-# The current state of a recorded or selected effect. Anything but an owned font
-# file or HKCU Fonts value is outside this version and stops the run.
+# The current state of a recorded or selected effect: an owned font file or HKCU Fonts value,
+# or a Noctty effect (ObserveNoctty). Anything else is outside this version and stops the run.
 function Observe($Effect) {
     $kind, $target = [string](Get-Field $Effect 'kind'), [string](Get-Field $Effect 'target')
     if ($kind -ceq 'file-created' -and [IO.Path]::GetDirectoryName($target) -eq $fontDirectory -and
         [IO.Path]::GetFileName($target) -match '^[0-9a-f]{64}\.ttf$') { return ObserveFile $target }
     if ($kind -ceq 'registry-value' -and $target -eq $fontKey) { return ObserveValue ([string](Get-Field $Effect 'name')) }
+    if ($kind -cne 'file-created' -or $target -eq $nocttyConfig) { return ObserveNoctty $Effect }
     throw "The effect ledger holds $kind $target, which this version (owned fonts only) does not handle."
 }
 
@@ -615,24 +620,33 @@ function OpenAttempt([string]$Id) {
     return $open
 }
 
-# The temporary path an intent named before creating it, checked to lie beside
-# its target as <target>.<guid32>.tmp; only such a path is ever deleted.
+# The temporary path an intent named before creating it, beside its target as
+# <target>.<guid32>.tmp (a file) or .staging (a tree); only such a path is ever removed.
 function IntentTemp($Record) {
-    $temp, $target = (Get-Field $Record 'temp'), [string](Get-Field $Record 'target')
-    if ($null -eq $temp) { return $null }
-    if ($temp -isnot [string] -or [IO.Path]::GetDirectoryName($temp) -ne [IO.Path]::GetDirectoryName($target) -or
-        [IO.Path]::GetFileName($temp) -cnotmatch ('^' + [regex]::Escape([IO.Path]::GetFileName($target)) + '\.[0-9a-f]{32}\.tmp$')) {
-        throw "A ledger intent names an invalid temporary path: $temp"
-    }
-    return $temp
+    $problem = Get-IntentTempProblem $Record
+    if ($problem) { throw "A ledger intent names an invalid temporary path: $problem" }
+    return Get-Field $Record 'temp'
 }
 
-# Closes or confirms an open attempt: first the temporary files its own intents
-# named, then a commit, void or undone record carrying the observed state.
+# Removes what an interrupted tree intent left in its own staging directory, one file or empty
+# directory at a time, only while every entry there belongs to its inventory; otherwise it stops.
+function CleanStaging($Intent) {
+    $staging = [string](IntentTemp $Intent)
+    $cleanup = Get-StagingCleanupSteps $Intent @(ObserveTree $staging -Entries)
+    if (-not $cleanup.ok) { throw "Staging directory $staging is kept: $($cleanup.reason)" }
+    foreach ($step in $cleanup.steps) {
+        if ($step.action -ceq 'delete-file') { [IO.File]::Delete($step.path) } else { [IO.Directory]::Delete($step.path, $false) }
+    }
+}
+
+# Closes or confirms an open attempt: first the temporary files or staging directories its
+# own intents named, then a commit, void or undone record carrying the observed state.
 function ResolveAttempt($Open, [string]$Phase) {
     foreach ($intent in @($Open | Where-Object { (Get-Field $_ 'phase') -ceq 'intent' })) {
         $temp = IntentTemp $intent
-        if ($temp -and (Test-Path -LiteralPath $temp -PathType Leaf)) { [IO.File]::Delete($temp) }
+        if (-not $temp -or -not (Test-Path -LiteralPath $temp)) { continue }
+        if ((Get-Field $intent 'kind') -ceq 'tree-extracted') { CleanStaging $intent }
+        elseif (Test-Path -LiteralPath $temp -PathType Leaf) { [IO.File]::Delete($temp) }
     }
     WriteRecord $Phase $Open[0] (Observe $Open[0])
 }
@@ -721,14 +735,22 @@ function UndoOwned($Open, $Expect, [switch]$Replacing) {
     WriteRecord 'undone' $Open[0] (Observe $Open[0])
 }
 
-# Creates an absent font file: intent (naming its temporary file), a new temporary
-# file written through and flushed, a rename that fails if the target exists, and
-# the commit. On failure the id is recovered at once when it can be.
-function CreateFontFile($Effect, [string]$Source) {
+# Runs the effect of an intent just written; on failure the id is recovered at once when it can be.
+function Recovering($Effect, [scriptblock]$Act) {
+    try { & $Act } catch {
+        $failure = $_
+        try { RecoverId $Effect.id } catch { Write-Warning "Recovery of $($Effect.id) deferred: $($_.Exception.Message)" }
+        throw $failure
+    }
+}
+
+# Creates an absent file from a path or bytes: intent (naming its temporary file), a new
+# temporary file written through and flushed, a rename that fails if the target exists, and the commit.
+function CreateOwnedFile($Effect, $Source) {
     $temp = $Effect.target + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
     WriteRecord 'intent' $Effect $null $temp
-    try {
-        $in = [IO.File]::OpenRead($Source)
+    Recovering $Effect {
+        $in = if ($Source -is [byte[]]) { [IO.MemoryStream]::new($Source) } else { [IO.File]::OpenRead($Source) }
         try {
             $out = [IO.FileStream]::new($temp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None,
                 65536, [IO.FileOptions]::WriteThrough)
@@ -737,25 +759,76 @@ function CreateFontFile($Effect, [string]$Source) {
         [IO.File]::Move($temp, $Effect.target)
         WriteRecord 'commit' $Effect (ObserveFile $Effect.target)
         $script:copied++
-    } catch {
-        $failure = $_
-        try { RecoverId $Effect.id } catch { Write-Warning "Recovery of $($Effect.id) deferred: $($_.Exception.Message)" }
-        throw $failure
     }
 }
 
-function CreateFontValue($Effect) {
+# Writes a String value into its existing HKCU key (the effect's target).
+function CreateOwnedValue($Effect) {
+    $subkey = $Effect.target -replace '^HKCU\\', ''
     WriteRecord 'intent' $Effect $null $null
-    try {
-        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($fontSubkey, $true)
+    Recovering $Effect {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($subkey, $true)
+        if ($null -eq $key) { throw "Key $($Effect.target) is missing." }
         try { $key.SetValue($Effect.name, $Effect.desired.data, [Microsoft.Win32.RegistryValueKind]::String) } finally { $key.Close() }
-        WriteRecord 'commit' $Effect (ObserveValue $Effect.name)
+        WriteRecord 'commit' $Effect (ObserveValue $Effect.name $subkey)
         $script:changed++
-    } catch {
-        $failure = $_
-        try { RecoverId $Effect.id } catch { Write-Warning "Recovery of $($Effect.id) deferred: $($_.Exception.Message)" }
-        throw $failure
     }
+}
+
+# Creates one absent HKCU key beneath an existing parent. The parent is opened, never created,
+# so no shared parent is made implicitly; both are checked before the intent.
+function CreateOwnedKey($Effect) {
+    $subkey = $Effect.target -replace '^HKCU\\', ''
+    $split = $subkey.LastIndexOf('\')
+    $parent = if ($split -gt 0) { [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($subkey.Substring(0, $split), $true) }
+    if ($null -eq $parent) { throw "Refusing to create $($Effect.target): its parent key is missing." }
+    try {
+        if ((ObserveKey $subkey).exists) { throw "Refusing to create $($Effect.target): it exists." }
+        WriteRecord 'intent' $Effect $null $null
+        Recovering $Effect {
+            $parent.CreateSubKey($subkey.Substring($split + 1)).Close()
+            WriteRecord 'commit' $Effect (ObserveKey $subkey)
+            $script:changed++
+        }
+    } finally { $parent.Close() }
+}
+
+# Creates an absent tree beneath an existing parent from a ZIP archive. Every entry name is
+# checked against the inventory before anything is written; the files go into a new staging
+# directory the intent names, which must then hold exactly the inventory, and one rename on the
+# same volume (failing if the target exists) makes it the target before the commit.
+function CreateOwnedTree($Effect, [string]$Zip) {
+    Add-Type -AssemblyName System.IO.Compression
+    $target = $Effect.target
+    if (-not (Test-Path -LiteralPath (Split-Path -Parent $target) -PathType Container)) { throw "Refusing to create ${target}: its parent is missing." }
+    if ((ObserveTree $target).exists) { throw "Refusing to create ${target}: it exists." }
+    $stream = [IO.File]::OpenRead($Zip)
+    try {
+        $archive = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Read)
+        try {
+            $problem = Get-ZipEntryProblem @($archive.Entries | ForEach-Object { $_.FullName }) $Effect.desired.files
+            if ($problem) { throw "Refusing to extract ${Zip}: $problem" }
+            $staging = $target + '.' + [guid]::NewGuid().ToString('N') + '.staging'
+            WriteRecord 'intent' $Effect $null $staging
+            Recovering $Effect {
+                $null = [IO.Directory]::CreateDirectory($staging)
+                foreach ($entry in $archive.Entries) {
+                    $path = Join-Path $staging $entry.FullName.TrimEnd('/').Replace('/', '\')
+                    if ($entry.FullName.EndsWith('/')) { $null = [IO.Directory]::CreateDirectory($path); continue }
+                    $null = [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))
+                    $in = $entry.Open()
+                    try {
+                        $out = [IO.FileStream]::new($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                        try { $in.CopyTo($out); $out.Flush($true) } finally { $out.Dispose() }
+                    } finally { $in.Dispose() }
+                }
+                if (-not (Test-EffectStateEqual 'tree-extracted' $Effect.desired (ObserveTree $staging))) { throw "Staged $staging differs from the inventory." }
+                [IO.Directory]::Move($staging, $target)
+                WriteRecord 'commit' $Effect (ObserveTree $target)
+                $script:copied++
+            }
+        } finally { $archive.Dispose() }
+    } finally { $stream.Dispose() }
 }
 
 # The selected font effects: each content-addressed file, and its HKCU value
@@ -874,9 +947,9 @@ function ConvergeFonts {
     foreach ($effect in $effects) {
         $file, $value = $effect.file, $effect.value
         $source = BundlePath "share/fonts/truetype/$($effect.font.file)"
-        ConvergeEffect $file $file.target { CreateFontFile $file $source }
+        ConvergeEffect $file $file.target { CreateOwnedFile $file $source }
         if (Test-EffectStateEqual 'file-created' $file.desired (ObserveFile $file.target)) {
-            ConvergeEffect $value "$fontKey\$($value.name)" { CreateFontValue $value }
+            ConvergeEffect $value "$fontKey\$($value.name)" { CreateOwnedValue $value }
         } else {
             $script:fontDrift += "$fontKey\$($value.name) not registered: its file is not the selected bytes"
         }

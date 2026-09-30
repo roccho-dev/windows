@@ -516,6 +516,32 @@ function Get-IntentTempProblem($Record) {
     return $null
 }
 
+# Why the entry names of an archive ($Names, '/'-separated as stored) are not exactly the
+# inventory $Files, or $null; checked before anything is extracted. Each name, less the
+# trailing '/' of a directory entry, is an inventory file or a directory above one, spelled
+# exactly, with safe segments and no '\'; no two names are equal ignoring case; every
+# inventory file is named.
+function Get-ZipEntryProblem($Names, $Files) {
+    $inventory = ConvertTo-FileMap $Files
+    if ($null -eq $inventory -or $inventory.Count -eq 0) { return 'The inventory is invalid.' }
+    $parents, $seen = @(), @{}
+    foreach ($file in $inventory.Keys) { $parts = $file.Split('/'); for ($i = 1; $i -lt $parts.Count; $i++) { $parents += $parts[0..($i - 1)] -join '/' } }
+    foreach ($entry in @($Names)) {
+        if ($entry -isnot [string]) { return 'An entry name is not a string.' }
+        $directory = $entry.EndsWith('/')
+        $name = if ($directory) { $entry.Substring(0, $entry.Length - 1) } else { $entry }
+        if ($name.Contains('\') -or @($name.Split('/') | Where-Object { -not (Test-PathSegment $_) }).Count) { return "Unsafe entry: $entry" }
+        if ($seen.ContainsKey($name)) { return "Entries repeat ignoring case: $entry" }
+        $seen[$name] = $true
+        if (($directory -and $parents -cnotcontains $name) -or (-not $directory -and @($inventory.Keys) -cnotcontains $name)) {
+            return "Not in the inventory: $entry"
+        }
+    }
+    $missing = @($inventory.Keys | Where-Object { -not $seen.ContainsKey($_) })
+    if ($missing.Count) { return "Inventory files the archive lacks: $($missing -join ', ')" }
+    return $null
+}
+
 # Cleanup of the staging directory an interrupted tree-extracted intent named, from
 # $Observed: every entry now beneath it as { path = '/'-relative; directory = bool;
 # reparse = bool }. Only an open intent's own valid staging path with a valid inventory

@@ -351,8 +351,124 @@ Must ((Test-EffectStateEqual tree-extracted $tree @{ exists = $true; files = @{ 
     (Get-UnownedClass tree-extracted $tree @{ exists = $true; files = $tree.files; other = @('j') } $null).class -ceq 'preexisting-drift') 'tree other entries'
 Must ($null -ne (Get-EffectRecordProblem (PureRecord 1 intent tree-extracted 'C:\u\t' $absent @{ exists = $true; files = $tree.files; other = @('e/') } $null $null))) 'a desired tree has no other entries'
 
-# The Noctty effect primitives, loaded alone from win.ps1 (no mode uses them yet) and run on
-# synthetic targets: a fresh RUNNER_TEMP directory (never deleted) and a proof HKCU key.
+# The create and recovery primitives, loaded alone from win.ps1 (no mode creates a Noctty effect
+# yet) and run against a scratch %LOCALAPPDATA% ($Scratch, never deleted), its own ledger and a
+# fresh HKCU CLSID it removes again. Self-contained and 5.1-safe: the proof runs it here and in a
+# Windows PowerShell 5.1 child, which alone (-Real) extracts the bundled Noctty, once.
+function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
+    Set-StrictMode -Version Latest
+    $ErrorActionPreference = 'Stop'
+    . (Join-Path $Root 'handoff-evaluate.ps1')
+    $names = 'WriteRecord', 'RecordsOf', 'OpenAttempt', 'IntentTemp', 'CleanStaging', 'ResolveAttempt', 'RecoverId', 'Recovering',
+        'CreateOwnedFile', 'CreateOwnedValue', 'CreateOwnedKey', 'CreateOwnedTree', 'Observe', 'ObserveNoctty', 'ObserveTree',
+        'ObserveKey', 'ObserveValue', 'ObserveFile', 'NocttyEffects', 'KeyEffect', 'ValueEffect', 'FileEffect'
+    $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'win.ps1'), [ref]$null, [ref]$null)
+    foreach ($definition in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cin $names }, $false)) {
+        . ([scriptblock]::Create($definition.Extent.Text))
+    }
+    function Must([bool]$Holds, [string]$Rule) { if (-not $Holds) { throw "Primitive proof failed: $Rule" } }
+    function Refused([scriptblock]$Act, [string]$Like) {
+        try { $null = & $Act } catch { if ($_.Exception.Message -like $Like) { return }; throw }
+        throw "Primitive proof failed: not refused ($Like)"
+    }
+    function Sha([string]$Text) { -join ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($Text)) | ForEach-Object { $_.ToString('x2') }) }
+    function Phases($Effect) { @(RecordsOf $Effect.id | ForEach-Object { $_.phase }) -join ',' }
+    function Tree([string]$Name, $Files) {
+        $target = Join-Path $Scratch "Programs\$Name"
+        [ordered]@{ id = 'tree-extracted:' + $target.ToUpperInvariant(); kind = 'tree-extracted'; target = $target
+            prior = @{ exists = $false }; desired = @{ exists = $true; files = $Files } }
+    }
+    function Staging($Effect) { $Effect.target + '.' + [guid]::NewGuid().ToString('N') + '.staging' }
+    $manifest = [IO.File]::ReadAllText((Join-Path $Root 'manifest.json')) | ConvertFrom-Json
+    $Mode, $localAppData, $ledgerDirectory, $zip = 'Apply', $Scratch, (Join-Path $Scratch 'ledger'), (Join-Path $Root 'payload\noctty.zip')
+    $fontDirectory, $fontKey = (Join-Path $Scratch 'fonts'), 'HKCU\Software\Microsoft\Windows NT\CurrentVersion\Fonts'
+    $nocttyDirectory = Join-Path $Scratch ('Programs\noctty-' + $manifest.noctty.version)
+    $nocttyConfig, $nocttyConfigText = (Join-Path $Scratch 'noctty\config.ghostty'), ('font-family = ' + $manifest.noctty.fontFamily + "`n")
+    $clsid = '{' + [guid]::NewGuid().ToString().ToUpperInvariant() + '}'
+    $nocttyRegistration = Get-NocttyRegistration @(@{ key = "Software\Classes\CLSID\$clsid\LocalServer32"; name = ''; data = 'proof' }) $nocttyDirectory $manifest.noctty.files
+    $script:ledgerRecords, $script:nextSeq, $script:recordsWritten, $script:copied, $script:changed = @(), 1, 0, 0, 0
+    $null = New-Item -ItemType Directory -Path $ledgerDirectory, (Join-Path $Scratch 'Programs'), (Split-Path -Parent $nocttyConfig) -Force
+    $selected = NocttyEffects
+
+    # The whole entry list is checked before anything is written.
+    $two = @{ 'noctty/a.txt' = (Sha 'a'); 'noctty/d/b.txt' = (Sha 'b') }
+    Must ($null -eq (Get-ZipEntryProblem @('noctty/', 'noctty/a.txt', 'noctty/d/', 'noctty/d/b.txt') $two)) 'an exact entry list'
+    foreach ($bad in @(@('noctty/a.txt', 'noctty/d/b.txt', 'noctty/x.txt'), @('noctty/a.txt'), @('noctty/a.txt', 'noctty/d/b.txt', 'NOCTTY/A.TXT'),
+            @('noctty/a.txt', 'noctty/d/b.txt', 'noctty/e/'), @('noctty\a.txt', 'noctty/d/b.txt'), @('noctty/a.txt', 'noctty/d/b.txt', 'noctty/NUL'),
+            @('Noctty/a.txt', 'noctty/d/b.txt'))) {
+        Must ($null -ne (Get-ZipEntryProblem $bad $two)) "entry list $($bad -join ',') is refused"
+    }
+    $before = $script:nextSeq
+    Refused { CreateOwnedTree (Tree 'noctty-wrong' $two) $zip } '*Not in the inventory*'
+    Must ($script:nextSeq -eq $before -and -not (Test-Path (Join-Path $Scratch 'Programs\noctty-wrong*'))) 'a differing archive is refused before any intent or write'
+    # Interruptions: (a) part of the inventory staged -> cleaned and voided; (b) a file the inventory
+    # does not name -> kept, and the intent stays open; (c) renamed but not committed -> confirmed.
+    $a, $b, $c = (Tree 'noctty-crash-a' $two), (Tree 'noctty-crash-b' $two), (Tree 'noctty-crash-c' $two)
+    $stageA, $stageB, $stageC = (Staging $a), (Staging $b), (Staging $c)
+    WriteRecord 'intent' $a $null $stageA; WriteRecord 'intent' $b $null $stageB; WriteRecord 'intent' $c $null $stageC
+    $null = New-Item -ItemType Directory -Path "$stageA\noctty", "$stageB\noctty", "$stageC\noctty\d"
+    foreach ($file in "$stageA\noctty\a.txt", "$stageB\noctty\a.txt", "$stageC\noctty\a.txt") { [IO.File]::WriteAllText($file, 'a') }
+    [IO.File]::WriteAllText("$stageB\foreign.txt", 'x')
+    [IO.File]::WriteAllText("$stageC\noctty\d\b.txt", 'b')
+    [IO.Directory]::Move($stageC, $c.target)
+    RecoverId $a.id
+    Refused { RecoverId $b.id } '*is kept*'
+    RecoverId $c.id
+    Must ((Phases $a) -ceq 'intent,void' -and -not (Test-Path -LiteralPath $stageA)) 'a partial staging directory is cleaned and voided'
+    Must ((Phases $b) -ceq 'intent' -and (Test-Path -LiteralPath "$stageB\foreign.txt") -and (Test-Path -LiteralPath "$stageB\noctty\a.txt")) 'foreign staging content is kept'
+    Must ((Phases $c) -ceq 'intent,commit') 'a renamed tree without its commit is confirmed'
+    # Keys and values: a missing parent or an existing key is refused before any intent; replays void and confirm.
+    $shared = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Classes\CLSID')
+    $sharedMade = $null -eq $shared
+    if ($sharedMade) { $shared = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Software\Classes\CLSID') }  # shared: the caller's
+    $shared.Close()
+    $key, $server, $value = $selected.keys[0], $selected.keys[1], $selected.values[0]
+    try {
+        Refused { CreateOwnedKey $server } '*parent key is missing*'
+        WriteRecord 'intent' $key $null $null; RecoverId $key.id
+        WriteRecord 'intent' $key $null $null
+        [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey(($key.target -replace '^HKCU\\', '')).Close()
+        RecoverId $key.id
+        Refused { CreateOwnedKey $key } '*it exists*'
+        CreateOwnedKey $server
+        WriteRecord 'intent' $value $null $null; RecoverId $value.id
+        CreateOwnedValue $value
+        Must ((Phases $key) -ceq 'intent,void,intent,commit' -and (Phases $server) -ceq 'intent,commit' -and
+            (Phases $value) -ceq 'intent,void,intent,commit' -and (Observe $value).data -ceq 'proof') 'key and value creation and replay'
+    } finally {
+        # Only what this block made, deepest first, never recursively.
+        $open = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(($server.target -replace '^HKCU\\', ''), $true)
+        if ($null -ne $open) { try { $open.DeleteValue('', $false) } finally { $open.Close() } }
+        foreach ($made in @($server, $key)) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey(($made.target -replace '^HKCU\\', ''), $false) }
+        $shared = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Classes\CLSID')
+        $empty = $shared.SubKeyCount + $shared.ValueCount -eq 0
+        $shared.Close()
+        if ($sharedMade -and $empty) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey('Software\Classes\CLSID', $false) }
+    }
+    CreateOwnedFile $selected.config ([Text.UTF8Encoding]::new($false).GetBytes($nocttyConfigText))
+    Must ((Phases $selected.config) -ceq 'intent,commit') 'the config is created from bytes'
+    if ($Real) {
+        CreateOwnedTree $selected.tree $zip
+        Must ((Phases $selected.tree) -ceq 'intent,commit' -and (Test-EffectStateEqual tree-extracted $selected.tree.desired (Observe $selected.tree)) -and
+            -not (Test-Path ($selected.tree.target + '.*.staging'))) 'the bundled Noctty is extracted exactly, through staging'
+        Refused { CreateOwnedTree $selected.tree $zip } '*it exists*'
+    }
+    "PASS primitives in PowerShell $($PSVersionTable.PSVersion)"
+}
+function Primitive51([string]$Scratch) {
+    $ErrorActionPreference = 'Continue'
+    $PSNativeCommandUseErrorActionPreference = $false
+    $load = "`$a = [Management.Automation.Language.Parser]::ParseFile('$(Join-Path $PSScriptRoot 'proof.ps1')', [ref]`$null, [ref]`$null); " +
+        ". ([scriptblock]::Create(`$a.Find({ param(`$n) `$n -is [Management.Automation.Language.FunctionDefinitionAst] -and `$n.Name -ceq 'PrimitiveProof' }, `$true).Extent.Text)); " +
+        "PrimitiveProof '$PSScriptRoot' '$Scratch' -Real"
+    $out = @(& $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $load 2>&1 | ForEach-Object { [string]$_ })
+    if ($LASTEXITCODE -ne 0 -or -not $out.Count -or $out[-1] -notlike 'PASS primitives*') { throw "The 5.1 primitive proof failed: $($out -join ' ')" }
+    $out[-1]
+}
+$primitives7 = PrimitiveProof $PSScriptRoot (Join-Path $env:RUNNER_TEMP ('primitives-' + [guid]::NewGuid().ToString('N')))
+
+# The Noctty effect descriptions and observers on synthetic targets: a fresh RUNNER_TEMP
+# directory (never deleted), where the 5.1 child creates the tree and config, and a proof HKCU key.
 $winFunctions = 'FileEffect', 'ValueEffect', 'KeyEffect', 'NocttyEffects', 'ObserveFile', 'ObserveValue', 'ObserveTree', 'ObserveKey', 'ObserveNoctty'
 $winAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'win.ps1'), [ref]$null, [ref]$null)
 foreach ($definition in $winAst.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cin $winFunctions }, $false)) {
@@ -378,9 +494,7 @@ Must (@($all | ForEach-Object { $_.id } | Sort-Object -Unique).Count -eq 19 -and
     $selected.config.desired.sha256 -ceq [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($configBytes)).ToLowerInvariant()) 'the 19 Noctty effects'
 # Observation: absent, then the exact extracted inventory and config; every anomaly differs.
 Must (-not $(ObserveNoctty $selected.tree).exists -and -not $(ObserveNoctty $selected.config).exists) 'absent Noctty targets'
-$null = New-Item -ItemType Directory -Path $nocttyDirectory, (Split-Path -Parent $nocttyConfig)
-Expand-Archive -LiteralPath (Join-Path $PSScriptRoot 'payload/noctty.zip') -DestinationPath $nocttyDirectory
-[IO.File]::WriteAllBytes($nocttyConfig, $configBytes)
+$primitives51 = Primitive51 $effectRoot
 $exact = { (Test-EffectStateEqual tree-extracted $selected.tree.desired (ObserveNoctty $selected.tree)) }
 Must ((& $exact) -and (Test-EffectStateEqual file-created $selected.config.desired (ObserveNoctty $selected.config))) 'the extracted tree and config are exact'
 $extraDir, $junction, $extraFile = "$nocttyDirectory\noctty\empty", "$nocttyDirectory\noctty\link", "$nocttyDirectory\noctty\extra.txt"
