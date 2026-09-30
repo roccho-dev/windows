@@ -125,12 +125,12 @@ if ($PSBoundParameters.ContainsKey('Packages')) {
 }
 if ($Typography -and ($Mode -ne 'Apply' -or $PSBoundParameters.ContainsKey('Packages'))) { throw '-Typography is only for -Mode Apply, without -Packages.' }
 # The desktop UI font face (a selected family, pack.py) set through ui-font.ahk by the locked interpreter package.
-$typography = Get-Field $manifest 'typography'
-if ($null -ne $typography -and (-not (Test-UiFontFace (Get-Field $typography 'face')) -or (Get-Field $typography 'script') -cne 'ui-font.ahk' -or
-        @($manifest.packages | Where-Object { $_.name -ceq (Get-Field $typography 'interpreter') }).Count -ne 1)) {
+$uiTypography = Get-Field $manifest 'typography'
+if ($null -ne $uiTypography -and (-not (Test-UiFontFace (Get-Field $uiTypography 'face')) -or (Get-Field $uiTypography 'script') -cne 'ui-font.ahk' -or
+        @($manifest.packages | Where-Object { $_.name -ceq (Get-Field $uiTypography 'interpreter') }).Count -ne 1)) {
     throw 'Invalid typography in manifest.'
 }
-if ($Typography -and $null -eq $typography) { throw 'This distribution selects no UI font face.' }
+if ($Typography -and $null -eq $uiTypography) { throw 'This distribution selects no UI font face.' }
 # Store apps Restore installs when absent (pack.py checks the same shape); never owned, updated or removed.
 $apps = @(Get-Field $manifest 'apps' | Where-Object { $null -ne $_ })
 foreach ($app in $apps) {
@@ -1148,7 +1148,7 @@ function NamesFace([string]$Name, $Faces) {
 function UiFontEffects {
     foreach ($slot in Get-UiFontSlots) {
         [ordered]@{ id = "ui-font-face:SPI:$($slot.ToUpperInvariant())"; kind = 'ui-font-face'; target = "spi:$slot"
-            prior = $null; desired = [ordered]@{ exists = $true; face = $typography.face } }
+            prior = $null; desired = [ordered]@{ exists = $true; face = $uiTypography.face } }
     }
 }
 
@@ -1156,7 +1156,7 @@ function UiFontEffects {
 # classed preexisting-match. Nothing is installed here (Restore installs packages first).
 function UiFontInterpreter {
     if ($null -ne $script:uiInterpreter) { return $script:uiInterpreter }
-    $package = $manifest.packages | Where-Object { $_.name -ceq (Get-Field $typography 'interpreter') } | Select-Object -First 1
+    $package = $manifest.packages | Where-Object { $_.name -ceq (Get-Field $uiTypography 'interpreter') } | Select-Object -First 1
     if ($null -eq $package) { throw 'This distribution selects no UI font interpreter.' }
     $state = ClassifyPackage $package
     if ($state.class -cnotin @('owned-match', 'preexisting-match')) {
@@ -1210,9 +1210,9 @@ function ConvergeUiFont {
     }
     foreach ($effect in $write) { WriteRecord 'intent' $effect $null $null }
     try {
-        UiFontSet $typography.face $expect
-        $wrong = @($write | Where-Object { (Observe $_).face -cne $typography.face } | ForEach-Object { $_.target })
-        if ($wrong.Count) { throw "HKCU WindowMetrics does not read back '$($typography.face)' for $($wrong -join ', ') (a registry silo?)." }
+        UiFontSet $uiTypography.face $expect
+        $wrong = @($write | Where-Object { (Observe $_).face -cne $uiTypography.face } | ForEach-Object { $_.target })
+        if ($wrong.Count) { throw "HKCU WindowMetrics does not read back '$($uiTypography.face)' for $($wrong -join ', ') (a registry silo?)." }
     } catch {
         $failure = $_
         foreach ($effect in $write) { try { RecoverId $effect.id } catch { Write-Warning "Recovery of $($effect.id) deferred: $($_.Exception.Message)" } }
@@ -1223,8 +1223,8 @@ function ConvergeUiFont {
 
 # Read-only: every slot names the selected face, owned or not.
 function AssertUiFont {
-    $wrong = @(UiFontEffects | ForEach-Object { $face = (Observe $_).face; if ($face -cne $typography.face) { "$($_.target) is '$face'" } })
-    if ($wrong.Count) { throw "UI font drift (selected '$($typography.face)'): $($wrong -join '; ')" }
+    $wrong = @(UiFontEffects | ForEach-Object { $face = (Observe $_).face; if ($face -cne $uiTypography.face) { "$($_.target) is '$face'" } })
+    if ($wrong.Count) { throw "UI font drift (selected '$($uiTypography.face)'): $($wrong -join '; ')" }
 }
 
 # ---- Store apps: installed when absent, never owned ------------------------------
@@ -2096,7 +2096,7 @@ try {
     }
     $ledgerFound, $nocttyPlan, $appStates = $false, $null, @()
     # UI font faces: Restore, and Apply -Typography; checked by RestoreTest too.
-    $uiFont = $null -ne $typography -and ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest' -or $Typography)
+    $uiFont = $null -ne $uiTypography -and ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest' -or $Typography)
     # The app's fonts likewise, for an app already present: -Typography never installs it, Restore does first.
     $appFonts, $appFontsResult = ($null -ne $appearanceApp -and ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest' -or $Typography)), 'notEvaluated'
     if ($Mode -eq 'Apply' -or $Mode -eq 'Restore') {
@@ -2182,7 +2182,7 @@ try {
             [ordered]@{ name = $name; version = $_.version
                 class = $(if ($state.Count) { $state[0].class } else { 'notEvaluated' }) } });
         appFonts = $appFontsResult
-        uiFont = $(if ($uiFont) { [ordered]@{ face = $typography.face; slots = @(Get-UiFontSlots) } } else { 'notEvaluated' })
+        uiFont = $(if ($uiFont) { [ordered]@{ face = $uiTypography.face; slots = @(Get-UiFontSlots) } } else { 'notEvaluated' })
         # Store apps: the version installed now; the Store moves it, and installing needs the network.
         apps = @($apps | ForEach-Object {
             $package = $_.package
