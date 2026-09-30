@@ -370,52 +370,58 @@ function Get-EffectAttempt($Records) {
     [ordered]@{ problem = $null; records = $attempt; closed = $closed }
 }
 
+# Class of a target nothing owns: absent when $Current does not exist, else
+# preexisting-match or preexisting-drift against $Desired; indeterminate when the
+# kind or a state is malformed. $Resolution is passed through.
+function Get-UnownedClass([string]$Kind, $Desired, $Current, $Resolution) {
+    $problem = if ($Kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'tree-extracted')) {
+        'The selection kind is not an effect kind.'
+    } else { Get-EffectStateProblem $Kind $Desired 'desired' }
+    if (-not $problem) { $problem = Get-EffectStateProblem $Kind $Current 'current' }
+    if ($problem) { return New-EffectClass 'indeterminate' $null $problem }
+    if (-not (Get-Field $Current 'exists')) { return New-EffectClass 'absent' $Resolution $null }
+    if (Test-EffectStateEqual $Kind $Desired $Current) { return New-EffectClass 'preexisting-match' $Resolution $null }
+    return New-EffectClass 'preexisting-drift' $Resolution $null
+}
+
 # Class of one effect target: absent, owned-match, owned-drift, preexisting-match,
-# preexisting-drift or indeterminate, plus a resolution for an interrupted intent.
+# preexisting-drift or indeterminate, plus a resolution that closes an open attempt.
 #   $Records  this id's ledger records, any order (empty when unrecorded)
 #   $Current  the observed state now, in the kind's state shape
-#   $Kind, $Desired  the selection. They decide when nothing is open for the id;
-#     when omitted after a closed attempt, that attempt's kind and desired stand in.
-#     With an open attempt the recorded effect decides, and a given $Kind must match.
-# With nothing open nothing is owned: absent when $Current does not exist, else
-# preexisting-match or preexisting-drift against $Desired. An open attempt with a
-# commit is owned: owned-match or owned-drift against the recorded desired. An
-# open attempt of intents only (interrupted) is owned-match with resolution
-# 'confirm' when $Current equals desired; with resolution 'void' and classed as
-# unowned when it equals prior; otherwise indeterminate. Malformed or inconsistent
-# records and a malformed $Current are indeterminate.
+#   $Kind, $Desired  the selection. Wherever the target is unowned they decide,
+#     and when omitted the latest attempt's kind and desired stand in. With an
+#     open attempt the recorded effect decides ownership, and a given $Kind must match.
+# With nothing open, nothing is owned (Get-UnownedClass). An open attempt whose
+# $Current equals desired is owned-match, with resolution 'confirm' when it has
+# no commit (an interrupted intent that took effect). One whose $Current equals
+# prior is unowned, classed exactly as if closed, with resolution 'undone' when
+# it has a commit (the effect was reverted) or 'void' when not (it never took
+# effect); so the class is the same before and after that closing record is
+# written. Otherwise a committed attempt is owned-drift and an uncommitted one
+# indeterminate. Malformed or inconsistent records and a malformed $Current are
+# indeterminate.
 function Get-EffectClass($Records, $Current, [string]$Kind, $Desired) {
     $attempt = Get-EffectAttempt $Records
     if ($attempt.problem) { return New-EffectClass 'indeterminate' $null $attempt.problem }
     $records = @($attempt.records)
-    if ($records.Count -eq 0 -or $attempt.closed) {
-        if (-not $Kind -and $records.Count) {
-            $Kind, $Desired = [string](Get-Field $records[0] 'kind'), (Get-Field $records[0] 'desired')
-        }
-        $problem = if ($Kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'tree-extracted')) {
-            'The selection kind is not an effect kind.'
-        } else { Get-EffectStateProblem $Kind $Desired 'desired' }
-        if (-not $problem) { $problem = Get-EffectStateProblem $Kind $Current 'current' }
-        if ($problem) { return New-EffectClass 'indeterminate' $null $problem }
-        if (-not (Get-Field $Current 'exists')) { return New-EffectClass 'absent' $null $null }
-        if (Test-EffectStateEqual $Kind $Desired $Current) { return New-EffectClass 'preexisting-match' $null $null }
-        return New-EffectClass 'preexisting-drift' $null $null
+    if ($records.Count -and -not $Kind) {
+        $Kind, $Desired = [string](Get-Field $records[0] 'kind'), (Get-Field $records[0] 'desired')
     }
+    if ($records.Count -eq 0 -or $attempt.closed) { return Get-UnownedClass $Kind $Desired $Current $null }
     $recorded = [string](Get-Field $records[0] 'kind')
-    if ($Kind -and $Kind -cne $recorded) { return New-EffectClass 'indeterminate' $null "Recorded kind $recorded is not $Kind." }
+    if ($Kind -cne $recorded) { return New-EffectClass 'indeterminate' $null "Recorded kind $recorded is not $Kind." }
     $problem = Get-EffectStateProblem $recorded $Current 'current'
     if ($problem) { return New-EffectClass 'indeterminate' $null $problem }
-    $prior, $desired = (Get-Field $records[0] 'prior'), (Get-Field $records[0] 'desired')
-    $written = Test-EffectStateEqual $recorded $desired $Current
-    if (@($records | Where-Object { (Get-Field $_ 'phase') -ceq 'commit' }).Count -gt 0) {
-        if ($written) { return New-EffectClass 'owned-match' $null $null }
-        return New-EffectClass 'owned-drift' $null 'The owned target differs from what was written.'
+    # Not $desired: PowerShell variable names ignore case, so it would overwrite $Desired.
+    $recordedPrior, $recordedDesired = (Get-Field $records[0] 'prior'), (Get-Field $records[0] 'desired')
+    $committed = @($records | Where-Object { (Get-Field $_ 'phase') -ceq 'commit' }).Count -gt 0
+    if (Test-EffectStateEqual $recorded $recordedDesired $Current) {
+        return New-EffectClass 'owned-match' $(if ($committed) { $null } else { 'confirm' }) $null
     }
-    if ($written) { return New-EffectClass 'owned-match' 'confirm' $null }
-    if (Test-EffectStateEqual $recorded $prior $Current) {
-        if (-not (Get-Field $Current 'exists')) { return New-EffectClass 'absent' 'void' $null }
-        return New-EffectClass 'preexisting-drift' 'void' $null
+    if (Test-EffectStateEqual $recorded $recordedPrior $Current) {
+        return Get-UnownedClass $Kind $Desired $Current $(if ($committed) { 'undone' } else { 'void' })
     }
+    if ($committed) { return New-EffectClass 'owned-drift' $null 'The owned target differs from what was written.' }
     return New-EffectClass 'indeterminate' $null 'An interrupted intent left the target in neither the prior nor the desired state.'
 }
 
@@ -501,7 +507,9 @@ function Test-TargetOverlap($First, $Other) {
 # effect without exactly one owned-match file-created backup of its own, with an
 # earlier intent, whose target is prior.backup and whose desired sha256 is
 # prior.sha256. ok is false when anything is refused, and then steps is empty.
-# resolutions lists interrupted intents to close as 'confirm' or 'void'.
+# resolutions lists the closing records the executor writes before acting:
+# 'confirm' (commit), 'void' or 'undone'; an id resolved 'void' or 'undone' is
+# unowned, so it is kept and never undone again.
 function Get-UninstallPlan($Records, $Observations) {
     $steps, $refused, $kept, $resolutions = @(), @(), @(), @()
     $all = @($Records | Where-Object { $null -ne $_ })
