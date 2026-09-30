@@ -425,14 +425,24 @@ only after the verified seed is written (a differing one writes nothing), recove
 removing the seed, and, with the profile only read, O1 keeping Chromium from installing
 (package drift, nothing written) and C1 stopping a stand-in owned tree before any effect.
 Chromium's first run is observed (b3a) as printed evidence that never fails the proof,
-within 120 s: the tree the S2-0 measurement extracted, with the bundled seed copied in,
+within a budget of about 120 s (each step starts only when its bounded share is left;
+the final bounded cleanup and readouts come on top): the tree the S2-0 measurement
+extracted, with the bundled seed copied in,
 is started only with scratch `--user-data-dir` profiles on the runner. It reports `First
 Run` and the six seed preferences after a first GUI run; which of `Default` and `Profile
 1` a first run over Preferences without `First Run` overwrites; the fonts a headless PDF
-embeds; the tree unchanged; every process from it ending, none from elsewhere; nothing
-new under the default `%LOCALAPPDATA%\Chromium` (moved aside, never deleted, never
-through a reparse point; anything not moved is a stop condition); fixed HKCU names before
-and after, read before any move; and the stop conditions b3b will assert. A real seeded install
+embeds; the tree unchanged; every `chrome.exe` as tree, descendant (traced by PID and
+creation time, its parent seen running at or after the child's creation), outside (only
+with a readable path elsewhere) or unknown, its windows closed one by one and 45 s to
+end, only tree and descendant processes ever killed, and H1 (all ended), H2 (the browser
+stays for an observed reason: background mode, or a window still left after closing)
+or H3 (outside) decided only on positive evidence, an unknown survivor being unproven,
+never a pass; Local State's `background_mode.enabled`; nothing new under the default
+`%LOCALAPPDATA%\Chromium` (moved aside, never deleted, never through a reparse point;
+anything not moved is a stop condition); fixed HKCU names before and after, read before
+any move, every added App Paths, Uninstall, StartMenuInternet, RegisteredApplications and
+`Software\Classes` name (those directly under it and OpenWithProgids) listed; and the
+stop conditions b3b will assert. A real seeded install
 through `win.ps1` is not exercised until b3b, nor a clean Windows 11 user until the VM run.
 It also requires every `win.ps1` answer to report
 `handoffProof = "unproven"` and `handoff-proof.ps1` to refuse the runner, so CI

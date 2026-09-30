@@ -1951,13 +1951,15 @@ Must ((Phases $crash.id) -ceq 'intent,void' -and -not (Test-Path -LiteralPath $c
 # Here the owned fonts are installed (A25's Apply) and the proof's own stand-in profile exists (A24). The tree S2-0
 # extracted and found exactly the pinned inventory (RUNNER_TEMP, never deleted) gets the bundled seed beside
 # chrome.exe, and Chromium starts only from that tree, only with fresh scratch --user-data-dir directories beside it,
-# never with --no-first-run or --no-sandbox. Observed: First Run and the six seed preferences after a first GUI run;
-# the tree still exactly the inventory and the seed (names, sizes, write times); every process from the tree ending
-# once its window closes (the rest killed and counted) and none started from elsewhere; nothing new under the
-# default %LOCALAPPDATA%\Chromium (anything new is moved aside, never deleted, so the proof's own cleanup holds);
-# HKCU names in fixed places before and after (C9); the fonts a headless PDF of the same profile embeds; and which
-# existing Preferences a first run over a profile without First Run overwrites. One 120-second budget: a step that
-# cannot get its minimum is skipped and says so. b3b turns the stop conditions listed at the end into assertions.
+# never with --no-first-run, --no-sandbox or any other flag that changes a first run. Observed: First Run and the six
+# seed preferences after a first GUI run; the tree still exactly the inventory and the seed (names, sizes, write
+# times); every chrome.exe in four classes (tree, descendant, outside, unknown; B3aPoll), its windows closed one by
+# one and 45 s for ours to end, the H1/H2/H3 decision on positive evidence, and only ours ever killed; Local State's
+# background_mode.enabled; nothing new under the default %LOCALAPPDATA%\Chromium (anything new is moved aside, never
+# deleted, so the proof's own cleanup holds); HKCU names in fixed places before and after (C9); the fonts a headless
+# PDF of the same profile embeds; and which existing Preferences a first run over a profile without First Run
+# overwrites. One 120-second budget: a step that cannot get its minimum is skipped and says so. b3b goes ahead only
+# when the stop conditions listed at the end are none, and turns them into assertions.
 $b3a = [ordered]@{ status = 'not run' }
 $b3aBudget, $b3aClock = 120, [Diagnostics.Stopwatch]::StartNew()
 function B3a([string]$Line) { Write-Host "b3a $Line" }
@@ -1967,22 +1969,86 @@ function B3aLeft([int]$Least, [string]$Step) {
     $left
 }
 function InTree([string]$Path) { $Path -and $Path.StartsWith($b3aTree + '\', [StringComparison]::OrdinalIgnoreCase) }
-# The chrome.exe processes from the tree now; any other chrome.exe that was not running before is remembered.
-function TreeProcesses {
-    $all = @(Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" | ForEach-Object { [pscustomobject]@{ id = [int]$_.ProcessId; path = [string]$_.ExecutablePath } })
-    foreach ($process in $all) { if (-not (InTree $process.path) -and $b3aBaseline -notcontains $process.id) { $script:b3aOutside[$process.id] = $process.path } }
-    @($all | Where-Object { InTree $_.path })
-}
-# Waits up to $Seconds for every process from the tree to end, then kills the rest; says which.
-function SettleChromium([int]$Seconds) {
-    $clock = [Diagnostics.Stopwatch]::StartNew()
-    while ($clock.Elapsed.TotalSeconds -lt $Seconds) {
-        if (-not @(TreeProcesses).Count) { return "all ended in $([Math]::Round($clock.Elapsed.TotalSeconds, 1)) s" }
-        Start-Sleep -Milliseconds 500
+# Every chrome.exe that appears after b3a starts, keyed by (PID, creation time) so a reused PID is never confused, in
+# four classes: tree (its path, read by CIM or retried through Get-Process, is in the tree); outside (its readable
+# path is elsewhere); descendant (its path is unreadable, as a sandboxed child's may be, and its parent is our launched
+# browser or a known descendant created no later and still seen running at or after the child's creation, so a PID the
+# parent left behind and another process reused never counts; the child itself created after the launch); unknown
+# (anything else: never counted as ours, never killed, never a pass). Returns the observations of the processes running
+# now; each carries lastSeen, the UTC time just before the poll that last saw it running.
+function B3aPoll {
+    $live, $polled = [Collections.Generic.List[object]]::new(), [DateTime]::UtcNow
+    foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'")) {
+        $created = $process.CreationDate.ToUniversalTime()
+        $key = "$($process.ProcessId)|$($created.Ticks)"
+        if ($b3aBaseline -contains $key) { continue }
+        if (-not $script:b3aSeen.ContainsKey($key)) {
+            $path = [string]$process.ExecutablePath
+            if (-not $path) { try { $path = [string](Get-Process -Id $process.ProcessId -ErrorAction Stop).Path } catch { $path = '' } }
+            $type = if ($null -eq $process.CommandLine) { '?' } elseif ($process.CommandLine -match '--type=(\S+)') { $Matches[1] } else { 'browser' }
+            $script:b3aSeen[$key] = [pscustomobject]@{ id = [int]$process.ProcessId; created = $created; parent = [int]$process.ParentProcessId
+                type = $type; path = $path; class = 'unknown'; lastSeen = $polled }
+        }
+        $script:b3aSeen[$key].lastSeen = $polled
+        $live.Add($script:b3aSeen[$key])
     }
-    $live = @(TreeProcesses)
-    foreach ($process in $live) { try { Stop-Process -Id $process.id -Force -ErrorAction Stop } catch { } }
-    "KILLED $($live.Count) still running after $Seconds s"
+    do {  # a child listed before its parent is traced on the next pass
+        $changed = $false
+        foreach ($seen in @($script:b3aSeen.Values | Where-Object { $_.class -ceq 'unknown' })) {
+            $class = if ($seen.path) { $(if (InTree $seen.path) { 'tree' } else { 'outside' }) }
+                elseif ($seen.created -ge $b3aLaunched -and @($script:b3aSeen.Values | Where-Object {
+                    $_.id -eq $seen.parent -and $_.class -cin @('tree', 'descendant') -and $_.created -le $seen.created -and
+                    $_.lastSeen -ge $seen.created }).Count) { 'descendant' }
+                else { 'unknown' }
+            if ($class -cne $seen.class) { $seen.class = $class; $changed = $true }
+        }
+    } while ($changed)
+    , $live
+}
+function Ours($Observations) { @($Observations | Where-Object { $_.class -cin @('tree', 'descendant') }) }
+# Waits up to $Seconds for every tree and descendant process to end (noting when $Browser, the launched process, ended);
+# then kills only those, once, and checks for 5 s that they are gone. Unknown ones are never killed, only reported.
+function SettleChromium([int]$Seconds, $Browser) {
+    $clock, $browserEnded = [Diagnostics.Stopwatch]::StartNew(), $null
+    do {
+        $live = B3aPoll
+        if ($Browser -and $null -eq $browserEnded -and $Browser.HasExited) { $browserEnded = [Math]::Round($clock.Elapsed.TotalSeconds, 1) }
+        if (-not @(Ours $live).Count) { break }
+        Start-Sleep -Milliseconds 500
+    } while ($clock.Elapsed.TotalSeconds -lt $Seconds)
+    $settle = [pscustomobject]@{ endedAll = -not @(Ours $live).Count; seconds = [Math]::Round($clock.Elapsed.TotalSeconds, 1)
+        watched = $null -ne $Browser; browserEnded = $browserEnded; killed = @(); survivors = @(); unknown = @() }
+    if (-not $settle.endedAll) {
+        $settle.killed = @(Ours $live | ForEach-Object { "$($_.type)[$($_.id)<$($_.parent)]" })
+        foreach ($process in (Ours $live)) { try { Stop-Process -Id $process.id -Force -ErrorAction Stop } catch { } }
+        $check = [Diagnostics.Stopwatch]::StartNew()
+        do { Start-Sleep -Milliseconds 500; $live = B3aPoll } while (@(Ours $live).Count -and $check.Elapsed.TotalSeconds -lt 5)
+        $settle.survivors = @(Ours $live | ForEach-Object { "$($_.type)[$($_.id)]" })
+    }
+    $settle.unknown = @($live | Where-Object { $_.class -ceq 'unknown' } | ForEach-Object { "$($_.type)[$($_.id)<$($_.parent)]" })
+    $settle
+}
+function SettleText($Settle) {
+    $(if ($Settle.endedAll) { "all ours ended in $($Settle.seconds) s" } else { "KILLED $($Settle.killed.Count) after $($Settle.seconds) s: $(Few $Settle.killed)" }) +
+        $(if ($Settle.watched) { "; browser $(if ($null -ne $Settle.browserEnded) { "ended after $($Settle.browserEnded) s" } else { 'did not end by itself' })" }) +
+        $(if ($Settle.survivors.Count) { "; SURVIVED the kill: $(Few $Settle.survivors)" }) + $(if ($Settle.unknown.Count) { "; UNKNOWN still running: $(Few $Settle.unknown)" })
+}
+# Closes the browser's windows as a user would, one at a time: while it has a main window, CloseMainWindow, then waits
+# up to 2 s for that window to go; at most five windows. Returns their titles.
+function CloseWindows($Browser) {
+    $titles = @()
+    for ($i = 0; $i -lt 5; $i++) {
+        try {
+            $Browser.Refresh()
+            if ($Browser.HasExited -or $Browser.MainWindowHandle -eq [IntPtr]::Zero) { break }
+            $handle = $Browser.MainWindowHandle
+            $titles += [string]$Browser.MainWindowTitle
+            $null = $Browser.CloseMainWindow()
+            $wait = [Diagnostics.Stopwatch]::StartNew()
+            do { Start-Sleep -Milliseconds 250; $Browser.Refresh() } while (-not $Browser.HasExited -and $Browser.MainWindowHandle -eq $handle -and $wait.Elapsed.TotalSeconds -lt 2)
+        } catch { break }
+    }
+    , $titles
 }
 function StartChromium([string[]]$Arguments) {
     $info = [Diagnostics.ProcessStartInfo]::new($b3aExe)
@@ -1994,8 +2060,8 @@ function StartChromium([string[]]$Arguments) {
 function WaitFor([scriptblock]$Done, [int]$Seconds) {
     $clock = [Diagnostics.Stopwatch]::StartNew()
     while ($clock.Elapsed.TotalSeconds -lt $Seconds) {
+        $null = B3aPoll  # observe first, so a fast first run still records its processes
         if (& $Done) { return [Math]::Round($clock.Elapsed.TotalSeconds, 1) }
-        $null = TreeProcesses
         Start-Sleep -Milliseconds 500
     }
     $null
@@ -2080,51 +2146,70 @@ try {
         '<p lang="ja" style="font-family:monospace">&#x65E5;&#x672C;&#x8A9E; monospace</p></body></html>')
     $pageUrl = ([Uri]$page).AbsoluteUri
     $defaultData = Join-Path $realLocal 'Chromium'
-    $b3aBaseline = @(Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" | ForEach-Object { [int]$_.ProcessId })
-    $script:b3aOutside = @{}
+    $b3aBaseline = @(Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" | ForEach-Object { "$($_.ProcessId)|$($_.CreationDate.ToUniversalTime().Ticks)" })
+    $script:b3aSeen = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $b3aLaunched = [DateTime]::UtcNow.AddSeconds(-1)
     $treeBefore, $defaultBefore, $hkcuBefore = (EntryStamps $b3aTree), (EntryStamps $defaultData), (HkcuNames)
     $b3a.status = 'started'
-    # (1) The first GUI run on an empty profile: First Run, then the six preferences once it has closed.
+    # (1) The first GUI run on an empty profile: First Run, then the six preferences once it has closed. Its windows are
+    # closed one by one as a user would; ours then get 45 s to end by themselves. Which of H1 (the browser and all ours
+    # end), H2 (the browser stays for an observed reason: background mode, or a window left after closing) or H3 (a chrome.exe
+    # from outside the tree) holds is decided on positive evidence only; anything else leaves b3b stopped.
     $userData = Join-Path $b3aDir 'user-data'
     try {
-        $wait = [Math]::Min(30, (B3aLeft 45 'first run') - 15)
+        $wait = [Math]::Min(10, (B3aLeft 72 'first run') - 62)
         $browser = StartChromium @("--user-data-dir=$userData", $pageUrl)
         $seconds = WaitFor { (Test-Path -LiteralPath (Join-Path $userData 'First Run')) -and (Test-Path -LiteralPath (Join-Path $userData 'Default\Preferences')) } $wait
         Start-Sleep -Seconds 2  # the page renders with the profile's fonts
-        $closed = try { $browser.CloseMainWindow() } catch { $false }
-        $b3a.firstRun = "First Run and Default\Preferences $(if ($null -ne $seconds) { "after $seconds s" } else { "NOT BOTH within $wait s" }); window $(if ($closed) { 'closed' } else { 'NOT FOUND' }); $(SettleChromium 15)"
+        $windows = CloseWindows $browser
+        # A window still there after the closing (one that did not close, or a sixth) is an observed reason to stay.
+        $windowLeft = try { $browser.Refresh(); -not $browser.HasExited -and $browser.MainWindowHandle -ne [IntPtr]::Zero } catch { $false }
+        $settle = SettleChromium 45 $browser
+        $b3a.firstRun = "First Run and Default\Preferences $(if ($null -ne $seconds) { "after $seconds s" } else { "NOT BOTH within $wait s" }); sent $($windows.Count) close request(s) to windows $(Few @($windows | ForEach-Object { "'$_'" })); $(if ($windowLeft) { 'a WINDOW IS LEFT' } else { 'no window left' }); $(SettleText $settle)"
         $b3a.firstRunSentinel = $(if (Test-Path -LiteralPath (Join-Path $userData 'First Run')) { 'present' } else { 'ABSENT' })
         $b3a.firstRunPreferences = SeedPreferences (Join-Path $userData 'Default\Preferences')
+        $background = try { Get-Field (Get-Field ([IO.File]::ReadAllText((Join-Path $userData 'Local State')) | ConvertFrom-Json -AsHashtable) 'background_mode') 'enabled' } catch { 'unreadable' }
+        $b3a.backgroundMode = $(if ($null -eq $background) { 'background_mode.enabled absent' } else { "background_mode.enabled $background" })
         if ($b3a.firstRunSentinel -ne 'present') { $b3aStops.Add('no First Run after a first run') }
         if ($b3a.firstRunPreferences -ne 'all six equal the seed') { $b3aStops.Add("seed preferences: $($b3a.firstRunPreferences)") }
-        # No main window to close is the runner's limit, not Chromium's: its processes are then killed, not judged.
-        if (-not $closed) { $b3aStops.Add('GUI unavailable on this runner (no main window): S7 before b3b') }
-        elseif ($b3a.firstRun -like '*KILLED*') { $b3aStops.Add('processes did not end') }
+        $outside = @($script:b3aSeen.Values | Where-Object { $_.class -ceq 'outside' })
+        $b3a.decision = if ($outside.Count) { "H3: chrome.exe from outside the tree $(Few @($outside | ForEach-Object { $_.path }))" }
+            elseif (-not $windows.Count) { 'unproven: no main window to close (the runner''s GUI)' }
+            elseif ($settle.unknown.Count) { 'unproven: unknown processes still running' }
+            elseif ($settle.endedAll -and $null -ne $settle.browserEnded -and @($script:b3aSeen.Values | Where-Object { $_.class -ceq 'tree' }).Count) {
+                'H1: the browser and every process of ours ended by themselves'
+            }
+            elseif ($null -eq $settle.browserEnded -and ($background -eq $true -or $windowLeft)) {
+                "H2: the browser stayed; $($b3a.backgroundMode)$(if ($windowLeft) { ', a window left after closing' })"
+            }
+            else { 'undecided: ours did not end and no reason was observed' }
+        if ($b3a.decision -like 'H3*') { $b3aStops.Add('H3: a process started from outside the tree (b3b is cancelled)') }
+        elseif ($b3a.decision -notlike 'H[12]*') { $b3aStops.Add("process behaviour $($b3a.decision): S7 before b3b") }
     } catch { $b3a.firstRun = "not observed: $($_.Exception.Message -replace '(.{300}).+', '$1...')"; $b3aStops.Add('first run unproven: S7 before b3b') }
     # (2) A first run over existing Preferences without First Run: which markers survive (O1's premise and range).
     try {
-        $wait = [Math]::Min(20, (B3aLeft 35 'overwrite') - 15)
+        $wait = [Math]::Min(8, (B3aLeft 35 'overwrite') - 27)
         $restored = Join-Path $b3aDir 'restored'
         $null = New-Item -ItemType Directory -Path (Join-Path $restored 'Default'), (Join-Path $restored 'Profile 1')
         foreach ($name in 'Default', 'Profile 1') { [IO.File]::WriteAllText((Join-Path $restored "$name\Preferences"), "{`"b3a_marker`":`"$name`"}") }
         $browser = StartChromium @("--user-data-dir=$restored", $pageUrl)
         $seconds = WaitFor { Test-Path -LiteralPath (Join-Path $restored 'First Run') } $wait
         Start-Sleep -Seconds 2
-        $closed = try { $browser.CloseMainWindow() } catch { $false }
-        $settled = SettleChromium 15
+        $windows = CloseWindows $browser
+        $settled = SettleText (SettleChromium 10 $browser)
         $marks = @(foreach ($name in 'Default', 'Profile 1') {
             $file = Join-Path $restored "$name\Preferences"
             $kept = (Test-Path -LiteralPath $file) -and [IO.File]::ReadAllText($file).Contains('"b3a_marker"')
             "$name $(if ($kept) { 'kept' } else { 'OVERWRITTEN' }) ($(SeedPreferences $file))"
         })
-        $b3a.overwrite = "First Run $(if ($null -ne $seconds) { "after $seconds s" } else { "NOT within $wait s" }); $($marks -join '; '); window $(if ($closed) { 'closed' } else { 'NOT FOUND' }); $settled"
+        $b3a.overwrite = "First Run $(if ($null -ne $seconds) { "after $seconds s" } else { "NOT within $wait s" }); $($marks -join '; '); sent $($windows.Count) close request(s); $settled"
         if ($marks[1] -like '*OVERWRITTEN*') { $b3aStops.Add('Profile 1 is overwritten too: widen SeedHazard before b3b') }
     } catch { $b3a.overwrite = "not observed: $($_.Exception.Message -replace '(.{300}).+', '$1...')" }
     # (3) The first profile printed headless: the fonts the PDF embeds (unproven when no /BaseFont is readable).
     try {
         $pdf = Join-Path $b3aDir 'page.pdf'
         $print = Bounded $b3aExe @('--headless=new', "--user-data-dir=$userData", "--print-to-pdf=$pdf", $pageUrl) ([Math]::Min(30, (B3aLeft 20 'headless PDF') - 10))
-        $settled = SettleChromium 8
+        $settled = SettleText (SettleChromium 8 $null)
         if (-not (Test-Path -LiteralPath $pdf)) { throw "no PDF (exit $($print.exit), $($print.seconds) s; $(Tail $print.stderr)); $settled" }
         $embedded = @([regex]::Matches([Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($pdf)), '/BaseFont\s*/(?:[A-Z]{6}\+)?([^\s/\[\]<>()]+)') |
             ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
@@ -2139,13 +2224,26 @@ try {
     $treeChanges = @(StampDiff $treeBefore (EntryStamps $b3aTree))
     $b3a.tree = $(if ($treeChanges.Count) { "CHANGED: $(Few $treeChanges)" } else { 'still exactly the inventory and the seed' })
     if ($treeChanges.Count) { $b3aStops.Add('the tree changed') }
-    $b3a.outside = $(if ($script:b3aOutside.Count) { "chrome.exe from ELSEWHERE: $(Few @($script:b3aOutside.Values))" } else { 'none from elsewhere' })
-    if ($script:b3aOutside.Count) { $b3aStops.Add('a process started from outside the tree') }
-    # C9 before any move aside, so a failed move cannot lose it.
+    # Every chrome.exe seen in any run, by class; parent and type for the ones not in the tree.
+    $seenAll = @($script:b3aSeen.Values)
+    $b3a.processes = (@('tree', 'descendant', 'outside', 'unknown' | ForEach-Object { $class = $_; "$class $(@($seenAll | Where-Object { $_.class -ceq $class }).Count)" }) -join ', ') +
+        "; not in the tree: $(Few @($seenAll | Where-Object { $_.class -cne 'tree' } | ForEach-Object { "$($_.class) $($_.type)[$($_.id)<$($_.parent)]$(if ($_.path) { ' ' + $_.path })" }))"
+    if (@($seenAll | Where-Object { $_.class -ceq 'outside' }).Count -and -not $b3aStops.Contains('H3: a process started from outside the tree (b3b is cancelled)')) {
+        $b3aStops.Add('H3: a process started from outside the tree (b3b is cancelled)')
+    }
+    # C9 before any move aside, so a failed move cannot lose it: every added name where registration matters (at most 100
+    # each), only the count and first names under Software\Chromium, Chromium's own state.
     $hkcuAfter = HkcuNames
     $added = @($hkcuAfter | Where-Object { -not $hkcuBefore.Contains($_) } | Sort-Object)
     $removed = @($hkcuBefore | Where-Object { -not $hkcuAfter.Contains($_) } | Sort-Object)
-    $b3a.hkcu = "added $(Few $added), removed $(Few $removed)"
+    $b3aGroups = [ordered]@{ 'App Paths' = 'Software\Microsoft\Windows\CurrentVersion\App Paths'; Uninstall = 'Software\Microsoft\Windows\CurrentVersion\Uninstall'
+        StartMenuInternet = 'Software\Clients\StartMenuInternet'; RegisteredApplications = 'Software\RegisteredApplications'; 'Classes (names directly under it and OpenWithProgids)' = 'Software\Classes' }
+    foreach ($group in $b3aGroups.GetEnumerator()) {
+        $names = @($added | Where-Object { $_.StartsWith($group.Value + '\', [StringComparison]::OrdinalIgnoreCase) -or $_.StartsWith($group.Value + '|', [StringComparison]::OrdinalIgnoreCase) })
+        $b3a["hkcu $($group.Key)"] = "added $($names.Count)$(if ($names.Count) { ': ' + (@($names | Select-Object -First 100) -join ', ') + $(if ($names.Count -gt 100) { ', ...' }) })"
+    }
+    $b3a['hkcu Software\Chromium'] = "added $(Few @($added | Where-Object { $_.StartsWith('Software\Chromium', [StringComparison]::OrdinalIgnoreCase) }))"
+    $b3a.hkcuRemoved = "removed $(Few $removed)"
     if (@($added | Where-Object { $_ -like 'Software\Microsoft\Windows\CurrentVersion\App Paths*' -or $_ -like 'Software\Microsoft\Windows\CurrentVersion\Uninstall*' }).Count) {
         $b3aStops.Add('App Paths or Uninstall gained an entry')
     }
@@ -2187,7 +2285,13 @@ try {
     $b3a.status = "not observed: $($_.Exception.Message -replace '(.{300}).+', '$1...')"
     $b3aStops.Add('b3a did not complete: S7 before b3b')
 } finally {
-    try { if (Get-Variable -Name b3aTree -ErrorAction SilentlyContinue) { $b3a.finalSettle = SettleChromium 5 } } catch { }
+    try {
+        if (Get-Variable -Name b3aSeen -Scope Script -ErrorAction SilentlyContinue) {
+            $b3aFinal = SettleChromium 5 $null
+            $b3a.finalSettle = SettleText $b3aFinal
+            if ($b3aFinal.survivors.Count -or $b3aFinal.unknown.Count) { $b3aStops.Add('processes remain after b3a: unproven, S7 before b3b') }
+        }
+    } catch { $b3a.finalSettle = "not settled: $($_.Exception.Message -replace '(.{200}).+', '$1...')" }
 }
 foreach ($entry in $b3a.GetEnumerator()) { B3a "$($entry.Key): $($entry.Value)" }
 B3a "stop conditions for b3b: $(if ($b3aStops.Count) { $b3aStops -join '; ' } else { 'none observed' })"
