@@ -932,6 +932,14 @@ function IsFontEffect($Record) {
     ($kind -ceq 'file-created' -and [IO.Path]::GetDirectoryName($target) -eq $fontDirectory) -or ($kind -ceq 'registry-value' -and $target -eq $fontKey)
 }
 
+# One undo step as text for the Uninstall answer: its action and what it acts on, a path (file or
+# directory), key\name (value) or key (created key). Steps are dictionaries, and under strict mode
+# a missing key throws, so each shape is checked, not assumed.
+function StepText($Step) {
+    $on = if ($Step.Contains('path')) { $Step.path } elseif ($Step.Contains('name')) { "$($Step.key)\$($Step.name)" } else { $Step.key }
+    "$($Step.action) $on"
+}
+
 # What of a plan takes part in the Fonts reference checks: HKCU Fonts value names, and files in the font directory.
 function FontValueNames($Steps) { @($Steps | Where-Object { $_.action -ceq 'delete-registry-value' -and $_.key -eq $fontKey } | ForEach-Object { $_.name }) }
 function IsFontFile($Step) { $Step.action -ceq 'delete-file' -and $Step.kind -ceq 'file-created' -and [IO.Path]::GetDirectoryName($Step.path) -eq $fontDirectory }
@@ -1279,7 +1287,7 @@ function Uninstall {
     $answer = [ordered]@{ mode = $Mode; apply = [bool]$Apply; source = $manifest.source; identity = $script:runIdentity
         ledgerFound = $found; siloCheck = 'notPerformed'
         scope = 'owned fonts and Noctty effects visible to this process, and the default-terminal selection this distribution wrote; packages and RentSsh are not in the ledger yet'
-        planned = @($steps | ForEach-Object { "$($_.action) $(if ($_.Contains('path')) { $_.path } else { "$($_.key)\$($_.name)" })" })
+        planned = @($steps | ForEach-Object { StepText $_ })
         resolutions = @($plan.resolutions | ForEach-Object { "$($_.id): $($_.resolution)" }); resumed = @($plan.resumed)
         defaultTerminal = $legacy.action
         refused = $refused; removed = $script:removed; recordsWritten = $script:recordsWritten

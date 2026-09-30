@@ -637,6 +637,53 @@ function Get-StagingCleanupSteps($Record, $Observed) {
     [ordered]@{ ok = $true; reason = $null; steps = $steps }
 }
 
+# R1: true when the ledger ($Records) proves this code once installed package $Package: some
+# tree-extracted attempt whose intent carries package = $Package (exactly, case-sensitive) has a
+# commit, whether or not a later record closed it. A void-only attempt (nothing was ever
+# extracted), another package's attempt (even a name that starts the same), an intent without
+# the field prove nothing, and neither does an id whose records together are not a valid history
+# (Get-EffectAttempt: a malformed record, a repeated seq, a commit describing another effect, a
+# void after a commit), nor any ledger in which two records share a seq. Only then is protected
+# data (a browser profile) taken as ours; the first install happens only while it is absent.
+function Test-PackageHistory($Records, [string]$Package) {
+    if (-not $Package) { return $false }
+    $all = @($Records | Where-Object { $null -ne $_ })
+    $seqs = @($all | ForEach-Object { [string](Get-Field $_ 'seq') })
+    if (@($seqs | Sort-Object -Unique).Count -ne $seqs.Count) { return $false }
+    foreach ($id in @($all | ForEach-Object { [string](Get-Field $_ 'id') } | Sort-Object -Unique -CaseSensitive)) {
+        $group = @($all | Where-Object { [string](Get-Field $_ 'id') -ceq $id })
+        if ((Get-EffectAttempt $group).problem) { continue }
+        # Valid as a whole, so every attempt starts with an intent and its commits describe that intent's effect.
+        $intent = $null
+        foreach ($record in @($group | Sort-Object { [long](Get-Field $_ 'seq') })) {
+            switch -CaseSensitive (Get-Field $record 'phase') {
+                'intent' { $intent = $record }
+                'commit' {
+                    if ($null -ne $intent -and (Get-Field $intent 'kind') -ceq 'tree-extracted' -and (Get-Field $intent 'package') -ceq $Package) { return $true }
+                }
+                default { $intent = $null }  # void or undone closes the attempt
+            }
+        }
+    }
+    return $false
+}
+
+# D-c: the one download file a package tree intent may use, '<staging>.asset' beside the staging
+# directory it names; derived, never free. Only for a well-formed tree-extracted intent whose
+# package is a lock name and whose target is exactly $Programs\<package, lowercase>-<version>,
+# the version starting with a digit and holding no '-' (so chromium-extra-1 is not Chromium's), so
+# the file lies beside that package's own staging directory; otherwise $null.
+function Get-PackageAssetPath($Record, [string]$Programs) {
+    $package, $target, $temp = (Get-Field $Record 'package'), [string](Get-Field $Record 'target'), (Get-Field $Record 'temp')
+    if ((Get-Field $Record 'kind') -cne 'tree-extracted' -or (Get-Field $Record 'phase') -cne 'intent' -or $temp -isnot [string] -or
+        $null -ne (Get-EffectRecordProblem $Record) -or $package -isnot [string] -or $package -cnotmatch '^[A-Za-z0-9][A-Za-z0-9.-]*$' -or
+        -not $Programs -or [IO.Path]::GetDirectoryName($target) -ne $Programs.TrimEnd('\') -or
+        [IO.Path]::GetFileName($target) -cnotmatch ('^' + [regex]::Escape($package.ToLowerInvariant()) + '-[0-9][A-Za-z0-9.]*$')) {
+        return $null
+    }
+    return $temp + '.asset'
+}
+
 # Why a machine-wide Noctty is present, or $null: any HKLM (either view) key for the
 # Noctty terminal or proxy CLSID in $ClsidKeys, or an HKLM Uninstall DisplayName in
 # $DisplayNames that names Noctty. Restore and Apply then stop before any effect.

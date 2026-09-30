@@ -9,7 +9,8 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hoste
 # win.ps1 runs as on a real host: a child Windows PowerShell 5.1 process with -File.
 # Success is exit code 0, nothing on stderr and exactly one JSON object on stdout.
 # A failure is rethrown with the child's error message, which 5.1 wraps at the
-# console width: its lines are rejoined up to the "At <script>:<line> char:<n>" line.
+# console width: its lines are rejoined up to the "At <script>:<line> char:<n>" line, which is
+# printed to the log (not added to the message, so negative controls keep their patterns).
 $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 function Win51([string[]]$Arguments) {
     $ErrorActionPreference = 'Continue'  # the child's stderr is data here, not an error of this process
@@ -21,7 +22,7 @@ function Win51([string[]]$Arguments) {
     if ($code -ne 0) {
         $message, $atPosition = '', $false
         foreach ($line in $stderr) {
-            if ($line -match '^At .+ char:\d+\s*$') { $atPosition = $true }
+            if ($line -match '^At .+ char:\d+\s*$' -and -not $atPosition) { $atPosition = $true; Write-Host "win.ps1 ($($Arguments -join ' ')) stopped: $($line.Trim())" }
             if (-not $atPosition) { $message += $line }
         }
         if (-not $message.Trim()) { $message = "win.ps1 exited $code without an error message: $($stderr -join ' ')" }
@@ -408,6 +409,64 @@ Must ((Rollback (Sel $wtConsole $terminal) @{ DelegationTerminal = $noctty } (Se
     (Rollback (Sel $null $null) $both (Sel $wtConsole $terminal)) -ceq 'refused' -and                                     # a foreign Terminal
     (Rollback (Sel $null $null) $both (Sel $terminal $noctty)) -ceq 'refused' -and                                       # a foreign Console
     (Rollback (Sel $wtConsole $noctty) @{} (Sel $wtConsole $noctty)) -ceq '') 'selection rollback of one run'
+# S2-1 R1: protected data is ours only after a committed attempt whose intent names exactly this package (any version).
+$pkgDesired = @{ exists = $true; files = @{ 'Chrome-bin/chrome.exe' = (Sha a); 'Chrome-bin/d/x.dll' = (Sha b) } }
+function PackageRecords($Seq, [string]$Leaf, $Package, [string[]]$Phases) {
+    $target = "C:\u\Programs\$Leaf"
+    foreach ($phase in $Phases) {
+        $r = PureRecord $Seq $phase tree-extracted $target $absent $pkgDesired $(switch ($phase) { 'intent' { $null } 'commit' { $pkgDesired } default { $absent } }) $null
+        $r.id = 'tree-extracted:' + $target.ToUpperInvariant()
+        if ($phase -ceq 'intent' -and $Package) { $r.package = $Package }
+        $Seq++; $r
+    }
+}
+Must ((Test-PackageHistory @(PackageRecords 1 'chromium-153' 'Chromium' @('intent', 'commit', 'undone')) 'Chromium') -and                 # an older version, removed
+    (Test-PackageHistory @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit')) 'Chromium') -and                              # open
+    (Test-PackageHistory (@(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'void')) + @(PackageRecords 3 'chromium-154' 'Chromium' @('intent', 'commit'))) 'Chromium') -and
+    -not (Test-PackageHistory @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'void')) 'Chromium') -and                          # void only
+    -not (Test-PackageHistory @(PackageRecords 1 'chromium-extra-1' 'Chromium-extra' @('intent', 'commit')) 'Chromium') -and              # another package
+    -not (Test-PackageHistory @(PackageRecords 1 'chromium-154' $null @('intent', 'commit')) 'Chromium') -and                               # no package field
+    -not (Test-PackageHistory @(PackageRecords 1 'chromium-154' 'chromium' @('intent', 'commit')) 'Chromium') -and                          # not exactly the name
+    -not (Test-PackageHistory (@(PackageRecords 1 'chromium-154' 'Other' @('intent', 'commit', 'undone')) + @(PackageRecords 4 'chromium-154' 'Chromium' @('intent', 'void'))) 'Chromium') -and
+    -not (Test-PackageHistory @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit')) '')) 'R1 package history'
+# Only a valid history counts: a malformed closing record, a commit of another effect, or a repeated
+# seq (within the id or across the ledger) makes a committed-looking attempt prove nothing.
+$malformed = @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit', 'undone')); $malformed[2].schema = 2
+$changed = @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit'))
+$changed[1].desired = @{ exists = $true; files = @{ 'Chrome-bin/chrome.exe' = (Sha c) } }; $changed[1].observed = $changed[1].desired
+$repeated = @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit')); $repeated[1].seq = 1
+$shared = @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit')) + @(PackageRecords 2 'autohotkey-2.0.28' 'AutoHotkey' @('intent'))
+Must (@($malformed, $changed, $repeated, $shared | Where-Object { Test-PackageHistory $_ 'Chromium' }).Count -eq 0 -and
+    (Test-PackageHistory $malformed[0..1] 'Chromium')) 'R1 history must be valid as a whole'
+# D-c: the asset file is derived from a valid package intent's staging directory, beside it, and nothing else.
+function AssetIntent([string]$Target, $Package, [string]$Temp) {
+    $r = PureRecord 1 intent tree-extracted $Target $absent $pkgDesired $null $null
+    if ($null -ne $Package) { $r.package = $Package }
+    if ($Temp) { $r.temp = $Temp }
+    $r
+}
+$pkgTarget = 'C:\u\Programs\chromium-154.0.8037.58'
+$pkgStaging = "$pkgTarget.$guid.staging"
+Must ((Get-PackageAssetPath (AssetIntent $pkgTarget 'Chromium' $pkgStaging) 'C:\u\Programs') -ceq "$pkgStaging.asset" -and
+    (Get-PackageAssetPath (AssetIntent $pkgTarget 'Chromium' $pkgStaging) 'C:\u\Programs\') -ceq "$pkgStaging.asset" -and
+    (Get-PackageAssetPath (AssetIntent 'C:\u\Programs\autohotkey-2.0.28' 'AutoHotkey' "C:\u\Programs\autohotkey-2.0.28.$guid.staging") 'C:\u\Programs') -ceq
+        "C:\u\Programs\autohotkey-2.0.28.$guid.staging.asset") 'a derived asset path'
+foreach ($bad in @(@($pkgTarget, $null, $pkgStaging, 'C:\u\Programs'), @($pkgTarget, 'AutoHotkey', $pkgStaging, 'C:\u\Programs'),
+        @($pkgTarget, 'Chromium', $null, 'C:\u\Programs'), @($pkgTarget, 'Chromium', "C:\u\Programs\other.$guid.staging", 'C:\u\Programs'),
+        @($pkgTarget, 'Chromium', $pkgStaging, 'C:\u\Other'), @('C:\u\Programs\x\chromium-154', 'Chromium', "C:\u\Programs\x\chromium-154.$guid.staging", 'C:\u\Programs'),
+        @('C:\u\Programs\chromium-', 'Chromium', "C:\u\Programs\chromium-.$guid.staging", 'C:\u\Programs'),
+        @('C:\u\Programs\chromiumx-1', 'Chromium', "C:\u\Programs\chromiumx-1.$guid.staging", 'C:\u\Programs'), @($pkgTarget, '..\x', $pkgStaging, 'C:\u\Programs'),
+        @('C:\u\Programs\chromium-extra-1', 'Chromium', "C:\u\Programs\chromium-extra-1.$guid.staging", 'C:\u\Programs'),
+        @($pkgTarget, 'Chromium', $pkgStaging, ''))) {
+    Must ($null -eq (Get-PackageAssetPath (AssetIntent $bad[0] $bad[1] $bad[2]) $bad[3])) "no asset path for $($bad -join ' | ')"
+}
+$committedIntent = AssetIntent $pkgTarget 'Chromium' $pkgStaging; $committedIntent.phase = 'commit'; $committedIntent.observed = $pkgDesired; $committedIntent.Remove('temp')
+Must ($null -eq (Get-PackageAssetPath $committedIntent 'C:\u\Programs')) 'no asset path from a commit'
+# C-1: a partly removed package tree resumes with steps only inside its own target; an unknown file refuses.
+$pkgRecord = @{ kind = 'tree-extracted'; target = $pkgTarget; desired = $pkgDesired }
+$resumed = Get-TreeUndoSteps $pkgRecord @{ exists = $true; files = @{ 'Chrome-bin/chrome.exe' = (Sha a) }; other = @('Chrome-bin/d/') }
+Must ($null -ne $resumed -and @($resumed).Count -eq 4 -and -not @($resumed | Where-Object { $_.path -cne $pkgTarget -and -not $_.path.StartsWith("$pkgTarget\") }).Count -and
+    $null -eq (Get-TreeUndoSteps $pkgRecord @{ exists = $true; files = @{ 'Chrome-bin/chrome.exe' = (Sha a); 'User Data/Default/Prefs' = (Sha c) }; other = @() })) 'C-1: package tree resume stays inside its target'
 
 # The create and recovery primitives, loaded alone from win.ps1 (no mode creates a Noctty effect
 # yet) and run against a scratch %LOCALAPPDATA% ($Scratch, never deleted), its own ledger and a
@@ -421,7 +480,8 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
         'CreateOwnedFile', 'CreateOwnedValue', 'CreateOwnedKey', 'CreateOwnedTree', 'Observe', 'ObserveNoctty', 'ObserveTree',
         'ObserveKey', 'ObserveValue', 'ObserveFile', 'NocttyEffects', 'KeyEffect', 'ValueEffect', 'FileEffect',
         'OrderedSteps', 'UndoOwnedSteps', 'RemoveTarget', 'FontReferences', 'FontReferenceTable', 'NocttyReferences',
-        'SelectNoctty', 'StartupPair', 'RecordPriorTerminal', 'TestNocttyRegistration', 'TestNocttyActivation', 'AssertActualSelection', 'RestoreLegacy'
+        'SelectNoctty', 'StartupPair', 'RecordPriorTerminal', 'TestNocttyRegistration', 'TestNocttyActivation', 'AssertActualSelection', 'RestoreLegacy',
+        'StepText'
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'win.ps1'), [ref]$null, [ref]$null)
     foreach ($definition in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cin $names }, $false)) {
         . ([scriptblock]::Create($definition.Extent.Text))
@@ -462,6 +522,16 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
     $before = $script:nextSeq
     Refused { CreateOwnedTree (Tree 'noctty-wrong' $two) $zip } '*Not in the inventory*'
     Must ($script:nextSeq -eq $before -and -not (Test-Path (Join-Path $Scratch 'Programs\noctty-wrong*'))) 'a differing archive is refused before any intent or write'
+    # R1 package history, in this edition: a valid committed attempt counts; with a malformed closing record it does not.
+    $history = Tree 'chromium-1' $two
+    $records = @(foreach ($r in @(@(1, 'intent', $null), @(2, 'commit', $history.desired), @(3, 'undone', @{ exists = $false }))) {
+        $record = @{ ledger = 'effects'; schema = 1; seq = $r[0]; phase = $r[1] }
+        foreach ($k in $history.Keys) { $record[$k] = $history[$k] }
+        if ($null -ne $r[2]) { $record.observed = $r[2] }
+        $record
+    })
+    $records[0].package = 'Chromium'; $records[2].schema = 2
+    Must ((Test-PackageHistory $records[0..1] 'Chromium') -and -not (Test-PackageHistory $records 'Chromium')) 'R1 package history in this edition'
     # Interruptions: (a) part of the inventory staged -> cleaned and voided; (b) a file the inventory
     # does not name -> kept, and the intent stays open; (c) renamed but not committed -> confirmed.
     $a, $b, $c = (Tree 'noctty-crash-a' $two), (Tree 'noctty-crash-b' $two), (Tree 'noctty-crash-c' $two)
@@ -485,6 +555,10 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
     Must ((@(OrderedSteps $mixed | ForEach-Object { "$($_.id):$($_.action)" }) -join ',') -ceq
         'v:delete-registry-value,k2:delete-empty-key,k1:delete-empty-key,f:delete-file,t:delete-file,t:remove-empty-directory') 'undo order'
     Refused { OrderedSteps @{ steps = @(@{ id = 'x'; kind = 'file-replaced'; action = 'restore-file' }) } } 'Unsupported undo step*'
+    # The Uninstall answer names every step shape; a created key has neither path nor name (CI #67).
+    Must (((@([ordered]@{ action = 'delete-file'; path = 'C:\u\f'; expectSha256 = (Sha 'a') }, [ordered]@{ action = 'remove-empty-directory'; path = 'C:\u\d' },
+            [ordered]@{ action = 'delete-registry-value'; key = 'HKCU\A'; name = 'v' }, [ordered]@{ action = 'delete-empty-key'; key = 'HKCU\A' }) |
+            ForEach-Object { StepText $_ }) -join ';') -ceq 'delete-file C:\u\f;remove-empty-directory C:\u\d;delete-registry-value HKCU\A\v;delete-empty-key HKCU\A') 'step text for every step shape'
     [IO.File]::Delete("$($c.target)\noctty\a.txt")
     $observed = @{}; $observed[$c.id] = Observe $c
     $plan = Get-UninstallPlan @(RecordsOf $c.id) $observed
