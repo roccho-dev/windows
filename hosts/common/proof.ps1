@@ -2351,24 +2351,65 @@ function AppPathKeyNow {
 }
 $shellDir = Join-Path $env:RUNNER_TEMP ('a30-' + [guid]::NewGuid().ToString('N'))  # empty, never deleted
 $null = New-Item -ItemType Directory -Path $shellDir
-function ShellChromium {  # ShellExecuteEx, as Win+R: the name alone, resolved by Windows
-    $info = [Diagnostics.ProcessStartInfo]::new('chromium')
-    $info.UseShellExecute, $info.WorkingDirectory = $true, $shellDir
-    $info.Arguments = "--headless=new `"--user-data-dir=$shellDir\profile`" about:blank"
-    [Diagnostics.Process]::Start($info)
+# ShellExecuteEx, as Win+R: the name alone, resolved by Windows. WorkingDirectory stays unset: with UseShellExecute
+# it names where the executable is (the .NET documentation), which bypasses App Paths. Only around the start is this
+# process's current directory the empty $shellDir (restored in finally), so nothing there can answer the name.
+function ShellStart([string]$Name, [string]$Arguments) {
+    $info = [Diagnostics.ProcessStartInfo]::new($Name)
+    $info.UseShellExecute, $info.Arguments = $true, $Arguments
+    $saved = [IO.Directory]::GetCurrentDirectory()
+    try { [IO.Directory]::SetCurrentDirectory($shellDir); [Diagnostics.Process]::Start($info) } finally { [IO.Directory]::SetCurrentDirectory($saved) }
+}
+function ShellChromium([string]$Name = 'chromium') { ShellStart $Name "--headless=new `"--user-data-dir=$shellDir\profile`" about:blank" }
+# The executable path of a started process, read by CIM for up to $Seconds; '' when it cannot be read.
+function StartedPath($Process, [int]$Seconds) {
+    $path, $clock = '', [Diagnostics.Stopwatch]::StartNew()
+    while ($null -ne $Process -and -not $path -and $clock.Elapsed.TotalSeconds -lt $Seconds) {
+        $path = [string](Get-CimInstance Win32_Process -Filter "ProcessId = $($Process.Id)").ExecutablePath
+        if (-not $path) { Start-Sleep -Milliseconds 250 }
+    }
+    $path
+}
+# Only after chromium failed to resolve, and never a pass (A30 fails whatever they show): the explicit chromium.exe; a
+# unique HKCU App Paths alias to ping.exe (a few seconds' life) in both spellings, removed again in finally, only its
+# own PIDs waited for or killed; and whether this process is elevated and UAC is on (HKLM read only).
+function A30Diagnostics {
+    $lines = [Collections.Generic.List[string]]::new()
+    try {
+        $started = ShellChromium 'chromium.exe'
+        $lines.Add("chromium.exe -> $(StartedPath $started 10); $(SettleText (SettleChromium 10 $started))")
+    } catch { $lines.Add("chromium.exe -> $($_.Exception.Message)") }
+    $probe = 'proof-' + [guid]::NewGuid().ToString('N')
+    $probeKey = "Software\Microsoft\Windows\CurrentVersion\App Paths\$probe.exe"
+    $created = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($probeKey)
+    try {
+        try { $created.SetValue('', (Join-Path $env:SystemRoot 'System32\PING.EXE')) } finally { $created.Close() }
+        foreach ($form in $probe, "$probe.exe") {
+            $pinged = $null
+            try { $pinged = ShellStart $form '-n 3 127.0.0.1'; $lines.Add("$form (HKCU alias to PING.EXE) -> $(StartedPath $pinged 5)") }
+            catch { $lines.Add("$form (HKCU alias to PING.EXE) -> $($_.Exception.Message)") }
+            finally { if ($null -ne $pinged -and -not $pinged.WaitForExit(8000)) { try { $pinged.Kill() } catch { } } }
+        }
+    } finally { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($probeKey, $false) }
+    $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $policy = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System')
+    $lua = if ($null -eq $policy) { 'absent' } else { try { [string]$policy.GetValue('EnableLUA', 'absent') } finally { $policy.Close() } }
+    $lines.Add("Administrators role: $admin; EnableLUA: $lua")
+    foreach ($line in $lines) { Write-Host "A30 diagnostic: $line" }
 }
 $appNow = AppPathKeyNow
 Must ((Phases $appKeyId) -ceq 'intent,commit' -and (Phases $appValueId) -ceq 'intent,commit' -and (NewRecords $mark @($appKeyId, $appValueId)) -eq 0 -and
     $null -ne $appNow -and $appNow.values.Count -eq 1 -and $appNow.values[0] -ceq '' -and -not $appNow.subkeys.Count -and $appNow.kind -ceq 'String' -and
     $appNow.data -ceq $chromiumExe) 'A30: the install owns App Paths\chromium.exe, one REG_SZ default value naming the owned chrome.exe; a second Apply writes nothing'
-Must ($null -eq (Get-Command chromium -ErrorAction SilentlyContinue)) 'A30: chromium is on no PATH, so only App Paths can resolve it'
-$launched, $launchedPath = (ShellChromium), $null
-$clock = [Diagnostics.Stopwatch]::StartNew()
-while ($null -ne $launched -and -not $launchedPath -and $clock.Elapsed.TotalSeconds -lt 15) {
-    $launchedPath = [string](Get-CimInstance Win32_Process -Filter "ProcessId = $($launched.Id)").ExecutablePath
-    if (-not $launchedPath) { Start-Sleep -Milliseconds 250 }
-}
-$launchSettled = SettleText (SettleChromium 15 $launched)
+Must ($null -eq (Get-Command chromium -ErrorAction SilentlyContinue) -and $null -eq (Get-Command chromium.exe -ErrorAction SilentlyContinue) -and
+    -not @(Get-ChildItem -LiteralPath $shellDir -Force -Filter 'chromium*').Count) 'A30: chromium and chromium.exe are on no PATH nor in the empty start directory, so only App Paths can resolve them'
+$launchedPath, $launchSettled = '', ''
+try {
+    $launched = ShellChromium
+    $launchedPath = StartedPath $launched 15
+    $launchSettled = SettleText (SettleChromium 15 $launched)
+} catch { $launchSettled = "not started: $($_.Exception.Message)" }
+if ($launchedPath -ne $chromiumExe) { A30Diagnostics }
 Must ($launchedPath -eq $chromiumExe) "A30: ShellExecute starts the owned chrome.exe by the name chromium ($launchedPath; $launchSettled)"
 $held = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($appSubkey, $true)
 try { $held.SetValue('Path', $shellDir) } finally { $held.Close() }
@@ -2383,10 +2424,16 @@ Must ($chromiumGone.ownedOpen -eq 0 -and -not (Test-Path -LiteralPath $chromiumT
     (Test-Path -LiteralPath (Join-Path $userData 'First Run'))) 'A29: Uninstall removes the Chromium tree with its seed, never a profile'
 AssertEmpty
 # A30, the negative control: the same Uninstall removed the value, then the key, and ShellExecute no longer finds chromium.
-$unresolved = $false
-try { $stray = ShellChromium; if ($null -ne $stray) { $null = SettleChromium 5 $stray } } catch { $unresolved = $true }
+# Same name and method as the positive check above, which alone makes this failure meaningful. Only "file not found"
+# (Win32 error 2) counts as the name no longer resolving; any other failure fails, with its own message.
+$unresolved, $strayPath, $strayError = $false, '', ''
+try { $stray = ShellChromium; $strayPath = StartedPath $stray 5; if ($null -ne $stray) { $null = SettleChromium 5 $stray } }
+catch {
+    $failure = $_.Exception.GetBaseException()
+    if ($failure -is [ComponentModel.Win32Exception] -and $failure.NativeErrorCode -eq 2) { $unresolved = $true } else { $strayError = $failure.Message }
+}
 Must ($null -eq (AppPathKeyNow) -and (Phases $appKeyId) -ceq 'intent,commit,undone' -and (Phases $appValueId) -ceq 'intent,commit,undone' -and
-    $unresolved) 'A30: Uninstall removes the App Paths value and key; ShellExecute then no longer finds chromium'
+    $unresolved) "A30: Uninstall removes the App Paths value and key; ShellExecute then no longer finds chromium$(if ($strayError) { " (it failed otherwise: $strayError)" } elseif (-not $unresolved) { " (it started '$strayPath')" })"
 [IO.File]::Delete($sentinel)
 [IO.File]::Delete($preferences)
 [IO.Directory]::Delete((Split-Path -Parent $preferences), $false)
