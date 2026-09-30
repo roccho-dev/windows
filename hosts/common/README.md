@@ -31,7 +31,7 @@ directory, then run:
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Validate     # read-only
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Restore      # fonts, UI font faces, Noctty, packages, Store apps (see below)
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Apply -Typography  # fonts and UI font faces only
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Apply -Typography  # fonts, UI font faces, a present app's fonts
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RestoreTest  # fail on drift
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Uninstall    # dry run: lists what it would revert
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Uninstall -Apply  # reverts owned fonts and Noctty, restores the selection
@@ -419,6 +419,45 @@ msstore --exact --silent`). With exactly one of that publisher it does nothing. 
 else fails and is never replaced. `Restore` and `RestoreTest` then require it to be
 present and report its version.
 
+**ChatGPT app fonts.** The app's `appearance` in `nix.nix` names font roles for the
+app's own settings: UI and content use IBM Plex Sans JP, and code uses PlemolJP Console
+NF, each written as a quoted CSS family, in both the light and dark themes.
+- **When it runs:** `Restore` sets them after installing the app and before its first
+  start. `Apply -Typography` sets them only when the app is already present.
+- **How it writes:** only through the app's own config service, the `codex.exe
+  app-server` bundled in the installed package. It calls `initialize`, `config/read`
+  with layers, then one `config/batchWrite` guarded by the user layer's
+  `expectedVersion`, then reads back. No model, thread or account request is made.
+  There is no file edit, internal IPC, `app.asar`, global-state or database write.
+- **What it changes:**
+  - An existing theme gets only its `ui`, `code` and `content` font leaves, and loses
+    any `uiFace`/`codeFace`/`contentFace` (a Face overrides the family). Its colors, the
+    mode and all other settings stay.
+  - An absent theme is created whole from the app's own defaults (`jq` of
+    26.928.1915.0, with `accentSource = "chatgpt"`). A theme with fonts alone is one the
+    app drops.
+- **Refusals:** a theme another config layer sets, one the app would reject, and a
+  read-only or repeated user layer are refused. A stale version is refused by the
+  service, and nothing is written.
+- **Ledger:** each theme is an `app-theme-fonts` effect with the prior font leaves
+  (Face objects included) recorded.
+  - `Uninstall` puts them back only while they are still the ones written. A theme it
+    created and nobody changed is removed whole; a recoloured one keeps its colors and
+    loses only the fonts, and stays valid.
+  - Fonts changed afterwards (the running app writes the whole theme when the user
+    changes appearance) are owned-drift: reported and never written. `Uninstall`
+    refuses them.
+  - Everything else in the user config is compared before and after each write
+    (values only, never printed), and a difference fails the run.
+- **Limits:**
+  - A running app shows the change after its next restart. Nothing here starts,
+    stops or restarts it; that restart and a visual check are the final gate.
+  - Starting the service does its normal runtime bookkeeping under the Codex home (and
+    its usual network requests), so the write is not the only file activity.
+  - Only this user's Codex config is written. The app's data, accounts and other
+    settings are never owned.
+  - `Uninstall` needs the app present while the ledger owns its fonts.
+
 This uses neither Microsoft DSC nor a pinned package. The Store serves and updates its
 current version, so installing needs the network and a restore gets that day's
 version. An app is not a ledger effect: it is never reinstalled, updated, closed or
@@ -547,7 +586,16 @@ NONCLIENTMETRICS slots took the face (six intents, one set of five). `Apply
 nothing but the six faces. A second run writes nothing; a changed face is drift and
 is not written. After A27's `Uninstall` every WindowMetrics value is byte-for-byte
 the runner's baseline again. `Restore`'s Store app step (WinGet) is not run on CI;
-only its decision (`Get-AppAction`) is.
+only its decision (`Get-AppAction`) is. The runner has no ChatGPT app, so the app fonts
+are proven on CI only as pure rules: complete default themes, font-only themes refused,
+the edits for an existing and an absent theme, records, classes, the undo of a created
+and a recoloured theme, and the comparison of the rest of the config. `Apply
+-Typography` there reports `appFonts = "appAbsent"`. The adapter itself was run
+outside CI, under Windows PowerShell 5.1, against the bundled service of package
+26.928.1915.0, on synthetic isolated Codex homes only (not the host's config). It
+passed: converge, a second run writing nothing, a stale version refused, user drift
+not written, and the `Uninstall` plan restoring the prior Face object and keeping a
+recoloured theme. A fresh home without `config.toml` got both default themes.
 It also requires every `win.ps1` answer to report
 `handoffProof = "unproven"` and `handoff-proof.ps1` to refuse the runner, so CI
 never claims a real default-terminal handoff. Negative controls must fail for

@@ -158,8 +158,24 @@ let
     # Not pinned: the Store serves and updates its current version, and installing needs the network.
     # An app present (this package name and publisher id) is never reinstalled, closed or removed, and
     # its data is never owned. The ChatGPT desktop app's package family is OpenAI.Codex_2p2nqsd0c76g0.
+    # appearance: the app's own font settings (its light and dark themes in the user's Codex config), written
+    # through the app's bundled config service. fonts name roles of `choices`, written as quoted CSS families.
+    # defaults are the app's own complete themes (initial.js `jq` of 26.928.1915.0, with accentSource), written
+    # only where a theme is absent: a theme with fonts alone is invalid and dropped by the app. Of an existing
+    # theme only the font leaves change (and a font Face, which would override the family, is removed).
     apps = [
-      { name = "ChatGPT"; source = "msstore"; id = "9PLM9XGG6VKS"; package = "OpenAI.Codex"; publisherId = "2p2nqsd0c76g0"; }
+      {
+        name = "ChatGPT"; source = "msstore"; id = "9PLM9XGG6VKS"; package = "OpenAI.Codex"; publisherId = "2p2nqsd0c76g0";
+        appearance = {
+          fonts = { ui = "ui"; content = "ui"; code = "terminal"; };
+          defaults = {
+            light = { accent = "#339cff"; accentSource = "chatgpt"; contrast = 45; ink = "#1a1c1f"; opaqueWindows = false; surface = "#ffffff";
+              semanticColors = { diffAdded = "#00a240"; diffRemoved = "#ba2623"; skill = "#924ff7"; }; };
+            dark = { accent = "#339cff"; accentSource = "chatgpt"; contrast = 60; ink = "#ffffff"; opaqueWindows = false; surface = "#181818";
+              semanticColors = { diffAdded = "#40c977"; diffRemoved = "#fa423e"; skill = "#ad7bf9"; }; };
+          };
+        };
+      }
     ];
   });
   fonts = pkgs.runCommand "common-fonts" { nativeBuildInputs = [ python ]; } ''

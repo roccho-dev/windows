@@ -289,6 +289,76 @@ Must ((Get-AppAction @() $app) -ceq 'install' -and (Get-AppAction @(@{ name = 'O
     (Get-AppAction @(@{ name = 'OpenAI.Codex'; publisherId = 'aaaaaaaaaaaaa' }) $app) -ceq 'refuse' -and
     (Get-AppAction @(@{ name = 'OpenAI.Codex'; publisherId = '2P2NQSD0C76G0' }) $app) -ceq 'refuse' -and
     (Get-AppAction @(@{ name = 'OpenAI.Codex'; publisherId = '2p2nqsd0c76g0' }, @{ name = 'OpenAI.Codex'; publisherId = '2p2nqsd0c76g0' }) $app) -ceq 'refuse') 'Get-AppAction'
+# ChatGPT app theme fonts (app-theme-fonts): the manifest's defaults make complete themes and fonts alone do not; an
+# existing theme gets its three font leaves and loses only the Faces it has; the undo removes a created theme only
+# while nobody changed it, and otherwise restores each leaf, keeping a recoloured theme valid; everything else of the
+# user config is compared, the font leaves aside.
+$appearance = @($manifest.apps | Where-Object { $null -ne $_.PSObject.Properties['appearance'] })[0].appearance
+$plexCss, $monoCss = '"IBM Plex Sans JP"', '"PlemolJP Console NF"'
+$appFonts = [ordered]@{ ui = $plexCss; code = $monoCss; content = $plexCss }
+Must ($appearance.fonts.ui -ceq $plexCss -and $appearance.fonts.content -ceq $plexCss -and $appearance.fonts.code -ceq $monoCss -and
+    $null -eq (Get-AppThemeProblem (New-AppTheme $appearance.defaults.light $appFonts)) -and $null -eq (Get-AppThemeProblem (New-AppTheme $appearance.defaults.dark $appFonts)) -and
+    (Get-AppThemeProblem @{ fonts = $appFonts }) -like 'accent*' -and
+    (Get-AppThemeProblem (New-AppTheme $appearance.defaults.dark @{ ui = 1; code = $null; content = $null })) -like 'fonts.ui*') 'app themes: complete defaults, font-only refused'
+$face = @{ family = 'Segoe UI'; fullName = 'Segoe UI'; postscriptName = 'SegoeUI' }
+$dark = '{"accent":"#3a83f7","accentSource":"chatgpt","contrast":60,"ink":"#ffffff","opaqueWindows":false,"surface":"#181818","semanticColors":{"diffAdded":"#40c977","diffRemoved":"#fa423e","skill":"#ad7bf9"},"fonts":{"content":"\"Segoe UI\"","contentFace":{"family":"Segoe UI","fullName":"Segoe UI","postscriptName":"SegoeUI"}}}' | ConvertFrom-Json
+$darkEdits = Get-AppFontEdits 'appearanceDarkChromeTheme' $dark $appFonts $appearance.defaults.dark
+$darkAfter = Get-AppThemeAfter 'appearanceDarkChromeTheme' $dark $darkEdits
+Must ((@($darkEdits | ForEach-Object { "$($_.keyPath)=$(ConvertTo-CanonicalJson $_.value)" }) -join '|') -ceq
+        'desktop.appearanceDarkChromeTheme.fonts.ui="\"IBM Plex Sans JP\""|desktop.appearanceDarkChromeTheme.fonts.code="\"PlemolJP Console NF\""|desktop.appearanceDarkChromeTheme.fonts.content="\"IBM Plex Sans JP\""|desktop.appearanceDarkChromeTheme.fonts.contentFace=null' -and
+    @($darkEdits | Where-Object { $_.mergeStrategy -cne 'replace' }).Count -eq 0 -and $null -eq (Get-AppThemeProblem $darkAfter) -and
+    (ConvertTo-CanonicalJson (Get-AppFontsState $darkAfter.fonts)) -ceq (ConvertTo-CanonicalJson $appFonts) -and $darkAfter.accent -ceq '#3a83f7' -and $darkAfter.contrast -eq 60) 'app fonts of an existing theme: font leaves only, its Face removed, colors kept'
+$lightEdits = Get-AppFontEdits 'appearanceLightChromeTheme' $null $appFonts $appearance.defaults.light
+Must ($lightEdits.Count -eq 1 -and $lightEdits[0].keyPath -ceq 'desktop.appearanceLightChromeTheme' -and $null -eq (Get-AppThemeProblem $lightEdits[0].value) -and
+    $lightEdits[0].value.accentSource -ceq 'chatgpt' -and $lightEdits[0].value.surface -ceq '#ffffff') 'app fonts of an absent theme: the whole default theme'
+# Records, classes and the undo of a leaf change and of a created theme.
+$priorDark = [ordered]@{ exists = $true; fonts = (Get-AppFontsState $dark.fonts) }
+$wantFonts = [ordered]@{ exists = $true; fonts = $appFonts }
+$created = New-AppTheme $appearance.defaults.light $appFonts
+$wantCreated = [ordered]@{ exists = $true; fonts = $appFonts; theme = $created }
+$empty = [ordered]@{ exists = $true; fonts = [ordered]@{} }
+function AppRecord($Seq, $Phase, $Target, $Prior, $Desired, $Observed) { $r = PureRecord $Seq $Phase app-theme-fonts $Target $Prior $Desired $Observed $null; $r.id = "app:$Target"; $r }
+$darkTarget, $lightTarget = 'codex-config:desktop.appearanceDarkChromeTheme', 'codex-config:desktop.appearanceLightChromeTheme'
+Must ($null -eq (Get-EffectRecordProblem (AppRecord 1 intent $darkTarget $priorDark $wantFonts $null)) -and
+    $null -eq (Get-EffectRecordProblem (AppRecord 2 commit $lightTarget $empty $wantCreated $wantFonts)) -and
+    (Get-EffectRecordProblem (AppRecord 1 intent $lightTarget $priorDark $wantCreated $null)) -ceq 'a created theme needs an empty prior.' -and
+    (Get-EffectRecordProblem (AppRecord 1 intent $lightTarget $empty ([ordered]@{ exists = $true; fonts = $appFonts; theme = @{ fonts = $appFonts } }) $null)) -like 'desired.theme: accent*' -and
+    (Get-EffectRecordProblem (AppRecord 1 intent $darkTarget $priorDark ([ordered]@{ exists = $true; fonts = [ordered]@{ ui = $plexCss; code = $monoCss; content = $plexCss; uiFace = $face } }) $null)) -ceq 'desired.fonts is not ui, code and content.' -and
+    (Get-EffectRecordProblem (AppRecord 1 intent 'codex-config:desktop.appearanceTheme' $priorDark $wantFonts $null)) -like 'target*' -and
+    (Get-EffectRecordProblem (AppRecord 1 intent $darkTarget $absent $wantFonts $null)) -ceq 'prior must exist.' -and
+    (Get-EffectRecordProblem (AppRecord 1 intent $darkTarget $wantFonts $wantFonts $null)) -like 'desired equals prior*') 'app-theme-fonts records'
+$darkNow = [ordered]@{ exists = $true; fonts = (Get-AppFontsState $darkAfter.fonts) }
+$userFonts = [ordered]@{ exists = $true; fonts = [ordered]@{ ui = '"Meiryo UI"'; code = $monoCss; content = $plexCss } }
+Must ((Get-UnownedClass app-theme-fonts $wantFonts $priorDark $null).class -ceq 'absent' -and (Get-UnownedClass app-theme-fonts $wantFonts $darkNow $null).class -ceq 'preexisting-match' -and
+    (Get-EffectClass @((AppRecord 1 intent $darkTarget $priorDark $wantFonts $null), (AppRecord 2 commit $darkTarget $priorDark $wantFonts $darkNow)) $userFonts '' $null).class -ceq 'owned-drift' -and
+    (Get-EffectClass @((AppRecord 1 intent $darkTarget $priorDark $wantFonts $null)) $priorDark '' $null).resolution -ceq 'void') 'app-theme-fonts classes'
+$darkUndo = @(Get-UndoSteps (AppRecord 1 intent $darkTarget $priorDark $wantFonts $null))[0]
+$darkUndoEdits = Get-AppFontUndoEdits $darkUndo $darkAfter
+$darkBack = Get-AppThemeAfter 'appearanceDarkChromeTheme' $darkAfter $darkUndoEdits
+Must ($darkUndo.action -ceq 'set-app-theme-fonts' -and $darkUndo.theme -ceq 'appearanceDarkChromeTheme' -and
+    (ConvertTo-CanonicalJson $darkBack) -ceq (ConvertTo-CanonicalJson $dark)) 'app fonts undo: the prior leaves and Face object back, nothing else'
+$lightUndo = @(Get-UndoSteps (AppRecord 1 intent $lightTarget $empty $wantCreated $null))[0]
+$recoloured = ($created | ConvertTo-Json -Depth 5 | ConvertFrom-Json)
+$recoloured.accent = '#ff0000'
+$recolouredBack = Get-AppThemeAfter 'appearanceLightChromeTheme' $recoloured (Get-AppFontUndoEdits $lightUndo $recoloured)
+$unchangedUndo = Get-AppFontUndoEdits $lightUndo ($created | ConvertTo-Json -Depth 5 | ConvertFrom-Json)  # one array: the edits of one batch
+$unchangedUndo = @($unchangedUndo | ForEach-Object { "$($_.keyPath)=$(ConvertTo-CanonicalJson $_.value)" }) -join '|'
+Must ($unchangedUndo -ceq 'desktop.appearanceLightChromeTheme=null' -and
+    $recolouredBack.accent -ceq '#ff0000' -and $null -eq (Get-AppThemeProblem $recolouredBack) -and @((Get-AppFontsState $recolouredBack.fonts).Keys).Count -eq 0) 'app fonts undo: a created theme goes whole only unchanged; recoloured, it keeps its colors, stays valid and loses the fonts'
+# The rest of the user config: font leaves and a created theme aside, any other change shows; key order does not.
+$config = '{"model":"m","desktop":{"appearanceTheme":"dark","codeFontSize":17,"appearanceDarkChromeTheme":{"accent":"#3a83f7","fonts":{"content":"x","other":"keep"}}},"z":{"b":1,"a":[1,"two"]}}' | ConvertFrom-Json
+$keys = @(Get-AppThemeKeys)
+$restBefore = Get-AppConfigRest $config $keys @()
+$fontOnly = ($config | ConvertTo-Json -Depth 8 | ConvertFrom-Json); $fontOnly.desktop.appearanceDarkChromeTheme.fonts.content = 'y'
+$fontOnly.desktop | Add-Member -NotePropertyName appearanceLightChromeTheme -NotePropertyValue ([pscustomobject]@{ accent = '#339cff' })
+$reordered = '{"z":{"a":[1,"two"],"b":1},"desktop":{"codeFontSize":17,"appearanceTheme":"dark","appearanceDarkChromeTheme":{"fonts":{"other":"keep","content":"x"},"accent":"#3a83f7"}},"model":"m"}' | ConvertFrom-Json
+$otherLeaf = ($config | ConvertTo-Json -Depth 8 | ConvertFrom-Json); $otherLeaf.desktop.appearanceDarkChromeTheme.fonts.other = 'changed'
+$mode = ($config | ConvertTo-Json -Depth 8 | ConvertFrom-Json); $mode.desktop.appearanceTheme = 'light'
+$caseKeys = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal); $caseKeys['b'] = 1; $caseKeys['A'] = 2; $caseKeys['a'] = 3  # TOML keys keep case
+Must ((Get-AppConfigRest $fontOnly $keys @('appearanceLightChromeTheme')) -ceq $restBefore -and (Get-AppConfigRest $reordered $keys @()) -ceq $restBefore -and
+    (Get-AppConfigRest $fontOnly $keys @()) -cne $restBefore -and (Get-AppConfigRest $otherLeaf $keys @()) -cne $restBefore -and (Get-AppConfigRest $mode $keys @()) -cne $restBefore -and
+    (ConvertTo-CanonicalJson $caseKeys) -ceq '{"A":2,"a":3,"b":1}') 'app config rest: only the font leaves and a created theme are set aside'
+Must ((@(Get-CssFamilies '"IBM Plex Sans JP", ''Segoe UI'' , monospace') -join '|') -ceq 'IBM Plex Sans JP|Segoe UI|monospace') 'CSS families of an app font'
 # P1b-lite: the plan groups the ledger by id in one pass and validates each id once (Get-EffectAttempt), with the
 # plan unchanged: interleaved attempts; a reverted and a voided id kept; a malformed id refused; ids that differ
 # only in case refuse the whole plan before any validation.

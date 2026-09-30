@@ -176,12 +176,17 @@ function Get-HandoffVerdict($Record, $Events, [string]$ExpectedTerminal) {
 #   registry-key-created  nothing more: the key exists
 #   ui-font-face    face, the slot's LOGFONTW lfFaceName (1 to 31 UTF-16 units, no
 #                   control), compared exactly; nothing else of the font is state
+#   app-theme-fonts fonts, the Get-AppFontLeaves of one ChatGPT app theme in the user's
+#                   Codex config (target codex-config:desktop.<Get-AppThemeKeys>), each
+#                   present leaf only, compared as canonical JSON; desired holds ui, code
+#                   and content and no *Face, and theme, the whole theme written, when the
+#                   attempt creates it (then prior.fonts is empty)
 # Per kind, prior and desired must be:
 #   file-created, tree-extracted,
 #   registry-key-created             prior absent, desired present
 #   file-replaced, prefix-inserted   prior present with backup, desired present
 #   registry-value                   prior either, desired present
-#   ui-font-face                     prior present, desired present
+#   ui-font-face, app-theme-fonts    prior present, desired present
 # A backup file is its own file-created effect with an earlier seq, so reverse
 # order restores from it before deleting it; Get-UninstallPlan enforces the pairing.
 
@@ -210,10 +215,173 @@ function Test-UiFontFace($Face) {
     $Face -is [string] -and $Face.Length -ge 1 -and $Face.Length -le 31 -and $Face -cnotmatch '[\x00-\x1f\x7f\ud800-\udfff]'
 }
 
-# True for an absolute file path, an HKCU key when $Kind is a registry kind, or spi:<slot>
-# for ui-font-face.
+# ---- ChatGPT app themes: font leaves of desktop.<theme> in the user's Codex config ----
+function Get-AppThemeKeys { @('appearanceLightChromeTheme', 'appearanceDarkChromeTheme') }
+function Get-AppFontLeaves { @('ui', 'code', 'content', 'uiFace', 'codeFace', 'contentFace') }
+
+# One JSON text per value, independent of property order and of the object type (a hashtable, an
+# ordered one, or ConvertFrom-Json's objects), so two readings of the same config compare equal.
+# $Omit (path -> 'drop' | 'prune'): a dotted path is left out, or left out while it is an empty object.
+function ConvertTo-CanonicalJson($Value, [string]$Path = '', $Omit = $null) {
+    if ($null -eq $Value) { return 'null' }
+    if ($Value -is [bool]) { if ($Value) { return 'true' } else { return 'false' } }
+    if ($Value -is [string]) { return (ConvertTo-Json -InputObject $Value -Compress) }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [single]) {
+        return ([IFormattable]$Value).ToString($null, [Globalization.CultureInfo]::InvariantCulture)
+    }
+    $pairs = $null  # assigned in each branch: an if-expression would unroll one pair, and an empty object to $null
+    if ($Value -is [Collections.IDictionary]) { $pairs = @(foreach ($key in $Value.Keys) { , @([string]$key, $Value[$key]) }) }
+    elseif ($Value -is [Management.Automation.PSCustomObject]) { $pairs = @(foreach ($property in $Value.PSObject.Properties) { , @($property.Name, $property.Value) }) }
+    if ($null -ne $pairs) {
+        $names = [string[]]@($pairs | ForEach-Object { $_[0] })
+        $values = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)  # TOML keys keep case
+        foreach ($pair in $pairs) { $values[$pair[0]] = $pair[1] }
+        [Array]::Sort($names, [StringComparer]::Ordinal)
+        $parts = foreach ($name in $names) {
+            $child = if ($Path) { "$Path.$name" } else { $name }
+            $rule = if ($null -ne $Omit) { $Omit[$child] }
+            if ($rule -ceq 'drop') { continue }
+            $text = ConvertTo-CanonicalJson $values[$name] $child $Omit
+            if ($rule -ceq 'prune' -and $text -ceq '{}') { continue }
+            (ConvertTo-Json -InputObject $name -Compress) + ':' + $text
+        }
+        return '{' + (@($parts) -join ',') + '}'
+    }
+    if ($Value -is [Collections.IEnumerable]) { return '[' + (@(foreach ($item in $Value) { ConvertTo-CanonicalJson $item }) -join ',') + ']' }
+    throw "Not a JSON value: $($Value.GetType().FullName)"
+}
+
+# A config/read layer's config as plain JSON values, in place: the layers carry each number as
+# {"$serde_json::private::Number": "<text>"} (26.928.1915.0; the effective config does not), read here as a number.
+function ConvertFrom-LayerNumbers($Value) {
+    if ($Value -is [Management.Automation.PSCustomObject]) {
+        $properties = @($Value.PSObject.Properties)
+        if ($properties.Count -eq 1 -and $properties[0].Name -ceq '$serde_json::private::Number' -and $properties[0].Value -is [string]) {
+            $text, $culture = $properties[0].Value, [Globalization.CultureInfo]::InvariantCulture
+            $long = 0L
+            if ([long]::TryParse($text, [Globalization.NumberStyles]::AllowLeadingSign, $culture, [ref]$long)) { return $long }
+            return [double]::Parse($text, [Globalization.NumberStyles]::Float, $culture)
+        }
+        foreach ($property in $properties) { $property.Value = ConvertFrom-LayerNumbers $property.Value }
+        return $Value
+    }
+    if ($Value -is [object[]]) {
+        for ($i = 0; $i -lt $Value.Count; $i++) { $Value[$i] = ConvertFrom-LayerNumbers $Value[$i] }
+        return , $Value
+    }
+    return $Value
+}
+
+# The Get-AppFontLeaves present in a theme's fonts table, as an ordered map (the state of an app-theme-fonts target).
+function Get-AppFontsState($Fonts) {
+    $state = [ordered]@{}
+    foreach ($leaf in Get-AppFontLeaves) { $value = Get-Field $Fonts $leaf; if ($null -ne $value) { $state[$leaf] = $value } }
+    $state
+}
+
+# Why a theme is not one the app accepts (its schema in 26.928.1915.0: the app drops an invalid theme whole),
+# or $null. fonts.ui and fonts.code may be missing: the app reads them as null.
+function Get-AppThemeProblem($Theme) {
+    if ($Theme -isnot [Collections.IDictionary] -and $Theme -isnot [Management.Automation.PSCustomObject]) { return 'The theme is not an object.' }
+    $hex = '^#[0-9a-fA-F]{6}\z'
+    foreach ($field in 'accent', 'ink', 'surface') { if ([string](Get-Field $Theme $field) -cnotmatch $hex) { return "$field is not a #rrggbb color." } }
+    $source = Get-Field $Theme 'accentSource'
+    if ($null -ne $source -and $source -cnotin @('chatgpt', 'custom')) { return 'accentSource is not chatgpt or custom.' }
+    $contrast = Get-Field $Theme 'contrast'
+    if (($contrast -isnot [int] -and $contrast -isnot [long]) -or $contrast -lt 0 -or $contrast -gt 100) { return 'contrast is not an integer from 0 to 100.' }
+    if ((Get-Field $Theme 'opaqueWindows') -isnot [bool]) { return 'opaqueWindows is not a boolean.' }
+    $semantic = Get-Field $Theme 'semanticColors'
+    foreach ($field in 'diffAdded', 'diffRemoved', 'skill') { if ([string](Get-Field $semantic $field) -cnotmatch $hex) { return "semanticColors.$field is not a #rrggbb color." } }
+    $fonts = Get-Field $Theme 'fonts'
+    if ($fonts -isnot [Collections.IDictionary] -and $fonts -isnot [Management.Automation.PSCustomObject]) { return 'fonts is not an object.' }
+    foreach ($leaf in 'ui', 'code', 'content') { $value = Get-Field $fonts $leaf; if ($null -ne $value -and $value -isnot [string]) { return "fonts.$leaf is not a string." } }
+    return $null
+}
+
+# The whole theme written where none exists: $Defaults (the app's own complete theme) with $Fonts (ui, code, content).
+function New-AppTheme($Defaults, $Fonts) {
+    $theme = [ordered]@{}
+    if ($Defaults -is [Collections.IDictionary]) { foreach ($key in $Defaults.Keys) { $theme[$key] = $Defaults[$key] } }
+    elseif ($null -ne $Defaults) { foreach ($property in $Defaults.PSObject.Properties) { $theme[$property.Name] = $property.Value } }
+    $theme.fonts = [ordered]@{ ui = (Get-Field $Fonts 'ui'); code = (Get-Field $Fonts 'code'); content = (Get-Field $Fonts 'content') }
+    $theme
+}
+
+# The config/batchWrite edits that give desktop.<$Key> the fonts $Fonts: from an absent theme ($Current $null), the
+# whole New-AppTheme; otherwise ui, code and content, and each *Face present set to null (deleted), since a Face
+# overrides its family. Nothing else of the theme is written.
+function Get-AppFontEdits([string]$Key, $Current, $Fonts, $Defaults) {
+    if ($null -eq $Current) { return , @([ordered]@{ keyPath = "desktop.$Key"; value = (New-AppTheme $Defaults $Fonts); mergeStrategy = 'replace' }) }
+    $present = Get-AppFontsState (Get-Field $Current 'fonts')
+    $edits = @(foreach ($leaf in 'ui', 'code', 'content') { [ordered]@{ keyPath = "desktop.$Key.fonts.$leaf"; value = (Get-Field $Fonts $leaf); mergeStrategy = 'replace' } }) +
+        @(foreach ($leaf in 'uiFace', 'codeFace', 'contentFace') { if ($present.Contains($leaf)) { [ordered]@{ keyPath = "desktop.$Key.fonts.$leaf"; value = $null; mergeStrategy = 'replace' } } })
+    return , $edits
+}
+
+# The theme desktop.<$Key> becomes after $Edits (Get-AppFontEdits or Get-AppFontUndoEdits) from $Theme ($null: absent),
+# as the service merges them: a whole-theme edit replaces or deletes it, a font leaf edit sets or deletes that leaf.
+function Get-AppThemeAfter([string]$Key, $Theme, $Edits) {
+    $result = $null
+    if ($null -ne $Theme) {
+        $result = [ordered]@{}
+        foreach ($pair in @(if ($Theme -is [Collections.IDictionary]) { foreach ($k in $Theme.Keys) { , @($k, $Theme[$k]) } } else { foreach ($p in $Theme.PSObject.Properties) { , @($p.Name, $p.Value) } })) {
+            $result[$pair[0]] = $pair[1]
+        }
+        $fonts = [ordered]@{}
+        $old = Get-Field $Theme 'fonts'
+        foreach ($pair in @(if ($old -is [Collections.IDictionary]) { foreach ($k in $old.Keys) { , @($k, $old[$k]) } } elseif ($null -ne $old) { foreach ($p in $old.PSObject.Properties) { , @($p.Name, $p.Value) } })) {
+            $fonts[$pair[0]] = $pair[1]
+        }
+        $result['fonts'] = $fonts
+    }
+    foreach ($edit in @($Edits)) {
+        if ($edit.keyPath -ceq "desktop.$Key") { $result = $edit.value; continue }
+        $leaf = $edit.keyPath.Substring("desktop.$Key.fonts.".Length)
+        if ($null -eq $result) { $result = [ordered]@{ fonts = [ordered]@{} } }
+        if ($null -eq $edit.value) { $result['fonts'].Remove($leaf) } else { $result['fonts'][$leaf] = $edit.value }
+    }
+    $result
+}
+
+# The edits of an undo step (Get-UndoSteps) from the theme now ($Current): a theme this created and nobody changed
+# since goes whole; otherwise every font leaf goes back to its prior value, or is deleted when it had none (a created
+# theme a user recoloured keeps its colors and stays valid: the app reads missing ui and code as null).
+function Get-AppFontUndoEdits($Step, $Current) {
+    $path = "desktop.$($Step.theme)"
+    if ($null -ne $Step.created -and (ConvertTo-CanonicalJson $Current) -ceq (ConvertTo-CanonicalJson $Step.created)) {
+        return , @([ordered]@{ keyPath = $path; value = $null; mergeStrategy = 'replace' })
+    }
+    $now = Get-AppFontsState (Get-Field $Current 'fonts')
+    $edits = @(foreach ($leaf in Get-AppFontLeaves) {
+        $prior = Get-Field $Step.fonts $leaf
+        if ($null -ne $prior) { [ordered]@{ keyPath = "$path.fonts.$leaf"; value = $prior; mergeStrategy = 'replace' } }
+        elseif ($now.Contains($leaf)) { [ordered]@{ keyPath = "$path.fonts.$leaf"; value = $null; mergeStrategy = 'replace' } }
+    })
+    return , $edits
+}
+
+# The user config without what the app-theme-fonts effects may change, as canonical JSON: each theme's font leaves
+# ($Keys), a theme created whole ($Created) and the tables left empty by that. Equal before and after a write when
+# nothing else changed.
+function Get-AppConfigRest($Config, [string[]]$Keys, [string[]]$Created) {
+    $omit = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    $omit['desktop'] = 'prune'
+    foreach ($key in $Keys) {
+        $omit["desktop.$key"] = $(if (@($Created) -ccontains $key) { 'drop' } else { 'prune' })
+        $omit["desktop.$key.fonts"] = 'prune'
+        foreach ($leaf in Get-AppFontLeaves) { $omit["desktop.$key.fonts.$leaf"] = 'drop' }
+    }
+    ConvertTo-CanonicalJson $Config '' $omit
+}
+
+# The CSS families an app font value names ('"A", "B"' -> A, B), for font collection.
+function Get-CssFamilies([string]$Value) { @($Value.Split(',') | ForEach-Object { $_.Trim().Trim('"', "'").Trim() } | Where-Object { $_ }) }
+
+# True for an absolute file path, an HKCU key when $Kind is a registry kind, spi:<slot> for ui-font-face, or
+# codex-config:desktop.<theme> for app-theme-fonts.
 function Test-EffectPath([string]$Kind, $Target) {
     if ($Kind -ceq 'ui-font-face') { return ($Target -is [string] -and (Get-UiFontSlots | ForEach-Object { "spi:$_" }) -ccontains $Target) }
+    if ($Kind -ceq 'app-theme-fonts') { return ($Target -is [string] -and (Get-AppThemeKeys | ForEach-Object { "codex-config:desktop.$_" }) -ccontains $Target) }
     $registry = $Kind -cin @('registry-value', 'registry-key-created')
     $root = if ($registry) { '^HKCU\\' } else { '^[A-Za-z]:\\' }
     if ($Target -isnot [string] -or $Target -notmatch $root) { return $false }
@@ -270,6 +438,13 @@ function Get-EffectStateProblem([string]$Kind, $State, [string]$Role) {
         }
         'registry-key-created' { }
         'ui-font-face' { if (-not (Test-UiFontFace (Get-Field $State 'face'))) { return "$Role.face is not a face name." } }
+        'app-theme-fonts' {
+            $fonts = Get-Field $State 'fonts'
+            if ($fonts -isnot [Collections.IDictionary] -and $fonts -isnot [Management.Automation.PSCustomObject]) { return "$Role.fonts is not an object." }
+            $names = @(if ($fonts -is [Collections.IDictionary]) { $fonts.Keys } else { $fonts.PSObject.Properties | ForEach-Object { $_.Name } })
+            if (@($names | Where-Object { (Get-AppFontLeaves) -cnotcontains $_ }).Count) { return "$Role.fonts holds more than the font leaves." }
+            foreach ($leaf in 'ui', 'code', 'content') { $value = Get-Field $fonts $leaf; if ($null -ne $value -and $value -isnot [string]) { return "$Role.fonts.$leaf is not a string." } }
+        }
         default {
             $sha = Get-Field $State 'sha256'
             if ($sha -isnot [string] -or $sha -notmatch '^[0-9A-Fa-f]{64}\z') { return "$Role.sha256 is not a SHA-256." }
@@ -302,6 +477,9 @@ function Test-EffectStateEqual([string]$Kind, $Expected, $Actual) {
         }
         'registry-key-created' { return $true }
         'ui-font-face' { return ([string](Get-Field $Expected 'face') -ceq [string](Get-Field $Actual 'face')) }
+        'app-theme-fonts' {
+            return ((ConvertTo-CanonicalJson (Get-AppFontsState (Get-Field $Expected 'fonts'))) -ceq (ConvertTo-CanonicalJson (Get-AppFontsState (Get-Field $Actual 'fonts'))))
+        }
         default {
             $sha = [string](Get-Field $Expected 'sha256')
             return ($sha -ne '' -and $sha -eq [string](Get-Field $Actual 'sha256'))
@@ -320,7 +498,7 @@ function Get-EffectRecordProblem($Record) {
     $phase = $fields.phase
     if ($phase -isnot [string] -or $phase -cnotin @('intent', 'commit', 'void', 'undone')) { return 'phase is not intent, commit, void or undone.' }
     $kind = $fields.kind
-    if ($kind -isnot [string] -or $kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted', 'ui-font-face')) {
+    if ($kind -isnot [string] -or $kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted', 'ui-font-face', 'app-theme-fonts')) {
         return 'kind is not an effect kind.'
     }
     $id = $fields.id
@@ -342,7 +520,20 @@ function Get-EffectRecordProblem($Record) {
     if (-not (Get-Field $desired 'exists')) { return 'desired must exist.' }
     if (Test-EffectStateEqual $kind $prior $desired) { return 'desired equals prior; there is no effect to own.' }
     if ($kind -in @('file-created', 'tree-extracted', 'registry-key-created') -and (Get-Field $prior 'exists')) { return 'prior must be absent.' }
-    if ($kind -ceq 'ui-font-face' -and -not (Get-Field $prior 'exists')) { return 'prior must exist.' }
+    if ($kind -cin @('ui-font-face', 'app-theme-fonts') -and -not (Get-Field $prior 'exists')) { return 'prior must exist.' }
+    if ($kind -ceq 'app-theme-fonts') {
+        $fonts = Get-AppFontsState (Get-Field $desired 'fonts')
+        if (@($fonts.Keys) -join ',' -cne 'ui,code,content' -or @($fonts.Values | Where-Object { $_ -isnot [string] -or $_ -eq '' }).Count) {
+            return 'desired.fonts is not ui, code and content.'
+        }
+        $theme = Get-Field $desired 'theme'
+        if ($null -ne $theme) {
+            if (@((Get-AppFontsState (Get-Field $prior 'fonts')).Keys).Count) { return 'a created theme needs an empty prior.' }
+            $problem = Get-AppThemeProblem $theme
+            if ($problem) { return "desired.theme: $problem" }
+            if ((ConvertTo-CanonicalJson (Get-AppFontsState (Get-Field $theme 'fonts'))) -cne (ConvertTo-CanonicalJson $fonts)) { return 'desired.theme has other fonts.' }
+        }
+    }
     if ($kind -in @('file-replaced', 'prefix-inserted')) {
         $backup = Get-Field $prior 'backup'
         if (-not (Get-Field $prior 'exists')) { return 'prior must exist.' }
@@ -424,16 +615,16 @@ function Get-EffectAttempt($Records) {
 # preexisting-match or preexisting-drift against $Desired; indeterminate when the
 # kind or a state is malformed. $Resolution is passed through. A UI font slot always
 # holds some face and holds no content of its own, so another face is absent (free to
-# take, recording that face as prior), never preexisting-drift.
+# take, recording that face as prior), never preexisting-drift; so do an app theme's fonts.
 function Get-UnownedClass([string]$Kind, $Desired, $Current, $Resolution) {
-    $problem = if ($Kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted', 'ui-font-face')) {
+    $problem = if ($Kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted', 'ui-font-face', 'app-theme-fonts')) {
         'The selection kind is not an effect kind.'
     } else { Get-EffectStateProblem $Kind $Desired 'desired' }
     if (-not $problem) { $problem = Get-EffectStateProblem $Kind $Current 'current' }
     if ($problem) { return New-EffectClass 'indeterminate' $null $problem }
     if (-not (Get-Field $Current 'exists')) { return New-EffectClass 'absent' $Resolution $null }
     if (Test-EffectStateEqual $Kind $Desired $Current) { return New-EffectClass 'preexisting-match' $Resolution $null }
-    if ($Kind -ceq 'ui-font-face') { return New-EffectClass 'absent' $Resolution $null }
+    if ($Kind -cin @('ui-font-face', 'app-theme-fonts')) { return New-EffectClass 'absent' $Resolution $null }
     return New-EffectClass 'preexisting-drift' $Resolution $null
 }
 
@@ -516,6 +707,11 @@ function Get-UndoSteps($Record) {
         # Face only, and only while the slot still holds the face the effect wrote.
         'ui-font-face' {
             [ordered]@{ action = 'set-ui-font-face'; slot = $target.Substring(4); face = (Get-Field $prior 'face'); expectFace = (Get-Field $desired 'face') }
+        }
+        # Only while the theme's fonts are still those written (Get-AppFontUndoEdits).
+        'app-theme-fonts' {
+            [ordered]@{ action = 'set-app-theme-fonts'; theme = $target.Substring('codex-config:desktop.'.Length)
+                fonts = (Get-AppFontsState (Get-Field $prior 'fonts')); expectFonts = (Get-AppFontsState (Get-Field $desired 'fonts')); created = (Get-Field $desired 'theme') }
         }
     }
 }

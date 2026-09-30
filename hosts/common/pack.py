@@ -383,17 +383,51 @@ def typography(value: object, entries: list[dict], packages: list[dict]) -> dict
 
 
 APP_KEYS = {"name", "source", "id", "package", "publisherId"}
+APP_FONTS = ("ui", "code", "content")
+THEME_KEYS = {"accent", "accentSource", "contrast", "ink", "opaqueWindows", "surface", "semanticColors"}
+THEME_COLORS = ("accent", "ink", "surface")
+SEMANTIC_COLORS = {"diffAdded", "diffRemoved", "skill"}
+HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
 
 
-def store_apps(value: object) -> list[dict]:
+def appearance(value: object, entries: list[dict]) -> dict:
+    """An app's font preconfiguration: {fonts: {ui, code, content: <role>}, defaults: {light, dark}}
+    becomes {fonts: {ui, code, content: '"<family>"'}, defaults}. Each default is a complete theme
+    as the app's schema requires one (win.ps1 Get-AppThemeProblem holds the same rule), fonts aside."""
+    if not isinstance(value, dict) or set(value) != {"fonts", "defaults"}:
+        raise ValueError("appearance is not {fonts, defaults}")
+    families = {e["role"]: e["family"] for e in entries}
+    fonts = value["fonts"]
+    if not isinstance(fonts, dict) or set(fonts) != set(APP_FONTS) or any(fonts[k] not in families for k in APP_FONTS):
+        raise ValueError(f"appearance fonts are not ui, code and content of selected roles: {fonts!r}")
+    if any(re.search(r'["\\\x00-\x1f]', families[fonts[k]]) for k in APP_FONTS):
+        raise ValueError("an appearance font family cannot be one quoted CSS family")
+    css = {k: f'"{families[fonts[k]]}"' for k in APP_FONTS}
+    defaults = value["defaults"]
+    if not isinstance(defaults, dict) or set(defaults) != {"light", "dark"}:
+        raise ValueError("appearance defaults are not light and dark")
+    for name, theme in defaults.items():
+        semantic = theme.get("semanticColors") if isinstance(theme, dict) else None
+        if not isinstance(theme, dict) or set(theme) != THEME_KEYS or \
+                not all(isinstance(theme[k], str) and HEX_COLOR.fullmatch(theme[k]) for k in THEME_COLORS) or \
+                theme["accentSource"] not in ("chatgpt", "custom") or \
+                type(theme["contrast"]) is not int or not 0 <= theme["contrast"] <= 100 or \
+                type(theme["opaqueWindows"]) is not bool or not isinstance(semantic, dict) or set(semantic) != SEMANTIC_COLORS or \
+                not all(isinstance(c, str) and HEX_COLOR.fullmatch(c) for c in semantic.values()):
+            raise ValueError(f"appearance default {name} is not a complete app theme")
+    return {"fonts": css, "defaults": defaults}
+
+
+def store_apps(value: object, entries: list[dict]) -> list[dict]:
     """Microsoft Store apps Restore installs when absent (official WinGet, msstore source, exact id)
-    and otherwise only reads: the package family name's name and publisher id identify it."""
+    and otherwise only reads: the package family name's name and publisher id identify it. At most
+    one app may carry an appearance: it writes the one Codex user config."""
     if value is None:
         return []
     if not isinstance(value, list):
         raise ValueError("apps is not a list")
     for app in value:
-        if not isinstance(app, dict) or set(app) != APP_KEYS or app["source"] != "msstore" or \
+        if not isinstance(app, dict) or set(app) - {"appearance"} != APP_KEYS or app["source"] != "msstore" or \
                 not all(isinstance(app[k], str) for k in APP_KEYS) or \
                 not re.fullmatch(r"[0-9A-Z]{12}", app["id"]) or \
                 not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 .-]*", app["name"]) or \
@@ -402,7 +436,9 @@ def store_apps(value: object) -> list[dict]:
     for key in ("name", "id", "package"):
         if len({app[key].casefold() for app in value}) != len(value):
             raise ValueError(f"Two apps share a {key}")
-    return value
+    if sum("appearance" in app for app in value) > 1:
+        raise ValueError("Two apps preconfigure the one Codex config")
+    return [{**app, "appearance": appearance(app["appearance"], entries)} if "appearance" in app else app for app in value]
 
 
 def seed_preferences(seed: dict, entries: list[dict]) -> bytes:
@@ -431,7 +467,6 @@ def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
     noctty_files = noctty_inventory(noctty)
     registration = noctty_registration(selected["noctty"].get("registration"), noctty_files)
     packages = inventoried(selected.get("packages"))
-    apps = store_apps(selected.get("apps"))
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         shutil.copytree(fonts / "share", root / "share")
@@ -439,6 +474,7 @@ def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
         if not entries:
             raise ValueError("Empty font payload")
         ui = typography(selected.get("typography"), entries, packages)
+        apps = store_apps(selected.get("apps"), entries)
         for name in ("win.ps1", "proof.ps1", "handoff-proof.ps1", "handoff-evaluate.ps1",
                      "package-view.ps1", "ui-font.ahk", "README.md"):
             shutil.copyfile(scripts / name, root / name)

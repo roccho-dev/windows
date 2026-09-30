@@ -334,14 +334,15 @@ class CompilerTests(unittest.TestCase):
         noctty, cloudflared, choices, scripts = self.inputs()
         selected = json.loads(choices.read_text())
         selected["typography"] = {"desktop": "fixture", "interpreter": "Fixture"}
-        selected["apps"] = [self.APP]
+        selected["apps"] = [{**self.APP, "appearance": self.appearance()}]
         choices.write_text(json.dumps(selected))
         pack.distribution(fonts, noctty, cloudflared, choices, scripts, "test", self.root / "out")
         with zipfile.ZipFile(self.root / "out" / "windows-dist.zip") as z:
             manifest = json.loads(z.read("manifest.json"))
             self.assertIn("ui-font.ahk", manifest["files"])
         self.assertEqual(manifest["typography"], {"face": "Test Font", "interpreter": "Fixture", "script": "ui-font.ahk"})
-        self.assertEqual(manifest["apps"], [self.APP])
+        self.assertEqual(manifest["apps"], [{**self.APP, "appearance": {"fonts": {k: '"Test Font"' for k in ("ui", "code", "content")},
+                                                                          "defaults": self.appearance()["defaults"]}}])
         # Without either, the manifest says so and win.ps1 converges neither.
         pack.distribution(fonts, noctty, cloudflared, *self.inputs()[2:], "test", self.root / "none")
         with zipfile.ZipFile(self.root / "none" / "windows-dist.zip") as z:
@@ -369,9 +370,54 @@ class CompilerTests(unittest.TestCase):
             with self.subTest(case=case), self.assertRaisesRegex(ValueError, "typography"):
                 pack.typography(value, fonts, packages)
 
+    # The app's own complete themes (26.928.1915.0 `jq`, with accentSource), as nix.nix declares them.
+    THEMES = {"light": {"accent": "#339cff", "accentSource": "chatgpt", "contrast": 45, "ink": "#1a1c1f", "opaqueWindows": False,
+                        "surface": "#ffffff", "semanticColors": {"diffAdded": "#00a240", "diffRemoved": "#ba2623", "skill": "#924ff7"}},
+              "dark": {"accent": "#339cff", "accentSource": "chatgpt", "contrast": 60, "ink": "#ffffff", "opaqueWindows": False,
+                       "surface": "#181818", "semanticColors": {"diffAdded": "#40c977", "diffRemoved": "#fa423e", "skill": "#ad7bf9"}}}
+
+    def appearance(self, **changes):
+        value = {"fonts": {"ui": "fixture", "content": "fixture", "code": "fixture"}, "defaults": json.loads(json.dumps(self.THEMES))}
+        value.update(changes)
+        return value
+
+    def test_appearance_contract(self):
+        entries = [{"role": "ui", "family": "IBM Plex Sans JP"}, {"role": "terminal", "family": "PlemolJP Console NF"}]
+        good = self.appearance(fonts={"ui": "ui", "content": "ui", "code": "terminal"})
+        self.assertEqual(pack.appearance(good, entries)["fonts"],
+                         {"ui": '"IBM Plex Sans JP"', "content": '"IBM Plex Sans JP"', "code": '"PlemolJP Console NF"'})
+        self.assertEqual(pack.appearance(good, entries)["defaults"], self.THEMES)
+
+        def theme(name, **changes):
+            themes = json.loads(json.dumps(self.THEMES))
+            themes[name].update(changes)
+            return themes
+        bad = {
+            "unknown role": self.appearance(fonts={"ui": "ui", "content": "ui", "code": "serif"}),
+            "missing content": self.appearance(fonts={"ui": "ui", "code": "terminal"}),
+            "no dark default": self.appearance(defaults={"light": self.THEMES["light"]}),
+            # A theme with fonts alone is one the app drops: every color is required.
+            "font-only theme": self.appearance(defaults={**self.THEMES, "light": {}}),
+            "missing surface": self.appearance(defaults={**self.THEMES, "dark": {k: v for k, v in self.THEMES["dark"].items() if k != "surface"}}),
+            "short hex": self.appearance(defaults=theme("light", accent="#39f")),
+            "contrast above 100": self.appearance(defaults=theme("dark", contrast=101)),
+            "bool contrast": self.appearance(defaults=theme("dark", contrast=True)),
+            "string opaqueWindows": self.appearance(defaults=theme("dark", opaqueWindows="false")),
+            "other accentSource": self.appearance(defaults=theme("dark", accentSource="system")),
+            "fonts in a default": self.appearance(defaults=theme("dark", fonts={"ui": None})),
+            "a semantic color missing": self.appearance(defaults=theme("light", semanticColors={"diffAdded": "#00a240", "skill": "#924ff7"})),
+        }
+        for case, value in bad.items():
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                pack.appearance(value, entries)
+        with self.assertRaises(ValueError):
+            pack.appearance(good, [{"role": "ui", "family": 'A "quoted" family'}, {"role": "terminal", "family": "x"}])
+        with self.assertRaisesRegex(ValueError, "one Codex config"):
+            pack.store_apps([{**self.APP, "appearance": good},
+                             {**self.APP, "name": "Other", "id": "9ABCDEFGHIJK", "package": "Other.App", "appearance": good}], entries)
     def test_store_app_contract(self):
-        self.assertEqual(pack.store_apps([self.APP]), [self.APP])
-        self.assertEqual(pack.store_apps(None), [])
+        self.assertEqual(pack.store_apps([self.APP], []), [self.APP])
+        self.assertEqual(pack.store_apps(None, []), [])
         bad = {
             "not a list": self.APP,
             "extra key": [{**self.APP, "version": "1.0"}],
@@ -388,7 +434,7 @@ class CompilerTests(unittest.TestCase):
         }
         for case, value in bad.items():
             with self.subTest(case=case), self.assertRaises(ValueError):
-                pack.store_apps(value)
+                pack.store_apps(value, [])
 
     def test_distribution_is_deterministic_and_complete(self):
         fonts = self.payload()

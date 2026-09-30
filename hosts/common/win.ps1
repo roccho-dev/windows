@@ -12,8 +12,8 @@ param(
     # Apply only: the locked packages (exact names) to converge; Apply converges none without it,
     # Restore always all. With -File, pass them as one comma-separated argument.
     [string[]]$Packages,
-    # Apply only: converge the owned fonts and the desktop UI font faces alone (no Noctty, package or
-    # app), for a machine where Restore stops elsewhere (e.g. a machine-wide Noctty).
+    # Apply only: converge the owned fonts, the desktop UI font faces and the fonts of an app already present,
+    # alone (no Noctty, package or app install), for a machine where Restore stops elsewhere (e.g. a machine-wide Noctty).
     [switch]$Typography
 )
 
@@ -139,7 +139,18 @@ foreach ($app in $apps) {
         [string](Get-Field $app 'package') -cnotmatch '^[A-Za-z0-9][A-Za-z0-9.-]*\z' -or [string](Get-Field $app 'publisherId') -cnotmatch '^[a-z0-9]{13}\z') {
         throw "Invalid app in manifest: $(Get-Field $app 'name')"
     }
+    # Its font preconfiguration (pack.py): quoted CSS families for ui, code and content, and the app's own complete
+    # light and dark themes, used only where a theme is absent.
+    $appearance = Get-Field $app 'appearance'
+    if ($null -ne $appearance) {
+        $fonts = Get-Field $appearance 'fonts'
+        if (@('ui', 'code', 'content' | Where-Object { [string](Get-Field $fonts $_) -cnotmatch '^"[^"\\\x00-\x1f]+"\z' }).Count -or
+            @('light', 'dark' | Where-Object { Get-AppThemeProblem (New-AppTheme (Get-Field (Get-Field $appearance 'defaults') $_) $fonts) }).Count) {
+            throw "Invalid app appearance in manifest: $(Get-Field $app 'name')"
+        }
+    }
 }
+if (@($apps | Where-Object { $null -ne (Get-Field $_ 'appearance') }).Count -gt 1) { throw 'Two apps preconfigure the one Codex config.' }
 $packageDirectories = @($manifest.packages | ForEach-Object { $_.directory })
 if (@($packageDirectories | Sort-Object -Unique).Count -ne $packageDirectories.Count) { throw 'Duplicate package directory.' }
 $protectedPaths = @($manifest.packages | ForEach-Object { @($_.protected) })
@@ -644,6 +655,7 @@ function IsPackageTree([string]$Target) {
 function Observe($Effect) {
     $kind, $target = [string](Get-Field $Effect 'kind'), [string](Get-Field $Effect 'target')
     if ($kind -ceq 'ui-font-face' -and (Test-EffectPath $kind $target)) { return ObserveUiFont $target.Substring(4) }
+    if ($kind -ceq 'app-theme-fonts' -and (Test-EffectPath $kind $target)) { return ObserveAppFonts $target.Substring('codex-config:desktop.'.Length) }
     if ($kind -ceq 'file-created' -and [IO.Path]::GetDirectoryName($target) -eq $fontDirectory -and
         [IO.Path]::GetFileName($target) -match '^[0-9a-f]{64}\.ttf$') { return ObserveFile $target }
     if ($kind -ceq 'registry-value' -and $target -eq $fontKey) { return ObserveValue ([string](Get-Field $Effect 'name')) }
@@ -670,8 +682,8 @@ function OpenAttempt([string]$Id) {
     if ($attempt.problem) { throw "Effect ledger id ${Id}: $($attempt.problem)" }
     if ($attempt.closed) { return @() }
     $open = @($attempt.records)
-    # A UI font slot always holds a face: its prior is the face written back, not content owned.
-    if ($open.Count -and (Get-Field (Get-Field $open[0] 'prior') 'exists') -and (Get-Field $open[0] 'kind') -cne 'ui-font-face') {
+    # A UI font slot always holds a face, and an app theme some fonts: the prior is written back, not content owned.
+    if ($open.Count -and (Get-Field (Get-Field $open[0] 'prior') 'exists') -and (Get-Field $open[0] 'kind') -cnotin @('ui-font-face', 'app-theme-fonts')) {
         throw "Effect ledger id $Id owns a target that existed before; this version owns only what it created."
     }
     return $open
@@ -733,7 +745,8 @@ function RecoverId([string]$Id) {
     if ($class.resolution) { ResolveAttempt $open ($(if ($class.resolution -ceq 'confirm') { 'commit' } else { $class.resolution })) }
 }
 
-function RecoverLedger { foreach ($id in @(LedgerIds)) { RecoverId $id } }
+# App font effects are read through the app's config service, so only ConvergeAppFonts and Uninstall (-All) recover them.
+function RecoverLedger([switch]$All) { foreach ($id in @(LedgerIds)) { if ($All -or -not (IsAppFontEffect @(RecordsOf $id)[0])) { RecoverId $id } } }
 
 # Every Fonts value that names a file, in HKCU and both HKLM views, resolved to a
 # full path (a bare file name is under %WINDIR%\Fonts). $Excluded are HKCU value
@@ -962,10 +975,10 @@ function ConvergeEffect($Effect, [string]$Label, [scriptblock]$Create) {
 # still names a file when that file goes, and a key has lost what the plan owns in it before it
 # goes. (The plan orders ids by their latest attempt.) Any other step stops the run.
 function OrderedSteps($Plan) {
-    $rank = @{ 'ui-font-face' = -1; 'registry-value' = 0; 'registry-key-created' = 1; 'file-created' = 2; 'tree-extracted' = 3 }
+    $rank = @{ 'ui-font-face' = -1; 'app-theme-fonts' = -1; 'registry-value' = 0; 'registry-key-created' = 1; 'file-created' = 2; 'tree-extracted' = 3 }
     $steps, $order = @($Plan.steps), 0
     foreach ($step in $steps) {
-        if ($step.action -cnotin @('set-ui-font-face', 'delete-registry-value', 'delete-empty-key', 'delete-file', 'remove-empty-directory') -or
+        if ($step.action -cnotin @('set-ui-font-face', 'set-app-theme-fonts', 'delete-registry-value', 'delete-empty-key', 'delete-file', 'remove-empty-directory') -or
             -not $rank.ContainsKey([string]$step.kind)) { throw "Unsupported undo step $($step.action)." }
     }
     @($steps | ForEach-Object { [pscustomobject]@{ step = $_; rank = $rank[[string]$_.kind]; order = $order++
@@ -987,6 +1000,7 @@ function UndoOwnedSteps($Steps) {
                         if ((ObserveUiFont $one.slot).face -cne $one.expectFace) { throw "Refusing to revert UI font $($one.slot): it changed since it was read." }
                         UiFontSet $one.face @{ $one.slot = $one.expectFace }
                     }
+                    'set-app-theme-fonts' { UndoAppFonts $one $null }
                     'delete-registry-value' { RemoveTarget $open[0] ([ordered]@{ exists = $true; type = $one.expectType; data = $one.expectData }) }
                     'delete-empty-key' { RemoveTarget $open[0] ([ordered]@{ exists = $true }) }
                     'remove-empty-directory' { if (Test-Path -LiteralPath $one.path -PathType Container) { [IO.Directory]::Delete($one.path, $false) } }
@@ -1018,7 +1032,8 @@ function IsFontEffect($Record) {
 # directory), key\name (value) or key (created key). Steps are dictionaries, and under strict mode
 # a missing key throws, so each shape is checked, not assumed.
 function StepText($Step) {
-    $on = if ($Step.Contains('path')) { $Step.path } elseif ($Step.Contains('slot')) { "spi:$($Step.slot) '$($Step.expectFace)' -> '$($Step.face)'" }
+    $on = if ($Step.Contains('path')) { $Step.path } elseif ($Step.Contains('expectFonts')) { "codex-config:desktop.$($Step.theme)" }
+        elseif ($Step.Contains('slot')) { "spi:$($Step.slot) '$($Step.expectFace)' -> '$($Step.face)'" }
         elseif ($Step.Contains('name')) { "$($Step.key)\$($Step.name)" } else { $Step.key }
     "$($Step.action) $on"
 }
@@ -1043,9 +1058,9 @@ function CollectFontGarbage($Selected) {
         return
     }
     $steps = @(OrderedSteps $plan)
-    $faces = @(UiFaces)
+    $faces = @(UiFaces) + @(AppFontFamilies)
     $held = @($steps | Where-Object { $_.action -ceq 'delete-registry-value' -and $_.key -eq $fontKey -and (NamesFace $_.name $faces) })
-    $script:gcKeptReferenced += @($held | ForEach-Object { "$fontKey\$($_.name) (a UI font slot names its family)" })
+    $script:gcKeptReferenced += @($held | ForEach-Object { "$fontKey\$($_.name) (a UI font slot or owned app font names its family)" })
     $steps = @($steps | Where-Object { @($held | ForEach-Object { $_.id }) -cnotcontains $_.id })
     $table = @(FontReferenceTable (FontValueNames $steps))
     $keep = @($steps | Where-Object { (IsFontFile $_) -and @(FontReferences $table $_.path $_.expectSha256).Count })
@@ -1220,7 +1235,7 @@ $script:appDrift = @()
 function AppStates {
     foreach ($app in $apps) {
         $found = @(Get-AppxPackage -Name $app.package | ForEach-Object {
-            [pscustomobject]@{ name = [string]$_.Name; publisherId = [string]$_.PublisherId; version = [string]$_.Version } })
+            [pscustomobject]@{ name = [string]$_.Name; publisherId = [string]$_.PublisherId; version = [string]$_.Version; installLocation = [string]$_.InstallLocation } })
         [pscustomobject]@{ app = $app; found = $found; action = (Get-AppAction $found $app) }
     }
 }
@@ -1233,6 +1248,235 @@ function ConvergeApps {
         $null = Invoke-Native $winget @('install', '--id', $state.app.id, '--source', 'msstore', '--exact', '--silent', '--disable-interactivity',
             '--accept-package-agreements', '--accept-source-agreements') 1800
         $script:changed++
+    }
+}
+
+# ---- ChatGPT app fonts (app-theme-fonts effects) through the app's own config service ----------------
+# The app keeps its appearance in the user's Codex config (desktop.appearance{Light,Dark}ChromeTheme). It is read and
+# written only through the codex.exe app-server the installed package bundles, as the app itself does:
+# initialize, config/read with layers, one config/batchWrite guarded by the user layer's expectedVersion, read back.
+# No model, thread or account request is made; nothing else of the app (its data, state, other settings) is read
+# for output or written. Starting the service lets it do its normal runtime bookkeeping under the Codex home.
+# A running app keeps its theme in memory until it restarts, and writes the whole theme itself when the user
+# changes appearance, which then wins (owned-drift here). Nothing here starts, stops or restarts the app.
+$script:appFontDrift, $script:appRead = @(), $null
+$appearanceApp = @($apps | Where-Object { $null -ne (Get-Field $_ 'appearance') })[0]
+function IsAppFontEffect($Record) { (Get-Field $Record 'kind') -ceq 'app-theme-fonts' }
+function AppFontsPresent { @(AppStates | Where-Object { $_.app.package -ceq $appearanceApp.package -and $_.action -ceq 'present' }).Count -eq 1 }
+
+# The present app's bundled codex.exe (Get-AppAction: exactly one package of that name and publisher).
+function AppServerExe {
+    $state = @(AppStates | Where-Object { $_.app.package -ceq $appearanceApp.package })[0]
+    if ($null -eq $state -or $state.action -cne 'present') { throw "$($appearanceApp.name) is not installed (one package $($appearanceApp.package) of publisher $($appearanceApp.publisherId)); its config service is unavailable." }
+    $exe = Join-Path $state.found[0].installLocation 'app\resources\codex.exe'
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "$exe is missing." }
+    $exe
+}
+
+# One app-server session: a process whose stdin, stdout and stderr are UTF-8 pipes, stderr drained (never printed:
+# it may hold config), every request answered before one absolute deadline; closed only if it started.
+function NewAppSession { [pscustomobject]@{ process = $null; started = $false; stderr = $null; pending = $null; next = 0; deadline = [DateTime]::UtcNow.AddSeconds(120) } }
+function StartAppSession($Session) {
+    $info = [Diagnostics.ProcessStartInfo]::new((AppServerExe), 'app-server')
+    $info.UseShellExecute, $info.CreateNoWindow = $false, $true
+    $info.RedirectStandardInput, $info.RedirectStandardOutput, $info.RedirectStandardError = $true, $true, $true
+    $info.StandardOutputEncoding, $info.StandardErrorEncoding = [Text.UTF8Encoding]::new($false), [Text.UTF8Encoding]::new($false)
+    $Session.process = [Diagnostics.Process]::new()
+    $Session.process.StartInfo = $info
+    # Windows PowerShell 5.1's stdin writer takes the console input encoding and writes its preamble at start: a UTF-8
+    # BOM the service rejects ("expected value at line 1 column 1"). Start with the same code page without a
+    # preamble, then put the console's encoding back.
+    $console = $null
+    try { if ([Console]::InputEncoding.GetPreamble().Length) { $console = [Console]::InputEncoding; [Console]::InputEncoding = [Text.UTF8Encoding]::new($false) } } catch { $console = $null }
+    try { $Session.started = $Session.process.Start() } finally { if ($null -ne $console) { try { [Console]::InputEncoding = $console } catch { } } }
+    if ($Session.process.StandardInput.Encoding.GetPreamble().Length) { throw "The $($appearanceApp.name) config service cannot be given a UTF-8 pipe without a byte order mark here." }
+    $Session.stderr = $Session.process.StandardError.ReadToEndAsync()
+    $null = AppCall $Session 'initialize' @{ clientInfo = @{ name = 'windows_iac'; title = 'windows-iac'; version = '1' } }
+    AppSend $Session ([ordered]@{ method = 'initialized'; params = @{} })
+}
+function CloseAppSession($Session) {
+    if ($null -eq $Session.process) { return }
+    try {
+        if ($Session.started) {
+            try { $Session.process.StandardInput.Close() } catch { }
+            if (-not $Session.process.WaitForExit(5000)) { try { $Session.process.Kill() } catch { }; $null = $Session.process.WaitForExit(5000) }
+        }
+    } finally { $Session.process.Dispose() }
+}
+# stdin as UTF-8 bytes (Windows PowerShell 5.1 has no StandardInputEncoding), one JSON message per line.
+function AppSend($Session, $Message) {
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Message | ConvertTo-Json -Depth 20 -Compress) + "`n")
+    $Session.process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+    $Session.process.StandardInput.BaseStream.Flush()
+}
+# One request and its answer; notifications and other messages are skipped. An error answer stops the run with the
+# service's message only, never a line of output.
+function AppCall($Session, [string]$Method, $Params) {
+    $Session.next++
+    $id = $Session.next
+    AppSend $Session ([ordered]@{ id = $id; method = $Method; params = $Params })
+    while ($true) {
+        $left = ($Session.deadline - [DateTime]::UtcNow).TotalMilliseconds
+        if ($null -eq $Session.pending) { $Session.pending = $Session.process.StandardOutput.ReadLineAsync() }
+        if ($left -le 0 -or -not $Session.pending.Wait([int][Math]::Max(0, $left))) { throw "The $($appearanceApp.name) config service did not answer $Method in time." }
+        $line = $Session.pending.Result
+        $Session.pending = $null
+        if ($null -eq $line) { throw "The $($appearanceApp.name) config service ended during $Method." }
+        if (-not $line.Trim()) { continue }
+        try { $message = $line | ConvertFrom-Json } catch { throw "The $($appearanceApp.name) config service answered $Method with a line that is not JSON." }
+        if ($null -ne (Get-Field $message 'method') -or [string](Get-Field $message 'id') -cne [string]$id) { continue }
+        $failure = Get-Field $message 'error'
+        if ($null -ne $failure) { throw "The $($appearanceApp.name) config service refused ${Method}: $(Get-Field $failure 'message')" }
+        return (Get-Field $message 'result')
+    }
+}
+
+# The config as the service reads it: the effective config, and exactly the user layer (the one without a profile)
+# with its file and version. A disabled (read-only) or repeated user layer stops the run; no user layer is accepted
+# only while the default config file does not exist (a fresh install), and then nothing guards the version.
+function ReadAppConfig($Session) {
+    $read = AppCall $Session 'config/read' @{ includeLayers = $true; cwd = $null }
+    $users = @(Get-Field $read 'layers' | Where-Object { (Get-Field (Get-Field $_ 'name') 'type') -ceq 'user' -and $null -eq (Get-Field (Get-Field $_ 'name') 'profile') })
+    $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }  # not $home: that is $HOME
+    if ($users.Count -gt 1) { throw 'The Codex config has more than one user layer; nothing is written.' }
+    if ($users.Count -eq 0 -and (Test-Path -LiteralPath (Join-Path $codexHome 'config.toml'))) { throw 'The Codex config service reads no user layer beside an existing config.toml; nothing is written.' }
+    if ($users.Count -and $null -ne (Get-Field $users[0] 'disabledReason')) { throw "The Codex user config is disabled: $(Get-Field $users[0] 'disabledReason')" }
+    [pscustomobject]@{ effective = (Get-Field $read 'config')
+        user = $(if ($users.Count) { ConvertFrom-LayerNumbers (Get-Field $users[0] 'config') } else { $null })
+        version = $(if ($users.Count) { [string](Get-Field $users[0] 'version') } else { $null })
+        file = $(if ($users.Count) { [string](Get-Field (Get-Field $users[0] 'name') 'file') } else { $null }) }
+}
+
+# The last reading, or one new session's reading; every write replaces it.
+function AppConfig {
+    if ($null -eq $script:appRead) {
+        $session = NewAppSession
+        try { StartAppSession $session; $script:appRead = ReadAppConfig $session } finally { CloseAppSession $session }
+    }
+    $script:appRead
+}
+function AppTheme($Read, [string]$Key) { Get-Field (Get-Field $Read.user 'desktop') $Key }
+function ObserveAppFonts([string]$Key) { [ordered]@{ exists = $true; fonts = (Get-AppFontsState (Get-Field (AppTheme (AppConfig) $Key) 'fonts')) } }
+
+function AppFontEffects {
+    $fonts = $appearanceApp.appearance.fonts
+    foreach ($key in Get-AppThemeKeys) {
+        [ordered]@{ id = "app-theme-fonts:CODEX-CONFIG:DESKTOP.$($key.ToUpperInvariant())"; kind = 'app-theme-fonts'; target = "codex-config:desktop.$key"
+            prior = $null; desired = [ordered]@{ exists = $true; fonts = [ordered]@{ ui = $fonts.ui; code = $fonts.code; content = $fonts.content } } }
+    }
+}
+
+# The families the owned app fonts name, from the ledger alone (font collection keeps them).
+function AppFontFamilies {
+    foreach ($id in @(LedgerIds | Where-Object { IsAppFontEffect @(RecordsOf $_)[0] })) {
+        $open = @(OpenAttempt $id)
+        if ($open.Count) { foreach ($value in (Get-AppFontsState (Get-Field (Get-Field $open[0] 'desired') 'fonts')).Values) { if ($value -is [string]) { Get-CssFamilies $value } } }
+    }
+}
+
+# One batchWrite of $Edits in $Session against the reading $Read, and the reading after it. Everything in the user
+# config but what $Keys/$Created may change must be unchanged (Get-AppConfigRest), or the run stops as drift.
+function WriteAppConfig($Session, $Read, $Edits, [string[]]$Keys, [string[]]$Created) {
+    $before = Get-AppConfigRest $Read.user $Keys $Created
+    $script:appRead = $null
+    $result = AppCall $Session 'config/batchWrite' ([ordered]@{ edits = @($Edits); filePath = $(if ($Read.file) { $Read.file } else { $null })
+        expectedVersion = $Read.version; reloadUserConfig = $true })
+    $script:appRead = ReadAppConfig $Session
+    $script:changed++
+    if ((Get-Field $result 'status') -cne 'ok') { $script:appFontDrift += "the written app fonts are overridden by another config layer ($(Get-Field $result 'status'))" }
+    if ((Get-AppConfigRest $script:appRead.user $Keys $Created) -cne $before) { $script:appFontDrift += 'the Codex user config changed beyond the app fonts during the write; check it' }
+    $script:appRead
+}
+
+# Undo of one owned theme's fonts (Get-AppFontUndoEdits), in $Session or a new one, only while the fonts are those written.
+function UndoAppFonts($Step, $Session) {
+    $own = $null -eq $Session
+    if ($own) { $Session = NewAppSession }
+    try {
+        if ($own) { StartAppSession $Session }
+        $read = ReadAppConfig $Session
+        $script:appRead = $read
+        $theme = AppTheme $read $Step.theme
+        if ((ConvertTo-CanonicalJson (Get-AppFontsState (Get-Field $theme 'fonts'))) -cne (ConvertTo-CanonicalJson $Step.expectFonts)) {
+            throw "Refusing to revert the app fonts of $($Step.theme): they changed since they were read."
+        }
+        $edits = Get-AppFontUndoEdits $Step $theme
+        $whole = @($edits | Where-Object { $_.keyPath -ceq "desktop.$($Step.theme)" }).Count -gt 0
+        $null = WriteAppConfig $Session $read $edits @($Step.theme) @(if ($whole) { $Step.theme })
+    } finally { if ($own) { CloseAppSession $Session } }
+}
+
+# Apply -Typography and Restore, for the present app: in one session, recovery of these two effects, their classes, a
+# changed selection reverted first, then one intent per theme to write, one batchWrite (expectedVersion), the reading
+# after it and a commit per theme read back. A theme another config layer sets, or one the app would drop as invalid
+# after the change, is drift and not written; so are fonts changed after this wrote them.
+function ConvergeAppFonts {
+    $session = NewAppSession
+    try {
+        StartAppSession $session
+        $script:appRead = ReadAppConfig $session
+        foreach ($effect in @(AppFontEffects)) { RecoverId $effect.id }
+        $states = @(AppFontEffects | ForEach-Object { [pscustomobject]@{ effect = $_; state = (Classify $_) } })
+        foreach ($s in $states) {
+            if ($s.state.class -cnotin @('absent', 'owned-match', 'owned-drift', 'preexisting-match')) { throw "App fonts $($s.effect.target) are $($s.state.class): $($s.state.reason)" }
+        }
+        $script:appFontDrift += @($states | Where-Object { $_.state.class -ceq 'owned-drift' } | ForEach-Object { "$($_.effect.target) fonts differ from those this wrote; not written" })
+        $changed = @($states | Where-Object { $_.state.class -ceq 'owned-match' -and -not (Test-EffectStateEqual 'app-theme-fonts' $_.state.recorded $_.effect.desired) })
+        foreach ($s in $changed) {
+            $step = @(Get-UndoSteps @(OpenAttempt $s.effect.id)[0])[0]
+            UndoAppFonts $step $session
+            WriteRecord 'undone' @(OpenAttempt $s.effect.id)[0] (Observe $s.effect)
+        }
+        $read = AppConfig
+        $write, $edits, $created = @(), @(), @()
+        foreach ($effect in @(@($states | Where-Object { $_.state.class -ceq 'absent' }) + $changed | ForEach-Object { $_.effect })) {
+            $key = $effect.target.Substring('codex-config:desktop.'.Length)
+            $theme = AppTheme $read $key
+            if ((ConvertTo-CanonicalJson (Get-Field (Get-Field $read.effective 'desktop') $key)) -cne (ConvertTo-CanonicalJson $theme)) {
+                $script:appFontDrift += "another Codex config layer sets desktop.$key; not written"; continue
+            }
+            $themeEdits = Get-AppFontEdits $key $theme $effect.desired.fonts (Get-Field $appearanceApp.appearance.defaults $(if ($key -clike '*Light*') { 'light' } else { 'dark' }))
+            $after = Get-AppThemeAfter $key $theme $themeEdits
+            $problem = Get-AppThemeProblem $after
+            if ($problem) { $script:appFontDrift += "desktop.$key would not be a theme the app accepts ($problem); not written"; continue }
+            $effect.prior = ObserveAppFonts $key
+            if ($null -eq $theme) { $effect.desired.theme = $after; $created += $key }
+            $write += $effect
+            $edits += $themeEdits
+        }
+        if (-not $write.Count) { return }
+        foreach ($effect in $write) { WriteRecord 'intent' $effect $null $null }
+        try {
+            $null = WriteAppConfig $session $read $edits @(Get-AppThemeKeys) $created
+            $wrong = @($write | Where-Object { -not (Test-EffectStateEqual 'app-theme-fonts' $_.desired (Observe $_)) } | ForEach-Object { $_.target })
+            if ($wrong.Count) { throw "The Codex user config does not read back the app fonts for $($wrong -join ', ')." }
+        } catch {
+            $failure = $_
+            try { $script:appRead = ReadAppConfig $session } catch { $script:appRead = $null }  # recovery reads this session's state
+            foreach ($effect in $write) { try { RecoverId $effect.id } catch { Write-Warning "Recovery of $($effect.id) deferred: $($_.Exception.Message)" } }
+            throw $failure
+        }
+        foreach ($effect in $write) { WriteRecord 'commit' $effect (Observe $effect) }
+        foreach ($effect in $write) {
+            $key = $effect.target.Substring('codex-config:desktop.'.Length)
+            $effective = Get-AppFontsState (Get-Field (Get-Field (Get-Field $script:appRead.effective 'desktop') $key) 'fonts')
+            if ((ConvertTo-CanonicalJson $effective) -cne (ConvertTo-CanonicalJson $effect.desired.fonts)) { $script:appFontDrift += "desktop.$key fonts are overridden by another config layer" }
+        }
+    } finally { CloseAppSession $session }
+}
+
+# Read-only (the service still does its bookkeeping): both themes of the present app name the selected fonts, in the
+# user layer and in effect, and each theme is one the app accepts.
+function AssertAppFonts {
+    $read = AppConfig
+    foreach ($effect in @(AppFontEffects)) {
+        $key = $effect.target.Substring('codex-config:desktop.'.Length)
+        $user, $effective = (AppTheme $read $key), (Get-Field (Get-Field $read.effective 'desktop') $key)
+        foreach ($theme in @($user, $effective)) {
+            $problem = if ($null -eq $theme) { 'absent' } else { Get-AppThemeProblem $theme }
+            if (-not $problem -and (ConvertTo-CanonicalJson (Get-AppFontsState (Get-Field $theme 'fonts'))) -cne (ConvertTo-CanonicalJson $effect.desired.fonts)) { $problem = 'other fonts' }
+            if ($problem) { throw "App font drift: desktop.$key is $problem." }
+        }
     }
 }
 
@@ -1761,7 +2005,7 @@ function Uninstall {
     $null = ReadLedger
     $observations = @{}
     try {
-        if ($Apply -and $found) { RecoverLedger }
+        if ($Apply -and $found) { RecoverLedger -All }
         foreach ($id in @(LedgerIds)) { $observations[$id] = Observe @(RecordsOf $id)[0] }
     } catch {
         throw "Uninstall refused for $($script:runIdentity.sid) (elevated: $($script:runIdentity.elevated)): $($_.Exception.Message)"
@@ -1818,7 +2062,7 @@ function Uninstall {
     }
     $answer = [ordered]@{ mode = $Mode; apply = [bool]$Apply; source = $manifest.source; identity = $script:runIdentity
         ledgerFound = $found; siloCheck = 'notPerformed'
-        scope = 'owned fonts, desktop UI font faces, Noctty, package trees and their App Paths names visible to this process, and the default-terminal selection this distribution wrote; protected package data (a browser profile), Store apps and RentSsh are not in the ledger'
+        scope = 'owned fonts, desktop UI font faces, the ChatGPT app''s theme fonts, Noctty, package trees and their App Paths names visible to this process, and the default-terminal selection this distribution wrote; protected package data (a browser profile), Store apps and RentSsh are not in the ledger'
         planned = @($steps | ForEach-Object { StepText $_ })
         resolutions = @($plan.resolutions | ForEach-Object { "$($_.id): $($_.resolution)" }); resumed = @($plan.resumed)
         defaultTerminal = $legacy.action
@@ -1831,6 +2075,7 @@ function Uninstall {
         registrationState = $(if (TestNocttyRegistration) { 'registered' } else { 'unregistered' }); handoffProof = 'unproven' }
     $answer | ConvertTo-Json -Compress -Depth 4
     if ($refused.Count) { throw "Uninstall refused; nothing was removed: $($refused -join '; ')" }
+    if ($script:appFontDrift.Count) { throw "App font drift: $($script:appFontDrift -join '; ')" }
 }
 
 $script:runIdentity = RunIdentity
@@ -1844,11 +2089,13 @@ try {
     $ledgerFound, $nocttyPlan, $appStates = $false, $null, @()
     # UI font faces: Restore, and Apply -Typography; checked by RestoreTest too.
     $uiFont = $null -ne $typography -and ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest' -or $Typography)
+    # The app's fonts likewise, for an app already present: -Typography never installs it, Restore does first.
+    $appFonts, $appFontsResult = ($null -ne $appearanceApp -and ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest' -or $Typography)), 'notEvaluated'
     if ($Mode -eq 'Apply' -or $Mode -eq 'Restore') {
         # Owned fonts and Noctty through the effect ledger (native files, trees and HKCU keys and
         # values): recovery, then every Noctty and font effect is classified before the first
         # one; fonts, then the UI font faces, then Noctty (tree, configuration, keys, values), then
-        # the selection. -Typography converges the fonts and the UI font faces alone.
+        # the selection. -Typography converges the fonts, the UI font faces and a present app's fonts alone.
         $ledgerFound = Test-Path -LiteralPath $ledgerDirectory -PathType Container
         LockLedger
         $null = ReadLedger
@@ -1869,11 +2116,16 @@ try {
             if ($Mode -eq 'Restore') { ConvergeApps }
         }
         ConvergeFonts
-        # The faces move only onto exact selected fonts, and old fonts go only once no slot names them.
-        if ($uiFont -and -not $script:fontDrift.Count) { AssertFonts; ConvergeUiFont }
+        # The faces and the app's fonts move only onto exact selected fonts, and old fonts go only once nothing names them.
+        if (($uiFont -or $appFonts) -and -not $script:fontDrift.Count) {
+            AssertFonts
+            if ($uiFont) { ConvergeUiFont }
+            if ($appFonts -and (AppFontsPresent)) { ConvergeAppFonts }
+        }
         CollectUnselectedFonts
         if ($script:fontDrift.Count) { throw "Font drift: $($script:fontDrift -join '; ')" }
         if ($script:uiFontDrift.Count) { throw "UI font drift: $($script:uiFontDrift -join '; ')" }
+        if ($script:appFontDrift.Count) { throw "App font drift: $($script:appFontDrift -join '; ')" }
         if (-not $Typography) {
             ApplyNoctty $nocttyPlan
             SelectNoctty -Check:($Mode -eq 'Restore')
@@ -1883,6 +2135,7 @@ try {
     }
     if ($Mode -ne 'Validate') { AssertFonts }
     if ($uiFont) { AssertUiFont }
+    if ($appFonts) { if (AppFontsPresent) { AssertAppFonts; $appFontsResult = 'selected' } else { $appFontsResult = 'appAbsent' } }
     if ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest') {
         $appStates = @(AppStates)
         $script:appDrift += @($appStates | Where-Object { $_.action -cne 'present' } | ForEach-Object {
@@ -1920,6 +2173,7 @@ try {
             $state = @($packageStates | Where-Object { $_.package.name -ceq $name })
             [ordered]@{ name = $name; version = $_.version
                 class = $(if ($state.Count) { $state[0].class } else { 'notEvaluated' }) } });
+        appFonts = $appFontsResult
         uiFont = $(if ($uiFont) { [ordered]@{ face = $typography.face; slots = @(Get-UiFontSlots) } } else { 'notEvaluated' })
         # Store apps: the version installed now; the Store moves it, and installing needs the network.
         apps = @($apps | ForEach-Object {
