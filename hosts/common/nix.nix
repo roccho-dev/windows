@@ -48,16 +48,89 @@ let
     url = "https://github.com/cloudflare/cloudflared/releases/download/${cloudflaredVersion}/cloudflared-windows-amd64.exe";
     sha256 = "5253e66f1f493c4e13539749f1aa86fd0c61e3072900fec29a44ba046a6d97e2";
   };
+  # Release-asset locks. The bytes are never bundled; the build fetches them only
+  # to verify the lock and pin the extracted file inventory; Restore must fetch
+  # and verify them again before any effect. Paths are relative to
+  # %LOCALAPPDATA% with '/' separators and must be names Windows recreates exactly.
+  #   directory   the only owned effect: the inventoried per-file tree, current user only;
+  #               no registry, shortcut, PATH or machine-scope effect. The inventory
+  #               lists files only; an archive with a directory holding no file fails
+  #               the build, so every directory is a parent of a listed file.
+  #   executable  a required file of that tree
+  #   existing    presence: an HKCU or HKLM Uninstall\<uninstallKey> entry with this
+  #               DisplayName and Publisher makes the product preexisting, never absent,
+  #               wherever that entry's own InstallLocation points. It is
+  #               preexisting-match only when its DisplayVersion and the ProductVersion
+  #               of <entry InstallLocation>/<existing.executable> equal version, else
+  #               preexisting-drift (also when InstallLocation is missing or unreadable).
+  #               Either way nothing is installed or written. existing.installLocation
+  #               is only the expected current-user location, kept disjoint from directory.
+  #   protected   runtime data the product uses but no mode owns, writes or removes
+  packageLocks = [
+    {
+      # Hibbiki third-party build (the approved exception). sha256 is GitHub's
+      # asset digest; sha1 is the one the publisher states on the release page.
+      name = "Chromium";
+      version = "154.0.8037.58";
+      url = "https://github.com/Hibbiki/chromium-win64/releases/download/v154.0.8037.58-r1689415/chrome.7z";
+      format = "7z";
+      size = 443675526;
+      sha256 = "c1b9d1384fe5e342d834c36e40aec905e6c534ca1292026a16293bc36d8b732c";
+      sha1 = "b154facbc2e76d781c162a504953a81d8062c8ea";
+      scope = "user";
+      effect = "tree-extracted";
+      directory = "Programs/chromium-154.0.8037.58";
+      executable = "Chrome-bin/chrome.exe";
+      existing = {
+        uninstallKey = "Chromium";
+        displayName = "Chromium";
+        publisher = "The Chromium Authors";
+        installLocation = "Chromium/Application";
+        executable = "chrome.exe";
+      };
+      # Without --user-data-dir this build uses the synced profile's location.
+      protected = [ "Chromium/User Data" ];
+    }
+    {
+      # Official release; publisher SHA256 equals GitHub's asset digest.
+      name = "AutoHotkey";
+      version = "2.0.28";
+      url = "https://github.com/AutoHotkey/AutoHotkey/releases/download/v2.0.28/AutoHotkey_2.0.28.zip";
+      format = "zip";
+      size = 3155126;
+      sha256 = "b63be7548792b4ad0dfe424d91cc69376694ed2f758245b7a75a0c77d693b478";
+      scope = "user";
+      effect = "tree-extracted";
+      directory = "Programs/autohotkey-2.0.28";
+      executable = "AutoHotkey64.exe";
+      existing = {
+        uninstallKey = "AutoHotkey";
+        displayName = "AutoHotkey (user)";
+        publisher = "AutoHotkey Foundation LLC";
+        installLocation = "Programs/AutoHotkey";
+        executable = "v2/AutoHotkey64.exe";
+      };
+      protected = [ ];
+    }
+  ];
+  # The fixed-output fetch checks sha256; pack.py checks size, sha1 and the
+  # archive listing, and inventories the tree 7-Zip extracts.
+  inventory = lock: let
+    archive = pkgs.fetchurl { inherit (lock) url sha256; };
+  in pkgs.runCommand "package-inventory-${lock.name}" { nativeBuildInputs = [ python pkgs._7zz ]; } ''
+    7zz l -slt ${archive} > listing.txt
+    python ${./pack.py} listing listing.txt
+    mkdir tree
+    7zz x -y -otree ${archive} > /dev/null
+    python ${./pack.py} inventory ${pkgs.writeText "${lock.name}-lock.json" (builtins.toJSON lock)} ${archive} listing.txt tree "$out"
+  '';
   windowsChoices = pkgs.writeText "windows-restore-selection.json" (builtins.toJSON {
     noctty = {
       version = nocttyVersion;
       fontFamily = "PlemolJP Console NF";
     };
     cloudflared.version = cloudflaredVersion;
-    packages = [
-      { name = "Chromium"; id = "Hibbiki.Chromium"; version = "154.0.8037.58"; }
-      { name = "AutoHotkey"; id = "AutoHotkey.AutoHotkey"; version = "2.0.28"; }
-    ];
+    packages = map (lock: lock // { inventory = "${inventory lock}"; }) packageLocks;
   });
   fonts = pkgs.runCommand "common-fonts" { nativeBuildInputs = [ python ]; } ''
     python ${./pack.py} fonts ${policy} "$out"

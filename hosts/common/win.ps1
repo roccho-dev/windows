@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 if ($env:OS -ne 'Windows_NT') { throw 'This activation backend requires Windows.' }
 $root = [IO.Path]::GetFullPath($PSScriptRoot) + [IO.Path]::DirectorySeparatorChar
 $manifest = Get-Content -LiteralPath (Join-Path $root 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
-if ($manifest.schemaVersion -ne 2 -or @($manifest.fonts).Count -eq 0 -or
+if ($manifest.schemaVersion -ne 3 -or @($manifest.fonts).Count -eq 0 -or
     @($manifest.packages).Count -eq 0 -or -not $manifest.noctty.version) {
     throw 'Invalid or empty distribution.'
 }
@@ -47,10 +47,153 @@ foreach ($file in Get-ChildItem -LiteralPath $root -Recurse -Force) {
 }
 $exe = BundlePath $manifest.backend
 if (-not $inventory.ContainsKey($manifest.backend)) { throw 'Unlisted backend.' }
-# Function definitions only: the pure evaluators (selection comparison, package
-# pins) and the package-context reader.
+# Function definitions only: the pure evaluators (selection comparison, path
+# segments, effect classes) and the package-context reader.
 . (BundlePath 'handoff-evaluate.ps1')
 . (BundlePath 'package-view.ps1')
+$localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+
+# ---- Pinned release-asset packages (manifest schema 3) ----------------------
+# nix.nix owns each lock and pack.py validates all of it at build. Here only the
+# shape this script reads is checked; it is not a defence, since manifest.json is
+# outside the bundle inventory. Paths are relative to %LOCALAPPDATA% with '/'.
+
+function TestWindowsRelative($Path) {
+    if ($Path -isnot [string] -or $Path -eq '') { return $false }
+    foreach ($segment in $Path.Split('/')) { if (-not (Test-PathSegment $segment)) { return $false } }
+    return $true
+}
+
+# True when one relative path equals or contains the other, per segment, ignoring case.
+function PathsOverlap([string]$One, [string]$Other) {
+    $a = $One.ToUpperInvariant().Split('/')
+    $b = $Other.ToUpperInvariant().Split('/')
+    for ($i = 0; $i -lt [Math]::Min($a.Count, $b.Count); $i++) { if ($a[$i] -cne $b[$i]) { return $false } }
+    return $true
+}
+
+# What this script reads of one package: name and version (which form the owned
+# directory Programs/<name>-<version>), the executable in the pinned inventory,
+# the five existing-install identity strings, and the protected paths, all as
+# Windows paths; the owned directory may not overlap an unowned path.
+function AssertPackageShape($Package) {
+    $name, $version, $existing = (Get-Field $Package 'name'), (Get-Field $Package 'version'), (Get-Field $Package 'existing')
+    $executable, $files = (Get-Field $Package 'executable'), (ConvertTo-FileMap (Get-Field $Package 'files'))
+    $protected = $null  # assigned directly: a function or if-expression would unroll a one-element array
+    if ($null -ne $Package.PSObject.Properties['protected']) { $protected = $Package.PSObject.Properties['protected'].Value }
+    if ($name -isnot [string] -or $name -cnotmatch '^[A-Za-z0-9][A-Za-z0-9.-]*$' -or
+        $version -isnot [string] -or $version -cnotmatch '^[A-Za-z0-9][A-Za-z0-9.-]*$' -or
+        (Get-Field $Package 'directory') -cne ('Programs/' + $name.ToLowerInvariant() + '-' + $version) -or
+        -not (TestWindowsRelative $executable) -or $null -eq $files -or -not $files.ContainsKey($executable) -or
+        @('uninstallKey', 'displayName', 'publisher', 'installLocation', 'executable' |
+            Where-Object { (Get-Field $existing $_) -isnot [string] -or (Get-Field $existing $_) -eq '' }).Count -gt 0 -or
+        $existing.uninstallKey.Contains('\') -or -not (TestWindowsRelative $existing.installLocation) -or
+        -not (TestWindowsRelative $existing.executable) -or $protected -isnot [array] -or
+        @($protected | Where-Object { -not (TestWindowsRelative $_) }).Count -gt 0) {
+        throw "Invalid package in manifest: $name"
+    }
+    foreach ($foreign in @($existing.installLocation) + @($protected)) {
+        if (PathsOverlap $Package.directory $foreign) { throw "Package directory overlaps an unowned path: $name" }
+    }
+}
+
+foreach ($package in $manifest.packages) { AssertPackageShape $package }
+$packageDirectories = @($manifest.packages | ForEach-Object { $_.directory })
+if (@($packageDirectories | Sort-Object -Unique).Count -ne $packageDirectories.Count) { throw 'Duplicate package directory.' }
+$protectedPaths = @($manifest.packages | ForEach-Object { @($_.protected) })
+# Every current-user location any mode writes stays clear of declared protected
+# runtime data (e.g. the synced browser profile), which no mode owns, writes or removes.
+foreach ($written in @('Microsoft/Windows/Fonts', 'noctty', ('Programs/noctty-' + $manifest.noctty.version), 'windows-iac') +
+        $packageDirectories) {
+    foreach ($protected in $protectedPaths) {
+        if (PathsOverlap $written $protected) { throw "A written location overlaps protected ${protected}: $written" }
+    }
+}
+
+# Every Uninstall entry that may be this product, read-only: the declared key name,
+# or any key with the declared DisplayName and Publisher, in HKCU and both HKLM
+# views. A machine-wide entry counts wherever its InstallLocation points. In an
+# app's registry silo (e.g. an agent sandbox) HKCU may be virtualized, as README
+# notes for %%Startup; run from an Explorer-launched shell.
+function FindUninstallEntries($Existing) {
+    $subkey = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+    foreach ($view in @(@('HKCU', 'CurrentUser', 'Default'), @('HKLM', 'LocalMachine', 'Registry64'),
+                        @('HKLM32', 'LocalMachine', 'Registry32'))) {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($view[1], $view[2])
+        try {
+            $uninstall = $base.OpenSubKey($subkey)
+            if ($null -eq $uninstall) { continue }
+            try {
+                foreach ($key in $uninstall.GetSubKeyNames()) {
+                    $entry = $uninstall.OpenSubKey($key)
+                    if ($null -eq $entry) { continue }
+                    try {
+                        $displayName, $publisher = $entry.GetValue('DisplayName'), $entry.GetValue('Publisher')
+                        if ($key -eq $Existing.uninstallKey -or
+                            ($displayName -ceq $Existing.displayName -and $publisher -ceq $Existing.publisher)) {
+                            [pscustomobject]@{ view = $view[0]; key = $key; displayName = $displayName; publisher = $publisher
+                                displayVersion = $entry.GetValue('DisplayVersion'); installLocation = $entry.GetValue('InstallLocation') }
+                        }
+                    } finally { $entry.Close() }
+                }
+            } finally { $uninstall.Close() }
+        } finally { $base.Close() }
+    }
+}
+
+# Why one Uninstall entry is not exactly the locked version of this product; none when it is.
+# The version is read from the entry's own InstallLocation, not from the lock.
+function ExistingProblems($Entry, $Package) {
+    $existing = $Package.existing
+    if ($Entry.key -ne $existing.uninstallKey) { "key is not $($existing.uninstallKey)" }
+    if ($Entry.displayName -cne $existing.displayName) { "DisplayName is '$($Entry.displayName)'" }
+    if ($Entry.publisher -cne $existing.publisher) { "Publisher is '$($Entry.publisher)'" }
+    if ($Entry.displayVersion -cne $Package.version) { "DisplayVersion is '$($Entry.displayVersion)'" }
+    $location = if ($Entry.installLocation -is [string]) {
+        [Environment]::ExpandEnvironmentVariables($Entry.installLocation.Trim().Trim('"'))
+    } else { '' }
+    if (-not $location -or -not [IO.Path]::IsPathRooted($location)) { return 'InstallLocation is missing or not absolute' }
+    $executable = Join-Path $location $existing.executable.Replace('/', '\')
+    if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { return "$executable is missing" }
+    $productVersion = [string](Get-Item -LiteralPath $executable).VersionInfo.ProductVersion
+    if ($productVersion.Trim() -cne $Package.version) { "$executable ProductVersion is '$productVersion'" }
+}
+
+# Read-only class of one package: preexisting-match or preexisting-drift whenever
+# an Uninstall entry may be this product (never absent then, and nothing is
+# written); indeterminate when the owned directory exists without one, since only
+# the effect ledger can show who made it; preexisting-drift when any declared
+# protected data exists without one (e.g. a profile left by a portable or removed
+# install, which an installed build would open); otherwise absent.
+function ClassifyPackage($Package) {
+    $entries = @(FindUninstallEntries $Package.existing)
+    if ($entries.Count) {
+        $problems = @(foreach ($entry in $entries) {
+            foreach ($problem in @(ExistingProblems $entry $Package)) { "$($entry.view)\$($entry.key): $problem" }
+        })
+        if ($problems.Count) { return New-EffectClass 'preexisting-drift' $null ($problems -join '; ') }
+        return New-EffectClass 'preexisting-match' $null $null
+    }
+    $target = Join-Path $localAppData $Package.directory.Replace('/', '\')
+    if (Test-Path -LiteralPath $target) {
+        return New-EffectClass 'indeterminate' $null "$target exists without an Uninstall entry; its owner is unknown without the effect ledger."
+    }
+    $present = @(@($Package.protected) | Where-Object { Test-Path -LiteralPath (Join-Path $localAppData $_.Replace('/', '\')) })
+    if ($present.Count) {
+        return New-EffectClass 'preexisting-drift' $null "protected data exists without an Uninstall entry: $($present -join ', ')"
+    }
+    return New-EffectClass 'absent' $null $null
+}
+
+# The clean-install gate. Installing creates an owned tree that only the effect
+# ledger can later prove ownership of and remove without recursive deletion, and
+# the fetch and extraction path awaits native adapter evidence; neither exists yet.
+# So an absent package stops Restore before any download or other effect.
+function InstallPackages($Packages) {
+    $names = @($Packages | ForEach-Object { "$($_.name) $($_.version)" }) -join ', '
+    throw ("Clean install of $names is disabled until the effect ledger is integrated; nothing was downloaded " +
+        'or changed. Install it by hand, or wait for the ledger slice.')
+}
 # Restore is per-user. An elevated token may belong to another account, and
 # elevated COM ignores per-user classes, so its activation check could start a
 # machine-wide Noctty instead of this user's registration.
@@ -60,9 +203,7 @@ if ($Mode -eq 'Restore' -and
     throw 'Run Restore unelevated, from an Explorer-launched shell of the user being restored.'
 }
 $configuration = BundlePath 'configuration.dsc.json'
-$packagesConfiguration = BundlePath 'packages.dsc.json'
-$fontDirectory = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Microsoft\Windows\Fonts'
-$localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+$fontDirectory = Join-Path $localAppData 'Microsoft\Windows\Fonts'
 $nocttyDirectory = Join-Path $localAppData ('Programs\noctty-' + $manifest.noctty.version)
 $nocttyExe = Join-Path $nocttyDirectory 'noctty\noctty.exe'
 $nocttyCom = Join-Path $nocttyDirectory 'noctty\noctty.com'
@@ -75,7 +216,8 @@ $nocttyTerminal = '{33368C6F-D328-410C-B225-26DC9F12C728}'
 $nocttyProxy = '{1D349824-21FB-46C7-ACF3-746EDC991D52}'
 $terminalProvenance = Join-Path $localAppData 'windows-iac\provenance\default-terminal.json'
 $oldPath, $oldResources, $oldFontDirectory = $env:PATH, $env:DSC_RESOURCE_PATH, $env:WINDOWS_IAC_FONT_DIR
-$copied, $changed, $packagesSet = 0, 0, 'notRun'
+$copied, $changed = 0, 0
+$packageStates = @()
 
 function InvokeDsc([string]$Operation, [string]$Document, [int]$Count) {
     $raw = & $exe --ignore-settings-file config $Operation --file $Document --output-format json
@@ -287,6 +429,21 @@ try {
     $env:PATH = (Split-Path -Parent $exe) + ';' + $oldPath
     $env:DSC_RESOURCE_PATH = Split-Path -Parent $exe
     $env:WINDOWS_IAC_FONT_DIR = $fontDirectory  # current-user Binding, not Spec
+    # Packages are read, never downloaded or extracted, outside Restore; Validate,
+    # Test and Apply do not read the machine for them at all.
+    if ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest') {
+        $packageStates = @(foreach ($package in $manifest.packages) {
+            [pscustomobject]@{ package = $package; state = (ClassifyPackage $package) }
+        })
+    }
+    if ($Mode -eq 'Restore') {
+        # Before any Restore effect: an unknown owner stops, and a clean install
+        # (fetch and verify every asset, then extract) runs first or not at all.
+        $unknown = @($packageStates | Where-Object { $_.state.class -ceq 'indeterminate' })
+        if ($unknown.Count) { throw "Package state unknown: $(@($unknown | ForEach-Object { $_.state.reason }) -join '; ')" }
+        $absent = @($packageStates | Where-Object { $_.state.class -ceq 'absent' } | ForEach-Object { $_.package })
+        if ($absent.Count) { InstallPackages $absent }
+    }
     $null = InvokeDsc 'get' $configuration @($manifest.fonts).Count
     if ($Mode -eq 'Apply' -or $Mode -eq 'Restore') {
         $null = New-Item -ItemType Directory -Path $fontDirectory -Force
@@ -317,14 +474,6 @@ try {
         $shortcut.TargetPath = $nocttyExe
         $shortcut.WorkingDirectory = Join-Path $nocttyDirectory 'noctty'
         $shortcut.Save()
-        # Test first: when every package is already exactly pinned, no installer runs,
-        # so running applications (e.g. a browser) and their state are left alone.
-        if (PackagesSatisfied (InvokeDsc 'test' $packagesConfiguration @($manifest.packages).Count)) {
-            $packagesSet = 'skipped'
-        } else {
-            $null = InvokeDsc 'set' $packagesConfiguration @($manifest.packages).Count
-            $packagesSet = 'applied'
-        }
         if (-not (TestTerminalPackage)) { throw 'Noctty default-terminal handoff requires Windows Terminal 1.24 or newer.' }
         if (-not (Test-Path -LiteralPath $terminalStartup)) {
             $null = New-Item -Path $terminalStartup
@@ -370,20 +519,25 @@ try {
         if (-not (TestTerminalPackage)) { throw 'Windows Terminal 1.24 or newer is missing.' }
         if (-not (TestNocttyRegistration)) { throw 'Noctty default-terminal registration drift.' }
         if ($Mode -eq 'RestoreTest') { AssertActualSelection }  # Restore checked it before success
-        $apps = InvokeDsc 'test' $packagesConfiguration @($manifest.packages).Count
-        foreach ($item in $apps.results) {
-            if ($item.result.inDesiredState -ne $true) { throw "Package drift: $($item.name)" }
-        }
-        if (-not (PackagesSatisfied $apps)) { throw 'Package drift: an installed version differs from its pin.' }
+        # A preexisting install is never written; one that is not exactly the locked
+        # version fails as that package's drift, after Restore's other effects.
+        $drift = @($packageStates | Where-Object { $_.state.class -cne 'preexisting-match' } |
+            ForEach-Object { "$($_.package.name) $($_.state.class): $($_.state.reason)" })
+        if ($drift.Count) { throw "Package drift: $($drift -join '; ')" }
     }
     # inDesiredState covers the declared state this mode tested. Handoff is never
     # part of it: this script does not launch or observe a console.
     [ordered]@{ mode = $Mode; source = $manifest.source; fontDirectory = $fontDirectory;
         fonts = @($manifest.fonts).Count; copied = $copied; changedProperties = $changed;
-        noctty = $manifest.noctty.version; packages = @($manifest.packages).Count;
+        noctty = $manifest.noctty.version
+        packages = @($manifest.packages | ForEach-Object {
+            $name = $_.name
+            $state = @($packageStates | Where-Object { $_.package.name -ceq $name })
+            [ordered]@{ name = $name; version = $_.version
+                class = $(if ($state.Count) { $state[0].state.class } else { 'notEvaluated' }) } });
         inDesiredState = ($Mode -ne 'Validate');
         registrationState = $(if (TestNocttyRegistration) { 'registered' } else { 'unregistered' });
-        handoffProof = 'unproven'; packagesSet = $packagesSet } | ConvertTo-Json -Compress
+        handoffProof = 'unproven' } | ConvertTo-Json -Compress -Depth 4
 }
 finally {
     $env:PATH, $env:DSC_RESOURCE_PATH, $env:WINDOWS_IAC_FONT_DIR = $oldPath, $oldResources, $oldFontDirectory
