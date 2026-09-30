@@ -398,11 +398,28 @@ $fontKey = 'HKCU\' + $fontSubkey
 $script:ledgerRecords, $script:nextSeq, $script:ledgerLock = @(), 1, $null
 # The same records by id (ordinal, so ids differing only in case stay apart and LedgerIds refuses
 # them), filled wherever ledgerRecords grows: a lookup no longer scans the whole ledger.
-$script:ledgerById = [Collections.Generic.Dictionary[string, Collections.Generic.List[object]]]::new([StringComparer]::Ordinal)
+# Each entry also caches that id's Get-EffectAttempt for this run: validation dominates a run's cost, and
+# the same id is validated by recovery, classification and collection. IndexRecord is the only way records
+# enter the index and drops the id's cached attempt; ReadLedger clears the index; replacing the index drops
+# every cache with it. Cached records and attempts are read-only.
+function NewLedgerIndex { [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal) }
+$script:ledgerById = NewLedgerIndex
 function IndexRecord($Record) {
     $id = [string](Get-Field $Record 'id')
-    if (-not $script:ledgerById.ContainsKey($id)) { $script:ledgerById[$id] = [Collections.Generic.List[object]]::new() }
-    $script:ledgerById[$id].Add($Record)
+    if (-not $script:ledgerById.ContainsKey($id)) {
+        $script:ledgerById[$id] = [pscustomobject]@{ records = [Collections.Generic.List[object]]::new(); attempt = $null }
+    }
+    $entry = $script:ledgerById[$id]
+    $entry.records.Add($Record)
+    $entry.attempt = $null
+}
+
+# Get-EffectAttempt of one id's records, computed once per index change.
+function AttemptOf([string]$Id) {
+    if (-not $script:ledgerById.ContainsKey($Id)) { return Get-EffectAttempt @() }
+    $entry = $script:ledgerById[$Id]
+    if ($null -eq $entry.attempt) { $entry.attempt = Get-EffectAttempt @($entry.records) }
+    return $entry.attempt
 }
 $script:copied, $script:changed, $script:removed, $script:recordsWritten = 0, 0, 0, 0
 $script:fontDrift, $script:sharedCreated, $script:gcKeptReferenced, $script:nocttyDrift = @(), @(), @(), @()
@@ -632,11 +649,11 @@ function LedgerIds {
     return $ids
 }
 
-function RecordsOf([string]$Id) { if ($script:ledgerById.ContainsKey($Id)) { @($script:ledgerById[$Id]) } else { @() } }
+function RecordsOf([string]$Id) { if ($script:ledgerById.ContainsKey($Id)) { @($script:ledgerById[$Id].records) } else { @() } }
 
 # The open attempt of an id (its records), or an empty list.
 function OpenAttempt([string]$Id) {
-    $attempt = Get-EffectAttempt (RecordsOf $Id)
+    $attempt = AttemptOf $Id
     if ($attempt.problem) { throw "Effect ledger id ${Id}: $($attempt.problem)" }
     if ($attempt.closed) { return @() }
     $open = @($attempt.records)
@@ -697,7 +714,7 @@ function ResolveAttempt($Open, [string]$Phase) {
 function RecoverId([string]$Id) {
     $open = @(OpenAttempt $Id)
     if (-not $open.Count) { return }
-    $class = Get-EffectClass (RecordsOf $Id) (Observe $open[0])
+    $class = Get-EffectClass $null (Observe $open[0]) '' $null (AttemptOf $Id)
     if ($class.class -ceq 'indeterminate') { throw "Effect ledger id $Id is indeterminate: $($class.reason)" }
     if ($class.resolution) { ResolveAttempt $open ($(if ($class.resolution -ceq 'confirm') { 'commit' } else { $class.resolution })) }
 }
@@ -897,7 +914,7 @@ function FontEffects {
 # state its open attempt recorded (for a changed selection).
 function Classify($Effect) {
     $open = @(OpenAttempt $Effect.id)
-    $class = Get-EffectClass (RecordsOf $Effect.id) (Observe $Effect) $Effect.kind $Effect.desired
+    $class = Get-EffectClass $null (Observe $Effect) $Effect.kind $Effect.desired (AttemptOf $Effect.id)
     if ($class.resolution) { throw "Effect ledger id $($Effect.id) was not recovered." }
     [pscustomobject]@{ class = $class.class; reason = $class.reason; open = $open
         recorded = $(if ($open.Count) { Get-Field $open[0] 'desired' } else { $null }) }
@@ -1324,7 +1341,7 @@ function Uninstall {
     }
     $open, $changedAfterClose = @(), @()
     foreach ($id in @(LedgerIds)) {
-        $attempt = Get-EffectAttempt (RecordsOf $id)
+        $attempt = AttemptOf $id
         # A malformed id has no attempt records; it stays open (the plan already refused it).
         if ($attempt.problem -or (-not $attempt.closed -and @($attempt.records).Count)) { $open += $id; continue }
         $first = @($attempt.records)[0]

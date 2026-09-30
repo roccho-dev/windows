@@ -16,6 +16,26 @@ function Get-Field($Object, [string]$Name) {
     return $property.Value
 }
 
+# Several properties at once, read as Get-Field reads each ($null when absent; a dictionary by its own
+# key comparison, anything else by its PowerShell properties), in one call: a hashtable name -> value.
+# Unlike Get-Field's return, a value is kept exactly as stored: an array stays an array, even with one
+# element or none. Validation reads records through this; one function call per field dominated its cost.
+function Get-Fields($Object, [string[]]$Names) {
+    $values = @{}
+    foreach ($name in $Names) { $values[$name] = $null }
+    if ($null -eq $Object) { return $values }
+    if ($Object -is [Collections.IDictionary]) {
+        foreach ($name in $Names) { $values[$name] = $Object[$name] }
+        return $values
+    }
+    $properties = $Object.PSObject.Properties
+    foreach ($name in $Names) {
+        $property = $properties[$name]
+        if ($null -ne $property) { $values[$name] = $property.Value }
+    }
+    return $values
+}
+
 # UTC time of a tracerpt TimeCreated/SystemTime, or $null when unparseable.
 # A trailing Z is UTC. A numeric offset is not trusted: tracerpt has printed the
 # local wall clock with a wrong offset (14:38:39.792622000+08:59 in Asia/Tokyo
@@ -252,9 +272,9 @@ function Test-EffectStateEqual([string]$Kind, $Expected, $Actual) {
     if (-not $e) { return $true }
     switch ($Kind) {
         'registry-value' {
-            return ([string](Get-Field $Expected 'type') -ceq [string](Get-Field $Actual 'type') -and
-                (ConvertTo-Json -Compress -InputObject @(Get-Field $Expected 'data')) -ceq
-                (ConvertTo-Json -Compress -InputObject @(Get-Field $Actual 'data')))
+            $want, $have = (Get-Fields $Expected @('type', 'data')), (Get-Fields $Actual @('type', 'data'))
+            return ([string]$want.type -ceq [string]$have.type -and
+                (ConvertTo-Json -Compress -InputObject @($want.data)) -ceq (ConvertTo-Json -Compress -InputObject @($have.data)))
         }
         'tree-extracted' {
             $want, $have = (ConvertTo-FileMap (Get-Field $Expected 'files')), (ConvertTo-FileMap (Get-Field $Actual 'files'))
@@ -275,30 +295,31 @@ function Test-EffectStateEqual([string]$Kind, $Expected, $Actual) {
 
 # The first problem with one ledger record, or $null when it is well formed.
 function Get-EffectRecordProblem($Record) {
-    if ((Get-Field $Record 'ledger') -cne 'effects') { return "ledger is not 'effects'." }
-    $schema = Get-Field $Record 'schema'
+    $fields = Get-Fields $Record @('ledger', 'schema', 'seq', 'phase', 'kind', 'id', 'target', 'name', 'package', 'prior', 'desired', 'observed', 'temp')
+    if ($fields.ledger -isnot [string] -or $fields.ledger -cne 'effects') { return "ledger is not 'effects'." }
+    $schema = $fields.schema
     if (($schema -isnot [int] -and $schema -isnot [long]) -or $schema -ne 1) { return 'schema is not 1.' }
-    $seq = Get-Field $Record 'seq'
+    $seq = $fields.seq
     if (($seq -isnot [int] -and $seq -isnot [long]) -or $seq -lt 1) { return 'seq is not a positive integer.' }
-    $phase = Get-Field $Record 'phase'
-    if ($phase -cnotin @('intent', 'commit', 'void', 'undone')) { return 'phase is not intent, commit, void or undone.' }
-    $kind = Get-Field $Record 'kind'
-    if ($kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted')) {
+    $phase = $fields.phase
+    if ($phase -isnot [string] -or $phase -cnotin @('intent', 'commit', 'void', 'undone')) { return 'phase is not intent, commit, void or undone.' }
+    $kind = $fields.kind
+    if ($kind -isnot [string] -or $kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted')) {
         return 'kind is not an effect kind.'
     }
-    $id = Get-Field $Record 'id'
+    $id = $fields.id
     if ($id -isnot [string] -or $id -eq '') { return 'id is empty.' }
-    $target = Get-Field $Record 'target'
+    $target = $fields.target
     if (-not (Test-EffectPath $kind $target)) { return 'target is not an absolute path or HKCU key.' }
-    $name = Get-Field $Record 'name'
+    $name = $fields.name
     if ($kind -eq 'registry-value' -and $name -isnot [string]) { return 'name is missing.' }
     if ($kind -ne 'registry-value' -and $null -ne $name) { return 'name belongs to registry-value only.' }
     # R1 reads package from intents; only a tree intent of that package's own tree may carry it.
-    $package = Get-Field $Record 'package'
+    $package = $fields.package
     if ($null -ne $package -and ($phase -cne 'intent' -or $kind -cne 'tree-extracted' -or -not (Test-PackageTarget $target $package))) {
         return 'package names no tree of that package.'
     }
-    $prior, $desired = (Get-Field $Record 'prior'), (Get-Field $Record 'desired')
+    $prior, $desired = $fields.prior, $fields.desired
     foreach ($problem in @((Get-EffectStateProblem $kind $prior 'prior'), (Get-EffectStateProblem $kind $desired 'desired'))) {
         if ($problem) { return $problem }
     }
@@ -318,12 +339,12 @@ function Get-EffectRecordProblem($Record) {
         return 'desired.files is empty.'
     }
     if ($kind -eq 'tree-extracted' -and @(Get-Field $desired 'other' | Where-Object { $null -ne $_ }).Count) { return 'desired.other is not empty.' }
-    $observed = Get-Field $Record 'observed'
+    $observed = $fields.observed
     if ($phase -ceq 'intent') {
         if ($null -ne $observed) { return 'an intent has no observed state.' }
         return Get-IntentTempProblem $Record
     }
-    if ($null -ne (Get-Field $Record 'temp')) { return 'only an intent names a temporary path.' }
+    if ($null -ne $fields.temp) { return 'only an intent names a temporary path.' }
     $problem = Get-EffectStateProblem $kind $observed 'observed'
     if ($problem) { return $problem }
     $expected, $label = if ($phase -ceq 'commit') { $desired, 'desired' } else { $prior, 'prior' }
@@ -333,13 +354,12 @@ function Get-EffectRecordProblem($Record) {
 
 # True when two well-formed records describe the same effect.
 function Test-SameEffect($First, $Other) {
-    $kind = [string](Get-Field $First 'kind')
-    $fp, $op = (Get-Field $First 'prior'), (Get-Field $Other 'prior')
-    $fd, $od = (Get-Field $First 'desired'), (Get-Field $Other 'desired')
-    return ([string](Get-Field $First 'id') -ceq [string](Get-Field $Other 'id') -and
-        $kind -ceq [string](Get-Field $Other 'kind') -and
-        [string](Get-Field $First 'target') -eq [string](Get-Field $Other 'target') -and
-        [string](Get-Field $First 'name') -ceq [string](Get-Field $Other 'name') -and
+    $names = @('id', 'kind', 'target', 'name', 'prior', 'desired')
+    $one, $two = (Get-Fields $First $names), (Get-Fields $Other $names)
+    $kind = [string]$one.kind
+    $fp, $op, $fd, $od = $one.prior, $two.prior, $one.desired, $two.desired
+    return ([string]$one.id -ceq [string]$two.id -and $kind -ceq [string]$two.kind -and
+        [string]$one.target -eq [string]$two.target -and [string]$one.name -ceq [string]$two.name -and
         (Test-EffectStateEqual $kind $fp $op) -and (Test-EffectStateEqual $kind $fd $od) -and
         [string](Get-Field $fp 'backup') -eq [string](Get-Field $op 'backup') -and
         [string](Get-Field $fd 'line') -ceq [string](Get-Field $od 'line'))
@@ -413,8 +433,10 @@ function Get-UnownedClass([string]$Kind, $Desired, $Current, $Resolution) {
 # written. Otherwise a committed attempt is owned-drift and an uncommitted one
 # indeterminate. Malformed or inconsistent records and a malformed $Current are
 # indeterminate.
-function Get-EffectClass($Records, $Current, [string]$Kind, $Desired) {
-    $attempt = Get-EffectAttempt $Records
+function Get-EffectClass($Records, $Current, [string]$Kind, $Desired, $Attempt) {
+    # $Attempt: Get-EffectAttempt of these records when the caller already holds it (win.ps1's per-run
+    # cache); then $Records is not read. (It is the same variable as $attempt below: names ignore case.)
+    if ($null -eq $Attempt) { $Attempt = Get-EffectAttempt $Records }
     if ($attempt.problem) { return New-EffectClass 'indeterminate' $null $attempt.problem }
     $records = @($attempt.records)
     if ($records.Count -and -not $Kind) {

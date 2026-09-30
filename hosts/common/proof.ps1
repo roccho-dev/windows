@@ -507,7 +507,7 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
         'ObserveKey', 'ObserveValue', 'ObserveFile', 'NocttyEffects', 'KeyEffect', 'ValueEffect', 'FileEffect',
         'OrderedSteps', 'UndoOwnedSteps', 'RemoveTarget', 'FontReferences', 'FontReferenceTable', 'NocttyReferences',
         'SelectNoctty', 'StartupPair', 'RecordPriorTerminal', 'TestNocttyRegistration', 'TestNocttyActivation', 'AssertActualSelection', 'RestoreLegacy',
-        'StepText', 'IsPackageTree', 'RemovePackageAsset', 'IndexRecord', 'ReadLedger', 'LedgerIds'
+        'StepText', 'IsPackageTree', 'RemovePackageAsset', 'IndexRecord', 'ReadLedger', 'LedgerIds', 'NewLedgerIndex', 'AttemptOf'
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'win.ps1'), [ref]$null, [ref]$null)
     foreach ($definition in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cin $names }, $false)) {
         . ([scriptblock]::Create($definition.Extent.Text))
@@ -534,7 +534,7 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
     $clsid = '{' + [guid]::NewGuid().ToString().ToUpperInvariant() + '}'
     $nocttyRegistration = Get-NocttyRegistration @(@{ key = "Software\Classes\CLSID\$clsid\LocalServer32"; name = ''; data = 'proof' }) $nocttyDirectory $manifest.noctty.files
     $script:ledgerRecords, $script:nextSeq, $script:recordsWritten, $script:copied, $script:changed, $script:removed = @(), 1, 0, 0, 0, 0
-    $script:ledgerById = [Collections.Generic.Dictionary[string, Collections.Generic.List[object]]]::new([StringComparer]::Ordinal)
+    $script:ledgerById = NewLedgerIndex
     $null = New-Item -ItemType Directory -Path $ledgerDirectory, (Join-Path $Scratch 'Programs'), (Split-Path -Parent $nocttyConfig) -Force
     $selected = NocttyEffects
 
@@ -789,16 +789,76 @@ public static string[] Split(string cmd) {
             $indexed.Count -ne $scanned.Count -or @(for ($i = 0; $i -lt $indexed.Count; $i++) { if (-not [object]::ReferenceEquals($indexed[$i], $scanned[$i])) { $i } }).Count
         }).Count -and @(RecordsOf 'no such id').Count -eq 0
     }
-    Must ((@(ScanIds).Count -ge 8) -and (IndexAgrees)) 'the ledger index equals a full scan'
+    # The per-id attempt cache (read-only, in the index entry) equals a fresh Get-EffectAttempt for every id: the
+    # same problem, closed flag and record objects; a second read returns the cached object itself; and
+    # Get-EffectClass given it answers exactly as Get-EffectClass computing it from the records.
+    function SameAttempt($Cached, $Fresh) {
+        $a, $b = @($Cached.records), @($Fresh.records)
+        [string]$Cached.problem -ceq [string]$Fresh.problem -and $Cached.closed -eq $Fresh.closed -and $a.Count -eq $b.Count -and
+            -not @(for ($i = 0; $i -lt $a.Count; $i++) { if (-not [object]::ReferenceEquals($a[$i], $b[$i])) { $i } }).Count
+    }
+    function CacheAgrees {
+        -not @(ScanIds | Where-Object {
+            $cached = AttemptOf $_
+            -not (SameAttempt $cached (Get-EffectAttempt (RecordsOf $_))) -or -not [object]::ReferenceEquals((AttemptOf $_), $cached)
+        }).Count
+    }
+    function ClassAgrees {
+        -not @(ScanIds | Where-Object {
+            $current = Observe @(RecordsOf $_)[0]
+            $with, $without = (Get-EffectClass $null $current '' $null (AttemptOf $_)), (Get-EffectClass (RecordsOf $_) $current)
+            "$($with.class)|$($with.resolution)|$($with.reason)" -cne "$($without.class)|$($without.resolution)|$($without.reason)"
+        }).Count
+    }
+    Must ((@(ScanIds).Count -ge 8) -and (IndexAgrees) -and (CacheAgrees) -and (ClassAgrees)) 'the ledger index and attempt cache equal a full scan'
+    # A write drops that id's cached attempt (here a closed package tree id gains a new intent).
+    $cachedBefore = AttemptOf $pkgTree.id
+    WriteRecord 'intent' $pkgTree $null $null
+    $cachedAfter = AttemptOf $pkgTree.id
+    Must ($cachedBefore.closed -and -not $cachedAfter.closed -and @($cachedAfter.records).Count -eq 1 -and
+        [object]::ReferenceEquals(@($cachedAfter.records)[0], @(RecordsOf $pkgTree.id)[-1]) -and (CacheAgrees)) 'a write drops that id''s cached attempt'
     $null = ReadLedger
-    Must ((IndexAgrees) -and @($script:ledgerRecords).Count -eq $script:nextSeq - 1) 'the ledger index equals a full scan after ReadLedger'
+    Must ((IndexAgrees) -and (CacheAgrees) -and (ClassAgrees) -and @($script:ledgerRecords).Count -eq $script:nextSeq - 1) 'index and cache equal a full scan after ReadLedger'
     $saved = $script:ledgerRecords, $script:ledgerById
     try {
-        $script:ledgerRecords, $script:ledgerById = @(), [Collections.Generic.Dictionary[string, Collections.Generic.List[object]]]::new([StringComparer]::Ordinal)
+        $script:ledgerRecords, $script:ledgerById = @(), (NewLedgerIndex)
         foreach ($id in 'case-A', 'CASE-a', 'case-A') { $record = [pscustomobject]@{ id = $id }; $script:ledgerRecords += $record; IndexRecord $record }
         Must (@(RecordsOf 'case-A').Count -eq 2 -and @(RecordsOf 'CASE-a').Count -eq 1 -and @(RecordsOf 'case-a').Count -eq 0) 'ids that differ only in case stay apart'
         Refused { LedgerIds } 'Two effect ledger ids differ only in case.'
+        # A malformed record reaching an id whose valid attempt is already cached makes that id malformed at once.
+        $cachedTree = Tree 'chromium-2' $two
+        function CacheRecord($Seq, [string]$Phase, $Observed) {
+            $record = @{ ledger = 'effects'; schema = 1; seq = $Seq; phase = $Phase }
+            foreach ($k in $cachedTree.Keys) { $record[$k] = $cachedTree[$k] }
+            if ($null -ne $Observed) { $record.observed = $Observed }
+            $record
+        }
+        $badSchema = CacheRecord 3 'undone' @{ exists = $false }; $badSchema.schema = 2
+        foreach ($case in @(@($badSchema, '*schema is not 1*'), @((CacheRecord 2 'undone' @{ exists = $false }), '*seq repeats*'),
+                @((CacheRecord 3 'void' @{ exists = $false }), '*cannot be voided*'))) {
+            $script:ledgerRecords, $script:ledgerById = @(), (NewLedgerIndex)
+            foreach ($record in (CacheRecord 1 'intent' $null), (CacheRecord 2 'commit' $cachedTree.desired)) { $script:ledgerRecords += $record; IndexRecord $record }
+            Must ($null -eq (AttemptOf $cachedTree.id).problem -and @(OpenAttempt $cachedTree.id).Count -eq 2) 'a valid attempt is cached'
+            $script:ledgerRecords += $case[0]; IndexRecord $case[0]
+            Must ((AttemptOf $cachedTree.id).problem -like $case[1]) "a cached id becomes malformed: $($case[1])"
+            Refused { OpenAttempt $cachedTree.id } $case[1]
+        }
     } finally { $script:ledgerRecords, $script:ledgerById = $saved }
+    Must ((IndexAgrees) -and (CacheAgrees)) 'the saved index and cache are restored'
+    # Get-Fields reads what Get-Field reads, for every shape (arrays kept as stored, compared as values);
+    # a dictionary keeps its own key comparison; a scalar field stored as a one-element array is malformed.
+    $fieldNames = @('a', 'b', 'c', 'd', 'e', 'f', 'missing', 'Length')
+    foreach ($shape in @([pscustomobject]@{ a = 1; b = 'x'; c = @('m'); d = @(); e = $null; f = @{ g = 1 } },
+            @{ a = 1; b = 'x'; c = @('m', 'n'); d = @(); e = $null; f = @{ g = 1 } }, [ordered]@{ A = 1; b = 'x'; c = @('m') }, $null, 'text', 42)) {
+        $batch = Get-Fields $shape $fieldNames
+        Must (@($batch.Keys).Count -eq $fieldNames.Count -and -not @($fieldNames | Where-Object {
+            (ConvertTo-Json -Compress -Depth 3 -InputObject @($batch[$_])) -cne (ConvertTo-Json -Compress -Depth 3 -InputObject @(Get-Field $shape $_)) }).Count) 'Get-Fields equals Get-Field'
+    }
+    $ordinalFields = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal); $ordinalFields['Key'] = 1
+    $oneElement = (Get-Fields ([pscustomobject]@{ c = @('m') }) @('c')).c
+    Must ($null -eq (Get-Fields $ordinalFields @('key')).key -and (Get-Fields $ordinalFields @('Key')).Key -eq 1 -and $oneElement -is [array] -and $oneElement.Count -eq 1 -and
+        (Get-EffectRecordProblem @{ ledger = 'effects'; schema = 1; seq = @(1); phase = 'intent'; kind = 'file-created'; id = 'x'; target = 'C:\u\f'
+            prior = @{ exists = $false }; desired = @{ exists = $true; sha256 = ('a' * 64) } }) -ceq 'seq is not a positive integer.') 'Get-Fields keeps arrays and source key comparison'
     "PASS primitives in PowerShell $($PSVersionTable.PSVersion)"
 }
 function Primitive51([string]$Scratch) {
