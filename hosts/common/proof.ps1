@@ -2334,9 +2334,11 @@ Must ((NewRecords $mark @($chromiumId)) -eq 0 -and @($chromiumAgain.packages | W
     (ProfileKept)) 'A29: after its first run a second Apply writes nothing for Chromium, still owned exactly'
 # A30 (S2-2d-b), within A29 so Chromium is downloaded once: A29's install also owned HKCU App Paths\<appPath> (key,
 # then its default REG_SZ naming the owned chrome.exe) and its second Apply wrote nothing for them; ShellExecute
-# (Win+R's API), from an empty directory and with chromium on no PATH, starts the owned chrome.exe by that name; a
-# value this distribution does not own in the key stops Uninstall before any removal (A3). Foreign keys, HKLM and
-# retired names are proven by the primitives on a throwaway name; Win+R itself only on the VM.
+# (Win+R's API), from an empty directory and with chromium on no PATH, starts the owned chrome.exe by that name
+# (appPathsLaunch 'proven'), or on this elevated runner none of the names tried here (chromium, chromium.exe,
+# same-name probe in two spellings) resolved using this ShellExecute method ('unproven');
+# a value this distribution does not own in the key stops Uninstall before any removal (A3). Foreign keys, HKLM and
+# retired names are proven by the primitives on a throwaway name; Win+R itself only on the VM (S7), before merge.
 $appSubkey = "Software\Microsoft\Windows\CurrentVersion\App Paths\$($chromium.appPath)"
 $appKeyId, $appValueId = ('registry-key-created:' + "HKCU\$appSubkey".ToUpperInvariant()), ('registry-value:' + "HKCU\$appSubkey|".ToUpperInvariant())
 $chromiumExe = Join-Path $chromiumTree $chromium.executable.Replace('/', '\')
@@ -2360,7 +2362,6 @@ function ShellStart([string]$Name, [string]$Arguments) {
     $saved = [IO.Directory]::GetCurrentDirectory()
     try { [IO.Directory]::SetCurrentDirectory($shellDir); [Diagnostics.Process]::Start($info) } finally { [IO.Directory]::SetCurrentDirectory($saved) }
 }
-function ShellChromium([string]$Name = 'chromium') { ShellStart $Name "--headless=new `"--user-data-dir=$shellDir\profile`" about:blank" }
 # The executable path of a started process, read by CIM for up to $Seconds; '' when it cannot be read.
 function StartedPath($Process, [int]$Seconds) {
     $path, $clock = '', [Diagnostics.Stopwatch]::StartNew()
@@ -2370,47 +2371,69 @@ function StartedPath($Process, [int]$Seconds) {
     }
     $path
 }
-# Only after chromium failed to resolve, and never a pass (A30 fails whatever they show): the explicit chromium.exe; a
-# unique HKCU App Paths alias to ping.exe (a few seconds' life) in both spellings, removed again in finally, only its
-# own PIDs waited for or killed; and whether this process is elevated and UAC is on (HKLM read only).
-function A30Diagnostics {
-    $lines = [Collections.Generic.List[string]]::new()
-    try {
-        $started = ShellChromium 'chromium.exe'
-        $lines.Add("chromium.exe -> $(StartedPath $started 10); $(SettleText (SettleChromium 10 $started))")
-    } catch { $lines.Add("chromium.exe -> $($_.Exception.Message)") }
-    $probe = 'proof-' + [guid]::NewGuid().ToString('N')
-    $probeKey = "Software\Microsoft\Windows\CurrentVersion\App Paths\$probe.exe"
-    $created = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($probeKey)
-    try {
-        try { $created.SetValue('', (Join-Path $env:SystemRoot 'System32\PING.EXE')) } finally { $created.Close() }
-        foreach ($form in $probe, "$probe.exe") {
-            $pinged = $null
-            try { $pinged = ShellStart $form '-n 3 127.0.0.1'; $lines.Add("$form (HKCU alias to PING.EXE) -> $(StartedPath $pinged 5)") }
-            catch { $lines.Add("$form (HKCU alias to PING.EXE) -> $($_.Exception.Message)") }
-            finally { if ($null -ne $pinged -and -not $pinged.WaitForExit(8000)) { try { $pinged.Kill() } catch { } } }
-        }
-    } finally { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($probeKey, $false) }
-    $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    $policy = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System')
-    $lua = if ($null -eq $policy) { 'absent' } else { try { [string]$policy.GetValue('EnableLUA', 'absent') } finally { $policy.Close() } }
-    $lines.Add("Administrators role: $admin; EnableLUA: $lua")
-    foreach ($line in $lines) { Write-Host "A30 diagnostic: $line" }
+# One ShellStart by $Name: { name; process; path (CIM, '' when unread); code (the Win32 error when it raised one, else
+# $null); error (the failure's message) }. Nothing started only when code is set and process is $null.
+function A30Try([string]$Name, [string]$Arguments, [int]$Seconds) {
+    $try = [pscustomobject]@{ name = $Name; process = $null; path = ''; code = $null; error = '' }
+    try { $try.process = ShellStart $Name $Arguments; $try.path = StartedPath $try.process $Seconds }
+    catch {
+        $failure = $_.Exception.GetBaseException()
+        $try.error = $failure.Message
+        if ($failure -is [ComponentModel.Win32Exception]) { $try.code = $failure.NativeErrorCode }
+    }
+    $try
 }
+function A30Text($Try) {
+    "$($Try.name) -> $(if ($null -ne $Try.code) { "Win32 $($Try.code) ($($Try.error))" } elseif ($Try.error) { "failed: $($Try.error)" } elseif ($Try.path) { "started $($Try.path)" } else { 'started, path unread' })"
+}
+function A30NotFound($Try) { $Try.code -eq 2 -and $null -eq $Try.process -and -not $Try.path }
+$a30ChromiumArguments = "--headless=new `"--user-data-dir=$shellDir\profile`" about:blank"
 $appNow = AppPathKeyNow
 Must ((Phases $appKeyId) -ceq 'intent,commit' -and (Phases $appValueId) -ceq 'intent,commit' -and (NewRecords $mark @($appKeyId, $appValueId)) -eq 0 -and
     $null -ne $appNow -and $appNow.values.Count -eq 1 -and $appNow.values[0] -ceq '' -and -not $appNow.subkeys.Count -and $appNow.kind -ceq 'String' -and
     $appNow.data -ceq $chromiumExe) 'A30: the install owns App Paths\chromium.exe, one REG_SZ default value naming the owned chrome.exe; a second Apply writes nothing'
 Must ($null -eq (Get-Command chromium -ErrorAction SilentlyContinue) -and $null -eq (Get-Command chromium.exe -ErrorAction SilentlyContinue) -and
     -not @(Get-ChildItem -LiteralPath $shellDir -Force -Filter 'chromium*').Count) 'A30: chromium and chromium.exe are on no PATH nor in the empty start directory, so only App Paths can resolve them'
-$launchedPath, $launchSettled = '', ''
-try {
-    $launched = ShellChromium
-    $launchedPath = StartedPath $launched 15
-    $launchSettled = SettleText (SettleChromium 15 $launched)
-} catch { $launchSettled = "not started: $($_.Exception.Message)" }
-if ($launchedPath -ne $chromiumExe) { A30Diagnostics }
-Must ($launchedPath -eq $chromiumExe) "A30: ShellExecute starts the owned chrome.exe by the name chromium ($launchedPath; $launchSettled)"
+# appPathsLaunch: 'proven' when ShellExecute starts exactly the owned chrome.exe by the name chromium (then the same
+# launch must fail with Win32 error 2 after Uninstall); otherwise chromium.exe and a same-name HKCU probe (a copy of
+# PING.EXE named proof-<guid>.exe, in its own scratch directory, never the empty start directory, under the key of that
+# very name, removed again in finally, only its own PID waited for or killed) are tried in both spellings, and
+# 'unproven' only when all four fail with Win32 error 2 (file not found) and this process is elevated: then none of the
+# names tried here (chromium, chromium.exe, same-name probe in two spellings) resolved using this ShellExecute method,
+# and only the VM (S7) can prove the launch. Anything else fails A30.
+$a30Launch = A30Try 'chromium' $a30ChromiumArguments 15
+$a30Lines = [Collections.Generic.List[string]]::new()
+$a30Lines.Add("$(A30Text $a30Launch); $(if ($null -ne $a30Launch.process) { SettleText (SettleChromium 15 $a30Launch.process) })")
+$appPathsLaunch = if ($a30Launch.path -eq $chromiumExe) { 'proven' } else { $null }
+if (-not $appPathsLaunch) {
+    $a30Explicit = A30Try 'chromium.exe' $a30ChromiumArguments 10
+    $a30Lines.Add("$(A30Text $a30Explicit); $(if ($null -ne $a30Explicit.process) { SettleText (SettleChromium 10 $a30Explicit.process) })")
+    $a30ProbeName = 'proof-' + [guid]::NewGuid().ToString('N')
+    $a30ProbeDir = Join-Path $env:RUNNER_TEMP ('a30-probe-' + [guid]::NewGuid().ToString('N'))  # never deleted
+    $null = New-Item -ItemType Directory -Path $a30ProbeDir
+    $a30ProbeExe = Join-Path $a30ProbeDir "$a30ProbeName.exe"
+    [IO.File]::Copy((Join-Path $env:SystemRoot 'System32\PING.EXE'), $a30ProbeExe, $false)
+    $a30ProbeKey = "Software\Microsoft\Windows\CurrentVersion\App Paths\$a30ProbeName.exe"
+    $a30Probes = @()
+    $a30Created = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($a30ProbeKey)
+    try {
+        try { $a30Created.SetValue('', $a30ProbeExe, [Microsoft.Win32.RegistryValueKind]::String) } finally { $a30Created.Close() }
+        foreach ($a30Form in $a30ProbeName, "$a30ProbeName.exe") {
+            $a30Probe = A30Try $a30Form '-n 3 127.0.0.1' 5
+            if ($null -ne $a30Probe.process -and -not $a30Probe.process.WaitForExit(8000)) { try { $a30Probe.process.Kill() } catch { } }
+            $a30Probes += $a30Probe
+            $a30Lines.Add("$(A30Text $a30Probe) (same-name HKCU probe, expected $a30ProbeExe)")
+        }
+    } finally { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($a30ProbeKey, $false) }
+    $a30Elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $a30Policy = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System')
+    $a30Lua = if ($null -eq $a30Policy) { 'absent' } else { try { [string]$a30Policy.GetValue('EnableLUA', 'absent') } finally { $a30Policy.Close() } }
+    $a30Lines.Add("elevated (Administrators role): $a30Elevated; EnableLUA: $a30Lua")
+    if ($a30Elevated -and -not @(@($a30Launch, $a30Explicit) + $a30Probes | Where-Object { -not (A30NotFound $_) }).Count) { $appPathsLaunch = 'unproven' }
+}
+foreach ($a30Line in $a30Lines) { Write-Host "A30 launch: $a30Line" }
+Write-Host "A30 appPathsLaunch: $(if ($appPathsLaunch) { $appPathsLaunch } else { 'failed' })"
+Must ($null -ne $appPathsLaunch) "A30: ShellExecute neither starts the owned chrome.exe by the name chromium nor fails, on this elevated runner, with none of the names tried here (chromium, chromium.exe, same-name probe in two spellings) resolved using this ShellExecute method ($($a30Lines -join '; '))"
 $held = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($appSubkey, $true)
 try { $held.SetValue('Path', $shellDir) } finally { $held.Close() }
 $count = @(Ledger).Count
@@ -2423,17 +2446,14 @@ $chromiumGone = RunUninstall -Apply
 Must ($chromiumGone.ownedOpen -eq 0 -and -not (Test-Path -LiteralPath $chromiumTree) -and (ProfileKept) -and
     (Test-Path -LiteralPath (Join-Path $userData 'First Run'))) 'A29: Uninstall removes the Chromium tree with its seed, never a profile'
 AssertEmpty
-# A30, the negative control: the same Uninstall removed the value, then the key, and ShellExecute no longer finds chromium.
-# Same name and method as the positive check above, which alone makes this failure meaningful. Only "file not found"
-# (Win32 error 2) counts as the name no longer resolving; any other failure fails, with its own message.
-$unresolved, $strayPath, $strayError = $false, '', ''
-try { $stray = ShellChromium; $strayPath = StartedPath $stray 5; if ($null -ne $stray) { $null = SettleChromium 5 $stray } }
-catch {
-    $failure = $_.Exception.GetBaseException()
-    if ($failure -is [ComponentModel.Win32Exception] -and $failure.NativeErrorCode -eq 2) { $unresolved = $true } else { $strayError = $failure.Message }
+# A30 after Uninstall: the value, then the key, are gone and closed undone (always); and, only when the launch was
+# proven, the same launch by the same name now fails with Win32 error 2 (file not found) and nothing else.
+Must ($null -eq (AppPathKeyNow) -and (Phases $appKeyId) -ceq 'intent,commit,undone' -and (Phases $appValueId) -ceq 'intent,commit,undone') 'A30: Uninstall removes the App Paths value, then the key'
+if ($appPathsLaunch -ceq 'proven') {
+    $a30Gone = A30Try 'chromium' $a30ChromiumArguments 5
+    if ($null -ne $a30Gone.process) { $null = SettleChromium 5 $a30Gone.process }
+    Must (A30NotFound $a30Gone) "A30: after Uninstall ShellExecute no longer finds chromium ($(A30Text $a30Gone))"
 }
-Must ($null -eq (AppPathKeyNow) -and (Phases $appKeyId) -ceq 'intent,commit,undone' -and (Phases $appValueId) -ceq 'intent,commit,undone' -and
-    $unresolved) "A30: Uninstall removes the App Paths value and key; ShellExecute then no longer finds chromium$(if ($strayError) { " (it failed otherwise: $strayError)" } elseif (-not $unresolved) { " (it started '$strayPath')" })"
 [IO.File]::Delete($sentinel)
 [IO.File]::Delete($preferences)
 [IO.Directory]::Delete((Split-Path -Parent $preferences), $false)
@@ -2533,4 +2553,5 @@ if ($g4.status -cne 'measured' -or (Get-Field $g4 'gate') -cne 'pass' -or $g4.st
     winReportsHandoffUnproven = $true; handoffProbeRefusedOnRunner = $true; handoffEvaluatorCases = $handoffCases;
     g4Measurement = $g4;
     noctty = 'native owned tree, configuration, COM keys and values and the default-terminal selection through Apply and Uninstall (A15-A21)'
-    scope = 'current-user owned fonts, Noctty, SSH client and locked packages (AutoHotkey ZIP and Chromium 7z with its font seed: install, ownership, its App Paths name resolved by ShellExecute, first run on scratch profiles, Uninstall) on an elevated Windows Server runner with Windows Terminal 1.23; not Restore (activation, package view, rollback), a clean unelevated Windows 11 user, Chromium on the default profile or started from Win+R itself, default-terminal handoff, real-host UX or a Cloudflare connection' } | ConvertTo-Json
+    appPathsLaunch = $appPathsLaunch
+    scope = 'current-user owned fonts, Noctty, SSH client and locked packages (AutoHotkey ZIP and Chromium 7z with its font seed: install, ownership, its App Paths registration' + $(if ($appPathsLaunch -ceq 'proven') { ' and its resolution by ShellExecute' } else { '; App Paths launch unproven on this elevated runner, VM S7 required' }) + ', first run on scratch profiles, Uninstall) on an elevated Windows Server runner with Windows Terminal 1.23; not Restore (activation, package view, rollback), a clean unelevated Windows 11 user, Chromium on the default profile or started from Win+R itself, default-terminal handoff, real-host UX or a Cloudflare connection' } | ConvertTo-Json

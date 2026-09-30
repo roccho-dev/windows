@@ -468,17 +468,28 @@ and Uninstall are record only). A second Apply then writes nothing for Chromium,
 owned exactly, and `Uninstall` removes the tree with its seed and keeps the profile and
 the scratch profiles. Within A29 (one download), A30 checks the same install owned
 `App Paths\chromium.exe` (one REG_SZ default naming the owned `chrome.exe`, written
-once), that ShellExecute (Win+R's API), from an empty directory with `chromium` on no
-PATH, starts that `chrome.exe` by name, that a foreign value in the key stops
-`Uninstall` before any removal, and that after `Uninstall` the key is gone and the name
-no longer resolves (the runner must have no `App Paths\chromium.exe` in HKCU or either
-HKLM view beforehand). The primitives prove, on a throwaway name in the runner's real
+once), that a foreign value in the key stops `Uninstall` before any removal, and that
+`Uninstall` removes the value, then the key (the runner must have no
+`App Paths\chromium.exe` in HKCU or either HKLM view beforehand). It then reports
+`appPathsLaunch` in the proof's answer: `proven` when ShellExecute (Win+R's API), from an
+empty directory with `chromium` on no PATH, starts exactly the owned `chrome.exe` by the
+name `chromium`, and the same launch then fails with "file not found" after `Uninstall`;
+`unproven` only when `chromium`, `chromium.exe` and a same-name HKCU probe (a copy of
+`PING.EXE` registered under its own name, both spellings) all fail with "file not found"
+on this elevated runner, that is, none of the names tried here (`chromium`,
+`chromium.exe`, same-name probe in two spellings) resolved using this ShellExecute
+method; any other
+outcome fails the proof. The primitives prove, on a throwaway name in the runner's real
 HKCU, a foreign key (even with our exact data) as drift that is never written, HKLM
 conflicts (stubbed), re-pointing, the tree reference and retired names; the main
 `Apply`/`RestoreTest` path meeting a foreign key (nothing written, package drift at the
 end) is not exercised end to end, only its decision. The
 runner is an elevated Windows Server: a clean, unelevated Windows 11 user's `Restore`,
 first run on the default `User Data` and Win+R itself are proven only by the VM run.
+**Required before merge, whatever `appPathsLaunch` says (VM run, S7):** on a clean
+Windows 11 VM, as an unelevated user in an Explorer-launched session, Win+R `chromium`
+after `Restore` starts the owned `chrome.exe` (positive), and the same Win+R after
+`Uninstall` finds nothing (negative).
 It also requires every `win.ps1` answer to report
 `handoffProof = "unproven"` and `handoff-proof.ps1` to refuse the runner, so CI
 never claims a real default-terminal handoff. Negative controls must fail for
@@ -498,8 +509,9 @@ claim one workflow prematurely. Existing OCI definitions and #8 are unchanged.
 
 `%LOCALAPPDATA%\windows-iac\provenance\default-terminal.json` is per-user state;
 rollback reads it and nothing removes it. A clean Chromium install and its App Paths
-name are enabled and proven on the CI runner (A29, A30), but the VM run is still open,
-so `Restore`/`Uninstall` as a whole is not complete.
+registration are enabled and proven on the CI runner (A29, A30; the launch by name as
+`appPathsLaunch` reports), but the VM run, including the Win+R positive and negative
+above, is still open, so `Restore`/`Uninstall` as a whole is not complete.
 
 **Required on a VM before the native registration is accepted (unproven here):**
 from an unelevated, Explorer-launched shell with Windows Terminal 1.24 or newer,
