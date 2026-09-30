@@ -63,6 +63,9 @@ let
   #               Either way nothing is installed or written. existing.installLocation
   #               is only the expected current-user location, kept disjoint from directory.
   #   protected   runtime data the product uses but no mode owns, writes or removes
+  #   seed        optional: Chromium's initial_preferences, beside the executable, which pack.py
+  #               writes from these font roles (families from choices); a file of the owned tree
+  #               that Chromium reads only when it creates a profile (README)
   packageLocks = [
     {
       # Hibbiki third-party build (the approved exception). sha256 is GitHub's
@@ -87,6 +90,7 @@ let
       };
       # Without --user-data-dir this build uses the synced profile's location.
       protected = [ "Chromium/User Data" ];
+      seed = { path = "Chrome-bin/initial_preferences"; fonts = { proportional = "ui"; fixed = "terminal"; }; };
     }
     {
       # Official release; publisher SHA256 equals GitHub's asset digest.
@@ -112,15 +116,17 @@ let
   ];
   # The fixed-output fetch checks sha256; pack.py checks size, sha1 and the
   # archive listing, and inventories the tree 7-Zip extracts: each file's sha256
-  # and unpackedSize, the sum of their sizes (never written here by hand).
+  # and unpackedSize, the sum of their sizes (never written here by hand). The seed is
+  # not part of the archive, so the inventory's input omits it.
   inventory = lock: let
     archive = pkgs.fetchurl { inherit (lock) url sha256; };
+    upstream = builtins.removeAttrs lock [ "seed" ];
   in pkgs.runCommand "package-inventory-${lock.name}" { nativeBuildInputs = [ python pkgs._7zz ]; } ''
     7zz l -slt ${archive} > listing.txt
     python ${./pack.py} listing listing.txt
     mkdir tree
     7zz x -y -otree ${archive} > /dev/null
-    python ${./pack.py} inventory ${pkgs.writeText "${lock.name}-lock.json" (builtins.toJSON lock)} ${archive} listing.txt tree "$out"
+    python ${./pack.py} inventory ${pkgs.writeText "${lock.name}-lock.json" (builtins.toJSON upstream)} ${archive} listing.txt tree "$out"
   '';
   windowsChoices = pkgs.writeText "windows-restore-selection.json" (builtins.toJSON {
     noctty = {

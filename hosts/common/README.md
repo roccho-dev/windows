@@ -331,6 +331,26 @@ refused before any effect until its own CI proof; nothing registers App Paths ye
 so an owned Chromium would not be launchable by name (required before PR-A is done);
 a read-only file in an extracted tree would make `Uninstall` fail (recorded, not hidden).
 
+**Chromium font seed (built, not yet written).** `pack.py` generates
+`payload/chromium/initial_preferences` from the lock's `seed` roles: exactly the six
+preferences `webkit.webprefs.fonts.{standard,sansserif,fixed}.{Zyyy,Jpan}`, IBM Plex Sans
+JP proportional and PlemolJP Console NF fixed (every TTF of a role must carry that
+typographic family). The manifest records its `path` beside `chrome.exe` in the owned
+tree, `file`, `sha256` and `size`; the archive may hold no `initial_preferences` or
+`master_preferences` there, and the seed is outside `files` and `unpackedSize`. No mode
+writes it yet; an owned clean install must write it before Chromium's clean install is
+enabled. Chromium reads it only on a first run, for a `User Data` without its first-run
+sentinel, and then **overwrites that profile's existing `Preferences`**. Boundary (the
+goal): a profile present at `Restore` stays untouched. Today that holds only because
+Chromium's 7z clean install is refused and no mode launches Chromium: R1 alone would
+still install when the ledger shows this package's history but `User Data` has no
+first-run sentinel. Before that refusal is lifted, S2-3b must install only without
+`User Data` or with that history and the sentinel. A partial `User Data` restored by
+hand later without its sentinel is outside automated prevention; S2-3b is to detect it
+at the next `Restore`/`RestoreTest`, before Chromium is launched. Neither gate exists
+yet. Sites that set fonts in CSS, serif, other scripts, and Chromium's and
+Windows' own UI are unaffected; a later user setting prevails, and sync may.
+
 **Torn record.** A power loss can tear only the highest-seq record, and every mode
 that reads the ledger then stops. Remove that one file by hand only if it is the
 highest `<seq>.json` **and** does not parse as JSON; then rerun, and recovery
@@ -357,9 +377,9 @@ avoiding in-place updates.
 
 ## Proof boundaries
 
-`test_pack.py` covers compiler metadata, license retention, deterministic ZIPs,
-hash inventories, and empty/duplicate/unsafe-input rejection using synthetic
-fixtures. It is not native Windows evidence.
+`test_pack.py` covers compiler metadata, license retention, font families,
+deterministic ZIPs and seed bytes, hash inventories, and empty/duplicate/unsafe/
+colliding-input rejection using synthetic fixtures. It is not native Windows evidence.
 
 `proof.ps1` runs only on disposable GitHub-hosted Windows runners. It requires
 exact source identity; checks the pure ledger classification for every kind;

@@ -58,6 +58,11 @@ def prepare_fonts(policy: list[dict], out: Path) -> None:
         for path in paths:
             with TTFont(path) as font:
                 name = font["name"].getDebugName(4)
+                # The typographic family (name ID 16, else 1) is the name a Chromium seed or the Noctty
+                # setting selects: every file of a role belongs to exactly the declared family.
+                family = font["name"].getDebugName(16) or font["name"].getDebugName(1)
+            if family != choice["family"]:
+                raise ValueError(f"Font family {family!r} is not {choice['family']!r}: {path.name}")
             if not name or name.casefold() in names:
                 raise ValueError(f"Missing or duplicate font full name: {name!r}")
             names.add(name.casefold())
@@ -83,6 +88,14 @@ def prepare_fonts(policy: list[dict], out: Path) -> None:
 PACKAGE_KEYS = {"name", "version", "url", "format", "size", "sha256", "scope", "effect", "directory",
                 "executable", "existing", "protected"}
 EXISTING_KEYS = {"uninstallKey", "displayName", "publisher", "installLocation", "executable"}
+# A seed is Chromium's initial_preferences beside the executable, holding only font preferences
+# written from roles; Chromium also reads the legacy name, so neither may come from the archive.
+SEED_KEYS, SEED_FONTS = {"path", "fonts"}, {"proportional", "fixed"}
+SEED_NAME, SEED_NAMES = "initial_preferences", ("initial_preferences", "master_preferences")
+# The preferences per role: webkit.webprefs.fonts.<generic>.<script>, nested as Chromium's
+# Preferences are; Zyyy is the default script, Jpan the one a Japanese page uses.
+SEED_GENERICS = {"standard": "proportional", "sansserif": "proportional", "fixed": "fixed"}
+SEED_SCRIPTS = ("Zyyy", "Jpan")
 TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*")
 # A version starts with a digit and holds no '-', so Programs/<name>-<version> splits one way
 # only (chromium-extra-1 is never Chromium's); win.ps1 Get-PackageAssetPath relies on it.
@@ -123,8 +136,8 @@ def package_locks(packages: object) -> list[dict]:
         raise ValueError("Empty package selection")
     names, owned = set(), []
     for package in packages:
-        if not isinstance(package, dict) or set(package) - {"sha1"} != PACKAGE_KEYS:
-            raise ValueError(f"Package lock keys differ from {sorted(PACKAGE_KEYS)} (+ optional sha1)")
+        if not isinstance(package, dict) or set(package) - {"sha1", "seed"} != PACKAGE_KEYS:
+            raise ValueError(f"Package lock keys differ from {sorted(PACKAGE_KEYS)} (+ optional sha1, seed)")
         name, version = text(package["name"], "name"), text(package["version"], "version")
         if not TOKEN.fullmatch(name) or not VERSION.fullmatch(version) or name.casefold() in names:
             raise ValueError(f"Invalid or duplicate package: {name!r} {version!r}")
@@ -145,7 +158,15 @@ def package_locks(packages: object) -> list[dict]:
         directory = windows_path(text(package["directory"], "directory"))
         if directory != f"Programs/{name.casefold()}-{version}":
             raise ValueError(f"Package directory is not the owned path: {directory}")
-        windows_path(text(package["executable"], "executable"))
+        executable = windows_path(text(package["executable"], "executable"))
+        if "seed" in package:
+            seed = package["seed"]
+            if (not isinstance(seed, dict) or set(seed) != SEED_KEYS or not isinstance(seed["fonts"], dict)
+                    or set(seed["fonts"]) != SEED_FONTS or not all(isinstance(r, str) and r for r in seed["fonts"].values())):
+                raise ValueError(f"Package {name} seed is not {{path, fonts: {{proportional, fixed}}}} with role names")
+            path = PurePosixPath(windows_path(text(seed["path"], f"{name} seed path")))
+            if path.name != SEED_NAME or path.parent != PurePosixPath(executable).parent:
+                raise ValueError(f"Package {name} seed is not {SEED_NAME} beside {executable}")
         existing = package["existing"]
         if not isinstance(existing, dict) or set(existing) != EXISTING_KEYS:
             raise ValueError(f"Package {name} existing-install keys differ from {sorted(EXISTING_KEYS)}")
@@ -247,6 +268,11 @@ def inventoried(packages: object) -> list[dict]:
             raise ValueError(f"Invalid inventory for {lock['name']}")
         for sha in files.values():
             hex_digest(sha, 64, f"{lock['name']} inventory sha256")
+        if "seed" in lock:
+            parent = PurePosixPath(lock["seed"]["path"]).parent
+            names = [lock["seed"]["path"]] + [(parent / n).as_posix() for n in SEED_NAMES]
+            if any(overlaps(name, path) for name in names for path in files):
+                raise ValueError(f"The {lock['name']} archive has its own preferences file or a path under the seed")
         lock["files"], lock["unpackedSize"] = files, inventory["unpackedSize"]
     return locks
 
@@ -328,6 +354,19 @@ def archive(root: Path, destination: Path) -> None:
             result.writestr(info, path.read_bytes(), compresslevel=9)
 
 
+def seed_preferences(seed: dict, entries: list[dict]) -> bytes:
+    """The seed's bytes: exactly the six font preferences, each role's family from fonts.json,
+    as compact sorted UTF-8 JSON with one trailing newline, so equal inputs give equal bytes."""
+    families = {e["role"]: e["family"] for e in entries}
+    for role in seed["fonts"].values():
+        if role not in families:
+            raise ValueError(f"Seed font role is not selected by common fonts: {role!r}")
+    fonts = {generic: {script: families[seed["fonts"][role]] for script in SEED_SCRIPTS}
+             for generic, role in SEED_GENERICS.items()}
+    document = {"webkit": {"webprefs": {"fonts": fonts}}}
+    return (json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
 def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
                  scripts: Path, source: str, out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
@@ -354,6 +393,15 @@ def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
         shutil.copyfile(noctty, root / "payload/noctty.zip")
         # The pinned official client, installed only by the explicit RentSsh mode, never by Restore.
         shutil.copyfile(cloudflared, root / "payload/cloudflared.exe")
+        # A seed ships as a bundle file; the manifest names where it goes and what it holds.
+        for package in packages:
+            if "seed" in package:
+                data = seed_preferences(package["seed"], entries)
+                seed_file = f"payload/{package['name'].casefold()}/{SEED_NAME}"
+                (root / seed_file).parent.mkdir()
+                (root / seed_file).write_bytes(data)
+                package["seed"] = {"path": package["seed"]["path"], "file": seed_file,
+                                   "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
         files = {p.relative_to(root).as_posix(): digest(p) for p in sorted(root.rglob("*")) if p.is_file()}
         write_json(root / "manifest.json", {"schemaVersion": 3, "source": source, "fonts": entries,
                    "noctty": {"version": selected["noctty"]["version"],

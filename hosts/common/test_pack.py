@@ -29,18 +29,21 @@ class CompilerTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-    def font(self, name="Test Font", filename="input.ttf"):
+    def font(self, name="Test Font", filename="input.ttf", family=None, typographic=None, folder="upstream"):
         builder = FontBuilder(1000, isTTF=True)
         builder.setupGlyphOrder([".notdef", "space"])
         builder.setupCharacterMap({32: "space"})
         builder.setupGlyf({name: TTGlyphPen(None).glyph() for name in (".notdef", "space")})
         builder.setupHorizontalMetrics({name: (500, 0) for name in (".notdef", "space")})
         builder.setupHorizontalHeader(ascent=800, descent=-200)
-        builder.setupNameTable({"familyName": name, "styleName": "Regular", "fullName": name,
-                               "uniqueFontIdentifier": name, "psName": name.replace(" ", "")})
+        names = {"familyName": family or name, "styleName": "Regular", "fullName": name,
+                 "uniqueFontIdentifier": name, "psName": name.replace(" ", "")}
+        if typographic:
+            names["typographicFamily"] = typographic
+        builder.setupNameTable(names)
         builder.setupOS2(sTypoAscender=800, sTypoDescender=-200, usWinAscent=800, usWinDescent=200)
         builder.setupPost()
-        source = self.root / "upstream"
+        source = self.root / folder
         source.mkdir(exist_ok=True)
         builder.save(source / filename)
         (source / "OFL.txt").write_text("Synthetic test license, not a redistributed font.")
@@ -76,6 +79,17 @@ class CompilerTests(unittest.TestCase):
         self.font(filename="duplicate.ttf")
         with self.assertRaisesRegex(ValueError, "duplicate"):
             pack.prepare_fonts([policy], self.root / "fonts")
+
+    def test_every_role_file_is_the_declared_family(self):
+        # A weight whose name ID 1 is "<family> Light" belongs by its typographic family (name ID 16).
+        policy = self.font()
+        self.font(name="Test Font Light", filename="light.ttf", family="Test Font Light", typographic="Test Font")
+        pack.prepare_fonts([policy], self.root / "fonts")
+        for case, (family, typographic) in {"name ID 1": ("Test Font Mono", None),
+                                            "name ID 16 wins": ("Test Font", "Other Font")}.items():
+            self.font(name="Odd", filename="odd.ttf", family=family, typographic=typographic)  # replaces the last
+            with self.subTest(case=case), self.assertRaisesRegex(ValueError, "Font family"):
+                pack.prepare_fonts([policy], self.root / f"fonts-{case}")
 
     def test_unsafe_paths_fail(self):
         for name in ("", "../escape", "/absolute", "C:/drive", "dir\\escape", "a/../../escape"):
@@ -150,6 +164,36 @@ class CompilerTests(unittest.TestCase):
         for case, packages in bad.items():
             with self.subTest(case=case), self.assertRaises(ValueError):
                 pack.package_locks(packages)
+
+    SEED = {"path": "bin/initial_preferences", "fonts": {"proportional": "fixture", "fixed": "fixture"}}
+
+    def seed(self, **changes):
+        seed = {"path": self.SEED["path"], "fonts": dict(self.SEED["fonts"])}
+        seed.update(changes)
+        return seed
+
+    def test_seed_lock_contract(self):
+        self.assertEqual(pack.package_locks([self.lock(seed=self.seed())]), [self.lock(seed=self.seed())])
+        bad = {
+            "not a dict": "bin/initial_preferences",
+            "extra key": self.seed(file="payload/x"),
+            "no fonts": {"path": "bin/initial_preferences"},
+            "fonts not a dict": self.seed(fonts="fixture"),
+            "a font key missing": self.seed(fonts={"proportional": "fixture"}),
+            "an extra font key": self.seed(fonts={**self.SEED["fonts"], "serif": "fixture"}),
+            "empty role": self.seed(fonts={"proportional": "", "fixed": "fixture"}),
+            "role not a string": self.seed(fonts={"proportional": 1, "fixed": "fixture"}),
+            "not beside the executable": self.seed(path="initial_preferences"),
+            "deeper than the executable": self.seed(path="bin/x/initial_preferences"),
+            "legacy name": self.seed(path="bin/master_preferences"),
+            "other case": self.seed(path="bin/Initial_Preferences"),
+            "other name": self.seed(path="bin/preferences.json"),
+            "escape": self.seed(path="bin/../bin/initial_preferences"),
+            "not a Windows path": self.seed(path="bin/initial_preferences."),
+        }
+        for case, seed in bad.items():
+            with self.subTest(case=case), self.assertRaisesRegex(ValueError, "seed|Not a Windows path|Unsafe"):
+                pack.package_locks([self.lock(seed=seed)])
 
     def test_windows_paths(self):
         for name in ("bin/fixture.exe", "Chrome-bin/154.0.8037.58/chrome.dll", "a/.hidden", "nul-free/aux2"):
@@ -287,6 +331,62 @@ class CompilerTests(unittest.TestCase):
             self.assertEqual(manifest["fonts"][0]["fullName"], "Test Font")
             self.assertNotIn(str(self.root), json.dumps(manifest))
             self.assertNotIn("WinGet", json.dumps(manifest))
+
+    def with_packages(self, choices, *packages):
+        selected = json.loads(choices.read_text())
+        selected["packages"] = list(packages)
+        choices.write_text(json.dumps(selected))
+
+    def test_seed_is_generated_from_roles(self):
+        fonts = self.payload()
+        noctty, cloudflared, choices, scripts = self.inputs()
+        self.with_packages(choices, self.lock(seed=self.seed(), inventory=str(self.inventory())))
+        for out in ("one", "two"):
+            pack.distribution(fonts, noctty, cloudflared, choices, scripts, "test", self.root / out)
+        first, second = [self.root / out / "windows-dist.zip" for out in ("one", "two")]
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+        family = {script: "Test Font" for script in ("Jpan", "Zyyy")}
+        expected = (json.dumps({"webkit": {"webprefs": {"fonts": {"fixed": family, "sansserif": family, "standard": family}}}},
+                               sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        with zipfile.ZipFile(first) as z:
+            manifest = json.loads(z.read("manifest.json"))
+            data = z.read("payload/fixture/initial_preferences")
+        # Exactly the six preferences, nested, compact, sorted, no BOM, one trailing newline.
+        self.assertEqual(data, expected)
+        self.assertEqual(data.count(b'"Test Font"'), 6)
+        self.assertEqual(manifest["packages"][0]["seed"],
+                         {"path": "bin/initial_preferences", "file": "payload/fixture/initial_preferences",
+                          "sha256": pack.hashlib.sha256(expected).hexdigest(), "size": len(expected)})
+        self.assertEqual(manifest["files"]["payload/fixture/initial_preferences"], pack.hashlib.sha256(expected).hexdigest())
+        # The seed is added to the tree, never counted in the archive's inventory or unpacked size.
+        self.assertEqual(manifest["packages"][0]["files"], {"bin/fixture.exe": "1" * 64})
+        self.assertEqual(manifest["packages"][0]["unpackedSize"], 10)
+
+    def test_seed_roles_and_collisions(self):
+        # A proportional role and a fixed role, each its own family, land on their own preferences.
+        fonts = self.root / "fonts"
+        pack.prepare_fonts([self.font(), dict(self.font(name="Mono Font", folder="mono"), role="mono")], fonts)
+        self.assertEqual(json.loads(pack.seed_preferences(self.seed(fonts={"proportional": "fixture", "fixed": "mono"}),
+                                                          json.loads((fonts / "fonts.json").read_text()))),
+                         {"webkit": {"webprefs": {"fonts": {
+                             "standard": {"Zyyy": "Test Font", "Jpan": "Test Font"},
+                             "sansserif": {"Zyyy": "Test Font", "Jpan": "Test Font"},
+                             "fixed": {"Zyyy": "Mono Font", "Jpan": "Mono Font"}}}}})
+        noctty, cloudflared, choices, scripts = self.inputs()
+        exe = {"bin/fixture.exe": "1" * 64}
+        for case, (seed, files, pattern) in {
+                "unselected role": (self.seed(fonts={"proportional": "fixture", "fixed": "absent"}), exe, "not selected"),
+                "archive has the seed": (self.seed(), {**exe, "bin/initial_preferences": "1" * 64}, "preferences"),
+                "archive has it in another case": (self.seed(), {**exe, "BIN/Initial_Preferences": "1" * 64}, "preferences"),
+                "archive has the legacy name": (self.seed(), {**exe, "bin/master_preferences": "1" * 64}, "preferences"),
+                "archive has a path under the seed": (self.seed(), {**exe, "bin/initial_preferences/x": "1" * 64}, "preferences"),
+                }.items():
+            self.with_packages(choices, self.lock(seed=seed, inventory=str(self.inventory(files))))
+            with self.subTest(case=case), self.assertRaisesRegex(ValueError, pattern):
+                pack.distribution(fonts, noctty, cloudflared, choices, scripts, "test", self.root / "out")
+        # The legacy name elsewhere in the archive is not beside the executable, so Chromium never reads it.
+        self.with_packages(choices, self.lock(seed=self.seed(), inventory=str(self.inventory({**exe, "master_preferences": "1" * 64}))))
+        pack.distribution(fonts, noctty, cloudflared, choices, scripts, "test", self.root / "elsewhere")
 
     def test_packages_need_a_valid_inventory(self):
         fonts = self.payload()
