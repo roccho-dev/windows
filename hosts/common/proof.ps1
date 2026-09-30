@@ -1771,19 +1771,20 @@ MustReject { Run 'Apply' } 'Torn or unreadable ledger record*'
 [IO.File]::Delete($torn)  # the documented manual step: only the highest record, only when it does not parse
 # The proof's Ledger cache (P4) reuses a parse only for identical text: a rewrite of the same length and with the old
 # timestamp is read again, and so is a same-length torn record (it no longer parses); the exact bytes then return.
+# The edited field is schema (1 -> 2), which every record has, whether win.ps1 or Craft wrote it.
 $first = Join-Path $ledgerDir '00000001.json'
 $firstBytes, $firstStamp = [IO.File]::ReadAllBytes($first), [IO.File]::GetLastWriteTimeUtc($first)
-$firstText, $firstUtc = [Text.Encoding]::UTF8.GetString($firstBytes), [string]@(Ledger)[0].utc
-$rewrite = [regex]::new('"utc":"2').Replace($firstText, '"utc":"3', 1)
+$firstText, $firstSchema = [Text.Encoding]::UTF8.GetString($firstBytes), @(Ledger)[0].schema
+$rewrite = [regex]::new('"schema":1(?=[,}])').Replace($firstText, '"schema":2', 1)
 try {
     [IO.File]::WriteAllText($first, $rewrite); [IO.File]::SetLastWriteTimeUtc($first, $firstStamp)
-    $rewrittenUtc = [string]@(Ledger)[0].utc
+    $rewrittenSchema = @(Ledger)[0].schema
     [IO.File]::WriteAllText($first, '{' + ('x' * ($firstText.Length - 1))); [IO.File]::SetLastWriteTimeUtc($first, $firstStamp)
     $tornReread = $false
     try { $null = Ledger } catch { $tornReread = $true }
 } finally { [IO.File]::WriteAllBytes($first, $firstBytes); [IO.File]::SetLastWriteTimeUtc($first, $firstStamp) }
-Must ($rewrite -cne $firstText -and $rewrite.Length -eq $firstText.Length -and $rewrittenUtc -cne $firstUtc -and $tornReread -and
-    [string]@(Ledger)[0].utc -ceq $firstUtc) 'P4: the proof ledger rereads a same-length rewrite or tear'
+Must ($firstSchema -eq 1 -and $rewrite -cne $firstText -and $rewrite.Length -eq $firstText.Length -and $rewrittenSchema -eq 2 -and $tornReread -and
+    @(Ledger)[0].schema -eq 1 -and [IO.File]::ReadAllText($first) -ceq $firstText) 'P4: the proof ledger rereads a same-length rewrite or tear'
 
 # A14: a foreign value naming an owned file keeps it: Uninstall refuses as a whole, GC keeps it open.
 SetFontValue 'Proof Foreign (TrueType)' (FontPath $fonts[0])
