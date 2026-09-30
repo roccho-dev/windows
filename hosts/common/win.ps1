@@ -1387,18 +1387,15 @@ function PackageInUse($Package, [string]$Tree) {
     }
 }
 
-# Before any effect: an indeterminate or owned-drift package stops the run, a clean install is refused
-# where its extraction is not proven yet (only ZIP until the 7z proof), and every install must fit its
-# volume and path limits (Get-PackageSpaceProblem), the earlier installs' space reserved. A profile a
-# seed would overwrite (O1), like R1's foreign profile, only keeps the package from installing or
-# converging: it is package drift after the other effects, and nothing is written for that package.
+# Before any effect: an indeterminate or owned-drift package stops the run, and every install (ZIP or 7z,
+# both through inbox tar.exe) must fit its volume and path limits (Get-PackageSpaceProblem), the earlier
+# installs' space reserved. A profile a seed would overwrite (O1), like R1's foreign profile, only keeps
+# the package from installing or converging: it is package drift after the other effects, and nothing is
+# written for that package.
 function PreflightPackages($States) {
     $blocked = @(foreach ($state in $States) {
         $label = "$($state.package.name) $($state.package.version)"
         if ($state.class -cin @('indeterminate', 'owned-drift')) { "${label}: $($state.reason)" }
-        elseif ($state.install -and $state.package.format -cne 'zip') {
-            "${label}: clean install from a $($state.package.format) asset is not enabled yet (its extraction awaits CI proof); install it by hand"
-        }
     })
     if ($blocked.Count) { throw "Packages stop the run before any effect: $($blocked -join '; ')" }
     $reserved = @{}

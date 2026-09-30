@@ -632,7 +632,7 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
     Must ((Test-PackageHistory (@($noise) + $records[0..1]) 'Chromium' $programsHere) -and
         -not (Test-PackageHistory (@($noise) + $records[0..1]) 'AutoHotkey' $programsHere) -and
         -not (Test-PackageHistory (@(@{ ledger = 'effects'; schema = 1; seq = 2; phase = 'intent'; id = 'noise' }) + $records[0..1]) 'Chromium' $programsHere)) 'P3 in this edition'
-    # S2-2b1 package primitives (clean install stays disabled). The class table: the ledger keeps ownership; an
+    # S2-2b1 package primitives. The class table: the ledger keeps ownership; an
     # external Uninstall entry is never taken over and beside an owned tree is a conflict; R1 for protected data.
     function PClass($Tree, $Entries = 0, $Problems = @(), $Protected = $false, $History = $false, $Changed = $false, $Hazard = $false) {
         $c = Get-PackageClass $Tree $Entries $Problems $Protected $History $Changed $Hazard
@@ -1384,24 +1384,8 @@ try {
     Say "HKCU\$startupPath restore: $restore"
 }
 
-# ---- S2-0 package measurement (G1, G5, G6, G7): printed evidence only; nothing here fails the proof ----
-# Each locked package is fetched from its exact locked HTTPS URL with inbox curl.exe, checked
-# against the locked size, sha256 and sha1, listed and extracted with inbox tar.exe, and the
-# extracted tree compared with the pinned inventory; every native call runs through the
-# Process API with a deadline. Scratch stays in a fresh RUNNER_TEMP directory. Counts and
-# at most five names per difference are printed. Starting Chromium or AutoHotkey (G3) and
-# the policy templates (not in the lock, so no pinned hash) are the next step.
-# The whole measurement shares one 300-second budget so it cannot push the required job past
-# its timeout: each step's deadline is what the budget has left (a step that cannot get its
-# minimum is skipped, and says so), and the hash walk stops when the budget is spent.
-$s20 = [ordered]@{ status = 'not run' }
-$s20Budget, $s20Clock = 300, [Diagnostics.Stopwatch]::StartNew()
-function S20([string]$Line) { Write-Host "S2-0 $Line" }
-function Left([int]$Least, [string]$Step) {
-    $left = [int]($s20Budget - $s20Clock.Elapsed.TotalSeconds)
-    if ($left -lt $Least) { throw "$Step skipped: $left s of the $s20Budget s budget left, $Least s needed" }
-    $left
-}
+# Helpers of the Chromium first-run observation (A29): a count with at most five names, the last lines of a
+# native command's output, and a native command run through the Process API with a deadline.
 function Few($Names) { $all = @($Names); "$($all.Count)$(if ($all.Count) { ' (' + ((@($all | Select-Object -First 5)) -join ', ') + $(if ($all.Count -gt 5) { ', ...' }) + ')' })" }
 function Tail([string]$Text) { ((@($Text -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -Last 3) -join ' | ') -replace '(.{300}).+', '$1...' }
 # A native command with a deadline: exit code, seconds, sampled peak working set, and its output.
@@ -1420,97 +1404,6 @@ function Bounded([string]$Exe, [string[]]$Arguments, [int]$Seconds) {
     if (-not $exit) { $process.WaitForExit(); $exit = $process.ExitCode }
     [pscustomobject]@{ exit = $exit; seconds = [Math]::Round($clock.Elapsed.TotalSeconds, 1)
         peakMB = $(if ($peak) { [Math]::Round($peak / 1MB) } else { 'n/a' }); stdout = $out.Result; stderr = $err.Result }
-}
-try {
-    $curl, $tar = (Join-Path $env:SystemRoot 'System32\curl.exe'), (Join-Path $env:SystemRoot 'System32\tar.exe')
-    $s20Dir = Join-Path $env:RUNNER_TEMP ('s2-0-' + [guid]::NewGuid().ToString('N'))  # fresh, never deleted
-    $null = New-Item -ItemType Directory -Path $s20Dir
-    $s20Clock.Restart()
-    foreach ($package in @($manifest.packages | Sort-Object size)) {  # the small AutoHotkey zip first
-        $facts = [ordered]@{ evidence = 'incomplete' }
-        try {
-            $dir = Join-Path $s20Dir $package.name
-            $asset, $tree = (Join-Path $dir "asset.$($package.format)"), (Join-Path $dir 'tree')
-            $null = New-Item -ItemType Directory -Path $dir, $tree
-            $limit = [Math]::Min($(if ($package.size -gt 100MB) { 180 } else { 60 }), (Left 60 'download') - 10)
-            $get = Bounded $curl @('--fail', '--silent', '--show-error', '--location', '--proto', '=https', '--proto-redir', '=https',
-                '--max-time', "$limit", '--output', $asset, $package.url) ($limit + 10)
-            $facts.download = "exit $($get.exit), $($get.seconds) s, peak $($get.peakMB) MB"
-            if ($get.exit -ne 0) { throw "download failed: $(Tail $get.stderr)" }
-            $null = Left 15 'verification'
-            $bytes = (Get-Item -LiteralPath $asset).Length
-            $sha256 = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash
-            $sha1 = Get-Field $package 'sha1'
-            $sha1Ok = $null -eq $sha1 -or (Get-FileHash -LiteralPath $asset -Algorithm SHA1).Hash -eq $sha1
-            if ($bytes -ne $package.size -or $sha256 -ne $package.sha256 -or -not $sha1Ok) {
-                $facts.verify = "MISMATCH: $bytes bytes (locked $($package.size)), sha256 $sha256, sha1 $(if ($sha1Ok) { 'match' } else { 'differs' })"
-                throw 'the asset differs from the lock; nothing else is read'
-            }
-            $facts.verify = "size, sha256$(if ($sha1) { ', sha1' }) match the lock"
-            $files = @{}
-            foreach ($entry in $package.files.PSObject.Properties) { $files[$entry.Name] = $entry.Value }
-            $parents = @{}
-            foreach ($name in $files.Keys) { $parts = $name.Split('/'); for ($i = 1; $i -lt $parts.Count; $i++) { $parents[$parts[0..($i - 1)] -join '/'] = $true } }
-            $list = Bounded $tar @('-tf', $asset) ([Math]::Min(120, (Left 20 'listing')))
-            $listed = @($list.stdout -split "`r?`n" | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('/') })
-            $facts.list = "exit $($list.exit), $($list.seconds) s, $($listed.Count) entries, outside the inventory $(Few @($listed | Where-Object { -not $files.ContainsKey($_) -and -not $parents.ContainsKey($_) })), inventory files not listed $(Few @($files.Keys | Where-Object { $listed -notcontains $_ }))"
-            if ($list.exit -ne 0) { throw "tar could not list: $(Tail $list.stderr)" }
-            $extract = Bounded $tar @('-xf', $asset, '-C', $tree) ([Math]::Min(240, (Left 60 'extraction')))
-            $facts.extract = "exit $($extract.exit), $($extract.seconds) s, peak $($extract.peakMB) MB"
-            if ($extract.exit -ne 0) { throw "tar could not extract: $(Tail $extract.stderr)" }
-            $clock = [Diagnostics.Stopwatch]::StartNew()
-            $found, $changed, $reparse, $spent = @{}, @(), @(), $false
-            foreach ($item in @(Get-ChildItem -LiteralPath $tree -Recurse -Force)) {
-                if ($s20Clock.Elapsed.TotalSeconds -gt $s20Budget) { $spent = $true; break }
-                $relative = $item.FullName.Substring($tree.Length + 1).Replace('\', '/')
-                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { $reparse += $relative; continue }
-                if ($item.PSIsContainer) { if (-not $parents.ContainsKey($relative)) { $changed += "$relative/" }; continue }
-                $found[$relative] = $true
-                if (-not $files.ContainsKey($relative) -or (Get-FileHash -LiteralPath $item.FullName).Hash -ne $files[$relative]) { $changed += $relative }
-            }
-            if ($spent) {
-                $facts.inventory = "INCOMPLETE: budget spent after $($found.Count) of $($files.Count) pinned files (so far extra or changed $(Few $changed))"
-                throw 'the inventory comparison did not finish'
-            }
-            $missing = @($files.Keys | Where-Object { -not $found.ContainsKey($_) })
-            $exact = -not $missing.Count -and -not $changed.Count -and -not $reparse.Count
-            $facts.inventory = "$(if ($exact) { 'exact' } else { 'DIFFERS' }): $($files.Count) pinned files, missing $(Few $missing), extra or changed $(Few $changed), reparse points $(Few $reparse), compared in $([Math]::Round($clock.Elapsed.TotalSeconds, 1)) s"
-            $facts.executable = "$($package.executable) $(if (Test-Path -LiteralPath (Join-Path $tree $package.executable.Replace('/', '\')) -PathType Leaf) { 'present' } else { 'MISSING' })"
-            # G7: the rename Restore will do right after extraction (same volume).
-            try { [IO.Directory]::Move($tree, (Join-Path $dir 'moved')); $facts.move = 'renamed right after extraction' }
-            catch { $facts.move = "rename failed: $($_.Exception.Message)" }
-            if ($exact -and $facts.move -like 'renamed*') { $facts.evidence = 'complete' }
-        } catch { $facts.error = ($_.Exception.Message -replace '(.{300}).+', '$1...') }
-        $s20[$package.name] = @($facts.GetEnumerator() | ForEach-Object { "$($_.Key): $($_.Value)" }) -join '; '
-        S20 "$($package.name) $($package.version): $($s20[$package.name])"
-    }
-    # G5: existing Chrome-like Uninstall entries on this runner versus the Hibbiki identity (read-only).
-    $chromium = @($manifest.packages | Where-Object { $_.name -ceq 'Chromium' })[0]
-    $seen = @(foreach ($view in @(@('HKCU', 'CurrentUser', 'Default'), @('HKLM', 'LocalMachine', 'Registry64'), @('HKLM32', 'LocalMachine', 'Registry32'))) {
-        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($view[1], $view[2])
-        try {
-            $uninstall = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
-            if ($null -eq $uninstall) { continue }
-            try {
-                foreach ($key in $uninstall.GetSubKeyNames()) {
-                    $entry = $uninstall.OpenSubKey($key)
-                    if ($null -eq $entry) { continue }
-                    try {
-                        $display, $publisher = [string]$entry.GetValue('DisplayName'), [string]$entry.GetValue('Publisher')
-                        if ($key -notlike '*chrom*' -and $display -notlike '*chrom*') { continue }
-                        $isHibbiki = $key -eq $chromium.existing.uninstallKey -or ($display -ceq $chromium.existing.displayName -and $publisher -ceq $chromium.existing.publisher)
-                        "$($view[0])\$key '$display' by '$publisher' $([string]$entry.GetValue('DisplayVersion')): $(if ($isHibbiki) { 'MATCHES the Hibbiki identity' } else { 'not the Hibbiki identity' })"
-                    } finally { $entry.Close() }
-                }
-            } finally { $uninstall.Close() }
-        } finally { $base.Close() }
-    })
-    $s20.chromeEntries = if ($seen.Count) { $seen -join ' | ' } else { 'none' }
-    S20 "G5 Chrome-like Uninstall entries: $($s20.chromeEntries)"
-    $s20.status = "measured (see each package); $([Math]::Round($s20Clock.Elapsed.TotalSeconds)) s of the $s20Budget s budget"
-} catch {
-    $s20.status = "measurement error: $($_.Exception.Message -replace '(.{300}).+', '$1...')"
-    S20 $s20.status
 }
 
 foreach ($font in $fonts) {
@@ -1855,8 +1748,8 @@ AssertEmpty
 if (-not (Test-Path -LiteralPath $foreignTemp)) { throw 'A temporary file no intent named was removed.' }
 [IO.File]::Delete($foreignTemp)
 
-# ---- A23-A27: locked packages through the effect ledger. AutoHotkey (3 MB ZIP) is downloaded once;
-# Chromium never is: its 7z clean install stays disabled until its own CI proof. The proof's own stand-ins
+# ---- A23-A29: locked packages through the effect ledger. AutoHotkey (3 MB ZIP) is downloaded once, and
+# Chromium (7z) once, in A29 after every stand-in of A24-A28 is gone. The proof's own stand-ins
 # (an Uninstall entry, a profile, crafted records) are removed again one entry at a time.
 $ahk = @($manifest.packages | Where-Object { $_.name -ceq 'AutoHotkey' })[0]
 $chromium = @($manifest.packages | Where-Object { $_.name -ceq 'Chromium' })[0]
@@ -1879,13 +1772,10 @@ function ExternalEntry {  # an AutoHotkey Uninstall entry the proof owns, whose 
 if ((Test-Path -LiteralPath $ahkTree) -or (Test-Path -LiteralPath $chromiumTree) -or (KeyExists $ahkKey) -or (Test-Path -LiteralPath (Split-Path -Parent $chromiumProfile))) {
     throw 'Proof requires no AutoHotkey or Chromium on this runner yet.'
 }
-# A24: -Packages is Apply-only and names locks exactly, once each; Chromium's 7z clean install is refused
-# before any record or download; a profile without this package's history is someone else's (R1).
+# A24: -Packages is Apply-only and names locks exactly, once each; a profile without this package's history
+# is someone else's (R1).
 MustReject { Win51 @('-Mode', 'Test', '-Packages', 'AutoHotkey') } '-Packages is only for -Mode Apply*'
 foreach ($bad in 'autohotkey', 'AutoHotkey,AutoHotkey', 'Nope') { MustReject { ApplyPackages $bad } 'Unknown or repeated package*' }
-$count = @(Ledger).Count
-MustReject { ApplyPackages 'Chromium' } '*clean install from a 7z asset is not enabled yet*'
-Must (@(Ledger).Count -eq $count -and -not (Test-Path -LiteralPath $chromiumTree)) 'A24: a Chromium clean install is refused before any effect'
 $null = New-Item -ItemType Directory -Path $chromiumProfile -Force
 [IO.File]::WriteAllText("$chromiumProfile\proof.txt", 'someone else''s profile')
 $mark = LastSeq
@@ -1947,19 +1837,82 @@ Must ((Phases $crash.id) -ceq 'intent' -and (Test-Path -LiteralPath "$($crash.st
 $null = Run 'Apply'
 Must ((Phases $crash.id) -ceq 'intent,void' -and -not (Test-Path -LiteralPath $crash.staging)) 'A25: recovery completes once the foreign file is gone'
 
-# ---- b3a (C1-C9): Chromium's first run, observed. Printed evidence only; nothing here fails the proof ----
-# Here the owned fonts are installed (A25's Apply) and the proof's own stand-in profile exists (A24). The tree S2-0
-# extracted and found exactly the pinned inventory (RUNNER_TEMP, never deleted) gets the bundled seed beside
-# chrome.exe, and Chromium starts only from that tree, only with fresh scratch --user-data-dir directories beside it,
-# never with --no-first-run, --no-sandbox or any other flag that changes a first run. Observed: First Run and the six
-# seed preferences after a first GUI run; the tree still exactly the inventory and the seed (names, sizes, write
-# times); every chrome.exe in four classes (tree, descendant, outside, unknown; B3aPoll), its windows closed one by
-# one and 45 s for ours to end, the H1/H2/H3 decision on positive evidence, and only ours ever killed; Local State's
-# background_mode.enabled; nothing new under the default %LOCALAPPDATA%\Chromium (anything new is moved aside, never
-# deleted, so the proof's own cleanup holds); HKCU names in fixed places before and after (C9); the fonts a headless
-# PDF of the same profile embeds; and which existing Preferences a first run over a profile without First Run
-# overwrites. One 120-second budget: a step that cannot get its minimum is skipped and says so. b3b goes ahead only
-# when the stop conditions listed at the end are none, and turns them into assertions.
+# A28 (S2-3b; the profile is only read). Before an install: with this package's
+# history (a closed attempt of an older version), a restored profile its seed would overwrite (O1:
+# Default\Preferences without First Run) keeps Chromium from installing, reported as package drift after the
+# other effects, which are converged already, so nothing at all is written. With First Run beside it Chromium
+# installs: that is A29, after A27, where the stand-in below is gone.
+$olderTree = Join-Path $programsDir 'chromium-153.0.1'
+$olderId, $olderDesired = ('tree-extracted:' + $olderTree.ToUpperInvariant()), @{ exists = $true; files = @{ 'Chrome-bin/chrome.exe' = ('a' * 64) } }
+Craft @{ phase = 'intent'; id = $olderId; kind = 'tree-extracted'; target = $olderTree; prior = $absent; desired = $olderDesired; package = 'Chromium' }
+Craft @{ phase = 'commit'; id = $olderId; kind = 'tree-extracted'; target = $olderTree; prior = $absent; desired = $olderDesired; observed = $olderDesired }
+Craft @{ phase = 'undone'; id = $olderId; kind = 'tree-extracted'; target = $olderTree; prior = $absent; desired = $olderDesired; observed = $absent }
+$preferences, $sentinel = (Join-Path $chromiumProfile 'Default\Preferences'), (Join-Path $chromiumProfile 'First Run')
+$restored = '{"proof":"a profile restored by hand"}'
+$null = New-Item -ItemType Directory -Path (Split-Path -Parent $preferences)
+[IO.File]::WriteAllText($preferences, $restored)
+$mark = LastSeq
+MustReject { ApplyPackages 'Chromium' } '*Package drift: Chromium preexisting-drift*without its First Run sentinel*nothing is installed*'
+[IO.File]::WriteAllText($sentinel, '')
+Must ((LastSeq) -eq $mark -and -not (Test-Path -LiteralPath $chromiumTree) -and [IO.File]::ReadAllText($preferences) -ceq $restored) 'A28: O1 before an install, nothing written'
+# An owned Chromium tree recorded for another selection (a stand-in holding only a stand-in executable, as if
+# written before the seed) is owned-drift (C1), which stops the run before any effect; the O1 reason comes first.
+$standIn = Join-Path $chromiumTree $chromium.executable.Replace('/', '\')
+$null = New-Item -ItemType Directory -Path (Split-Path -Parent $standIn)
+[IO.File]::WriteAllText($standIn, 'a stand-in, not Chromium')
+$standInDesired = @{ exists = $true; files = @{ $chromium.executable = (Get-FileHash -LiteralPath $standIn).Hash.ToLowerInvariant() } }
+Craft @{ phase = 'intent'; id = $chromiumId; kind = 'tree-extracted'; target = $chromiumTree; prior = $absent; desired = $standInDesired; package = 'Chromium' }
+Craft @{ phase = 'commit'; id = $chromiumId; kind = 'tree-extracted'; target = $chromiumTree; prior = $absent; desired = $standInDesired; observed = $standInDesired }
+$mark = LastSeq
+MustReject { ApplyPackages 'Chromium' } '*Packages stop the run before any effect: Chromium 154*installed for another inventory or seed*'
+[IO.File]::Delete($sentinel)
+MustReject { ApplyPackages 'Chromium' } '*Packages stop the run before any effect: Chromium 154*without its First Run sentinel*do not start this Chromium*'
+Must ((LastSeq) -eq $mark -and (Phases $chromiumId) -ceq 'intent,commit' -and (Test-Path -LiteralPath $standIn) -and
+    [IO.File]::ReadAllText($preferences) -ceq $restored) 'A28: C1 stops an owned Chromium before any effect; the profile is only read'
+# A27: Uninstall leaves everything alone while a package executable is in use; closed, it removes every owned
+# effect, the package tree too, and never the protected profile.
+$count = @(Ledger).Count
+$handle = [IO.File]::Open((Join-Path $ahkTree $ahk.executable.Replace('/', '\')), 'Open', 'Read', 'Read')
+try { MustReject { RunUninstall -Apply } '*is in use*' } finally { $handle.Dispose() }
+Must (@(Ledger).Count -eq $count -and (AhkExact)) 'A27: an in-use package stops Uninstall before any removal'
+$gone = RunUninstall -Apply
+Must ($gone.ownedOpen -eq 0 -and -not (Test-Path -LiteralPath $ahkTree) -and -not (Test-Path -LiteralPath $chromiumTree) -and
+    (Test-Path -LiteralPath "$chromiumProfile\proof.txt") -and [IO.File]::ReadAllText($preferences) -ceq $restored) 'A27: Uninstall removes the package trees, never the profile'
+AssertEmpty
+
+# ---- A29 (b3b): the locked Chromium, installed for real (downloaded once), owned, first run, and removed ----
+# Here A27 has removed the stand-in 154 tree and every owned effect; the proof's stand-in profile keeps its restored
+# Default\Preferences, and First Run is written beside it, so R1 (the history of 153 and of the closed stand-in 154)
+# and O1 (a sentinel is present) both let Chromium install over an existing profile, which is never written.
+[IO.File]::WriteAllText($sentinel, '')
+function ProfileKept { (Test-Path -LiteralPath "$chromiumProfile\proof.txt") -and (Test-Path -LiteralPath $sentinel) -and [IO.File]::ReadAllText($preferences) -ceq $restored }
+function ChromiumExact {  # exactly the pinned inventory and the seed, by SHA-256
+    $want = @{}
+    foreach ($entry in $chromium.files.PSObject.Properties) { $want[$entry.Name] = $entry.Value }
+    $want[$chromium.seed.path] = $chromium.seed.sha256
+    (Test-Path -LiteralPath $chromiumTree) -and @(Get-ChildItem -LiteralPath $chromiumTree -Recurse -Force -File).Count -eq $want.Count -and
+        -not @($want.Keys | Where-Object { $path = Join-Path $chromiumTree $_.Replace('/', '\')
+            -not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-FileHash -LiteralPath $path).Hash -ne $want[$_] }).Count
+}
+$mark = LastSeq
+$chromiumInstalled = ApplyPackages 'Chromium'
+$chromiumRecords = @(Ledger | Where-Object { $_.id -ceq $chromiumId -and [long]$_.seq -gt $mark })
+Must (@($chromiumInstalled.packages | Where-Object { $_.name -ceq 'Chromium' })[0].class -ceq 'owned-match' -and
+    (@($chromiumRecords | ForEach-Object { $_.phase }) -join ',') -ceq 'intent,commit' -and $chromiumRecords[0].package -ceq 'Chromium' -and (ChromiumExact) -and
+    -not @(Get-ChildItem -LiteralPath $programsDir -Force | Where-Object { $_.Name -like "$(Split-Path -Leaf $chromiumTree).*" }).Count -and
+    (ProfileKept)) 'A29: Chromium is installed and owned exactly (inventory and seed), no asset or staging left, the profile unchanged'
+# Its first run, observed on the owned tree (the former b3a, now failing on its stop conditions): Chromium starts only
+# from that tree, only with fresh scratch --user-data-dir directories in RUNNER_TEMP, never with --no-first-run,
+# --no-sandbox or any other flag that changes a first run; the baseline (tree, default %LOCALAPPDATA%\Chromium, HKCU)
+# is taken after the install and just before the first launch. Observed: First Run and the six seed preferences after
+# a first GUI run; the tree still exactly the inventory and the seed (names, sizes, write times); every chrome.exe in
+# four classes (tree, descendant, outside, unknown; B3aPoll), its windows closed one by one and 45 s for ours to end,
+# the H1/H2/H3 decision on positive evidence, and only ours ever killed; Local State's background_mode.enabled;
+# nothing new under the default %LOCALAPPDATA%\Chromium (anything new is moved aside, never deleted); HKCU names in
+# fixed places before and after (C9); the fonts a headless PDF of the same profile embeds; and which existing
+# Preferences a first run over a profile without First Run overwrites. One 120-second budget: a step that cannot get
+# its minimum is skipped and says so. Record only: an unreadable PDF, the names added elsewhere than App Paths and
+# Uninstall, Software\Chromium; everything else listed at the end fails the proof.
 $b3a = [ordered]@{ status = 'not run' }
 $b3aBudget, $b3aClock = 120, [Diagnostics.Stopwatch]::StartNew()
 function B3a([string]$Line) { Write-Host "b3a $Line" }
@@ -2128,17 +2081,14 @@ function SeedPreferences([string]$Preferences) {
 }
 $b3aStops = [Collections.Generic.List[string]]::new()
 try {
-    $b3aPackage = @($manifest.packages | Where-Object { $_.name -ceq 'Chromium' })[0]
-    if (-not $s20.Contains('Chromium') -or -not ([string]$s20['Chromium']).StartsWith('evidence: complete')) { throw 'S2-0 did not leave an exact Chromium tree; nothing started' }
-    $b3aTree = Join-Path $s20Dir 'Chromium\moved'
+    $b3aPackage, $b3aTree = $chromium, $chromiumTree
     $b3aExe = Join-Path $b3aTree $b3aPackage.executable.Replace('/', '\')
     $b3aDir = Join-Path $env:RUNNER_TEMP ('b3a-' + [guid]::NewGuid().ToString('N'))  # fresh, never deleted
     $null = New-Item -ItemType Directory -Path $b3aDir
     $seedSource = Join-Path $PSScriptRoot $b3aPackage.seed.file.Replace('/', '\')
     if ((Get-FileHash -LiteralPath $seedSource).Hash -ne $b3aPackage.seed.sha256) { throw 'the bundled seed is not the manifest''s; nothing started' }
     $b3aSeedFonts = Get-Field (Get-Field (Get-Field ([IO.File]::ReadAllText($seedSource) | ConvertFrom-Json) 'webkit') 'webprefs') 'fonts'
-    [IO.File]::Copy($seedSource, (Join-Path $b3aTree $b3aPackage.seed.path.Replace('/', '\')), $false)
-    $b3a.seed = "copied beside $($b3aPackage.executable) in the S2-0 tree"
+    $b3a.seed = "written by win.ps1 beside $($b3aPackage.executable) in the owned tree"
     $page = Join-Path $b3aDir 'page.html'
     [IO.File]::WriteAllText($page, '<!doctype html><html><head><meta charset="utf-8"><title>b3a</title></head><body>' +
         '<p lang="ja">&#x65E5;&#x672C;&#x8A9E;&#x306E;&#x672C;&#x6587; default</p><p>Latin default text</p>' +
@@ -2154,7 +2104,7 @@ try {
     # (1) The first GUI run on an empty profile: First Run, then the six preferences once it has closed. Its windows are
     # closed one by one as a user would; ours then get 45 s to end by themselves. Which of H1 (the browser and all ours
     # end), H2 (the browser stays for an observed reason: background mode, or a window left after closing) or H3 (a chrome.exe
-    # from outside the tree) holds is decided on positive evidence only; anything else leaves b3b stopped.
+    # from outside the tree) holds is decided on positive evidence only; anything else fails the proof.
     $userData = Join-Path $b3aDir 'user-data'
     try {
         $wait = [Math]::Min(10, (B3aLeft 72 'first run') - 62)
@@ -2183,28 +2133,31 @@ try {
                 "H2: the browser stayed; $($b3a.backgroundMode)$(if ($windowLeft) { ', a window left after closing' })"
             }
             else { 'undecided: ours did not end and no reason was observed' }
-        if ($b3a.decision -like 'H3*') { $b3aStops.Add('H3: a process started from outside the tree (b3b is cancelled)') }
-        elseif ($b3a.decision -notlike 'H[12]*') { $b3aStops.Add("process behaviour $($b3a.decision): S7 before b3b") }
-    } catch { $b3a.firstRun = "not observed: $($_.Exception.Message -replace '(.{300}).+', '$1...')"; $b3aStops.Add('first run unproven: S7 before b3b') }
+        if ($b3a.decision -like 'H3*') { $b3aStops.Add('H3: a process started from outside the tree') }
+        elseif ($b3a.decision -notlike 'H[12]*') { $b3aStops.Add("process behaviour $($b3a.decision)") }
+    } catch { $b3a.firstRun = "not observed: $($_.Exception.Message -replace '(.{300}).+', '$1...')"; $b3aStops.Add('first run unproven') }
     # (2) A first run over existing Preferences without First Run: which markers survive (O1's premise and range).
     try {
         $wait = [Math]::Min(8, (B3aLeft 35 'overwrite') - 27)
-        $restored = Join-Path $b3aDir 'restored'
-        $null = New-Item -ItemType Directory -Path (Join-Path $restored 'Default'), (Join-Path $restored 'Profile 1')
-        foreach ($name in 'Default', 'Profile 1') { [IO.File]::WriteAllText((Join-Path $restored "$name\Preferences"), "{`"b3a_marker`":`"$name`"}") }
-        $browser = StartChromium @("--user-data-dir=$restored", $pageUrl)
-        $seconds = WaitFor { Test-Path -LiteralPath (Join-Path $restored 'First Run') } $wait
+        $b3aRestored = Join-Path $b3aDir 'restored'
+        $null = New-Item -ItemType Directory -Path (Join-Path $b3aRestored 'Default'), (Join-Path $b3aRestored 'Profile 1')
+        foreach ($name in 'Default', 'Profile 1') { [IO.File]::WriteAllText((Join-Path $b3aRestored "$name\Preferences"), "{`"b3a_marker`":`"$name`"}") }
+        $browser = StartChromium @("--user-data-dir=$b3aRestored", $pageUrl)
+        $seconds = WaitFor { Test-Path -LiteralPath (Join-Path $b3aRestored 'First Run') } $wait
         Start-Sleep -Seconds 2
         $windows = CloseWindows $browser
         $settled = SettleText (SettleChromium 10 $browser)
         $marks = @(foreach ($name in 'Default', 'Profile 1') {
-            $file = Join-Path $restored "$name\Preferences"
+            $file = Join-Path $b3aRestored "$name\Preferences"
             $kept = (Test-Path -LiteralPath $file) -and [IO.File]::ReadAllText($file).Contains('"b3a_marker"')
             "$name $(if ($kept) { 'kept' } else { 'OVERWRITTEN' }) ($(SeedPreferences $file))"
         })
         $b3a.overwrite = "First Run $(if ($null -ne $seconds) { "after $seconds s" } else { "NOT within $wait s" }); $($marks -join '; '); sent $($windows.Count) close request(s); $settled"
-        if ($marks[1] -like '*OVERWRITTEN*') { $b3aStops.Add('Profile 1 is overwritten too: widen SeedHazard before b3b') }
-    } catch { $b3a.overwrite = "not observed: $($_.Exception.Message -replace '(.{300}).+', '$1...')" }
+        if ($marks[1] -like '*OVERWRITTEN*') { $b3aStops.Add('Profile 1 is overwritten too, while SeedHazard reads only Default') }
+    } catch {
+        $b3a.overwrite = "not observed: $($_.Exception.Message -replace '(.{300}).+', '$1...')"
+        $b3aStops.Add('the overwrite range (Default and Profile 1) was not observed')
+    }
     # (3) The first profile printed headless: the fonts the PDF embeds (unproven when no /BaseFont is readable).
     try {
         $pdf = Join-Path $b3aDir 'page.pdf'
@@ -2228,8 +2181,8 @@ try {
     $seenAll = @($script:b3aSeen.Values)
     $b3a.processes = (@('tree', 'descendant', 'outside', 'unknown' | ForEach-Object { $class = $_; "$class $(@($seenAll | Where-Object { $_.class -ceq $class }).Count)" }) -join ', ') +
         "; not in the tree: $(Few @($seenAll | Where-Object { $_.class -cne 'tree' } | ForEach-Object { "$($_.class) $($_.type)[$($_.id)<$($_.parent)]$(if ($_.path) { ' ' + $_.path })" }))"
-    if (@($seenAll | Where-Object { $_.class -ceq 'outside' }).Count -and -not $b3aStops.Contains('H3: a process started from outside the tree (b3b is cancelled)')) {
-        $b3aStops.Add('H3: a process started from outside the tree (b3b is cancelled)')
+    if (@($seenAll | Where-Object { $_.class -ceq 'outside' }).Count -and -not $b3aStops.Contains('H3: a process started from outside the tree')) {
+        $b3aStops.Add('H3: a process started from outside the tree')
     }
     # C9 before any move aside, so a failed move cannot lose it: every added name where registration matters (at most 100
     # each), only the count and first names under Software\Chromium, Chromium's own state.
@@ -2283,61 +2236,30 @@ try {
     $b3a.status = "observed in $([Math]::Round($b3aClock.Elapsed.TotalSeconds)) s of the $b3aBudget s budget"
 } catch {
     $b3a.status = "not observed: $($_.Exception.Message -replace '(.{300}).+', '$1...')"
-    $b3aStops.Add('b3a did not complete: S7 before b3b')
+    $b3aStops.Add('the first-run observation did not complete')
 } finally {
     try {
         if (Get-Variable -Name b3aSeen -Scope Script -ErrorAction SilentlyContinue) {
             $b3aFinal = SettleChromium 5 $null
             $b3a.finalSettle = SettleText $b3aFinal
-            if ($b3aFinal.survivors.Count -or $b3aFinal.unknown.Count) { $b3aStops.Add('processes remain after b3a: unproven, S7 before b3b') }
+            if ($b3aFinal.survivors.Count -or $b3aFinal.unknown.Count) { $b3aStops.Add('processes remain after the observation: unproven') }
         }
     } catch { $b3a.finalSettle = "not settled: $($_.Exception.Message -replace '(.{200}).+', '$1...')" }
 }
 foreach ($entry in $b3a.GetEnumerator()) { B3a "$($entry.Key): $($entry.Value)" }
-B3a "stop conditions for b3b: $(if ($b3aStops.Count) { $b3aStops -join '; ' } else { 'none observed' })"
-# A28 (S2-3b, Chromium never downloaded; the profile is only read). Before an install: with this package's
-# history (a closed attempt of an older version), a restored profile its seed would overwrite (O1:
-# Default\Preferences without First Run) keeps Chromium from installing, reported as package drift after the
-# other effects, which are converged already, so nothing at all is written; with First Run beside it, only the
-# 7z refusal is left.
-$olderTree = Join-Path $programsDir 'chromium-153.0.1'
-$olderId, $olderDesired = ('tree-extracted:' + $olderTree.ToUpperInvariant()), @{ exists = $true; files = @{ 'Chrome-bin/chrome.exe' = ('a' * 64) } }
-Craft @{ phase = 'intent'; id = $olderId; kind = 'tree-extracted'; target = $olderTree; prior = $absent; desired = $olderDesired; package = 'Chromium' }
-Craft @{ phase = 'commit'; id = $olderId; kind = 'tree-extracted'; target = $olderTree; prior = $absent; desired = $olderDesired; observed = $olderDesired }
-Craft @{ phase = 'undone'; id = $olderId; kind = 'tree-extracted'; target = $olderTree; prior = $absent; desired = $olderDesired; observed = $absent }
-$preferences, $sentinel = (Join-Path $chromiumProfile 'Default\Preferences'), (Join-Path $chromiumProfile 'First Run')
-$restored = '{"proof":"a profile restored by hand"}'
-$null = New-Item -ItemType Directory -Path (Split-Path -Parent $preferences)
-[IO.File]::WriteAllText($preferences, $restored)
+B3a "stop conditions: $(if ($b3aStops.Count) { $b3aStops -join '; ' } else { 'none observed' })"
+Must (-not $b3aStops.Count) "A29: Chromium's first run on the owned tree: $($b3aStops -join '; ')"
+# After its first run a second Apply writes nothing for Chromium, which is still exactly owned (win.ps1's own reading).
 $mark = LastSeq
-MustReject { ApplyPackages 'Chromium' } '*Package drift: Chromium preexisting-drift*without its First Run sentinel*nothing is installed*'
-[IO.File]::WriteAllText($sentinel, '')
-MustReject { ApplyPackages 'Chromium' } '*clean install from a 7z asset is not enabled yet*'
-Must ((LastSeq) -eq $mark -and -not (Test-Path -LiteralPath $chromiumTree) -and [IO.File]::ReadAllText($preferences) -ceq $restored) 'A28: O1 before an install, nothing written'
-# An owned Chromium tree recorded for another selection (a stand-in holding only a stand-in executable, as if
-# written before the seed) is owned-drift (C1), which stops the run before any effect; the O1 reason comes first.
-$standIn = Join-Path $chromiumTree $chromium.executable.Replace('/', '\')
-$null = New-Item -ItemType Directory -Path (Split-Path -Parent $standIn)
-[IO.File]::WriteAllText($standIn, 'a stand-in, not Chromium')
-$standInDesired = @{ exists = $true; files = @{ $chromium.executable = (Get-FileHash -LiteralPath $standIn).Hash.ToLowerInvariant() } }
-Craft @{ phase = 'intent'; id = $chromiumId; kind = 'tree-extracted'; target = $chromiumTree; prior = $absent; desired = $standInDesired; package = 'Chromium' }
-Craft @{ phase = 'commit'; id = $chromiumId; kind = 'tree-extracted'; target = $chromiumTree; prior = $absent; desired = $standInDesired; observed = $standInDesired }
-$mark = LastSeq
-MustReject { ApplyPackages 'Chromium' } '*Packages stop the run before any effect: Chromium 154*installed for another inventory or seed*'
-[IO.File]::Delete($sentinel)
-MustReject { ApplyPackages 'Chromium' } '*Packages stop the run before any effect: Chromium 154*without its First Run sentinel*do not start this Chromium*'
-Must ((LastSeq) -eq $mark -and (Phases $chromiumId) -ceq 'intent,commit' -and (Test-Path -LiteralPath $standIn) -and
-    [IO.File]::ReadAllText($preferences) -ceq $restored) 'A28: C1 stops an owned Chromium before any effect; the profile is only read'
-# A27: Uninstall leaves everything alone while a package executable is in use; closed, it removes every owned
-# effect, the package tree too, and never the protected profile.
-$count = @(Ledger).Count
-$handle = [IO.File]::Open((Join-Path $ahkTree $ahk.executable.Replace('/', '\')), 'Open', 'Read', 'Read')
-try { MustReject { RunUninstall -Apply } '*is in use*' } finally { $handle.Dispose() }
-Must (@(Ledger).Count -eq $count -and (AhkExact)) 'A27: an in-use package stops Uninstall before any removal'
-$gone = RunUninstall -Apply
-Must ($gone.ownedOpen -eq 0 -and -not (Test-Path -LiteralPath $ahkTree) -and -not (Test-Path -LiteralPath $chromiumTree) -and
-    (Test-Path -LiteralPath "$chromiumProfile\proof.txt") -and [IO.File]::ReadAllText($preferences) -ceq $restored) 'A27: Uninstall removes the package trees, never the profile'
+$chromiumAgain = ApplyPackages 'Chromium'
+Must ((NewRecords $mark @($chromiumId)) -eq 0 -and @($chromiumAgain.packages | Where-Object { $_.name -ceq 'Chromium' })[0].class -ceq 'owned-match' -and
+    (ProfileKept)) 'A29: after its first run a second Apply writes nothing for Chromium, still owned exactly'
+# Uninstall removes the tree file by file, its seed too, and never the profile or the scratch profiles.
+$chromiumGone = RunUninstall -Apply
+Must ($chromiumGone.ownedOpen -eq 0 -and -not (Test-Path -LiteralPath $chromiumTree) -and (ProfileKept) -and
+    (Test-Path -LiteralPath (Join-Path $userData 'First Run'))) 'A29: Uninstall removes the Chromium tree with its seed, never a profile'
 AssertEmpty
+[IO.File]::Delete($sentinel)
 [IO.File]::Delete($preferences)
 [IO.Directory]::Delete((Split-Path -Parent $preferences), $false)
 [IO.File]::Delete("$chromiumProfile\proof.txt")
@@ -2434,6 +2356,6 @@ if ($g4.status -cne 'measured' -or (Get-Field $g4 'gate') -cne 'pass' -or $g4.st
     uninstallEmptiedOwnedFonts = $true;
     rentSsh = "cloudflared $($manifest.cloudflared.version) client, strict config, Include preserved and idempotent, drift repaired"
     winReportsHandoffUnproven = $true; handoffProbeRefusedOnRunner = $true; handoffEvaluatorCases = $handoffCases;
-    g4Measurement = $g4; s20Measurement = $s20;
+    g4Measurement = $g4;
     noctty = 'native owned tree, configuration, COM keys and values and the default-terminal selection through Apply and Uninstall (A15-A21)'
-    scope = 'current-user owned fonts, Noctty and SSH-client convergence on an elevated runner with Windows Terminal 1.23; not Restore (activation, package view, rollback), packages, rendering, default-terminal handoff, real-host UX or a Cloudflare connection' } | ConvertTo-Json
+    scope = 'current-user owned fonts, Noctty, SSH client and locked packages (AutoHotkey ZIP and Chromium 7z with its font seed: install, ownership, first run on scratch profiles, Uninstall) on an elevated Windows Server runner with Windows Terminal 1.23; not Restore (activation, package view, rollback), a clean unelevated Windows 11 user, Chromium on the default profile or launched by name, default-terminal handoff, real-host UX or a Cloudflare connection' } | ConvertTo-Json

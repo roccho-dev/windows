@@ -326,9 +326,9 @@ Once the selected version is owned and exact, owned trees of its other versions 
 removed the Uninstall way (a tree in use, or one another effect refers to, is kept
 and reported). `Uninstall` refuses, before removing anything, while a package's
 executable is in use; it never removes protected data, and never App Paths or an
-external install. **Limits now:** a clean install from a 7z asset (Chromium) is
-refused before any effect until its own CI proof; nothing registers App Paths yet,
-so an owned Chromium would not be launchable by name (required before PR-A is done);
+external install. A 7z asset (Chromium) installs like a ZIP, through inbox
+`tar.exe`. **Limits now:** nothing registers App Paths yet, so an owned Chromium
+would not be launchable by name (required before PR-A is done);
 a read-only file in an extracted tree would make `Uninstall` fail (recorded, not hidden).
 
 **Chromium font seed.** `pack.py` generates
@@ -343,8 +343,7 @@ the seed into staging as a new, flushed file from the bundle (length and SHA-256
 checked again); the staged tree must be exactly the inventory and the seed, which
 recovery and `Uninstall` remove with the tree. An owned tree recorded for another
 inventory or seed of the same version is `owned-drift` (Uninstall, then install again).
-Nothing installs Chromium until its 7z clean install is enabled (b3). Chromium reads the
-seed only on a first run, for a `User Data` without its `First Run` sentinel, and then
+Chromium reads the seed only on a first run, for a `User Data` without its `First Run` sentinel, and then
 **overwrites that profile's existing `Preferences`**. So every mode reads, and never
 writes, `User Data\First Run` and `User Data\Default\Preferences` (no mode starts
 Chromium): while `Default\Preferences` exists without `First Run`, an install is
@@ -412,8 +411,8 @@ primitives also run in a Windows PowerShell 5.1 child on synthetic targets. The
 G4 gate measures the vendor's own registration against the six values. A
 `Restore` rollback after a failed activation or package check is not exercised
 on CI (`Restore` refuses the elevated runner, whose Windows Terminal is 1.23).
-For packages (A23-A28, AutoHotkey downloaded once, Chromium never) it checks the
-`-Packages` contract, the Chromium 7z refusal and R1 before any effect, an external
+For packages (A23-A29, AutoHotkey and Chromium each downloaded once) it checks the
+`-Packages` contract and R1 before any effect, an external
 entry never taken over (alone or beside the owned tree), a clean AutoHotkey install
 owned exactly with no asset or staging left and a second Apply writing nothing,
 an owned older version collected, interrupted installs recovered (asset and
@@ -424,12 +423,16 @@ malformed seed refused, the listing against the inventory alone, a staging tree 
 only after the verified seed is written (a differing one writes nothing), recovery
 removing the seed, and, with the profile only read, O1 keeping Chromium from installing
 (package drift, nothing written) and C1 stopping a stand-in owned tree before any effect.
-Chromium's first run is observed (b3a) as printed evidence that never fails the proof,
-within a budget of about 120 s (each step starts only when its bounded share is left;
-the final bounded cleanup and readouts come on top): the tree the S2-0 measurement
-extracted, with the bundled seed copied in,
-is started only with scratch `--user-data-dir` profiles on the runner. It reports `First
-Run` and the six seed preferences after a first GUI run; which of `Default` and `Profile
+A29 installs the locked Chromium for real through `win.ps1` (`Apply -Packages
+Chromium`) over the proof's stand-in profile, with `First Run` beside it and this
+package's history (so R1 and O1 allow it and the profile is never written): one intent
+naming the package and one commit, the tree exactly the inventory and the seed, no
+asset or staging left. Its first run is then observed and asserted, within a budget of
+about 120 s (each step starts only when its bounded share is left; the final bounded
+cleanup and readouts come on top), the baseline taken after the install and just
+before the first launch: the owned tree is started only with scratch
+`--user-data-dir` profiles on the runner. It requires `First Run` and the six seed
+preferences after a first GUI run; which of `Default` and `Profile
 1` a first run over Preferences without `First Run` overwrites; the fonts a headless PDF
 embeds; the tree unchanged; every `chrome.exe` as tree, descendant (traced by PID and
 creation time, its parent seen running at or after the child's creation), outside (only
@@ -441,9 +444,13 @@ never a pass; Local State's `background_mode.enabled`; nothing new under the def
 `%LOCALAPPDATA%\Chromium` (moved aside, never deleted, never through a reparse point;
 anything not moved is a stop condition); fixed HKCU names before and after, read before
 any move, every added App Paths, Uninstall, StartMenuInternet, RegisteredApplications and
-`Software\Classes` name (those directly under it and OpenWithProgids) listed; and the
-stop conditions b3b will assert. A real seeded install
-through `win.ps1` is not exercised until b3b, nor a clean Windows 11 user until the VM run.
+`Software\Classes` name (those directly under it and OpenWithProgids) listed; any stop
+condition fails the proof (only an unreadable PDF and the names added outside App Paths
+and Uninstall are record only). A second Apply then writes nothing for Chromium, still
+owned exactly, and `Uninstall` removes the tree with its seed and keeps the profile and
+the scratch profiles. The runner is an elevated Windows Server: a clean, unelevated
+Windows 11 user's `Restore`, first run on the default `User Data` and launch by name are
+proven only by the VM run.
 It also requires every `win.ps1` answer to report
 `handoffProof = "unproven"` and `handoff-proof.ps1` to refuse the runner, so CI
 never claims a real default-terminal handoff. Negative controls must fail for
@@ -462,9 +469,9 @@ final single `ci.yml` with the open OCI stack. Do not discard existing proof to
 claim one workflow prematurely. Existing OCI definitions and #8 are unchanged.
 
 `%LOCALAPPDATA%\windows-iac\provenance\default-terminal.json` is per-user state;
-rollback reads it and nothing removes it. A clean Chromium install is not enabled
-yet (its 7z extraction awaits its own CI proof), so a clean `Restore` still stops at the package gate and
-`Restore`/`Uninstall` as a whole is not complete.
+rollback reads it and nothing removes it. A clean Chromium install is enabled and
+proven on the CI runner (A29), but App Paths (launch by name) and the VM run are still
+open, so `Restore`/`Uninstall` as a whole is not complete.
 
 **Required on a VM before the native registration is accepted (unproven here):**
 from an unelevated, Explorer-launched shell with Windows Terminal 1.24 or newer,
