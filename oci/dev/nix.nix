@@ -120,12 +120,18 @@
 
         # One foreground child whose environment is built from nothing (env -i). The key reaches it only on
         # descriptor 3, a here-string that bash passes as a pipe because the key is one short line (never a file,
-        # argv or stdin); the child reads it, closes the descriptor and becomes the program, so stdin, stdout, the
-        # exit status and signals are the program's own.
+        # argv or stdin). At that fixed boundary the child reads the key, then closes every descriptor above 2 that is
+        # still open (the key pipe and anything the caller left open; bash -c has no script descriptor of its own) and
+        # becomes the program, so only stdin, stdout and stderr, the exit status and signals are the program's own.
         say "${announce}"
         # shellcheck disable=SC2016
         exec "$cu/env" -i PATH="$cu" HOME=/homeless-shelter LANG=C.UTF-8 ${childEnv} \
-          ${pkgs.bash}/bin/bash -c 'IFS= read -r -u 3 JEV_API_KEY || true; exec 3<&-; export JEV_API_KEY; exec env -u PWD -u SHLVL -u OLDPWD -- "$0"' \
+          ${pkgs.bash}/bin/bash -c 'IFS= read -r -u 3 JEV_API_KEY || true
+            for f in /proc/$$/fd/*; do
+              n=''${f##*/}
+              if [[ $n =~ ^[0-9]+$ ]] && [ "$n" -gt 2 ] && [ -e "$f" ]; then exec {n}<&-; fi
+            done
+            unset f n; export JEV_API_KEY; exec env -u PWD -u SHLVL -u OLDPWD -- "$0"' \
           "$program" 3<<< "$key"
       '';
     };

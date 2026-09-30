@@ -226,14 +226,19 @@ NIX
   port=$((20000 + RANDOM % 20000))
   marker=/tmp/voice-ui-jev-proof-$port
   mkdir "$fx/tmp"
-  # The child's open descriptors, apart from 255 (a bash script's own file): only stdin, stdout and stderr.
-  only_stdio() { test "$(grep -vxF 255 "$1" | tr '\n' ' ')" = "0 1 2 "; }
+  # The child's open descriptors, apart from 255 (a bash script's own file): only stdin, stdout and stderr. Every
+  # launch below also holds descriptors 7 and 9 in the caller, so a descriptor the caller leaves open must not leak.
+  only_stdio() {
+    local got
+    got=$(grep -vxF 255 "$1" | tr '\n' ' ')
+    [ "$got" = "0 1 2 " ] || { echo "child descriptors are '$got', expected '0 1 2 '" >&2; return 1; }
+  }
   launch_as() {
     local expect=$1 code=0
     shift
     rm -f "$marker" "$marker.fds"
     env TMPDIR="$fx/tmp" GH_TOKEN=fixture-gh GH_CONFIG_DIR=/nonexistent SOPS_AGE_KEY_FILE=/nonexistent HOST=0.0.0.0 SHELLOPTS=xtrace \
-      'BASH_FUNC_leak%%=() { :; }' 'NOT-AN-IDENTIFIER=leak' "$launch" "$@" > "$out" 2>&1 || code=$?
+      'BASH_FUNC_leak%%=() { :; }' 'NOT-AN-IDENTIFIER=leak' "$launch" "$@" > "$out" 2>&1 7< /dev/null 9< /dev/null || code=$?
     if grep -qF "$key" "$out"; then echo 'the key reached launcher output' >&2; return 1; fi
     if [ "$expect" = pass ]; then [ "$code" -eq 0 ] && [ -e "$marker" ]; else [ "$code" -ne 0 ] && [ ! -e "$marker" ]; fi \
       || { cat "$out" >&2; echo "voice-ui-jev-dev: expected $expect, exit $code: $*" >&2; return 1; }
@@ -305,7 +310,7 @@ NIX
     rm -f "$ops_fds"
     printf '%s' "$input" | env TMPDIR="$fx/tmp" GH_TOKEN=fixture-gh GH_CONFIG_DIR=/nonexistent SOPS_AGE_KEY_FILE=/nonexistent \
       JEV_API_KEY=parent-leak SHELLOPTS=xtrace 'BASH_FUNC_leak%%=() { :; }' 'NOT-AN-IDENTIFIER=leak' \
-      "$ops" "$@" > "$ops_out" 2> "$ops_err" || code=$?
+      "$ops" "$@" > "$ops_out" 2> "$ops_err" 7< /dev/null 9< /dev/null || code=$?
     if grep -qF "$key" "$ops_out" "$ops_err"; then echo 'the key reached ops-jev output' >&2; return 1; fi
     if grep -qF 'ops-jev:' "$ops_out"; then echo 'ops-jev wrote its own messages to stdout' >&2; return 1; fi
     case $expect in
