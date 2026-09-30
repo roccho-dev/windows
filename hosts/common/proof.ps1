@@ -476,10 +476,10 @@ $script:validateAttempt, $script:attemptsValidated = ${function:Get-EffectAttemp
 try {
     ${function:Get-EffectAttempt} = { $script:attemptsValidated++; & $script:validateAttempt @args }
     $withNoise = Hist ($noise + $chromium)
-    $validated = $script:attemptsValidated
-    Must ($withNoise -and $validated -eq 1 -and (Hist ($chromium + $noise)) -and (Hist ($noise + $retried)) -and -not (Hist $noise) -and
+    $p3Validated = $script:attemptsValidated
+    Must ($withNoise -and $p3Validated -eq 1 -and (Hist ($chromium + $noise)) -and (Hist ($noise + $retried)) -and -not (Hist $noise) -and
         -not (Hist ($noise + @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'void')))) -and -not (Hist ($collides + $chromium)) -and
-        (Hist $noise 'AutoHotkey') -and -not (Hist $noise[3..9] 'AutoHotkey')) "P3: R1 amid unrelated ledger noise ($validated validated)"
+        (Hist $noise 'AutoHotkey') -and -not (Hist $noise[3..9] 'AutoHotkey')) "P3: R1 amid unrelated ledger noise ($p3Validated validated)"
     # The R1 guard it feeds: protected data (a synced profile) beside noise alone is foreign, never installed over.
     $guard = Get-PackageClass 'absent' 0 @() $true (Hist $noise)
     Must ($guard.class -ceq 'preexisting-drift' -and -not $guard.install -and (Get-PackageClass 'absent' 0 @() $true (Hist ($noise + $chromium))).install) 'P3: the R1 protected-data guard'
