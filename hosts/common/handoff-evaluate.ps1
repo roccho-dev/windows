@@ -180,21 +180,29 @@ function Test-EffectPath([string]$Kind, $Target) {
     return $true
 }
 
+# One relative path of '/'-separated segments, each exactly as Test-PathSegment allows (that
+# function is the specification; proof.ps1 checks they agree), as one regex, so a whole
+# inventory is checked without a function call per name or segment.
+function Get-RelativePathRegex {
+    $segment = '(?!(?:CON|PRN|AUX|NUL|COM\d|LPT\d)(?:\.[^/]*)?(?:/|\z))[^\\/:*?"<>|\x00-\x1f]*[^\\/:*?"<>|\x00-\x1f. ]'
+    [regex]::new("^$segment(?:/$segment)*\z", [Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant')
+}
+
+function Test-RelativePath([string]$Name) { (Get-RelativePathRegex).IsMatch($Name) }
+
 # A '/'-path -> sha256 map as a case-insensitive hashtable, or $null when it is
 # not a map, a path is not a safe relative path, a hash is malformed, or two
-# paths differ only in case.
+# paths differ only in case. One pass over the name/value pairs (a dictionary key
+# named Keys is an ordinary name), with the path regex built once per map.
 function ConvertTo-FileMap($Files) {
-    if ($Files -is [Collections.IDictionary]) { $names = @($Files.Keys) }
-    elseif ($Files -is [Management.Automation.PSCustomObject]) { $names = @($Files.PSObject.Properties | ForEach-Object Name) }
+    if ($Files -is [Collections.IDictionary]) { $pairs = @(foreach ($entry in $Files.GetEnumerator()) { , @($entry.Key, $entry.Value) }) }
+    elseif ($Files -is [Management.Automation.PSCustomObject]) { $pairs = @(foreach ($property in $Files.PSObject.Properties) { , @($property.Name, $property.Value) }) }
     else { return $null }
-    $map = @{}
-    foreach ($name in $names) {
-        $sha = Get-Field $Files $name
-        if ($name -isnot [string] -or $sha -isnot [string] -or $sha -notmatch '^[0-9A-Fa-f]{64}$' -or
-            $map.ContainsKey($name)) { return $null }
-        foreach ($segment in $name.Split('/')) {
-            if (-not (Test-PathSegment $segment)) { return $null }
-        }
+    $path, $map = (Get-RelativePathRegex), @{}
+    foreach ($pair in $pairs) {
+        $name, $sha = $pair[0], $pair[1]
+        if ($name -isnot [string] -or $sha -isnot [string] -or $sha -notmatch '^[0-9A-Fa-f]{64}\z' -or
+            $map.ContainsKey($name) -or -not $path.IsMatch($name)) { return $null }
         $map[$name] = $sha
     }
     return $map
@@ -219,7 +227,7 @@ function Get-EffectStateProblem([string]$Kind, $State, [string]$Role) {
         'registry-key-created' { }
         default {
             $sha = Get-Field $State 'sha256'
-            if ($sha -isnot [string] -or $sha -notmatch '^[0-9A-Fa-f]{64}$') { return "$Role.sha256 is not a SHA-256." }
+            if ($sha -isnot [string] -or $sha -notmatch '^[0-9A-Fa-f]{64}\z') { return "$Role.sha256 is not a SHA-256." }
         }
     }
     return $null
@@ -563,7 +571,7 @@ function Get-IntentTempProblem($Record) {
     if ($null -eq $temp) { return $null }
     $suffix = switch -CaseSensitive ([string](Get-Field $Record 'kind')) { 'file-created' { 'tmp' } 'tree-extracted' { 'staging' } }
     if (-not $suffix) { return "A $(Get-Field $Record 'kind') intent names no temporary path." }
-    if ($temp -isnot [string] -or $temp -cnotmatch ('^' + [regex]::Escape($target) + '\.[0-9a-f]{32}\.' + $suffix + '$')) {
+    if ($temp -isnot [string] -or $temp -cnotmatch ('^' + [regex]::Escape($target) + '\.[0-9a-f]{32}\.' + $suffix + '\z')) {
         return "The temporary path is not $target.<guid32>.$suffix."
     }
     return $null
@@ -676,9 +684,9 @@ function Test-PackageHistory($Records, [string]$Package) {
 function Get-PackageAssetPath($Record, [string]$Programs) {
     $package, $target, $temp = (Get-Field $Record 'package'), [string](Get-Field $Record 'target'), (Get-Field $Record 'temp')
     if ((Get-Field $Record 'kind') -cne 'tree-extracted' -or (Get-Field $Record 'phase') -cne 'intent' -or $temp -isnot [string] -or
-        $null -ne (Get-EffectRecordProblem $Record) -or $package -isnot [string] -or $package -cnotmatch '^[A-Za-z0-9][A-Za-z0-9.-]*$' -or
+        $null -ne (Get-EffectRecordProblem $Record) -or $package -isnot [string] -or $package -cnotmatch '^[A-Za-z0-9][A-Za-z0-9.-]*\z' -or
         -not $Programs -or [IO.Path]::GetDirectoryName($target) -ne $Programs.TrimEnd('\') -or
-        [IO.Path]::GetFileName($target) -cnotmatch ('^' + [regex]::Escape($package.ToLowerInvariant()) + '-[0-9][A-Za-z0-9.]*$')) {
+        [IO.Path]::GetFileName($target) -cnotmatch ('^' + [regex]::Escape($package.ToLowerInvariant()) + '-[0-9][A-Za-z0-9.]*\z')) {
         return $null
     }
     return $temp + '.asset'

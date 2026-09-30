@@ -11,28 +11,37 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hoste
 # A failure is rethrown with the child's error message, which 5.1 wraps at the
 # console width: its lines are rejoined up to the "At <script>:<line> char:<n>" line, which is
 # printed to the log (not added to the message, so negative controls keep their patterns).
+# Every child also logs one timing line: its arguments, exit code, seconds and ledger record count.
 $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 function Win51([string[]]$Arguments) {
     $ErrorActionPreference = 'Continue'  # the child's stderr is data here, not an error of this process
     $PSNativeCommandUseErrorActionPreference = $false
-    $lines = @(& $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'win.ps1') @Arguments 2>&1)
-    $code = $LASTEXITCODE
-    $stdout = @($lines | Where-Object { $_ -isnot [Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() })
-    $stderr = @($lines | Where-Object { $_ -is [Management.Automation.ErrorRecord] } | ForEach-Object { $_.ToString() })
-    if ($code -ne 0) {
-        $message, $atPosition = '', $false
-        foreach ($line in $stderr) {
-            if ($line -match '^At .+ char:\d+\s*$' -and -not $atPosition) { $atPosition = $true; Write-Host "win.ps1 ($($Arguments -join ' ')) stopped: $($line.Trim())" }
-            if (-not $atPosition) { $message += $line }
+    # One timing line per child, success or failure, to the log only: seconds and the effect ledger's record count.
+    $clock, $code = [Diagnostics.Stopwatch]::StartNew(), 'none'
+    try {
+        $lines = @(& $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'win.ps1') @Arguments 2>&1)
+        $code = $LASTEXITCODE
+        $stdout = @($lines | Where-Object { $_ -isnot [Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() })
+        $stderr = @($lines | Where-Object { $_ -is [Management.Automation.ErrorRecord] } | ForEach-Object { $_.ToString() })
+        if ($code -ne 0) {
+            $message, $atPosition = '', $false
+            foreach ($line in $stderr) {
+                if ($line -match '^At .+ char:\d+\s*$' -and -not $atPosition) { $atPosition = $true; Write-Host "win.ps1 ($($Arguments -join ' ')) stopped: $($line.Trim())" }
+                if (-not $atPosition) { $message += $line }
+            }
+            if (-not $message.Trim()) { $message = "win.ps1 exited $code without an error message: $($stderr -join ' ')" }
+            throw [Management.Automation.RuntimeException]::new($message)
         }
-        if (-not $message.Trim()) { $message = "win.ps1 exited $code without an error message: $($stderr -join ' ')" }
-        throw [Management.Automation.RuntimeException]::new($message)
+        if ($stderr.Count) { throw "win.ps1 succeeded but wrote to stderr: $($stderr -join ' ')" }
+        if ($stdout.Count -ne 1) { throw "win.ps1 printed $($stdout.Count) output lines instead of one JSON object." }
+        try { $answer = $stdout[0] | ConvertFrom-Json } catch { throw "win.ps1 printed malformed JSON: $($stdout[0])" }
+        if ($answer -isnot [Management.Automation.PSCustomObject]) { throw "win.ps1 printed JSON that is not one object: $($stdout[0])" }
+        return $answer
+    } finally {
+        $ledger = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'windows-iac\ledger'
+        $records = if (Test-Path -LiteralPath $ledger) { @(Get-ChildItem -LiteralPath $ledger -Filter '*.json').Count } else { 0 }
+        Write-Host "win.ps1 $($Arguments -join ' ') exit $code $([Math]::Round($clock.Elapsed.TotalSeconds, 1)) s ledger $records"
     }
-    if ($stderr.Count) { throw "win.ps1 succeeded but wrote to stderr: $($stderr -join ' ')" }
-    if ($stdout.Count -ne 1) { throw "win.ps1 printed $($stdout.Count) output lines instead of one JSON object." }
-    try { $answer = $stdout[0] | ConvertFrom-Json } catch { throw "win.ps1 printed malformed JSON: $($stdout[0])" }
-    if ($answer -isnot [Management.Automation.PSCustomObject]) { throw "win.ps1 printed JSON that is not one object: $($stdout[0])" }
-    return $answer
 }
 function Run([string]$Mode) { Win51 @('-Mode', $Mode) }
 # A wrapped child message may gain or lose a space at a line break, so a pattern
@@ -522,6 +531,27 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
     $before = $script:nextSeq
     Refused { CreateOwnedTree (Tree 'noctty-wrong' $two) $zip } '*Not in the inventory*'
     Must ($script:nextSeq -eq $before -and -not (Test-Path (Join-Path $Scratch 'Programs\noctty-wrong*'))) 'a differing archive is refused before any intent or write'
+    # The one relative-path regex agrees with Test-PathSegment (the specification), per segment, on every
+    # real name in this bundle and on adversarial ones, in this edition.
+    $pathNames = @($manifest.noctty.files.PSObject.Properties | ForEach-Object Name) + @($manifest.files.PSObject.Properties | ForEach-Object Name) +
+        @($manifest.packages | ForEach-Object { $_.files.PSObject.Properties | ForEach-Object Name }) +
+        @('', '.', '..', 'a/', '/a', 'a//b', 'a\b', 'C:x', 'a.', 'a ', ' a', 'a. ', 'a .', '.a', 'a..b', "a`n", "a`r`n", "a`r", "`na", "a`tb", "a$([char]0x7f)b",
+          'CON', 'con', 'Con.txt', 'CON.', 'CON.tar.gz', 'CONX', 'XCON', 'COM1', 'com9.log', 'COM10', 'COM0', 'LPT1', 'lpt5.x', 'AUX', 'NUL', 'nul.', 'PRN.a',
+          "COM$([char]0x0661)", "LPT$([char]0x0669).txt", "COM$([char]0xFF11)", 'd/CON', 'CON/d', 'd/nul.txt/e', "a$([char]0x00A0)", "a$([char]0x3000)",
+          "$([char]0xD83D)$([char]0xDE00)", "a$([char]0xD83D)", "a/b`n", "a`n/b", 'a|b', 'a"b', 'a*b', 'a?b', 'a<b', 'a>b', 'a:b', [string][char]0x212A,
+          [string][char]0x017F, [string][char]0x0131, [string][char]0x0130, 'Chrome-bin/154.0.8037.58/chrome.dll')
+    $disagree = @($pathNames | Where-Object { (Test-RelativePath $_) -ne (-not @($_.Split('/') | Where-Object { -not (Test-PathSegment $_) }).Count) })
+    Must (-not $disagree.Count) "the relative-path regex agrees with Test-PathSegment on $($pathNames.Count) names ($($disagree.Count) differ)"
+    # ConvertTo-FileMap keeps the real inventory exactly; a trailing newline is no SHA-256 or staging path anywhere;
+    # a key named Keys is an ordinary name; two names differing only in case are refused.
+    $inventory = ConvertTo-FileMap $manifest.noctty.files
+    $shaA = 'a' * 64
+    $ordinal = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal); $ordinal['A/x'] = $shaA; $ordinal['a/x'] = $shaA
+    Must ($inventory.Count -eq @($manifest.noctty.files.PSObject.Properties).Count -and
+        -not @($manifest.noctty.files.PSObject.Properties | Where-Object { $inventory[$_.Name] -cne $_.Value }).Count -and
+        $null -eq (ConvertTo-FileMap @{ 'a' = "$shaA`n" }) -and $null -ne (Get-EffectStateProblem 'file-created' @{ exists = $true; sha256 = "$shaA`n" } 'x') -and
+        $null -ne (Get-IntentTempProblem @{ kind = 'tree-extracted'; target = 'C:\u\t'; temp = "C:\u\t.$('0123456789abcdef' * 2).staging`n" }) -and
+        (ConvertTo-FileMap @{ 'Keys' = $shaA; 'b' = $shaA }).Count -eq 2 -and $null -eq (ConvertTo-FileMap $ordinal)) 'file maps and strict anchors'
     # R1 package history, in this edition: a valid committed attempt counts; with a malformed closing record it does not.
     $history = Tree 'chromium-1' $two
     $records = @(foreach ($r in @(@(1, 'intent', $null), @(2, 'commit', $history.desired), @(3, 'undone', @{ exists = $false }))) {
