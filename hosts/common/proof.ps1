@@ -552,7 +552,8 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
         'OrderedSteps', 'UndoOwnedSteps', 'RemoveTarget', 'FontReferences', 'FontReferenceTable', 'NocttyReferences',
         'SelectNoctty', 'StartupPair', 'RecordPriorTerminal', 'TestNocttyRegistration', 'TestNocttyActivation', 'AssertActualSelection', 'RestoreLegacy',
         'StepText', 'IsPackageTree', 'RemovePackageAsset', 'IndexRecord', 'ReadLedger', 'LedgerIds', 'NewLedgerIndex', 'AttemptOf',
-        'PackageEffect', 'SeedHazard', 'WriteSeed'
+        'PackageEffect', 'SeedHazard', 'WriteSeed', 'AppPathEffects', 'IsAppPathEffect', 'MachineAppPath', 'EffectClass', 'AppPathState',
+        'ConvergeAppPath', 'CollectAppPathGarbage', 'ConvergeEffect', 'Classify', 'UndoOwned', 'SharedKey', 'ObserveKeyContent'
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'win.ps1'), [ref]$null, [ref]$null)
     foreach ($definition in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cin $names }, $false)) {
         . ([scriptblock]::Create($definition.Extent.Text))
@@ -807,6 +808,74 @@ public static string[] Split(string cmd) {
         Must ($null -eq $empty -and $found -ceq "$userData\Default\Preferences" -and $null -eq $unseeded -and $null -eq $sentinel -and
             [IO.File]::ReadAllText("$userData\Default\Preferences") -ceq '{"proof":1}') 'O1: Preferences without First Run is found, and only read'
     } finally { $localAppData = $savedLocal }
+    # S2-2d-b, App Paths, on a unique name in this user's real HKCU App Paths (collected again below). The shape
+    # (not the lock) makes an effect App Paths; only an owned or installed package without hazard or conflict is
+    # selected; the K-rule: a foreign key, even with our exact data, is drift and never taken over; an HKLM entry
+    # (either view) is a conflict, beside an owned key too, which is then only reported; create, read back and
+    # re-point to a new version; the value names its tree (reference guard); A3 keeps a retired key holding
+    # foreign content; a retired name is collected value then key, but not while a seed would overwrite a profile.
+    $registryViews = @(@('HKCU', 'CurrentUser', 'Default'), @('HKLM', 'LocalMachine', 'Registry64'), @('HKLM32', 'LocalMachine', 'Registry32'))
+    $appPathsSubkey = 'Software\Microsoft\Windows\CurrentVersion\App Paths'
+    $script:packageDrift, $script:sharedCreated = @(), @()
+    $appName = 'proof-' + [guid]::NewGuid().ToString('N') + '.exe'
+    $appSubkey = "$appPathsSubkey\$appName"
+    $appPackage = [pscustomobject]@{ name = 'Chromium'; version = '9.8'; directory = 'Programs/chromium-9.8'; executable = 'Chrome-bin/chrome.exe'
+        files = [pscustomobject]@{ 'Chrome-bin/chrome.exe' = (Sha 'exe') }; protected = @('Chromium/User Data'); appPath = $appName }
+    function AppState($Class = 'owned-match', $Install = $false, $Hazard = $false, $Conflict = $false) {
+        [pscustomobject]@{ package = $appPackage; class = $Class; install = $Install; hazard = $Hazard; conflict = $Conflict }
+    }
+    $appEffects = AppPathEffects $appPackage
+    $appExe = Join-Path $localAppData 'Programs\chromium-9.8\Chrome-bin\chrome.exe'
+    Must ($appEffects.key.target -ceq "HKCU\$appSubkey" -and $appEffects.value.target -ceq "HKCU\$appSubkey" -and $appEffects.value.name -ceq '' -and
+        $appEffects.value.desired.data -ceq $appExe -and (IsAppPathEffect $appEffects.key) -and (IsAppPathEffect $appEffects.value) -and
+        (IsAppPathEffect @{ kind = 'registry-key-created'; target = "HKCU\$appPathsSubkey\retired.exe" }) -and
+        -not (IsAppPathEffect @{ kind = 'registry-value'; target = "HKCU\$appSubkey"; name = 'Path' }) -and
+        -not (IsAppPathEffect @{ kind = 'registry-key-created'; target = "HKCU\$appSubkey\sub" }) -and
+        -not (IsAppPathEffect @{ kind = 'registry-key-created'; target = "HKCU\$appPathsSubkey\x.cmd" }) -and
+        -not (IsAppPathEffect @{ kind = 'registry-key-created'; target = "HKCU\$appPathsSubkey\NUL.exe" })) 'App Paths effects and their shape'
+    Must ($null -eq (AppPathState (AppState 'owned-match' $false $true)) -and $null -eq (AppPathState (AppState 'owned-match' $false $false $true)) -and
+        $null -eq (AppPathState (AppState 'absent')) -and $null -eq (AppPathState (AppState 'owned-drift')) -and
+        $null -eq (AppPathState ([pscustomobject]@{ package = [pscustomobject]@{ name = 'X' }; class = 'owned-match'; install = $false; hazard = $false; conflict = $false }))) 'App Paths only for an owned or installed package without hazard or conflict'
+    $absentState = AppPathState (AppState)
+    $foreign = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($appSubkey)
+    try { $foreign.SetValue('', $appExe) } finally { $foreign.Close() }
+    $foreignState = AppPathState (AppState)
+    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($appSubkey)
+    $machine = ${function:MachineAppPath}
+    try { ${function:MachineAppPath} = { 'HKLM\stub' }; $machineState = AppPathState (AppState) } finally { ${function:MachineAppPath} = $machine }
+    Must ($absentState.write -and -not $absentState.converged -and -not $absentState.reason -and
+        -not $foreignState.write -and -not $foreignState.converged -and $foreignState.reason -like '*never taken over*' -and
+        -not $machineState.write -and $machineState.reason -like 'HKLM\stub registers*' -and $machineState.reason -notlike '*Uninstall removes ours*') 'the App Paths K-rule and HKLM conflict before any write'
+    ConvergeAppPath $absentState
+    $read = ObserveValue '' $appSubkey
+    $ownedState = AppPathState (AppState)
+    try { ${function:MachineAppPath} = { 'HKLM\stub' }; $laterState = AppPathState (AppState) } finally { ${function:MachineAppPath} = $machine }
+    Must ((Phases $appEffects.key) -ceq 'intent,commit' -and (Phases $appEffects.value) -ceq 'intent,commit' -and $read.type -ceq 'String' -and $read.data -ceq $appExe -and
+        $ownedState.converged -and -not $ownedState.write -and -not $laterState.write -and $laterState.reason -like '*(Uninstall removes ours)*' -and
+        (ObserveKey $appSubkey).exists) 'an App Paths name is created (key, then its default value) and an HKLM conflict beside it is only reported'
+    $appPackage.version, $appPackage.directory = '9.9', 'Programs/chromium-9.9'
+    $movedState = AppPathState (AppState)
+    ConvergeAppPath $movedState
+    $movedExe = Join-Path $localAppData 'Programs\chromium-9.9\Chrome-bin\chrome.exe'
+    Must ($movedState.write -and (Phases $appEffects.value) -ceq 'intent,commit,undone,intent,commit' -and (Phases $appEffects.key) -ceq 'intent,commit' -and
+        (ObserveValue '' $appSubkey).data -ceq $movedExe -and (AppPathState (AppState)).converged) 'a new version re-points the owned App Paths value'
+    $reference = [pscustomobject]@{ label = "HKCU\$appSubkey"; data = $movedExe; id = $appEffects.value.id }
+    Must ($null -ne (Get-TreeReferenceProblem @($reference) (Join-Path $localAppData 'Programs\chromium-9.9') @()) -and
+        $null -eq (Get-TreeReferenceProblem @($reference) (Join-Path $localAppData 'Programs\chromium-9.9') @($appEffects.value.id)) -and
+        $null -eq (Get-TreeReferenceProblem @($reference) (Join-Path $localAppData 'Programs\chromium-9.8') @())) 'an App Paths value keeps the tree it names unless the same plan removes it'
+    CollectAppPathGarbage @(AppState 'owned-match' $false $true)
+    Must ((ObserveKey $appSubkey).exists -and (Phases $appEffects.key) -ceq 'intent,commit') 'no App Paths collection while a seed would overwrite a profile'
+    $held = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($appSubkey, $true)
+    try { $held.SetValue('Path', 'foreign') } finally { $held.Close() }
+    CollectAppPathGarbage @()  # the unique name is declared by no lock: retired
+    $keptDrift = @($script:packageDrift)
+    $held = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($appSubkey, $true)
+    try { $held.DeleteValue('Path') } finally { $held.Close() }
+    $script:packageDrift = @()
+    CollectAppPathGarbage @()
+    Must (@($keptDrift | Where-Object { $_ -like "*holds foreign content the plan does not remove: value 'Path'*" }).Count -and
+        -not (ObserveKey $appSubkey).exists -and (Phases $appEffects.key) -ceq 'intent,commit,undone' -and
+        (Phases $appEffects.value) -ceq 'intent,commit,undone,intent,commit,undone' -and -not $script:packageDrift.Count) 'A3 keeps a retired App Paths key with foreign content; without it the name is collected, value then key'
     # Interruptions: (a) part of the inventory staged -> cleaned and voided; (b) a file the inventory
     # does not name -> kept, and the intent stays open; (c) renamed but not committed -> confirmed.
     $a, $b, $c = (Tree 'noctty-crash-a' $two), (Tree 'noctty-crash-b' $two), (Tree 'noctty-crash-c' $two)
@@ -1772,6 +1841,15 @@ function ExternalEntry {  # an AutoHotkey Uninstall entry the proof owns, whose 
 if ((Test-Path -LiteralPath $ahkTree) -or (Test-Path -LiteralPath $chromiumTree) -or (KeyExists $ahkKey) -or (Test-Path -LiteralPath (Split-Path -Parent $chromiumProfile))) {
     throw 'Proof requires no AutoHotkey or Chromium on this runner yet.'
 }
+# A29/A30 own App Paths\<appPath>: any existing entry, in HKCU or either HKLM view, would make them fail as drift.
+$runnerAppPaths = @(foreach ($view in @(@('HKCU', 'CurrentUser', 'Default'), @('HKLM', 'LocalMachine', 'Registry64'), @('HKLM32', 'LocalMachine', 'Registry32'))) {
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($view[1], $view[2])
+    try {
+        $key = $base.OpenSubKey("Software\Microsoft\Windows\CurrentVersion\App Paths\$($chromium.appPath)")
+        if ($null -ne $key) { $key.Close(); "$($view[0])\Software\Microsoft\Windows\CurrentVersion\App Paths\$($chromium.appPath)" }
+    } finally { $base.Close() }
+})
+if ($runnerAppPaths.Count) { throw "Proof requires no App Paths entry for $($chromium.appPath) on this runner yet: $($runnerAppPaths -join ', ')" }
 # A24: -Packages is Apply-only and names locks exactly, once each; a profile without this package's history
 # is someone else's (R1).
 MustReject { Win51 @('-Mode', 'Test', '-Packages', 'AutoHotkey') } '-Packages is only for -Mode Apply*'
@@ -2254,11 +2332,61 @@ $mark = LastSeq
 $chromiumAgain = ApplyPackages 'Chromium'
 Must ((NewRecords $mark @($chromiumId)) -eq 0 -and @($chromiumAgain.packages | Where-Object { $_.name -ceq 'Chromium' })[0].class -ceq 'owned-match' -and
     (ProfileKept)) 'A29: after its first run a second Apply writes nothing for Chromium, still owned exactly'
+# A30 (S2-2d-b), within A29 so Chromium is downloaded once: A29's install also owned HKCU App Paths\<appPath> (key,
+# then its default REG_SZ naming the owned chrome.exe) and its second Apply wrote nothing for them; ShellExecute
+# (Win+R's API), from an empty directory and with chromium on no PATH, starts the owned chrome.exe by that name; a
+# value this distribution does not own in the key stops Uninstall before any removal (A3). Foreign keys, HKLM and
+# retired names are proven by the primitives on a throwaway name; Win+R itself only on the VM.
+$appSubkey = "Software\Microsoft\Windows\CurrentVersion\App Paths\$($chromium.appPath)"
+$appKeyId, $appValueId = ('registry-key-created:' + "HKCU\$appSubkey".ToUpperInvariant()), ('registry-value:' + "HKCU\$appSubkey|".ToUpperInvariant())
+$chromiumExe = Join-Path $chromiumTree $chromium.executable.Replace('/', '\')
+function AppPathKeyNow {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($appSubkey)
+    if ($null -eq $key) { return $null }
+    try {
+        $names = @($key.GetValueNames())
+        [pscustomobject]@{ values = $names; subkeys = @($key.GetSubKeyNames()); kind = $(if ($names -contains '') { [string]$key.GetValueKind('') })
+            data = [string]$key.GetValue('', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
+    } finally { $key.Close() }
+}
+$shellDir = Join-Path $env:RUNNER_TEMP ('a30-' + [guid]::NewGuid().ToString('N'))  # empty, never deleted
+$null = New-Item -ItemType Directory -Path $shellDir
+function ShellChromium {  # ShellExecuteEx, as Win+R: the name alone, resolved by Windows
+    $info = [Diagnostics.ProcessStartInfo]::new('chromium')
+    $info.UseShellExecute, $info.WorkingDirectory = $true, $shellDir
+    $info.Arguments = "--headless=new `"--user-data-dir=$shellDir\profile`" about:blank"
+    [Diagnostics.Process]::Start($info)
+}
+$appNow = AppPathKeyNow
+Must ((Phases $appKeyId) -ceq 'intent,commit' -and (Phases $appValueId) -ceq 'intent,commit' -and (NewRecords $mark @($appKeyId, $appValueId)) -eq 0 -and
+    $null -ne $appNow -and $appNow.values.Count -eq 1 -and $appNow.values[0] -ceq '' -and -not $appNow.subkeys.Count -and $appNow.kind -ceq 'String' -and
+    $appNow.data -ceq $chromiumExe) 'A30: the install owns App Paths\chromium.exe, one REG_SZ default value naming the owned chrome.exe; a second Apply writes nothing'
+Must ($null -eq (Get-Command chromium -ErrorAction SilentlyContinue)) 'A30: chromium is on no PATH, so only App Paths can resolve it'
+$launched, $launchedPath = (ShellChromium), $null
+$clock = [Diagnostics.Stopwatch]::StartNew()
+while ($null -ne $launched -and -not $launchedPath -and $clock.Elapsed.TotalSeconds -lt 15) {
+    $launchedPath = [string](Get-CimInstance Win32_Process -Filter "ProcessId = $($launched.Id)").ExecutablePath
+    if (-not $launchedPath) { Start-Sleep -Milliseconds 250 }
+}
+$launchSettled = SettleText (SettleChromium 15 $launched)
+Must ($launchedPath -eq $chromiumExe) "A30: ShellExecute starts the owned chrome.exe by the name chromium ($launchedPath; $launchSettled)"
+$held = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($appSubkey, $true)
+try { $held.SetValue('Path', $shellDir) } finally { $held.Close() }
+$count = @(Ledger).Count
+MustReject { RunUninstall -Apply } "*holds foreign content the plan does not remove: value 'Path'*"
+Must (@(Ledger).Count -eq $count -and (ChromiumExact) -and (AppPathKeyNow).data -ceq $chromiumExe) 'A30: foreign content in the owned App Paths key stops Uninstall before any removal'
+$held = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($appSubkey, $true)
+try { $held.DeleteValue('Path') } finally { $held.Close() }
 # Uninstall removes the tree file by file, its seed too, and never the profile or the scratch profiles.
 $chromiumGone = RunUninstall -Apply
 Must ($chromiumGone.ownedOpen -eq 0 -and -not (Test-Path -LiteralPath $chromiumTree) -and (ProfileKept) -and
     (Test-Path -LiteralPath (Join-Path $userData 'First Run'))) 'A29: Uninstall removes the Chromium tree with its seed, never a profile'
 AssertEmpty
+# A30, the negative control: the same Uninstall removed the value, then the key, and ShellExecute no longer finds chromium.
+$unresolved = $false
+try { $stray = ShellChromium; if ($null -ne $stray) { $null = SettleChromium 5 $stray } } catch { $unresolved = $true }
+Must ($null -eq (AppPathKeyNow) -and (Phases $appKeyId) -ceq 'intent,commit,undone' -and (Phases $appValueId) -ceq 'intent,commit,undone' -and
+    $unresolved) 'A30: Uninstall removes the App Paths value and key; ShellExecute then no longer finds chromium'
 [IO.File]::Delete($sentinel)
 [IO.File]::Delete($preferences)
 [IO.Directory]::Delete((Split-Path -Parent $preferences), $false)
@@ -2358,4 +2486,4 @@ if ($g4.status -cne 'measured' -or (Get-Field $g4 'gate') -cne 'pass' -or $g4.st
     winReportsHandoffUnproven = $true; handoffProbeRefusedOnRunner = $true; handoffEvaluatorCases = $handoffCases;
     g4Measurement = $g4;
     noctty = 'native owned tree, configuration, COM keys and values and the default-terminal selection through Apply and Uninstall (A15-A21)'
-    scope = 'current-user owned fonts, Noctty, SSH client and locked packages (AutoHotkey ZIP and Chromium 7z with its font seed: install, ownership, first run on scratch profiles, Uninstall) on an elevated Windows Server runner with Windows Terminal 1.23; not Restore (activation, package view, rollback), a clean unelevated Windows 11 user, Chromium on the default profile or launched by name, default-terminal handoff, real-host UX or a Cloudflare connection' } | ConvertTo-Json
+    scope = 'current-user owned fonts, Noctty, SSH client and locked packages (AutoHotkey ZIP and Chromium 7z with its font seed: install, ownership, its App Paths name resolved by ShellExecute, first run on scratch profiles, Uninstall) on an elevated Windows Server runner with Windows Terminal 1.23; not Restore (activation, package view, rollback), a clean unelevated Windows 11 user, Chromium on the default profile or started from Win+R itself, default-terminal handoff, real-host UX or a Cloudflare connection' } | ConvertTo-Json

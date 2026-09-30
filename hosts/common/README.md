@@ -325,11 +325,29 @@ are removed and the intent voided; anything else there stops recovery and is kep
 Once the selected version is owned and exact, owned trees of its other versions are
 removed the Uninstall way (a tree in use, or one another effect refers to, is kept
 and reported). `Uninstall` refuses, before removing anything, while a package's
-executable is in use; it never removes protected data, and never App Paths or an
+executable is in use; it never removes protected data, a foreign App Paths name or an
 external install. A 7z asset (Chromium) installs like a ZIP, through inbox
-`tar.exe`. **Limits now:** nothing registers App Paths yet, so an owned Chromium
-would not be launchable by name (required before PR-A is done);
-a read-only file in an extracted tree would make `Uninstall` fail (recorded, not hidden).
+`tar.exe`.
+
+**Launch by name (App Paths).** A lock's `appPath` (Chromium: `chromium.exe`, never the
+executable's own name) is the only name owned: the key
+`HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths\<appPath>` and its default
+REG_SZ naming the owned executable, written after the tree and pointed at a new
+version before old trees go; the `App Paths` key itself is shared, never owned. It is
+written only for a package owned exactly (or just installed) without a conflict or a
+profile its seed would overwrite, and only while the key and its default value are each
+absent or owned: a key or value this distribution does not own is drift even with our
+exact data (never taken over; remove it by hand, then `Restore`), and so is the name in
+HKLM (64- or 32-bit view), which HKCU would shadow; an owned key that later meets one is
+only reported. While it names a tree, that tree is not collected or uninstalled unless
+the same plan removes the value. A name no lock declares any more is collected by a run
+that handles packages (`Restore`, or `Apply -Packages`): value, then key, only while the
+key holds nothing else, and never while a seed would overwrite a profile; `Uninstall`
+removes it likewise, refusing a key with foreign content (A3).
+Nothing else is registered: no `Path` value, shortcut, PATH, HKLM, file or URL
+association, or default-browser entry. **Limits now:** a package removed from the
+locks altogether leaves its ledger records unreadable, as for its tree; a read-only
+file in an extracted tree would make `Uninstall` fail (recorded, not hidden).
 
 **Chromium font seed.** `pack.py` generates
 `payload/chromium/initial_preferences` from the lock's `seed` roles: exactly the six
@@ -411,7 +429,7 @@ primitives also run in a Windows PowerShell 5.1 child on synthetic targets. The
 G4 gate measures the vendor's own registration against the six values. A
 `Restore` rollback after a failed activation or package check is not exercised
 on CI (`Restore` refuses the elevated runner, whose Windows Terminal is 1.23).
-For packages (A23-A29, AutoHotkey and Chromium each downloaded once) it checks the
+For packages (A23-A30, AutoHotkey and Chromium each downloaded once) it checks the
 `-Packages` contract and R1 before any effect, an external
 entry never taken over (alone or beside the owned tree), a clean AutoHotkey install
 owned exactly with no asset or staging left and a second Apply writing nothing,
@@ -448,9 +466,19 @@ any move, every added App Paths, Uninstall, StartMenuInternet, RegisteredApplica
 condition fails the proof (only an unreadable PDF and the names added outside App Paths
 and Uninstall are record only). A second Apply then writes nothing for Chromium, still
 owned exactly, and `Uninstall` removes the tree with its seed and keeps the profile and
-the scratch profiles. The runner is an elevated Windows Server: a clean, unelevated
-Windows 11 user's `Restore`, first run on the default `User Data` and launch by name are
-proven only by the VM run.
+the scratch profiles. Within A29 (one download), A30 checks the same install owned
+`App Paths\chromium.exe` (one REG_SZ default naming the owned `chrome.exe`, written
+once), that ShellExecute (Win+R's API), from an empty directory with `chromium` on no
+PATH, starts that `chrome.exe` by name, that a foreign value in the key stops
+`Uninstall` before any removal, and that after `Uninstall` the key is gone and the name
+no longer resolves (the runner must have no `App Paths\chromium.exe` in HKCU or either
+HKLM view beforehand). The primitives prove, on a throwaway name in the runner's real
+HKCU, a foreign key (even with our exact data) as drift that is never written, HKLM
+conflicts (stubbed), re-pointing, the tree reference and retired names; the main
+`Apply`/`RestoreTest` path meeting a foreign key (nothing written, package drift at the
+end) is not exercised end to end, only its decision. The
+runner is an elevated Windows Server: a clean, unelevated Windows 11 user's `Restore`,
+first run on the default `User Data` and Win+R itself are proven only by the VM run.
 It also requires every `win.ps1` answer to report
 `handoffProof = "unproven"` and `handoff-proof.ps1` to refuse the runner, so CI
 never claims a real default-terminal handoff. Negative controls must fail for
@@ -469,9 +497,9 @@ final single `ci.yml` with the open OCI stack. Do not discard existing proof to
 claim one workflow prematurely. Existing OCI definitions and #8 are unchanged.
 
 `%LOCALAPPDATA%\windows-iac\provenance\default-terminal.json` is per-user state;
-rollback reads it and nothing removes it. A clean Chromium install is enabled and
-proven on the CI runner (A29), but App Paths (launch by name) and the VM run are still
-open, so `Restore`/`Uninstall` as a whole is not complete.
+rollback reads it and nothing removes it. A clean Chromium install and its App Paths
+name are enabled and proven on the CI runner (A29, A30), but the VM run is still open,
+so `Restore`/`Uninstall` as a whole is not complete.
 
 **Required on a VM before the native registration is accepted (unproven here):**
 from an unelevated, Explorer-launched shell with Windows Terminal 1.24 or newer,

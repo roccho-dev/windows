@@ -619,13 +619,18 @@ function IsPackageTree([string]$Target) {
 }
 
 # The current state of a recorded or selected effect: an owned font file or HKCU Fonts value, a
-# package tree, or a Noctty effect (ObserveNoctty). Anything else is outside this version and stops the run.
+# package tree, an App Paths key or default value, or a Noctty effect (ObserveNoctty). Anything else is
+# outside this version and stops the run.
 function Observe($Effect) {
     $kind, $target = [string](Get-Field $Effect 'kind'), [string](Get-Field $Effect 'target')
     if ($kind -ceq 'file-created' -and [IO.Path]::GetDirectoryName($target) -eq $fontDirectory -and
         [IO.Path]::GetFileName($target) -match '^[0-9a-f]{64}\.ttf$') { return ObserveFile $target }
     if ($kind -ceq 'registry-value' -and $target -eq $fontKey) { return ObserveValue ([string](Get-Field $Effect 'name')) }
     if ($kind -ceq 'tree-extracted' -and (IsPackageTree $target)) { return ObserveTree $target }
+    if (IsAppPathEffect $Effect) {
+        $subkey = $target -replace '^HKCU\\', ''
+        if ($kind -ceq 'registry-key-created') { return ObserveKey $subkey } else { return ObserveValue '' $subkey }
+    }
     if ($kind -cne 'file-created' -or $target -eq $nocttyConfig) { return ObserveNoctty $Effect }
     throw "The effect ledger holds $kind $target, which this version (owned fonts only) does not handle."
 }
@@ -1264,7 +1269,11 @@ function TreeReferenceProblems($Steps) {
     $trees = @($Steps | Where-Object { $_.kind -ceq 'tree-extracted' } | ForEach-Object { $_.id } | Sort-Object -Unique -CaseSensitive)
     if (-not $trees.Count) { return }
     $servers = @($nocttyRegistration.values | ForEach-Object { $_.key } | Where-Object { $_ -match '\\(LocalServer32|InprocServer32)$' } | Sort-Object -Unique)
-    $references = @(NocttyReferences $registryViews $servers)
+    # App Paths default values name a tree too: every name a lock declares or the ledger owns, in HKCU and HKLM.
+    $appNames = @(@($manifest.packages | ForEach-Object { Get-Field $_ 'appPath' }) + @(LedgerIds | ForEach-Object {
+        $first = @(RecordsOf $_)[0]; if (IsAppPathEffect $first) { [IO.Path]::GetFileName([string](Get-Field $first 'target')) } }) |
+        Where-Object { $_ } | Sort-Object -Unique)
+    $references = @(NocttyReferences $registryViews ($servers + @($appNames | ForEach-Object { "$appPathsSubkey\$_" })))
     $removed = @($Steps | Where-Object { $_.action -ceq 'delete-registry-value' } | ForEach-Object { $_.id })
     foreach ($id in $trees) {
         $problem = Get-TreeReferenceProblem $references ([string](Get-Field @(RecordsOf $id)[0] 'target')) $removed
@@ -1274,6 +1283,97 @@ function TreeReferenceProblems($Steps) {
 
 # ---- Locked packages: one owned tree per package through the effect ledger ----------
 $script:packageDrift = @()
+# The per-user App Paths root; only <appPath>, its key and default value, is ever owned beneath it.
+$appPathsSubkey = 'Software\Microsoft\Windows\CurrentVersion\App Paths'
+
+# The owned launch-by-name effects of a package with an appPath (Nix names it): the key
+# HKCU\...\App Paths\<appPath> and its default value, a REG_SZ naming the owned executable.
+function AppPathEffects($Package) {
+    $subkey = "$appPathsSubkey\$($Package.appPath)"
+    [ordered]@{ key = (KeyEffect $subkey)
+        value = (ValueEffect '' (Join-Path (PackageEffect $Package).target $Package.executable.Replace('/', '\')) ('HKCU\' + $subkey)) }
+}
+
+# True for a record of an App Paths effect, by its shape and not by the lock, so a name the lock no longer
+# declares (retired or renamed) stays readable for collection and Uninstall: the key App Paths\<name>.exe
+# (one segment, as pack.py and AssertPackageShape allow) or that key's default value.
+function IsAppPathEffect($Record) {
+    $kind, $target, $name = [string](Get-Field $Record 'kind'), [string](Get-Field $Record 'target'), (Get-Field $Record 'name')
+    $prefix = "HKCU\$appPathsSubkey\"
+    if (-not $target.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    $leaf = $target.Substring($prefix.Length)
+    $leaf -cmatch '^[A-Za-z0-9][A-Za-z0-9._-]*\.exe\z' -and (Test-PathSegment $leaf) -and
+        ($kind -ceq 'registry-key-created' -or ($kind -ceq 'registry-value' -and $name -is [string] -and $name -ceq ''))
+}
+
+# The HKLM App Paths entries (64- and 32-bit views) for $Name, read-only: HKCU would shadow each of them.
+function MachineAppPath([string]$Name) {
+    foreach ($view in @($registryViews | Where-Object { $_[1] -ceq 'LocalMachine' })) {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($view[1], $view[2])
+        try { $key = $base.OpenSubKey("$appPathsSubkey\$Name"); if ($null -ne $key) { $key.Close(); "$($view[0])\$appPathsSubkey\$Name" } } finally { $base.Close() }
+    }
+}
+
+# The class of one effect now against the ledger; an attempt still to be resolved reads as indeterminate.
+function EffectClass($Effect) {
+    $class = Get-EffectClass $null (Observe $Effect) $Effect.kind $Effect.desired (AttemptOf $Effect.id)
+    if ($class.resolution) { 'indeterminate' } else { $class.class }
+}
+
+# Read-only: the App Paths name of a package this run owns exactly or has just installed, as { name; effects;
+# write; converged; reason }, or $null when the package declares none or is not ours to launch now (not owned,
+# drift, a conflict, or a profile its seed would overwrite, O1). K-rule: it is written only while the key and its
+# default value are each absent or owned; a key or value this distribution does not own is drift even when its
+# data is ours (never taken over), and so is the name in HKLM (either view), which HKCU would shadow. An owned key
+# meeting such a conflict is only reported (Uninstall removes it).
+function AppPathState($State) {
+    $name = Get-Field $State.package 'appPath'
+    if ($null -eq $name -or $State.hazard -or $State.conflict -or -not ($State.install -or $State.class -ceq 'owned-match')) { return $null }
+    $effects = AppPathEffects $State.package
+    $machine = @(MachineAppPath $name)
+    $key, $value = (EffectClass $effects.key), (EffectClass $effects.value)
+    $attempt = AttemptOf $effects.value.id
+    $recorded = if (@($attempt.records).Count -and -not $attempt.closed) { Get-Field @($attempt.records)[0] 'desired' } else { $null }
+    $reason = if ($machine.Count) {
+            "$($machine -join ', ') registers $name for this machine, which HKCU would shadow; nothing is written$(if ($key -like 'owned-*') { ' (Uninstall removes ours)' })"
+        } elseif ($key -cnotin @('absent', 'owned-match') -or $value -cnotin @('absent', 'owned-match', 'owned-drift')) {
+            "$($effects.key.target) is $key and its default value ${value}: not this distribution's, never taken over; remove it by hand, then Restore"
+        }
+    $write = -not $reason -and ($key -cne 'owned-match' -or $value -cne 'owned-match' -or -not (Test-EffectStateEqual 'registry-value' $recorded $effects.value.desired))
+    [pscustomobject]@{ name = $name; effects = $effects; write = $write; converged = -not $reason -and -not $write; reason = $reason }
+}
+
+# Creates or re-owns an App Paths name AppPathState found writable: the shared App Paths key if missing (never
+# owned), then the key, then its default value (an owned value naming an older tree is reverted and written again).
+function ConvergeAppPath($AppPath) {
+    SharedKey $appPathsSubkey
+    ConvergeEffect $AppPath.effects.key "App Paths $($AppPath.name)" { CreateOwnedKey $AppPath.effects.key }
+    ConvergeEffect $AppPath.effects.value "App Paths $($AppPath.name) default value" { CreateOwnedValue $AppPath.effects.value }
+}
+
+# Owned App Paths names no lock declares any more (retired or renamed), removed the Uninstall way: value, then key,
+# only while the key holds nothing else (A3); anything refused is kept and reported. None while a package's seed
+# would overwrite a profile (O1: nothing of that package is written or removed then).
+function CollectAppPathGarbage($States) {
+    if (@($States | Where-Object { $_.hazard }).Count) { return }
+    $declared = @($manifest.packages | ForEach-Object { Get-Field $_ 'appPath' } | Where-Object { $null -ne $_ })
+    $prefix = "HKCU\$appPathsSubkey\"
+    $ids = @(LedgerIds | Where-Object {
+        $first = @(RecordsOf $_)[0]
+        (IsAppPathEffect $first) -and @(OpenAttempt $_).Count -and $declared -notcontains ([string](Get-Field $first 'target')).Substring($prefix.Length) })
+    if (-not $ids.Count) { return }
+    $observations = @{}
+    foreach ($id in $ids) { $observations[$id] = Observe @(RecordsOf $id)[0] }
+    $plan = Get-UninstallPlan @($ids | ForEach-Object { RecordsOf $_ }) $observations
+    $problems = @($plan.refused | ForEach-Object { "$($_.id): $($_.reason)" })
+    if ($plan.ok) {
+        $contents = @{}
+        foreach ($step in @(OrderedSteps $plan | Where-Object { $_.action -ceq 'delete-empty-key' })) { $contents[$step.key] = ObserveKeyContent ($step.key -replace '^HKCU\\', '') }
+        $problems += @(Get-ForeignKeyContent @(OrderedSteps $plan) $contents @{})
+    }
+    if ($problems.Count) { $script:packageDrift += "retired App Paths kept: $($problems -join '; ')"; return }
+    UndoOwnedSteps @(OrderedSteps $plan)
+}
 
 # The owned effect of one locked package: its tree Programs\<name>-<version> with the pinned inventory
 # and, for a seeded package, its seed (never in the archive; the listing is checked against the
@@ -1508,7 +1608,8 @@ function Uninstall {
             $references = @(FontReferences $table $step.path $step.expectSha256)
             if ($references.Count) { $refused += "$($step.id): referenced by $($references -join ', ')" }
         }
-        $com = @($steps | Where-Object { $_.action -ceq 'delete-registry-value' -and $_.key -ne $fontKey })
+        $com = @($steps | Where-Object { $_.action -ceq 'delete-registry-value' -and $_.key -ne $fontKey -and
+            -not ([string]$_.key).StartsWith("HKCU\$appPathsSubkey\", [StringComparison]::OrdinalIgnoreCase) })
         if ($com.Count) {
             if ($legacy.action -cin @('refuse', 'report')) { $refused += "default-terminal record: $($legacy.reason)" }
             $terminal = @(@($legacy.steps | Where-Object { $_.name -ceq 'DelegationTerminal' } | ForEach-Object { $_.value }) + @((StartupPair).terminal))[0]
@@ -1545,7 +1646,7 @@ function Uninstall {
     }
     $answer = [ordered]@{ mode = $Mode; apply = [bool]$Apply; source = $manifest.source; identity = $script:runIdentity
         ledgerFound = $found; siloCheck = 'notPerformed'
-        scope = 'owned fonts, Noctty and package trees visible to this process, and the default-terminal selection this distribution wrote; protected package data (a browser profile) and RentSsh are not in the ledger'
+        scope = 'owned fonts, Noctty, package trees and their App Paths names visible to this process, and the default-terminal selection this distribution wrote; protected package data (a browser profile) and RentSsh are not in the ledger'
         planned = @($steps | ForEach-Object { StepText $_ })
         resolutions = @($plan.resolutions | ForEach-Object { "$($_.id): $($_.resolution)" }); resumed = @($plan.resumed)
         defaultTerminal = $legacy.action
@@ -1583,6 +1684,10 @@ try {
         $packageStates = @(SelectedPackages | ForEach-Object { ClassifyPackage $_ })
         PreflightPackages $packageStates
         foreach ($state in @($packageStates | Where-Object { $_.install })) { InstallPackage $state }
+        # App Paths names point at the selected trees before old versions go, and retired names are collected, only
+        # in a run that handles packages (Restore, or Apply with -Packages): without them no package state is touched.
+        foreach ($appPath in @($packageStates | ForEach-Object { AppPathState $_ } | Where-Object { $null -ne $_ -and $_.write })) { ConvergeAppPath $appPath }
+        if ($packageStates.Count) { CollectAppPathGarbage $packageStates }
         foreach ($state in @($packageStates | Where-Object { $_.install -or $_.class -ceq 'owned-match' })) { CollectPackageGarbage $state }
         ConvergeFonts
         if ($script:fontDrift.Count) { throw "Font drift: $($script:fontDrift -join '; ')" }
@@ -1599,7 +1704,14 @@ try {
         if ($Mode -eq 'RestoreTest') { AssertActualSelection }  # Restore checked it before success
     }
     # Every package this run covered is owned-match or preexisting-match, with no external install beside
-    # an owned tree; anything else (never written) and any old version kept fails as package drift.
+    # an owned tree, and an owned one launches by its App Paths name; anything else (never written) and any
+    # old version kept fails as package drift.
+    foreach ($state in $packageStates) {
+        $appPath = AppPathState $state
+        if ($null -ne $appPath -and -not $appPath.converged) {
+            $script:packageDrift += "$($state.package.name) App Paths $($appPath.name): $(if ($appPath.reason) { $appPath.reason } else { 'not written' })"
+        }
+    }
     $drift = @(@($packageStates | Where-Object { -not $_.converged } | ForEach-Object { "$($_.package.name) $($_.class): $($_.reason)" }) + $script:packageDrift)
     if ($drift.Count) { throw "Package drift: $($drift -join '; ')" }
     # inDesiredState covers the declared state this mode tested. Handoff is never
