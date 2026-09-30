@@ -362,6 +362,49 @@ def archive(root: Path, destination: Path) -> None:
             result.writestr(info, path.read_bytes(), compresslevel=9)
 
 
+def typography(value: object, entries: list[dict], packages: list[dict]) -> dict | None:
+    """The desktop UI font face win.ps1 sets through ui-font.ahk: {desktop: <role>, interpreter:
+    <package name>} becomes {face: <that role's family>, interpreter, script}. The face fits a
+    LOGFONTW lfFaceName (1 to 31 UTF-16 units, no control or surrogate), as Test-UiFontFace checks."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"desktop", "interpreter"}:
+        raise ValueError("typography is not {desktop, interpreter}")
+    families = {e["role"]: e["family"] for e in entries}
+    if value["desktop"] not in families:
+        raise ValueError(f"typography role is not selected by common fonts: {value['desktop']!r}")
+    face = families[value["desktop"]]
+    units = len(face.encode("utf-16-le")) // 2
+    if not 1 <= units <= 31 or re.search(r"[\x00-\x1f\x7f\ud800-\udfff]", face):
+        raise ValueError(f"typography face does not fit a LOGFONTW: {face!r}")
+    if [p["name"] for p in packages].count(value["interpreter"]) != 1:
+        raise ValueError(f"typography interpreter is not one locked package: {value['interpreter']!r}")
+    return {"face": face, "interpreter": value["interpreter"], "script": "ui-font.ahk"}
+
+
+APP_KEYS = {"name", "source", "id", "package", "publisherId"}
+
+
+def store_apps(value: object) -> list[dict]:
+    """Microsoft Store apps Restore installs when absent (official WinGet, msstore source, exact id)
+    and otherwise only reads: the package family name's name and publisher id identify it."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("apps is not a list")
+    for app in value:
+        if not isinstance(app, dict) or set(app) != APP_KEYS or app["source"] != "msstore" or \
+                not all(isinstance(app[k], str) for k in APP_KEYS) or \
+                not re.fullmatch(r"[0-9A-Z]{12}", app["id"]) or \
+                not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 .-]*", app["name"]) or \
+                not TOKEN.fullmatch(app["package"]) or not re.fullmatch(r"[a-z0-9]{13}", app["publisherId"]):
+            raise ValueError(f"App is not {sorted(APP_KEYS)} of a msstore id and package identity: {app!r}")
+    for key in ("name", "id", "package"):
+        if len({app[key].casefold() for app in value}) != len(value):
+            raise ValueError(f"Two apps share a {key}")
+    return value
+
+
 def seed_preferences(seed: dict, entries: list[dict]) -> bytes:
     """The seed's bytes: exactly the six font preferences, each role's family from fonts.json,
     as compact sorted UTF-8 JSON with one trailing newline, so equal inputs give equal bytes."""
@@ -388,14 +431,16 @@ def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
     noctty_files = noctty_inventory(noctty)
     registration = noctty_registration(selected["noctty"].get("registration"), noctty_files)
     packages = inventoried(selected.get("packages"))
+    apps = store_apps(selected.get("apps"))
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         shutil.copytree(fonts / "share", root / "share")
         entries = json.loads((fonts / "fonts.json").read_text(encoding="utf-8"))
         if not entries:
             raise ValueError("Empty font payload")
+        ui = typography(selected.get("typography"), entries, packages)
         for name in ("win.ps1", "proof.ps1", "handoff-proof.ps1", "handoff-evaluate.ps1",
-                     "package-view.ps1", "README.md"):
+                     "package-view.ps1", "ui-font.ahk", "README.md"):
             shutil.copyfile(scripts / name, root / name)
         (root / "payload").mkdir()
         shutil.copyfile(noctty, root / "payload/noctty.zip")
@@ -417,7 +462,7 @@ def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
                               "files": noctty_files, "registration": registration},
                    "cloudflared": {"version": selected["cloudflared"]["version"], "file": "payload/cloudflared.exe",
                                    "sha256": files["payload/cloudflared.exe"]},
-                   "packages": packages, "files": files})
+                   "packages": packages, "typography": ui, "apps": apps, "files": files})
         output = out / "windows-dist.zip"
         archive(root, output)
         (out / "windows-dist.zip.sha256").write_text(digest(output) + "  windows-dist.zip\n", encoding="ascii")

@@ -150,9 +150,10 @@ function Get-HandoffVerdict($Record, $Events, [string]$ExpectedTerminal) {
 #   phase     'intent' | 'commit' | 'void' | 'undone'
 #   id        opaque effect key, stable for one target
 #   kind      file-created | file-replaced | prefix-inserted | registry-value |
-#             registry-key-created | tree-extracted
+#             registry-key-created | tree-extracted | ui-font-face
 #   target    absolute file or directory path (drive, backslashes, no . or ..),
-#             or an HKCU\ key for the registry kinds; never HKLM
+#             or an HKCU\ key for the registry kinds; never HKLM; for ui-font-face
+#             spi:<slot>, one of Get-UiFontSlots
 #   name      registry-value only: the value name ('' is the default value)
 #   prior     the state before the effect
 #   desired   the state the effect writes; never equal to prior, so an already
@@ -173,11 +174,14 @@ function Get-HandoffVerdict($Record, $Events, [string]$ExpectedTerminal) {
 #                   tree may add other, the entries that are not such a file (reparse
 #                   points, directories without a file, unsafe names), empty in desired
 #   registry-key-created  nothing more: the key exists
+#   ui-font-face    face, the slot's LOGFONTW lfFaceName (1 to 31 UTF-16 units, no
+#                   control), compared exactly; nothing else of the font is state
 # Per kind, prior and desired must be:
 #   file-created, tree-extracted,
 #   registry-key-created             prior absent, desired present
 #   file-replaced, prefix-inserted   prior present with backup, desired present
 #   registry-value                   prior either, desired present
+#   ui-font-face                     prior present, desired present
 # A backup file is its own file-created effect with an earlier seq, so reverse
 # order restores from it before deleting it; Get-UninstallPlan enforces the pairing.
 
@@ -198,8 +202,18 @@ function Test-PackageTarget([string]$Target, $Package, [string]$Programs) {
         (-not $PSBoundParameters.ContainsKey('Programs') -or ($Programs -and [IO.Path]::GetDirectoryName($Target) -eq $Programs.TrimEnd('\')))
 }
 
-# True for an absolute file path, or an HKCU key when $Kind is a registry kind.
+# The ui-font.ahk slots, in its order: the five NONCLIENTMETRICSW fonts, then the icon title font.
+function Get-UiFontSlots { @('caption', 'smCaption', 'menu', 'status', 'message', 'icon') }
+
+# True for one LOGFONTW face name: 1 to 31 UTF-16 units, no control character or surrogate.
+function Test-UiFontFace($Face) {
+    $Face -is [string] -and $Face.Length -ge 1 -and $Face.Length -le 31 -and $Face -cnotmatch '[\x00-\x1f\x7f\ud800-\udfff]'
+}
+
+# True for an absolute file path, an HKCU key when $Kind is a registry kind, or spi:<slot>
+# for ui-font-face.
 function Test-EffectPath([string]$Kind, $Target) {
+    if ($Kind -ceq 'ui-font-face') { return ($Target -is [string] -and (Get-UiFontSlots | ForEach-Object { "spi:$_" }) -ccontains $Target) }
     $registry = $Kind -cin @('registry-value', 'registry-key-created')
     $root = if ($registry) { '^HKCU\\' } else { '^[A-Za-z]:\\' }
     if ($Target -isnot [string] -or $Target -notmatch $root) { return $false }
@@ -255,6 +269,7 @@ function Get-EffectStateProblem([string]$Kind, $State, [string]$Role) {
             if (@(Get-Field $State 'other' | Where-Object { $null -ne $_ -and $_ -isnot [string] }).Count) { return "$Role.other is not a list of paths." }
         }
         'registry-key-created' { }
+        'ui-font-face' { if (-not (Test-UiFontFace (Get-Field $State 'face'))) { return "$Role.face is not a face name." } }
         default {
             $sha = Get-Field $State 'sha256'
             if ($sha -isnot [string] -or $sha -notmatch '^[0-9A-Fa-f]{64}\z') { return "$Role.sha256 is not a SHA-256." }
@@ -286,6 +301,7 @@ function Test-EffectStateEqual([string]$Kind, $Expected, $Actual) {
                 (@(Get-Field $Actual 'other' | Where-Object { $null -ne $_ } | Sort-Object) -join '|')
         }
         'registry-key-created' { return $true }
+        'ui-font-face' { return ([string](Get-Field $Expected 'face') -ceq [string](Get-Field $Actual 'face')) }
         default {
             $sha = [string](Get-Field $Expected 'sha256')
             return ($sha -ne '' -and $sha -eq [string](Get-Field $Actual 'sha256'))
@@ -304,7 +320,7 @@ function Get-EffectRecordProblem($Record) {
     $phase = $fields.phase
     if ($phase -isnot [string] -or $phase -cnotin @('intent', 'commit', 'void', 'undone')) { return 'phase is not intent, commit, void or undone.' }
     $kind = $fields.kind
-    if ($kind -isnot [string] -or $kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted')) {
+    if ($kind -isnot [string] -or $kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted', 'ui-font-face')) {
         return 'kind is not an effect kind.'
     }
     $id = $fields.id
@@ -326,6 +342,7 @@ function Get-EffectRecordProblem($Record) {
     if (-not (Get-Field $desired 'exists')) { return 'desired must exist.' }
     if (Test-EffectStateEqual $kind $prior $desired) { return 'desired equals prior; there is no effect to own.' }
     if ($kind -in @('file-created', 'tree-extracted', 'registry-key-created') -and (Get-Field $prior 'exists')) { return 'prior must be absent.' }
+    if ($kind -ceq 'ui-font-face' -and -not (Get-Field $prior 'exists')) { return 'prior must exist.' }
     if ($kind -in @('file-replaced', 'prefix-inserted')) {
         $backup = Get-Field $prior 'backup'
         if (-not (Get-Field $prior 'exists')) { return 'prior must exist.' }
@@ -405,15 +422,18 @@ function Get-EffectAttempt($Records) {
 
 # Class of a target nothing owns: absent when $Current does not exist, else
 # preexisting-match or preexisting-drift against $Desired; indeterminate when the
-# kind or a state is malformed. $Resolution is passed through.
+# kind or a state is malformed. $Resolution is passed through. A UI font slot always
+# holds some face and holds no content of its own, so another face is absent (free to
+# take, recording that face as prior), never preexisting-drift.
 function Get-UnownedClass([string]$Kind, $Desired, $Current, $Resolution) {
-    $problem = if ($Kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted')) {
+    $problem = if ($Kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted', 'ui-font-face')) {
         'The selection kind is not an effect kind.'
     } else { Get-EffectStateProblem $Kind $Desired 'desired' }
     if (-not $problem) { $problem = Get-EffectStateProblem $Kind $Current 'current' }
     if ($problem) { return New-EffectClass 'indeterminate' $null $problem }
     if (-not (Get-Field $Current 'exists')) { return New-EffectClass 'absent' $Resolution $null }
     if (Test-EffectStateEqual $Kind $Desired $Current) { return New-EffectClass 'preexisting-match' $Resolution $null }
+    if ($Kind -ceq 'ui-font-face') { return New-EffectClass 'absent' $Resolution $null }
     return New-EffectClass 'preexisting-drift' $Resolution $null
 }
 
@@ -493,6 +513,10 @@ function Get-UndoSteps($Record) {
         # Removed only while it holds no value and no subkey; never recursively.
         'registry-key-created' { [ordered]@{ action = 'delete-empty-key'; key = $target } }
         'tree-extracted' { $tree = Get-TreeUndoSteps $Record $null; $tree }
+        # Face only, and only while the slot still holds the face the effect wrote.
+        'ui-font-face' {
+            [ordered]@{ action = 'set-ui-font-face'; slot = $target.Substring(4); face = (Get-Field $prior 'face'); expectFace = (Get-Field $desired 'face') }
+        }
     }
 }
 
@@ -1114,4 +1138,17 @@ function Get-LegacyTerminalPlan($Record, $Current) {
         return [ordered]@{ action = 'none'; reason = 'Already restored: the current selection equals the recorded prior one.'; steps = @() }
     }
     [ordered]@{ action = 'restore'; key = $key; steps = $steps; reason = $null }
+}
+
+# What Apply or Restore does for one declared Store app ($App: { name; package; publisherId }), from
+# $Found, the packages of the current user named $App.package (each { name; publisherId; version }):
+# 'install' when there is none; 'present' when there is exactly one, of that publisher (any version:
+# a Store app updates itself, so the version is reported, not pinned); 'refuse' otherwise. An app is
+# never reinstalled, updated, closed or removed, and its data is never owned.
+function Get-AppAction($Found, $App) {
+    $package, $publisher = [string](Get-Field $App 'package'), [string](Get-Field $App 'publisherId')
+    $named = @($Found | Where-Object { $null -ne $_ -and [string](Get-Field $_ 'name') -ceq $package })
+    if ($named.Count -eq 0) { return 'install' }
+    if ($named.Count -eq 1 -and [string](Get-Field $named[0] 'publisherId') -ceq $publisher) { return 'present' }
+    return 'refuse'
 }

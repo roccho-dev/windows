@@ -11,7 +11,10 @@ param(
     [switch]$Apply,
     # Apply only: the locked packages (exact names) to converge; Apply converges none without it,
     # Restore always all. With -File, pass them as one comma-separated argument.
-    [string[]]$Packages
+    [string[]]$Packages,
+    # Apply only: converge the owned fonts and the desktop UI font faces alone (no Noctty, package or
+    # app), for a machine where Restore stops elsewhere (e.g. a machine-wide Noctty).
+    [switch]$Typography
 )
 
 # The native Windows activation adapter. Product selection belongs to the built distribution (Nix).
@@ -118,6 +121,23 @@ if ($PSBoundParameters.ContainsKey('Packages')) {
     if (-not $packageNames.Count -or @($packageNames | Sort-Object -Unique -CaseSensitive).Count -ne $packageNames.Count -or
         @($packageNames | Where-Object { $locked -cnotcontains $_ }).Count) {
         throw "Unknown or repeated package in -Packages: $($packageNames -join ', ') (locked: $($locked -join ', '))"
+    }
+}
+if ($Typography -and ($Mode -ne 'Apply' -or $PSBoundParameters.ContainsKey('Packages'))) { throw '-Typography is only for -Mode Apply, without -Packages.' }
+# The desktop UI font face (a selected family, pack.py) set through ui-font.ahk by the locked interpreter package.
+$typography = Get-Field $manifest 'typography'
+if ($null -ne $typography -and (-not (Test-UiFontFace (Get-Field $typography 'face')) -or (Get-Field $typography 'script') -cne 'ui-font.ahk' -or
+        @($manifest.packages | Where-Object { $_.name -ceq (Get-Field $typography 'interpreter') }).Count -ne 1)) {
+    throw 'Invalid typography in manifest.'
+}
+if ($Typography -and $null -eq $typography) { throw 'This distribution selects no UI font face.' }
+# Store apps Restore installs when absent (pack.py checks the same shape); never owned, updated or removed.
+$apps = @(Get-Field $manifest 'apps' | Where-Object { $null -ne $_ })
+foreach ($app in $apps) {
+    if ((Get-Field $app 'source') -cne 'msstore' -or [string](Get-Field $app 'id') -cnotmatch '^[0-9A-Z]{12}\z' -or
+        [string](Get-Field $app 'name') -cnotmatch '^[A-Za-z0-9][A-Za-z0-9 .-]*\z' -or
+        [string](Get-Field $app 'package') -cnotmatch '^[A-Za-z0-9][A-Za-z0-9.-]*\z' -or [string](Get-Field $app 'publisherId') -cnotmatch '^[a-z0-9]{13}\z') {
+        throw "Invalid app in manifest: $(Get-Field $app 'name')"
     }
 }
 $packageDirectories = @($manifest.packages | ForEach-Object { $_.directory })
@@ -619,10 +639,11 @@ function IsPackageTree([string]$Target) {
 }
 
 # The current state of a recorded or selected effect: an owned font file or HKCU Fonts value, a
-# package tree, an App Paths key or default value, or a Noctty effect (ObserveNoctty). Anything else is
-# outside this version and stops the run.
+# package tree, an App Paths key or default value, a UI font slot, or a Noctty effect (ObserveNoctty).
+# Anything else is outside this version and stops the run.
 function Observe($Effect) {
     $kind, $target = [string](Get-Field $Effect 'kind'), [string](Get-Field $Effect 'target')
+    if ($kind -ceq 'ui-font-face' -and (Test-EffectPath $kind $target)) { return ObserveUiFont $target.Substring(4) }
     if ($kind -ceq 'file-created' -and [IO.Path]::GetDirectoryName($target) -eq $fontDirectory -and
         [IO.Path]::GetFileName($target) -match '^[0-9a-f]{64}\.ttf$') { return ObserveFile $target }
     if ($kind -ceq 'registry-value' -and $target -eq $fontKey) { return ObserveValue ([string](Get-Field $Effect 'name')) }
@@ -649,7 +670,8 @@ function OpenAttempt([string]$Id) {
     if ($attempt.problem) { throw "Effect ledger id ${Id}: $($attempt.problem)" }
     if ($attempt.closed) { return @() }
     $open = @($attempt.records)
-    if ($open.Count -and (Get-Field (Get-Field $open[0] 'prior') 'exists')) {
+    # A UI font slot always holds a face: its prior is the face written back, not content owned.
+    if ($open.Count -and (Get-Field (Get-Field $open[0] 'prior') 'exists') -and (Get-Field $open[0] 'kind') -cne 'ui-font-face') {
         throw "Effect ledger id $Id owns a target that existed before; this version owns only what it created."
     }
     return $open
@@ -933,16 +955,17 @@ function ConvergeEffect($Effect, [string]$Label, [scriptblock]$Create) {
     }
 }
 
-# The undo steps of a plan in execution order, by the kind of their effect: values, created
-# keys deepest first, files, then trees. The sort is stable, so each id's steps stay together
+# The undo steps of a plan in execution order, by the kind of their effect: UI font faces (so no
+# slot names a font the plan removes, and the interpreter is still there), values, created keys
+# deepest first, files, then trees. The sort is stable, so each id's steps stay together
 # and in their own order (a tree's files, its directories, its root). No value the plan removes
 # still names a file when that file goes, and a key has lost what the plan owns in it before it
 # goes. (The plan orders ids by their latest attempt.) Any other step stops the run.
 function OrderedSteps($Plan) {
-    $rank = @{ 'registry-value' = 0; 'registry-key-created' = 1; 'file-created' = 2; 'tree-extracted' = 3 }
+    $rank = @{ 'ui-font-face' = -1; 'registry-value' = 0; 'registry-key-created' = 1; 'file-created' = 2; 'tree-extracted' = 3 }
     $steps, $order = @($Plan.steps), 0
     foreach ($step in $steps) {
-        if ($step.action -cnotin @('delete-registry-value', 'delete-empty-key', 'delete-file', 'remove-empty-directory') -or
+        if ($step.action -cnotin @('set-ui-font-face', 'delete-registry-value', 'delete-empty-key', 'delete-file', 'remove-empty-directory') -or
             -not $rank.ContainsKey([string]$step.kind)) { throw "Unsupported undo step $($step.action)." }
     }
     @($steps | ForEach-Object { [pscustomobject]@{ step = $_; rank = $rank[[string]$_.kind]; order = $order++
@@ -960,6 +983,10 @@ function UndoOwnedSteps($Steps) {
             $open = @(OpenAttempt $run[0].id)
             foreach ($one in $run) {
                 switch -CaseSensitive ($one.action) {
+                    'set-ui-font-face' {
+                        if ((ObserveUiFont $one.slot).face -cne $one.expectFace) { throw "Refusing to revert UI font $($one.slot): it changed since it was read." }
+                        UiFontSet $one.face @{ $one.slot = $one.expectFace }
+                    }
                     'delete-registry-value' { RemoveTarget $open[0] ([ordered]@{ exists = $true; type = $one.expectType; data = $one.expectData }) }
                     'delete-empty-key' { RemoveTarget $open[0] ([ordered]@{ exists = $true }) }
                     'remove-empty-directory' { if (Test-Path -LiteralPath $one.path -PathType Container) { [IO.Directory]::Delete($one.path, $false) } }
@@ -991,7 +1018,8 @@ function IsFontEffect($Record) {
 # directory), key\name (value) or key (created key). Steps are dictionaries, and under strict mode
 # a missing key throws, so each shape is checked, not assumed.
 function StepText($Step) {
-    $on = if ($Step.Contains('path')) { $Step.path } elseif ($Step.Contains('name')) { "$($Step.key)\$($Step.name)" } else { $Step.key }
+    $on = if ($Step.Contains('path')) { $Step.path } elseif ($Step.Contains('slot')) { "spi:$($Step.slot) '$($Step.expectFace)' -> '$($Step.face)'" }
+        elseif ($Step.Contains('name')) { "$($Step.key)\$($Step.name)" } else { $Step.key }
     "$($Step.action) $on"
 }
 
@@ -1000,8 +1028,9 @@ function FontValueNames($Steps) { @($Steps | Where-Object { $_.action -ceq 'dele
 function IsFontFile($Step) { $Step.action -ceq 'delete-file' -and $Step.kind -ceq 'file-created' -and [IO.Path]::GetDirectoryName($Step.path) -eq $fontDirectory }
 
 # Owned font effects no longer selected, reverted by the same plan as Uninstall:
-# values first, then files. A file some Fonts value still names is kept open and
-# reported; a refused plan or a locked file fails the run.
+# values first, then files. A value of a family some UI font slot still names (UiFaces), and so
+# its file, is kept open and reported, as is a file some Fonts value still names; a refused plan
+# or a locked file fails the run.
 function CollectFontGarbage($Selected) {
     $ids = @(LedgerIds | Where-Object { $Selected -notcontains $_ -and (IsFontEffect @(RecordsOf $_)[0]) -and @(OpenAttempt $_).Count })
     if (-not $ids.Count) { return }
@@ -1014,6 +1043,10 @@ function CollectFontGarbage($Selected) {
         return
     }
     $steps = @(OrderedSteps $plan)
+    $faces = @(UiFaces)
+    $held = @($steps | Where-Object { $_.action -ceq 'delete-registry-value' -and $_.key -eq $fontKey -and (NamesFace $_.name $faces) })
+    $script:gcKeptReferenced += @($held | ForEach-Object { "$fontKey\$($_.name) (a UI font slot names its family)" })
+    $steps = @($steps | Where-Object { @($held | ForEach-Object { $_.id }) -cnotcontains $_.id })
     $table = @(FontReferenceTable (FontValueNames $steps))
     $keep = @($steps | Where-Object { (IsFontFile $_) -and @(FontReferences $table $_.path $_.expectSha256).Count })
     $script:gcKeptReferenced += @($keep | ForEach-Object { $_.path })
@@ -1022,7 +1055,8 @@ function CollectFontGarbage($Selected) {
 
 # Apply and Restore, after recovery and PlanNoctty: classify every font effect before the
 # first effect, then create or re-own each file and, once its file is exactly the
-# selection, its value; then collect unselected owned fonts.
+# selection, its value. Unselected owned fonts are collected later (CollectUnselectedFonts),
+# once the UI font slots name the selection.
 function ConvergeFonts {
     $effects = @(FontEffects)
     foreach ($effect in $effects) {
@@ -1053,8 +1087,9 @@ function ConvergeFonts {
             $script:fontDrift += "$fontKey\$($value.name) not registered: its file is not the selected bytes"
         }
     }
-    CollectFontGarbage @($effects | ForEach-Object { $_.file.id; $_.value.id })
 }
+
+function CollectUnselectedFonts { CollectFontGarbage @(FontEffects | ForEach-Object { $_.file.id; $_.value.id }) }
 
 # Read-only: every selected font file and value is exactly the selection.
 function AssertFonts {
@@ -1065,6 +1100,139 @@ function AssertFonts {
         if (-not (Test-EffectStateEqual 'registry-value' $effect.value.desired (ObserveValue $effect.value.name))) {
             throw "Registry drift: $($effect.value.name)"
         }
+    }
+}
+
+# ---- Desktop UI font faces (ui-font-face effects) -------------------------------
+# Six slots, face only, set by ui-font.ahk (SystemParametersInfoW) with the locked interpreter, which
+# checks each slot's expected face first and restores everything else it could have moved. Observation
+# reads what SPI persists, HKCU WindowMetrics, so recovery and Uninstall read a slot without the
+# interpreter. A face the user changed after this wrote it is owned-drift: reported, never written.
+$script:uiFontDrift, $script:uiInterpreter = @(), $null
+$windowMetricsSubkey = 'Control Panel\Desktop\WindowMetrics'
+$uiFontValues = @{ caption = 'CaptionFont'; smCaption = 'SmCaptionFont'; menu = 'MenuFont'; status = 'StatusFont'; message = 'MessageFont'; icon = 'IconFont' }
+
+function ObserveUiFont([string]$Slot) {
+    $name = $uiFontValues[$Slot]
+    $value = ObserveValue $name $windowMetricsSubkey
+    $bytes = if ($value.exists -and $value.type -ceq 'Binary') { [byte[]]$value.data } else { $null }
+    if ($null -eq $bytes -or $bytes.Length -ne 92) { throw "HKCU\$windowMetricsSubkey\$name is not a LOGFONTW." }
+    $face = [Text.Encoding]::Unicode.GetString($bytes, 28, 64)
+    $end = $face.IndexOf([char]0)
+    [ordered]@{ exists = $true; face = $(if ($end -ge 0) { $face.Substring(0, $end) } else { $face }) }
+}
+
+# The faces the readable slots name now; font collection keeps their families.
+function UiFaces { foreach ($slot in Get-UiFontSlots) { try { (ObserveUiFont $slot).face } catch { } } }
+function NamesFace([string]$Name, $Faces) {
+    foreach ($face in @($Faces)) { if ($Name.StartsWith("$face ", [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+    return $false
+}
+
+# The selected slot effects; prior is the face found when the intent is written.
+function UiFontEffects {
+    foreach ($slot in Get-UiFontSlots) {
+        [ordered]@{ id = "ui-font-face:SPI:$($slot.ToUpperInvariant())"; kind = 'ui-font-face'; target = "spi:$slot"
+            prior = $null; desired = [ordered]@{ exists = $true; face = $typography.face } }
+    }
+}
+
+# The interpreter package's executable with its locked SHA-256: the owned tree, or an existing install
+# classed preexisting-match. Nothing is installed here (Restore installs packages first).
+function UiFontInterpreter {
+    if ($null -ne $script:uiInterpreter) { return $script:uiInterpreter }
+    $package = @($manifest.packages | Where-Object { $_.name -ceq $typography.interpreter })[0]
+    $state = ClassifyPackage $package
+    if ($state.class -cnotin @('owned-match', 'preexisting-match')) {
+        throw "The UI font interpreter $($package.name) $($package.version) is $($state.class)$(if ($state.reason) { ": $($state.reason)" }); Restore installs it."
+    }
+    $want = (ConvertTo-FileMap $package.files)[$package.executable]
+    $candidates = @(Join-Path $state.effect.target $package.executable.Replace('/', '\')) + @(FindUninstallEntries $package.existing |
+        Where-Object { $_.installLocation -is [string] -and $_.installLocation.Trim() } |
+        ForEach-Object { Join-Path ([Environment]::ExpandEnvironmentVariables($_.installLocation.Trim().Trim('"'))) $package.existing.executable.Replace('/', '\') })
+    foreach ($exe in $candidates) {
+        if ((Test-Path -LiteralPath $exe -PathType Leaf) -and (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash -eq $want) {
+            $script:uiInterpreter = $exe
+            return $exe
+        }
+    }
+    throw "No $($package.name) executable with the locked SHA-256 was found."
+}
+
+# One ui-font.ahk set: $Face into each slot of $Expect (slot -> the face it must hold now).
+function UiFontSet([string]$Face, [hashtable]$Expect) {
+    $arguments = @('/ErrorStdOut', (BundlePath 'ui-font.ahk'), 'set', $Face) + @($Expect.Keys | Sort-Object | ForEach-Object { "$_=$($Expect[$_])" })
+    $null = Invoke-Native (UiFontInterpreter) $arguments 60
+    $script:changed++
+}
+
+# Apply -Typography and Restore, once the selected fonts are exact: every slot is classified first; an owned
+# face of an earlier selection goes back to its prior; then one intent per slot to write, one set of them all
+# (each slot's expected face is its prior), and a commit per slot read back. A failure recovers each slot at
+# once when it can: one that took the face commits, one that did not is voided.
+function ConvergeUiFont {
+    $states = @(UiFontEffects | ForEach-Object { [pscustomobject]@{ effect = $_; state = (Classify $_) } })
+    foreach ($s in $states) {
+        if ($s.state.class -cnotin @('absent', 'owned-match', 'owned-drift', 'preexisting-match')) { throw "UI font $($s.effect.target) is $($s.state.class): $($s.state.reason)" }
+    }
+    $script:uiFontDrift += @($states | Where-Object { $_.state.class -ceq 'owned-drift' } |
+        ForEach-Object { "$($_.effect.target) is '$((Observe $_.effect).face)', not the face this wrote; not written" })
+    $changed = @($states | Where-Object { $_.state.class -ceq 'owned-match' -and -not (Test-EffectStateEqual 'ui-font-face' $_.state.recorded $_.effect.desired) })
+    if ($changed.Count) {
+        $observations = @{}
+        foreach ($s in $changed) { $observations[$s.effect.id] = Observe $s.effect }
+        $plan = Get-UninstallPlan @($changed | ForEach-Object { RecordsOf $_.effect.id }) $observations
+        if (-not $plan.ok) { throw "UI font faces of an earlier selection cannot be reverted: $(@($plan.refused | ForEach-Object { "$($_.id): $($_.reason)" }) -join '; ')" }
+        UndoOwnedSteps @(OrderedSteps $plan)
+    }
+    $write = @(@($states | Where-Object { $_.state.class -ceq 'absent' }) + $changed | ForEach-Object { $_.effect })
+    if (-not $write.Count) { return }
+    $expect = @{}
+    foreach ($effect in $write) {
+        $effect.prior = Observe $effect
+        $expect[$effect.target.Substring(4)] = $effect.prior.face
+    }
+    foreach ($effect in $write) { WriteRecord 'intent' $effect $null $null }
+    try {
+        UiFontSet $typography.face $expect
+        $wrong = @($write | Where-Object { (Observe $_).face -cne $typography.face } | ForEach-Object { $_.target })
+        if ($wrong.Count) { throw "HKCU WindowMetrics does not read back '$($typography.face)' for $($wrong -join ', ') (a registry silo?)." }
+    } catch {
+        $failure = $_
+        foreach ($effect in $write) { try { RecoverId $effect.id } catch { Write-Warning "Recovery of $($effect.id) deferred: $($_.Exception.Message)" } }
+        throw $failure
+    }
+    foreach ($effect in $write) { WriteRecord 'commit' $effect (Observe $effect) }
+}
+
+# Read-only: every slot names the selected face, owned or not.
+function AssertUiFont {
+    $wrong = @(UiFontEffects | ForEach-Object { $face = (Observe $_).face; if ($face -cne $typography.face) { "$($_.target) is '$face'" } })
+    if ($wrong.Count) { throw "UI font drift (selected '$($typography.face)'): $($wrong -join '; ')" }
+}
+
+# ---- Store apps: installed when absent, never owned ------------------------------
+# Presence is this user's package of that name and publisher (Get-AppAction), any version: the Store updates
+# an app itself, so a restore gets the version the Store serves that day (online only), reported, not pinned.
+# An app present is never reinstalled, updated, closed or removed, and its data is never touched.
+$script:appDrift = @()
+
+function AppStates {
+    foreach ($app in $apps) {
+        $found = @(Get-AppxPackage -Name $app.package | ForEach-Object {
+            [pscustomobject]@{ name = [string]$_.Name; publisherId = [string]$_.PublisherId; version = [string]$_.Version } })
+        [pscustomobject]@{ app = $app; found = $found; action = (Get-AppAction $found $app) }
+    }
+}
+
+# Restore: each absent app through the official WinGet from the Microsoft Store source, by its exact id.
+function ConvergeApps {
+    foreach ($state in @(AppStates | Where-Object { $_.action -ceq 'install' })) {
+        $winget = Join-Path $localAppData 'Microsoft\WindowsApps\winget.exe'
+        if (-not (Test-Path -LiteralPath $winget)) { $script:appDrift += "$($state.app.name): WinGet (App Installer) is missing; not installed"; continue }
+        $null = Invoke-Native $winget @('install', '--id', $state.app.id, '--source', 'msstore', '--exact', '--silent', '--disable-interactivity',
+            '--accept-package-agreements', '--accept-source-agreements') 1800
+        $script:changed++
     }
 }
 
@@ -1618,6 +1786,10 @@ function Uninstall {
         $contents, $alsoRemoved = @{}, @{ ('HKCU\' + $startupSubkey) = @($legacy.steps | Where-Object { $null -eq $_.value } | ForEach-Object { $_.name }) }
         foreach ($step in @($steps | Where-Object { $_.action -ceq 'delete-empty-key' })) { $contents[$step.key] = ObserveKeyContent ($step.key -replace '^HKCU\\', '') }
         $refused += @(Get-ForeignKeyContent $steps $contents $alsoRemoved) + @(TreeReferenceProblems $steps)
+        # A UI font face goes back through the interpreter, before any tree (OrderedSteps), so it must be there now.
+        if (@($steps | Where-Object { $_.action -ceq 'set-ui-font-face' }).Count) {
+            try { $null = UiFontInterpreter } catch { $refused += "UI font faces: $($_.Exception.Message)" }
+        }
         # A package tree whose executable runs (an exclusive read/write open fails) is not touched, so a
         # running browser never loses half its files; a partly removed tree still resumes (D1).
         $programs = Join-Path $localAppData 'Programs'
@@ -1646,7 +1818,7 @@ function Uninstall {
     }
     $answer = [ordered]@{ mode = $Mode; apply = [bool]$Apply; source = $manifest.source; identity = $script:runIdentity
         ledgerFound = $found; siloCheck = 'notPerformed'
-        scope = 'owned fonts, Noctty, package trees and their App Paths names visible to this process, and the default-terminal selection this distribution wrote; protected package data (a browser profile) and RentSsh are not in the ledger'
+        scope = 'owned fonts, desktop UI font faces, Noctty, package trees and their App Paths names visible to this process, and the default-terminal selection this distribution wrote; protected package data (a browser profile), Store apps and RentSsh are not in the ledger'
         planned = @($steps | ForEach-Object { StepText $_ })
         resolutions = @($plan.resolutions | ForEach-Object { "$($_.id): $($_.resolution)" }); resumed = @($plan.resumed)
         defaultTerminal = $legacy.action
@@ -1669,34 +1841,54 @@ try {
         $null = ReadLedger
         $packageStates = @(SelectedPackages | ForEach-Object { ClassifyPackage $_ })
     }
-    $ledgerFound, $nocttyPlan = $false, $null
+    $ledgerFound, $nocttyPlan, $appStates = $false, $null, @()
+    # UI font faces: Restore, and Apply -Typography; checked by RestoreTest too.
+    $uiFont = $null -ne $typography -and ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest' -or $Typography)
     if ($Mode -eq 'Apply' -or $Mode -eq 'Restore') {
         # Owned fonts and Noctty through the effect ledger (native files, trees and HKCU keys and
         # values): recovery, then every Noctty and font effect is classified before the first
-        # one; fonts, then Noctty (tree, configuration, keys, values), then the selection.
+        # one; fonts, then the UI font faces, then Noctty (tree, configuration, keys, values), then
+        # the selection. -Typography converges the fonts and the UI font faces alone.
         $ledgerFound = Test-Path -LiteralPath $ledgerDirectory -PathType Container
         LockLedger
         $null = ReadLedger
         RecoverLedger
-        $nocttyPlan = PlanNoctty -Restore:($Mode -eq 'Restore')
-        # Packages (all for Restore, those named by -Packages for Apply), classified after recovery;
-        # every package refusal comes before the first effect, then installs, then old versions go.
-        $packageStates = @(SelectedPackages | ForEach-Object { ClassifyPackage $_ })
-        PreflightPackages $packageStates
-        foreach ($state in @($packageStates | Where-Object { $_.install })) { InstallPackage $state }
-        # App Paths names point at the selected trees before old versions go, and retired names are collected, only
-        # in a run that handles packages (Restore, or Apply with -Packages): without them no package state is touched.
-        foreach ($appPath in @($packageStates | ForEach-Object { AppPathState $_ } | Where-Object { $null -ne $_ -and $_.write })) { ConvergeAppPath $appPath }
-        if ($packageStates.Count) { CollectAppPathGarbage $packageStates }
-        foreach ($state in @($packageStates | Where-Object { $_.install -or $_.class -ceq 'owned-match' })) { CollectPackageGarbage $state }
+        if (-not $Typography) {
+            $nocttyPlan = PlanNoctty -Restore:($Mode -eq 'Restore')
+            # Packages (all for Restore, those named by -Packages for Apply), classified after recovery;
+            # every package refusal comes before the first effect, then installs, then old versions go.
+            # The UI font interpreter is a package, so Restore installs it before the faces are set.
+            $packageStates = @(SelectedPackages | ForEach-Object { ClassifyPackage $_ })
+            PreflightPackages $packageStates
+            foreach ($state in @($packageStates | Where-Object { $_.install })) { InstallPackage $state }
+            # App Paths names point at the selected trees before old versions go, and retired names are collected, only
+            # in a run that handles packages (Restore, or Apply with -Packages): without them no package state is touched.
+            foreach ($appPath in @($packageStates | ForEach-Object { AppPathState $_ } | Where-Object { $null -ne $_ -and $_.write })) { ConvergeAppPath $appPath }
+            if ($packageStates.Count) { CollectAppPathGarbage $packageStates }
+            foreach ($state in @($packageStates | Where-Object { $_.install -or $_.class -ceq 'owned-match' })) { CollectPackageGarbage $state }
+            if ($Mode -eq 'Restore') { ConvergeApps }
+        }
         ConvergeFonts
+        # The faces move only onto exact selected fonts, and old fonts go only once no slot names them.
+        if ($uiFont -and -not $script:fontDrift.Count) { AssertFonts; ConvergeUiFont }
+        CollectUnselectedFonts
         if ($script:fontDrift.Count) { throw "Font drift: $($script:fontDrift -join '; ')" }
-        ApplyNoctty $nocttyPlan
-        SelectNoctty -Check:($Mode -eq 'Restore')
-        if ($script:nocttyDrift.Count) { throw "Noctty drift: $($script:nocttyDrift -join '; ')" }
-        $packageStates = @(SelectedPackages | ForEach-Object { ClassifyPackage $_ })  # as they are now, for the verdict
+        if ($script:uiFontDrift.Count) { throw "UI font drift: $($script:uiFontDrift -join '; ')" }
+        if (-not $Typography) {
+            ApplyNoctty $nocttyPlan
+            SelectNoctty -Check:($Mode -eq 'Restore')
+            if ($script:nocttyDrift.Count) { throw "Noctty drift: $($script:nocttyDrift -join '; ')" }
+            $packageStates = @(SelectedPackages | ForEach-Object { ClassifyPackage $_ })  # as they are now, for the verdict
+        }
     }
     if ($Mode -ne 'Validate') { AssertFonts }
+    if ($uiFont) { AssertUiFont }
+    if ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest') {
+        $appStates = @(AppStates)
+        $script:appDrift += @($appStates | Where-Object { $_.action -cne 'present' } | ForEach-Object {
+            "$($_.app.name) ($($_.app.package)) is $(if ($_.action -ceq 'install') { 'not installed' } else { "not exactly one package of publisher $($_.app.publisherId); never replaced" })" })
+        if ($script:appDrift.Count) { throw "App drift: $($script:appDrift -join '; ')" }
+    }
     if ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest') {
         if (-not (TestNoctty)) { throw 'Noctty files or font configuration drift.' }
         if (-not (TestTerminalPackage)) { throw 'Windows Terminal 1.24 or newer is missing.' }
@@ -1728,6 +1920,13 @@ try {
             $state = @($packageStates | Where-Object { $_.package.name -ceq $name })
             [ordered]@{ name = $name; version = $_.version
                 class = $(if ($state.Count) { $state[0].class } else { 'notEvaluated' }) } });
+        uiFont = $(if ($uiFont) { [ordered]@{ face = $typography.face; slots = @(Get-UiFontSlots) } } else { 'notEvaluated' })
+        # Store apps: the version installed now; the Store moves it, and installing needs the network.
+        apps = @($apps | ForEach-Object {
+            $package = $_.package
+            $state = @($appStates | Where-Object { $_.app.package -ceq $package })
+            [ordered]@{ name = $_.name; package = $package; id = $_.id
+                version = $(if ($state.Count -and $state[0].action -ceq 'present') { $state[0].found[0].version } else { 'notEvaluated' }) } });
         inDesiredState = ($Mode -ne 'Validate');
         registrationState = $(if (TestNocttyRegistration) { 'registered' } else { 'unregistered' });
         handoffProof = 'unproven' } | ConvertTo-Json -Compress -Depth 4

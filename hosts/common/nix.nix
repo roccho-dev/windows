@@ -151,6 +151,16 @@ let
     };
     cloudflared.version = cloudflaredVersion;
     packages = map (lock: lock // { inventory = "${inventory lock}"; }) packageLocks;
+    # The desktop UI font face: the family of this role, set face-only in the six Win32 UI font slots
+    # (SystemParametersInfoW) by ui-font.ahk, run by this locked package's interpreter (no compiler).
+    typography = { desktop = "ui"; interpreter = "AutoHotkey"; };
+    # Microsoft Store apps Restore installs when absent, by the official WinGet from the msstore source.
+    # Not pinned: the Store serves and updates its current version, and installing needs the network.
+    # An app present (this package name and publisher id) is never reinstalled, closed or removed, and
+    # its data is never owned. The ChatGPT desktop app's package family is OpenAI.Codex_2p2nqsd0c76g0.
+    apps = [
+      { name = "ChatGPT"; source = "msstore"; id = "9PLM9XGG6VKS"; package = "OpenAI.Codex"; publisherId = "2p2nqsd0c76g0"; }
+    ];
   });
   fonts = pkgs.runCommand "common-fonts" { nativeBuildInputs = [ python ]; } ''
     python ${./pack.py} fonts ${policy} "$out"

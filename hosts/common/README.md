@@ -30,7 +30,8 @@ directory, then run:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Validate     # read-only
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Restore      # fonts, Noctty, packages (see below)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Restore      # fonts, UI font faces, Noctty, packages, Store apps (see below)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Apply -Typography  # fonts and UI font faces only
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RestoreTest  # fail on drift
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Uninstall    # dry run: lists what it would revert
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Uninstall -Apply  # reverts owned fonts and Noctty, restores the selection
@@ -377,6 +378,52 @@ unproven until the VM run. Sites that set fonts in CSS, serif, other scripts, an
 Chromium's and Windows' own UI are unaffected; a later user setting prevails, and sync
 may.
 
+### Desktop UI font faces
+
+`typography` in `nix.nix` names a font role (`ui`, IBM Plex Sans JP) and the locked
+interpreter package (AutoHotkey). `Restore`, and `Apply -Typography` (the fonts and
+these faces alone, for a machine where `Restore` stops elsewhere, e.g. at a
+machine-wide Noctty), set that family as the face of the six Win32 UI font slots
+(caption, small caption, menu, status, message; icon title) through
+`SystemParametersInfoW`. The call is made by `ui-font.ahk`, run by the owned (or an
+exact preexisting) `AutoHotkey64.exe` whose SHA-256 is the lock's. No compiler,
+`Add-Type`, input, hook or window is involved. Only `lfFaceName` changes: before writing,
+the script requires each slot's persisted `HKCU\Control Panel\Desktop\WindowMetrics` value to equal its
+live LOGFONTW, and each slot it sets to hold the face the ledger expects. Otherwise
+it refuses and writes nothing. Afterwards every other byte of the six fonts and every
+other WindowMetrics value must be unchanged, or it puts all of them back and fails.
+Sizes, weights and the DPI are never written. The live and persisted units agree at
+100% scaling; at other scalings that precheck may refuse, which is safe but
+unproven.
+
+Each slot is a `ui-font-face` ledger effect (target `spi:<slot>`, state `face`,
+prior the face found). Another face in a slot nothing owns is `absent`, taken with
+that face recorded as prior. One set covers every slot to write, then one commit
+per slot read back. Recovery commits a slot that took the face and voids one that
+did not. A face changed after this wrote it is owned-drift: `Apply` reports UI
+font drift and writes nothing, and `Uninstall` refuses it (set it back by hand).
+`Uninstall` writes each prior face back through the interpreter before any tree
+goes. It refuses when the interpreter is missing. Unselected owned fonts are
+collected only after the faces move, and a font whose family a slot still names
+is kept. This covers classic Win32 UI text only: modern Windows shell and XAML
+text, and each application's own fonts, are unaffected. A running application may
+need a restart to pick up the change.
+
+### Store apps
+
+`apps` in `nix.nix` lists Microsoft Store apps by Store id, package name and publisher
+id. For now it holds only the ChatGPT desktop app: `9PLM9XGG6VKS`, package family
+`OpenAI.Codex_2p2nqsd0c76g0`. `Restore` reads this user's packages (`Get-AppxPackage`).
+With none of that name it runs the official WinGet (`winget install --id <id> --source
+msstore --exact --silent`). With exactly one of that publisher it does nothing. Anything
+else fails and is never replaced. `Restore` and `RestoreTest` then require it to be
+present and report its version.
+
+This uses neither Microsoft DSC nor a pinned package. The Store serves and updates its
+current version, so installing needs the network and a restore gets that day's
+version. An app is not a ledger effect: it is never reinstalled, updated, closed or
+removed, and its data and settings, including in-app fonts, are not owned or written.
+
 **Torn record.** A power loss can tear only the highest-seq record, and every mode
 that reads the ledger then stops. Remove that one file by hand only if it is the
 highest `<seq>.json` **and** does not parse as JSON; then rerun, and recovery
@@ -384,7 +431,8 @@ closes the attempt from the machine's state. A record that parses but is invalid
 is never removed: stop and investigate.
 **Stale lock.** A power loss can also leave `ledger\.lock`, and every writer then stops with "Another run holds the effect ledger lock"; delete that one file by hand only when no `win.ps1` (`powershell.exe`) process is running.
 
-**#14 (RentSsh).** The ledger owns only what it created (prior absent). A
+**#14 (RentSsh).** The ledger owns only what it created (prior absent), except a UI
+font face, whose slot always holds one (above). A
 `prefix-inserted` or `file-replaced` effect cannot be moved to a new version by
 undo-then-rewrite, because the restored prior classifies as `preexisting-*`; #14
 must define an explicit transition record first.
@@ -491,6 +539,15 @@ first run on the default `User Data` and Win+R itself are proven only by the VM 
 Windows 11 VM, as an unelevated user in an Explorer-launched session, Win+R `chromium`
 after `Restore` starts the owned `chrome.exe` (positive), and the same Win+R after
 `Uninstall` finds nothing (negative).
+A31 (UI font faces, while AutoHotkey is owned) first runs `ui-font.ahk get`. It
+requires each live LOGFONTW to equal the runner's persisted value, and the script
+to refuse an unexpected face without writing. It then models a crash after the five
+NONCLIENTMETRICS slots took the face (six intents, one set of five). `Apply
+-Typography` commits those five, voids the icon, writes it anew and changes
+nothing but the six faces. A second run writes nothing; a changed face is drift and
+is not written. After A27's `Uninstall` every WindowMetrics value is byte-for-byte
+the runner's baseline again. `Restore`'s Store app step (WinGet) is not run on CI;
+only its decision (`Get-AppAction`) is.
 It also requires every `win.ps1` answer to report
 `handoffProof = "unproven"` and `handoff-proof.ps1` to refuse the runner, so CI
 never claims a real default-terminal handoff. Negative controls must fail for
@@ -522,7 +579,15 @@ showing no write inside its tree (G3). These also gate leaving out the vendor's
 bookkeeping keys and descriptions; if handoff fails without them, they become
 owned values.
 
-Application/UI selection beyond noctty, Japanese/Nerd/Emoji rendering,
+**Recorded host observations (2026-10-01, no clean VM).** On the maintainer's host, a
+Noctty sample of ASCII, kana, kanji and the Nerd Font glyph U+F121 was accepted by the
+user as rendering without visible missing-glyph boxes. That host's Noctty was already
+configured with PlemolJP. This is an accepted visual sample on one existing machine.
+It is not a clean-install, `Restore` or VM result. No UI font face or Store app was
+applied on that host. The clean VM run (S7) is deferred by the user, so a full clean
+restore is not claimed.
+
+Application/UI selection beyond noctty and the six Win32 UI font slots, Japanese/Nerd/Emoji rendering,
 font reload/relogin, Linux profile activation, and real-host
 Spec + Binding → Runtime → Proof/restoration remain unproven. Installing a font
 does not prove an application uses it. Native `nix.exe` is not a prerequisite.
