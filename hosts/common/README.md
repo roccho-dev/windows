@@ -486,7 +486,8 @@ conflicts (stubbed), re-pointing, the tree reference and retired names; the main
 end) is not exercised end to end, only its decision. The
 runner is an elevated Windows Server: a clean, unelevated Windows 11 user's `Restore`,
 first run on the default `User Data` and Win+R itself are proven only by the VM run.
-**Required before merge, whatever `appPathsLaunch` says (VM run, S7):** on a clean
+**Required before #7 is complete and before this build is used on a real host, whatever
+`appPathsLaunch` says (VM run, S7):** on a clean
 Windows 11 VM, as an unelevated user in an Explorer-launched session, Win+R `chromium`
 after `Restore` starts the owned `chrome.exe` (positive), and the same Win+R after
 `Uninstall` finds nothing (negative).

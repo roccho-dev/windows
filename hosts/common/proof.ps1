@@ -2338,7 +2338,8 @@ Must ((NewRecords $mark @($chromiumId)) -eq 0 -and @($chromiumAgain.packages | W
 # (appPathsLaunch 'proven'), or on this elevated runner none of the names tried here (chromium, chromium.exe,
 # same-name probe in two spellings) resolved using this ShellExecute method ('unproven');
 # a value this distribution does not own in the key stops Uninstall before any removal (A3). Foreign keys, HKLM and
-# retired names are proven by the primitives on a throwaway name; Win+R itself only on the VM (S7), before merge.
+# retired names are proven by the primitives on a throwaway name; Win+R itself only on the VM (S7), before #7 is
+# complete and before this build is used on a real host.
 $appSubkey = "Software\Microsoft\Windows\CurrentVersion\App Paths\$($chromium.appPath)"
 $appKeyId, $appValueId = ('registry-key-created:' + "HKCU\$appSubkey".ToUpperInvariant()), ('registry-value:' + "HKCU\$appSubkey|".ToUpperInvariant())
 $chromiumExe = Join-Path $chromiumTree $chromium.executable.Replace('/', '\')
