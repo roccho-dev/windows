@@ -423,8 +423,17 @@ seed (A28 and the primitives) it checks the bundled bytes against the font roles
 malformed seed refused, the listing against the inventory alone, a staging tree exact
 only after the verified seed is written (a differing one writes nothing), recovery
 removing the seed, and, with the profile only read, O1 keeping Chromium from installing
-(package drift, nothing written) and C1 stopping a stand-in owned tree before any effect. A real seeded Chromium install and its
-first run are not exercised until b3 and the VM run.
+(package drift, nothing written) and C1 stopping a stand-in owned tree before any effect.
+Chromium's first run is observed (b3a) as printed evidence that never fails the proof,
+within 120 s: the tree the S2-0 measurement extracted, with the bundled seed copied in,
+is started only with scratch `--user-data-dir` profiles on the runner. It reports `First
+Run` and the six seed preferences after a first GUI run; which of `Default` and `Profile
+1` a first run over Preferences without `First Run` overwrites; the fonts a headless PDF
+embeds; the tree unchanged; every process from it ending, none from elsewhere; nothing
+new under the default `%LOCALAPPDATA%\Chromium` (moved aside, never deleted, never
+through a reparse point; anything not moved is a stop condition); fixed HKCU names before
+and after, read before any move; and the stop conditions b3b will assert. A real seeded install
+through `win.ps1` is not exercised until b3b, nor a clean Windows 11 user until the VM run.
 It also requires every `win.ps1` answer to report
 `handoffProof = "unproven"` and `handoff-proof.ps1` to refuse the runner, so CI
 never claims a real default-terminal handoff. Negative controls must fail for

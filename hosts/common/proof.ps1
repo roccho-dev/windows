@@ -1946,6 +1946,251 @@ Must ((Phases $crash.id) -ceq 'intent' -and (Test-Path -LiteralPath "$($crash.st
 [IO.File]::Delete("$($crash.staging)\foreign.txt")
 $null = Run 'Apply'
 Must ((Phases $crash.id) -ceq 'intent,void' -and -not (Test-Path -LiteralPath $crash.staging)) 'A25: recovery completes once the foreign file is gone'
+
+# ---- b3a (C1-C9): Chromium's first run, observed. Printed evidence only; nothing here fails the proof ----
+# Here the owned fonts are installed (A25's Apply) and the proof's own stand-in profile exists (A24). The tree S2-0
+# extracted and found exactly the pinned inventory (RUNNER_TEMP, never deleted) gets the bundled seed beside
+# chrome.exe, and Chromium starts only from that tree, only with fresh scratch --user-data-dir directories beside it,
+# never with --no-first-run or --no-sandbox. Observed: First Run and the six seed preferences after a first GUI run;
+# the tree still exactly the inventory and the seed (names, sizes, write times); every process from the tree ending
+# once its window closes (the rest killed and counted) and none started from elsewhere; nothing new under the
+# default %LOCALAPPDATA%\Chromium (anything new is moved aside, never deleted, so the proof's own cleanup holds);
+# HKCU names in fixed places before and after (C9); the fonts a headless PDF of the same profile embeds; and which
+# existing Preferences a first run over a profile without First Run overwrites. One 120-second budget: a step that
+# cannot get its minimum is skipped and says so. b3b turns the stop conditions listed at the end into assertions.
+$b3a = [ordered]@{ status = 'not run' }
+$b3aBudget, $b3aClock = 120, [Diagnostics.Stopwatch]::StartNew()
+function B3a([string]$Line) { Write-Host "b3a $Line" }
+function B3aLeft([int]$Least, [string]$Step) {
+    $left = [int]($b3aBudget - $b3aClock.Elapsed.TotalSeconds)
+    if ($left -lt $Least) { throw "$Step skipped: $left s of the $b3aBudget s budget left, $Least s needed" }
+    $left
+}
+function InTree([string]$Path) { $Path -and $Path.StartsWith($b3aTree + '\', [StringComparison]::OrdinalIgnoreCase) }
+# The chrome.exe processes from the tree now; any other chrome.exe that was not running before is remembered.
+function TreeProcesses {
+    $all = @(Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" | ForEach-Object { [pscustomobject]@{ id = [int]$_.ProcessId; path = [string]$_.ExecutablePath } })
+    foreach ($process in $all) { if (-not (InTree $process.path) -and $b3aBaseline -notcontains $process.id) { $script:b3aOutside[$process.id] = $process.path } }
+    @($all | Where-Object { InTree $_.path })
+}
+# Waits up to $Seconds for every process from the tree to end, then kills the rest; says which.
+function SettleChromium([int]$Seconds) {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    while ($clock.Elapsed.TotalSeconds -lt $Seconds) {
+        if (-not @(TreeProcesses).Count) { return "all ended in $([Math]::Round($clock.Elapsed.TotalSeconds, 1)) s" }
+        Start-Sleep -Milliseconds 500
+    }
+    $live = @(TreeProcesses)
+    foreach ($process in $live) { try { Stop-Process -Id $process.id -Force -ErrorAction Stop } catch { } }
+    "KILLED $($live.Count) still running after $Seconds s"
+}
+function StartChromium([string[]]$Arguments) {
+    $info = [Diagnostics.ProcessStartInfo]::new($b3aExe)
+    foreach ($argument in $Arguments) { $info.ArgumentList.Add($argument) }
+    $info.UseShellExecute = $false
+    [Diagnostics.Process]::Start($info)
+}
+# Polls $Done every half second for up to $Seconds; the seconds it took, or $null.
+function WaitFor([scriptblock]$Done, [int]$Seconds) {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    while ($clock.Elapsed.TotalSeconds -lt $Seconds) {
+        if (& $Done) { return [Math]::Round($clock.Elapsed.TotalSeconds, 1) }
+        $null = TreeProcesses
+        Start-Sleep -Milliseconds 500
+    }
+    $null
+}
+# Relative path -> 'dir' or 'length|write ticks' for every entry beneath $Path (none when it is absent).
+function EntryStamps([string]$Path) {
+    $map = @{}
+    if (Test-Path -LiteralPath $Path) {
+        foreach ($item in @(Get-ChildItem -LiteralPath $Path -Recurse -Force)) {
+            $map[$item.FullName.Substring($Path.Length)] = $(if ($item.PSIsContainer) { 'dir' } else { "$($item.Length)|$($item.LastWriteTimeUtc.Ticks)" })
+        }
+    }
+    $map
+}
+# True when $Path's full path lies strictly beneath $Root and neither $Root, $Path nor any directory between them is a
+# reparse point, so a move never renames a link or reaches through one.
+function SafeBeneath([string]$Path, [string]$Root) {
+    $full, $base = [IO.Path]::GetFullPath($Path), [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    if (-not $full.StartsWith($base + '\', [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    for ($at = $full; $at.Length -ge $base.Length; $at = [IO.Path]::GetDirectoryName($at)) {
+        if ((Get-Item -LiteralPath $at -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+    }
+    $true
+}
+function StampDiff($Before, $After) {
+    @(@($After.Keys | Where-Object { -not $Before.ContainsKey($_) } | Sort-Object | ForEach-Object { "+$_" }) +
+        @($Before.Keys | Where-Object { -not $After.ContainsKey($_) } | Sort-Object | ForEach-Object { "-$_" }) +
+        @($After.Keys | Where-Object { $Before.ContainsKey($_) -and $After[$_] -ne 'dir' -and $Before[$_] -ne $After[$_] } | Sort-Object | ForEach-Object { "~$_" }))
+}
+# C9: HKCU key and value names in fixed places only (App Paths, Uninstall, Software\Chromium in depth, the browser
+# registrations, the names directly under Software\Classes and the web types' OpenWithProgids), read-only.
+$b3aPlaces = @(@('Software\Microsoft\Windows\CurrentVersion\App Paths', $false), @('Software\Microsoft\Windows\CurrentVersion\Uninstall', $false),
+    @('Software\Chromium', $true), @('Software\Clients\StartMenuInternet', $false), @('Software\RegisteredApplications', $false),
+    @('Software\Classes', $false)) + @('.htm', '.html', '.pdf', '.svg', '.webp', '.xht', '.xhtml', 'http', 'https' | ForEach-Object { , @("Software\Classes\$_\OpenWithProgids", $false) })
+function HkcuNames {
+    $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $walk = {
+        param([string]$Path, [bool]$Deep)
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($Path)
+        if ($null -eq $key) { return }
+        try {
+            foreach ($value in $key.GetValueNames()) { $null = $names.Add("$Path|$value") }
+            foreach ($sub in $key.GetSubKeyNames()) { $null = $names.Add("$Path\$sub"); if ($Deep) { & $walk "$Path\$sub" $true } }
+        } finally { $key.Close() }
+    }
+    foreach ($place in $b3aPlaces) { & $walk $place[0] $place[1] }
+    , $names
+}
+# The six seed preferences in a profile's Preferences against the bundled seed.
+function SeedPreferences([string]$Preferences) {
+    if (-not (Test-Path -LiteralPath $Preferences)) { return 'no Preferences' }
+    try {
+        $json = [IO.File]::ReadAllText($Preferences)
+        $document = try { $json | ConvertFrom-Json -AsHashtable } catch { $json | ConvertFrom-Json }
+        $found = Get-Field (Get-Field (Get-Field $document 'webkit') 'webprefs') 'fonts'
+    } catch { return "unreadable: $($_.Exception.Message -replace '(.{200}).+', '$1...')" }
+    $wrong = @(foreach ($generic in 'standard', 'sansserif', 'fixed') {
+        foreach ($code in 'Zyyy', 'Jpan') {
+            $want, $have = (Get-Field (Get-Field $b3aSeedFonts $generic) $code), (Get-Field (Get-Field $found $generic) $code)
+            if ([string]$have -cne [string]$want) { "$generic.$code=$(if ($null -eq $have) { 'absent' } else { $have })" }
+        }
+    })
+    if ($wrong.Count) { "DIFFER: $($wrong -join ', ')" } else { 'all six equal the seed' }
+}
+$b3aStops = [Collections.Generic.List[string]]::new()
+try {
+    $b3aPackage = @($manifest.packages | Where-Object { $_.name -ceq 'Chromium' })[0]
+    if (-not $s20.Contains('Chromium') -or -not ([string]$s20['Chromium']).StartsWith('evidence: complete')) { throw 'S2-0 did not leave an exact Chromium tree; nothing started' }
+    $b3aTree = Join-Path $s20Dir 'Chromium\moved'
+    $b3aExe = Join-Path $b3aTree $b3aPackage.executable.Replace('/', '\')
+    $b3aDir = Join-Path $env:RUNNER_TEMP ('b3a-' + [guid]::NewGuid().ToString('N'))  # fresh, never deleted
+    $null = New-Item -ItemType Directory -Path $b3aDir
+    $seedSource = Join-Path $PSScriptRoot $b3aPackage.seed.file.Replace('/', '\')
+    if ((Get-FileHash -LiteralPath $seedSource).Hash -ne $b3aPackage.seed.sha256) { throw 'the bundled seed is not the manifest''s; nothing started' }
+    $b3aSeedFonts = Get-Field (Get-Field (Get-Field ([IO.File]::ReadAllText($seedSource) | ConvertFrom-Json) 'webkit') 'webprefs') 'fonts'
+    [IO.File]::Copy($seedSource, (Join-Path $b3aTree $b3aPackage.seed.path.Replace('/', '\')), $false)
+    $b3a.seed = "copied beside $($b3aPackage.executable) in the S2-0 tree"
+    $page = Join-Path $b3aDir 'page.html'
+    [IO.File]::WriteAllText($page, '<!doctype html><html><head><meta charset="utf-8"><title>b3a</title></head><body>' +
+        '<p lang="ja">&#x65E5;&#x672C;&#x8A9E;&#x306E;&#x672C;&#x6587; default</p><p>Latin default text</p>' +
+        '<p lang="ja" style="font-family:sans-serif">&#x65E5;&#x672C;&#x8A9E; sans-serif</p><p style="font-family:monospace">monospace 0O1lI</p>' +
+        '<p lang="ja" style="font-family:monospace">&#x65E5;&#x672C;&#x8A9E; monospace</p></body></html>')
+    $pageUrl = ([Uri]$page).AbsoluteUri
+    $defaultData = Join-Path $realLocal 'Chromium'
+    $b3aBaseline = @(Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" | ForEach-Object { [int]$_.ProcessId })
+    $script:b3aOutside = @{}
+    $treeBefore, $defaultBefore, $hkcuBefore = (EntryStamps $b3aTree), (EntryStamps $defaultData), (HkcuNames)
+    $b3a.status = 'started'
+    # (1) The first GUI run on an empty profile: First Run, then the six preferences once it has closed.
+    $userData = Join-Path $b3aDir 'user-data'
+    try {
+        $wait = [Math]::Min(30, (B3aLeft 45 'first run') - 15)
+        $browser = StartChromium @("--user-data-dir=$userData", $pageUrl)
+        $seconds = WaitFor { (Test-Path -LiteralPath (Join-Path $userData 'First Run')) -and (Test-Path -LiteralPath (Join-Path $userData 'Default\Preferences')) } $wait
+        Start-Sleep -Seconds 2  # the page renders with the profile's fonts
+        $closed = try { $browser.CloseMainWindow() } catch { $false }
+        $b3a.firstRun = "First Run and Default\Preferences $(if ($null -ne $seconds) { "after $seconds s" } else { "NOT BOTH within $wait s" }); window $(if ($closed) { 'closed' } else { 'NOT FOUND' }); $(SettleChromium 15)"
+        $b3a.firstRunSentinel = $(if (Test-Path -LiteralPath (Join-Path $userData 'First Run')) { 'present' } else { 'ABSENT' })
+        $b3a.firstRunPreferences = SeedPreferences (Join-Path $userData 'Default\Preferences')
+        if ($b3a.firstRunSentinel -ne 'present') { $b3aStops.Add('no First Run after a first run') }
+        if ($b3a.firstRunPreferences -ne 'all six equal the seed') { $b3aStops.Add("seed preferences: $($b3a.firstRunPreferences)") }
+        # No main window to close is the runner's limit, not Chromium's: its processes are then killed, not judged.
+        if (-not $closed) { $b3aStops.Add('GUI unavailable on this runner (no main window): S7 before b3b') }
+        elseif ($b3a.firstRun -like '*KILLED*') { $b3aStops.Add('processes did not end') }
+    } catch { $b3a.firstRun = "not observed: $($_.Exception.Message -replace '(.{300}).+', '$1...')"; $b3aStops.Add('first run unproven: S7 before b3b') }
+    # (2) A first run over existing Preferences without First Run: which markers survive (O1's premise and range).
+    try {
+        $wait = [Math]::Min(20, (B3aLeft 35 'overwrite') - 15)
+        $restored = Join-Path $b3aDir 'restored'
+        $null = New-Item -ItemType Directory -Path (Join-Path $restored 'Default'), (Join-Path $restored 'Profile 1')
+        foreach ($name in 'Default', 'Profile 1') { [IO.File]::WriteAllText((Join-Path $restored "$name\Preferences"), "{`"b3a_marker`":`"$name`"}") }
+        $browser = StartChromium @("--user-data-dir=$restored", $pageUrl)
+        $seconds = WaitFor { Test-Path -LiteralPath (Join-Path $restored 'First Run') } $wait
+        Start-Sleep -Seconds 2
+        $closed = try { $browser.CloseMainWindow() } catch { $false }
+        $settled = SettleChromium 15
+        $marks = @(foreach ($name in 'Default', 'Profile 1') {
+            $file = Join-Path $restored "$name\Preferences"
+            $kept = (Test-Path -LiteralPath $file) -and [IO.File]::ReadAllText($file).Contains('"b3a_marker"')
+            "$name $(if ($kept) { 'kept' } else { 'OVERWRITTEN' }) ($(SeedPreferences $file))"
+        })
+        $b3a.overwrite = "First Run $(if ($null -ne $seconds) { "after $seconds s" } else { "NOT within $wait s" }); $($marks -join '; '); window $(if ($closed) { 'closed' } else { 'NOT FOUND' }); $settled"
+        if ($marks[1] -like '*OVERWRITTEN*') { $b3aStops.Add('Profile 1 is overwritten too: widen SeedHazard before b3b') }
+    } catch { $b3a.overwrite = "not observed: $($_.Exception.Message -replace '(.{300}).+', '$1...')" }
+    # (3) The first profile printed headless: the fonts the PDF embeds (unproven when no /BaseFont is readable).
+    try {
+        $pdf = Join-Path $b3aDir 'page.pdf'
+        $print = Bounded $b3aExe @('--headless=new', "--user-data-dir=$userData", "--print-to-pdf=$pdf", $pageUrl) ([Math]::Min(30, (B3aLeft 20 'headless PDF') - 10))
+        $settled = SettleChromium 8
+        if (-not (Test-Path -LiteralPath $pdf)) { throw "no PDF (exit $($print.exit), $($print.seconds) s; $(Tail $print.stderr)); $settled" }
+        $embedded = @([regex]::Matches([Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($pdf)), '/BaseFont\s*/(?:[A-Z]{6}\+)?([^\s/\[\]<>()]+)') |
+            ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+        if (-not $embedded.Count) { $b3a.pdf = "unproven: no readable /BaseFont (exit $($print.exit), $($print.seconds) s); $settled" }
+        else {
+            $plex, $plemol = [bool]@($embedded | Where-Object { $_ -like 'IBMPlexSansJP*' }).Count, [bool]@($embedded | Where-Object { $_ -like 'PlemolJPConsoleNF*' }).Count
+            $b3a.pdf = "embeds $($embedded -join ', '); IBM Plex Sans JP $(if ($plex) { 'yes' } else { 'NO' }), PlemolJP Console NF $(if ($plemol) { 'yes' } else { 'NO' }); $settled"
+            if (-not ($plex -and $plemol)) { $b3aStops.Add('the PDF lacks a seeded font') }
+        }
+    } catch { $b3a.pdf = "not observed: $($_.Exception.Message -replace '(.{300}).+', '$1...')" }
+    # After every run: the tree, the processes, the default profile location and HKCU (C9).
+    $treeChanges = @(StampDiff $treeBefore (EntryStamps $b3aTree))
+    $b3a.tree = $(if ($treeChanges.Count) { "CHANGED: $(Few $treeChanges)" } else { 'still exactly the inventory and the seed' })
+    if ($treeChanges.Count) { $b3aStops.Add('the tree changed') }
+    $b3a.outside = $(if ($script:b3aOutside.Count) { "chrome.exe from ELSEWHERE: $(Few @($script:b3aOutside.Values))" } else { 'none from elsewhere' })
+    if ($script:b3aOutside.Count) { $b3aStops.Add('a process started from outside the tree') }
+    # C9 before any move aside, so a failed move cannot lose it.
+    $hkcuAfter = HkcuNames
+    $added = @($hkcuAfter | Where-Object { -not $hkcuBefore.Contains($_) } | Sort-Object)
+    $removed = @($hkcuBefore | Where-Object { -not $hkcuAfter.Contains($_) } | Sort-Object)
+    $b3a.hkcu = "added $(Few $added), removed $(Few $removed)"
+    if (@($added | Where-Object { $_ -like 'Software\Microsoft\Windows\CurrentVersion\App Paths*' -or $_ -like 'Software\Microsoft\Windows\CurrentVersion\Uninstall*' }).Count) {
+        $b3aStops.Add('App Paths or Uninstall gained an entry')
+    }
+    $defaultChanges = @(StampDiff $defaultBefore (EntryStamps $defaultData))
+    $b3a.defaultProfile = $(if ($defaultChanges.Count) { "CHANGED: $(Few $defaultChanges)" } else { "nothing new under $defaultData" })
+    if ($defaultChanges.Count) {
+        $b3aStops.Add('the default profile location changed')
+        # Move what is new aside (never delete it), top-most entries only, so A28 and the proof's cleanup of its stand-in
+        # hold: each source strictly beneath the default location with no reparse point on the way, each target in a
+        # fresh directory beside it. Anything not moved is a stop condition, as is a failed move.
+        try {
+            $aside = Join-Path $realLocal ('b3a-aside-' + [guid]::NewGuid().ToString('N'))
+            if (Test-Path -LiteralPath $aside) { throw "$aside already exists" }
+            $null = New-Item -ItemType Directory -Path $aside
+            $asideFull = [IO.Path]::GetFullPath($aside)
+            $new = @($defaultChanges | Where-Object { $_.StartsWith('+') } | ForEach-Object { $_.Substring(1) } | Sort-Object Length)
+            $moved, $unsafe = 0, @()
+            foreach ($relative in $new) {
+                if (@($new | Where-Object { $relative.StartsWith($_ + '\') }).Count) { continue }
+                $source, $target = ($defaultData + $relative), (Join-Path $aside ([string]$moved))
+                if (-not (SafeBeneath $source $defaultData) -or -not [IO.Path]::GetFullPath($target).StartsWith($asideFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                    $unsafe += $relative; continue
+                }
+                if (Test-Path -LiteralPath $source -PathType Container) { [IO.Directory]::Move($source, $target) } else { [IO.File]::Move($source, $target) }
+                $moved++
+            }
+            $b3a.defaultProfile += "; moved $moved new entries aside to $aside"
+            if ($unsafe.Count) {
+                $b3a.defaultProfile += "; NOT moved (outside it or a reparse point): $(Few $unsafe)"
+                $b3aStops.Add('a new default-profile entry was not moved aside: A28 and the cleanup may fail')
+            }
+        } catch {
+            $b3a.defaultProfile += "; could NOT move aside: $($_.Exception.Message -replace '(.{200}).+', '$1...')"
+            $b3aStops.Add('a new default-profile entry was not moved aside: A28 and the cleanup may fail')
+        }
+    }
+    $b3a.status = "observed in $([Math]::Round($b3aClock.Elapsed.TotalSeconds)) s of the $b3aBudget s budget"
+} catch {
+    $b3a.status = "not observed: $($_.Exception.Message -replace '(.{300}).+', '$1...')"
+    $b3aStops.Add('b3a did not complete: S7 before b3b')
+} finally {
+    try { if (Get-Variable -Name b3aTree -ErrorAction SilentlyContinue) { $b3a.finalSettle = SettleChromium 5 } } catch { }
+}
+foreach ($entry in $b3a.GetEnumerator()) { B3a "$($entry.Key): $($entry.Value)" }
+B3a "stop conditions for b3b: $(if ($b3aStops.Count) { $b3aStops -join '; ' } else { 'none observed' })"
 # A28 (S2-3b, Chromium never downloaded; the profile is only read). Before an install: with this package's
 # history (a closed attempt of an older version), a restored profile its seed would overwrite (O1:
 # Default\Preferences without First Run) keeps Chromium from installing, reported as package drift after the
