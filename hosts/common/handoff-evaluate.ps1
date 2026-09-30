@@ -447,26 +447,61 @@ function Get-UndoSteps($Record) {
         }
         # Removed only while it holds no value and no subkey; never recursively.
         'registry-key-created' { [ordered]@{ action = 'delete-empty-key'; key = $target } }
-        'tree-extracted' {
-            $files = ConvertTo-FileMap (Get-Field $desired 'files')
-            $paths = [string[]]@($files.Keys)
-            [Array]::Sort($paths, [StringComparer]::OrdinalIgnoreCase)
-            $directories = @{}
-            foreach ($relative in $paths) {
-                [ordered]@{ action = 'delete-file'; path = $target + '\' + $relative.Replace('/', '\'); expectSha256 = $files[$relative] }
-                $parts = $relative.Split('/')
-                for ($i = 1; $i -lt $parts.Count; $i++) { $directories[$parts[0..($i - 1)] -join '\'] = $true }
-            }
-            # Descending order puts every directory before its parent.
-            $names = [string[]]@($directories.Keys)
-            [Array]::Sort($names, [StringComparer]::OrdinalIgnoreCase)
-            [Array]::Reverse($names)
-            foreach ($directory in $names) {
-                [ordered]@{ action = 'remove-empty-directory'; path = $target + '\' + $directory }
-            }
-            [ordered]@{ action = 'remove-empty-directory'; path = $target }
-        }
+        'tree-extracted' { $tree = Get-TreeUndoSteps $Record $null; $tree }
     }
+}
+
+# The undo steps of an owned tree: each file still present, with the sha256 to read back
+# first, then each inventory directory still present, deepest first, then the root; every
+# removal non-recursive. $Current $null means the whole inventory. A partly removed tree
+# ($Current, as observed) resumes only while each file is an inventory file with its recorded
+# sha256 and each other entry an inventory directory left empty ('<dir>/'); otherwise $null.
+function Get-TreeUndoSteps($Record, $Current) {
+    $target = [string](Get-Field $Record 'target')
+    $files = ConvertTo-FileMap (Get-Field (Get-Field $Record 'desired') 'files')
+    $present = if ($null -eq $Current) { $files } else { ConvertTo-FileMap (Get-Field $Current 'files') }
+    if ($null -eq $files -or $null -eq $present -or ($null -ne $Current -and (Get-Field $Current 'exists') -ne $true)) { return $null }
+    $implied, $directories = @{}, @{}
+    foreach ($relative in $files.Keys) {
+        $parts = $relative.Split('/')
+        for ($i = 1; $i -lt $parts.Count; $i++) { $implied[$parts[0..($i - 1)] -join '\'] = $true }
+    }
+    foreach ($relative in $present.Keys) {
+        if (-not $files.ContainsKey($relative) -or $present[$relative] -ne $files[$relative]) { return $null }
+        $parts = $relative.Split('/')
+        for ($i = 1; $i -lt $parts.Count; $i++) { $directories[$parts[0..($i - 1)] -join '\'] = $true }
+    }
+    foreach ($entry in @(Get-Field $Current 'other' | Where-Object { $null -ne $_ })) {
+        $directory = ([string]$entry).TrimEnd('/').Replace('/', '\')
+        if (-not ([string]$entry).EndsWith('/') -or -not $implied.ContainsKey($directory)) { return $null }
+        $directories[$directory] = $true
+    }
+    $paths, $names = [string[]]@($present.Keys), [string[]]@($directories.Keys)
+    [Array]::Sort($paths, [StringComparer]::OrdinalIgnoreCase)
+    [Array]::Sort($names, [StringComparer]::OrdinalIgnoreCase)
+    [Array]::Reverse($names)  # descending puts every directory before its parent
+    $steps = @($paths | ForEach-Object { [ordered]@{ action = 'delete-file'; path = $target + '\' + $_.Replace('/', '\'); expectSha256 = $files[$_] } }) +
+        @($names | ForEach-Object { [ordered]@{ action = 'remove-empty-directory'; path = $target + '\' + $_ } }) +
+        @([ordered]@{ action = 'remove-empty-directory'; path = $target })
+    return ,$steps
+}
+
+# Why an owned tree may not be removed, or $null: a reference ($References, each { label; id;
+# data }, such as a COM server path) the plan does not remove ($RemovedIds) names $Tree or a
+# path beneath it. data is read as Windows reads it: environment variables expanded, a leading
+# quote taking the path to the closing quote, the full path compared per segment ignoring case.
+# Data that is not a path counts when it contains $Tree at all, ignoring case.
+function Get-TreeReferenceProblem($References, [string]$Tree, $RemovedIds) {
+    $root = $Tree.TrimEnd('\').ToUpperInvariant()
+    foreach ($reference in @($References | Where-Object { $null -ne $_ })) {
+        if (@($RemovedIds) -ccontains [string](Get-Field $reference 'id')) { continue }
+        $data = [Environment]::ExpandEnvironmentVariables([string](Get-Field $reference 'data')).Trim()
+        $path = if ($data.StartsWith('"')) { $data.Substring(1).Split('"')[0] } else { $data }
+        try { $full = [IO.Path]::GetFullPath($path).ToUpperInvariant() } catch { $full = $null }
+        $hit = if ($null -eq $full) { $data.ToUpperInvariant().Contains($root) } else { $full -ceq $root -or $full.StartsWith($root + '\', [StringComparison]::Ordinal) }
+        if ($hit) { return "$(Get-Field $reference 'label') names ${Tree}: $data" }
+    }
+    return $null
 }
 
 # True when two records' targets cannot have separate owners: the same registry
@@ -644,8 +679,9 @@ function Get-NocttyRegistration($Rows, [string]$Install, $Files) {
 # The uninstall plan for all ledger records ($Records, any order) and
 # $Observations, a map id -> current state; a missing observation is indeterminate.
 # Ids are visited by the seq of their open attempt's intent, latest first. Only
-# owned-match produces steps, each tagged with its id so the executor writes that
-# id's `undone` after its steps; owned-drift and indeterminate are refused;
+# owned-match, and a partly removed tree that can resume (listed in resumed), produce
+# steps, each tagged with its id and kind so the executor writes that id's `undone`
+# after its steps; other owned-drift and indeterminate are refused;
 # unowned targets (absent, preexisting-*, closed or voided attempts) are kept
 # untouched and listed. Also refused: a repeated seq or ids differing only in case
 # (the whole plan); open attempts whose targets overlap (Test-TargetOverlap); an
@@ -708,19 +744,26 @@ function Get-UninstallPlan($Records, $Observations) {
             foreach ($entry in $binders[$backup]) { $entry.refusal = 'Its backup also serves another effect.' }
         }
     }
+    $resumed = @()
     foreach ($entry in @($entries | Sort-Object @{ Expression = 'start'; Descending = $true }, id -CaseSensitive)) {
         $class = $entry.class
         if ($class.resolution) { $resolutions += [ordered]@{ id = $entry.id; resolution = $class.resolution } }
+        # A partly removed owned tree (owned-drift) resumes when Get-TreeUndoSteps allows it.
+        $resume = $null
+        if ($class.class -ceq 'owned-drift' -and (Get-Field $entry.record 'kind') -ceq 'tree-extracted') {
+            $resume = Get-TreeUndoSteps $entry.record (Get-Field $Observations $entry.id)
+        }
         if ($entry.refusal) {
             $refused += [ordered]@{ id = $entry.id; class = 'indeterminate'; reason = $entry.refusal }
-        } elseif ($class.class -ceq 'owned-match') {
-            foreach ($step in @(Get-UndoSteps $entry.record)) { $step['id'] = $entry.id; $steps += $step }
+        } elseif ($class.class -ceq 'owned-match' -or $null -ne $resume) {
+            if ($null -ne $resume) { $resumed += $entry.id } else { $resume = @(Get-UndoSteps $entry.record) }
+            foreach ($step in $resume) { $step['id'] = $entry.id; $step['kind'] = [string](Get-Field $entry.record 'kind'); $steps += $step }
         } elseif ($class.class -cin @('owned-drift', 'indeterminate')) {
             $refused += [ordered]@{ id = $entry.id; class = $class.class; reason = $class.reason }
         } else { $kept += [ordered]@{ id = $entry.id; class = $class.class } }
     }
     if ($refused.Count) { $steps = @() }
-    [ordered]@{ ok = ($refused.Count -eq 0); steps = $steps; refused = $refused; kept = $kept; resolutions = $resolutions }
+    [ordered]@{ ok = ($refused.Count -eq 0); steps = $steps; refused = $refused; kept = $kept; resolutions = $resolutions; resumed = $resumed }
 }
 
 # Rollback plan from the older default-terminal record win.ps1 writes once to

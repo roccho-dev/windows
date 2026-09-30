@@ -589,6 +589,26 @@ function ObserveNoctty($Effect) {
     throw "$kind $target is not a selected Noctty effect."
 }
 
+# The COM server paths that may name a Noctty tree, for Get-TreeReferenceProblem: the default
+# value of each of $Subkeys (the LocalServer32 and InprocServer32 keys) in each of $Views
+# (@(label, hive, view)), as { label; id; data }; in HKCU, id is the owning value effect's.
+function NocttyReferences($Views, [string[]]$Subkeys) {
+    foreach ($view in @($Views)) {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($view[1], $view[2])
+        try {
+            foreach ($subkey in $Subkeys) {
+                $key = $base.OpenSubKey($subkey)
+                if ($null -eq $key) { continue }
+                try {
+                    if ($key.GetValueNames() -notcontains '') { continue }
+                    [pscustomobject]@{ label = "$($view[0])\$subkey"; data = [string]$key.GetValue('', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                        id = $(if ($view[0] -ceq 'HKCU') { 'registry-value:' + "HKCU\$subkey|".ToUpperInvariant() } else { $null }) }
+                } finally { $key.Close() }
+            }
+        } finally { $base.Close() }
+    }
+}
+
 # The current state of a recorded or selected effect: an owned font file or HKCU Fonts value,
 # or a Noctty effect (ObserveNoctty). Anything else is outside this version and stops the run.
 function Observe($Effect) {
@@ -706,22 +726,30 @@ function FontReferences($Table, [string]$Path, [string]$Sha) {
     }
 }
 
-# Removes one owned target only while it is exactly $Expect, and (unless the same
-# path is about to be recreated, -Replacing) a font file only while no Fonts value
-# refers to it; never recursively, never deferred.
+# Removes one owned file, value or created key only while it is exactly $Expect, and
+# (unless the same path is about to be recreated, -Replacing) a file only while no Fonts
+# value refers to it; a key only while it holds nothing (plan-time A3 decides first; this
+# is the backstop). Never recursively, never deferred.
 function RemoveTarget($Effect, $Expect, [switch]$Replacing) {
-    $kind = [string](Get-Field $Effect 'kind')
+    $kind, $target = [string](Get-Field $Effect 'kind'), [string](Get-Field $Effect 'target')
     $current = Observe $Effect
     if (-not (Test-EffectStateEqual $kind $Expect $current)) { throw "Refusing to remove $(Get-Field $Effect 'id'): it changed since it was read." }
-    if ($kind -ceq 'file-created') {
-        $target = [string](Get-Field $Effect 'target')
+    $subkey = $target -replace '^HKCU\\', ''
+    if ($kind -ceq 'registry-key-created') {
+        $split = $subkey.LastIndexOf('\')
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($subkey)
+        if ($null -eq $key) { throw "Refusing to remove ${target}: it disappeared since it was read." }
+        try { if ($key.ValueCount + $key.SubKeyCount) { throw "Refusing to remove ${target}: it holds foreign content." } } finally { $key.Close() }
+        $parent = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($subkey.Substring(0, $split), $true)
+        try { $parent.DeleteSubKey($subkey.Substring($split + 1), $false) } finally { $parent.Close() }
+    } elseif ($kind -ceq 'file-created') {
         if (-not $Replacing) {
             $references = @(FontReferences @(FontReferenceTable @()) $target $current.sha256)
             if ($references.Count) { throw "Refusing to remove ${target}: referenced by $($references -join ', ')." }
         }
         try { [IO.File]::Delete($target) } catch { throw "Could not remove $target (in use?): $($_.Exception.Message)" }
     } else {
-        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($fontSubkey, $true)
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($subkey, $true)
         try { $key.DeleteValue([string](Get-Field $Effect 'name')) } finally { $key.Close() }
     }
     $script:removed++
@@ -876,29 +904,69 @@ function ConvergeEffect($Effect, [string]$Label, [scriptblock]$Create) {
     }
 }
 
-# The undo steps of a plan in execution order: every font value before any font
-# file, so no value this plan removes still names a file when that file goes. (The
-# plan orders ids by their latest attempt, and a repaired file is newer than its
-# value.) A step of any other kind is outside this version.
+# The undo steps of a plan in execution order, by the kind of their effect: values, created
+# keys deepest first, files, then trees. The sort is stable, so each id's steps stay together
+# and in their own order (a tree's files, its directories, its root). No value the plan removes
+# still names a file when that file goes, and a key has lost what the plan owns in it before it
+# goes. (The plan orders ids by their latest attempt.) Any other step stops the run.
 function OrderedSteps($Plan) {
-    $steps = @($Plan.steps)
+    $rank = @{ 'registry-value' = 0; 'registry-key-created' = 1; 'file-created' = 2; 'tree-extracted' = 3 }
+    $steps, $order = @($Plan.steps), 0
     foreach ($step in $steps) {
-        if ($step.action -cnotin @('delete-registry-value', 'delete-file')) { throw "Unsupported undo step $($step.action)." }
+        if ($step.action -cnotin @('delete-registry-value', 'delete-empty-key', 'delete-file', 'remove-empty-directory') -or
+            -not $rank.ContainsKey([string]$step.kind)) { throw "Unsupported undo step $($step.action)." }
     }
-    @($steps | Where-Object { $_.action -ceq 'delete-registry-value' }) + @($steps | Where-Object { $_.action -ceq 'delete-file' })
+    @($steps | ForEach-Object { [pscustomobject]@{ step = $_; rank = $rank[[string]$_.kind]; order = $order++
+            depth = $(if ($_.action -ceq 'delete-empty-key') { -$_.key.Split('\').Count } else { 0 }) } } |
+        Sort-Object rank, depth, order | ForEach-Object { $_.step })
 }
 
-function UndoStep($Step) {
-    $open = @(OpenAttempt $Step.id)
-    if ($Step.action -ceq 'delete-file') { UndoOwned $open ([ordered]@{ exists = $true; sha256 = $Step.expectSha256 }) }
-    else { UndoOwned $open ([ordered]@{ exists = $true; type = $Step.expectType; data = $Step.expectData }) }
+# Runs ordered undo steps, each id's consecutive steps together, then writes that id's one
+# undone record. A tree's files are read back just before removal and its directories go only
+# when empty (already gone: skipped, as in a resumed plan); nothing is removed recursively.
+function UndoOwnedSteps($Steps) {
+    $run = @()
+    foreach ($step in @($Steps) + @($null)) {
+        if ($run.Count -and ($null -eq $step -or $step.id -cne $run[0].id)) {
+            $open = @(OpenAttempt $run[0].id)
+            foreach ($one in $run) {
+                switch -CaseSensitive ($one.action) {
+                    'delete-registry-value' { RemoveTarget $open[0] ([ordered]@{ exists = $true; type = $one.expectType; data = $one.expectData }) }
+                    'delete-empty-key' { RemoveTarget $open[0] ([ordered]@{ exists = $true }) }
+                    'remove-empty-directory' { if (Test-Path -LiteralPath $one.path -PathType Container) { [IO.Directory]::Delete($one.path, $false) } }
+                    'delete-file' {
+                        if ($one.kind -cne 'tree-extracted') { RemoveTarget $open[0] ([ordered]@{ exists = $true; sha256 = $one.expectSha256 }); break }
+                        if (-not (Test-EffectStateEqual 'file-created' ([ordered]@{ exists = $true; sha256 = $one.expectSha256 }) (ObserveFile $one.path))) {
+                            throw "Refusing to remove $($one.path): it changed since it was read."
+                        }
+                        try { [IO.File]::Delete($one.path) } catch { throw "Could not remove $($one.path) (in use?): $($_.Exception.Message)" }
+                        $script:removed++
+                    }
+                }
+            }
+            WriteRecord 'undone' $open[0] (Observe $open[0])
+            $run = @()
+        }
+        if ($null -ne $step) { $run += $step }
+    }
 }
+
+# True for a record of a font effect, by its kind and target: a file in the font directory or
+# an HKCU Fonts value. Font collection considers only these, never another owned effect.
+function IsFontEffect($Record) {
+    $kind, $target = [string](Get-Field $Record 'kind'), [string](Get-Field $Record 'target')
+    ($kind -ceq 'file-created' -and [IO.Path]::GetDirectoryName($target) -eq $fontDirectory) -or ($kind -ceq 'registry-value' -and $target -eq $fontKey)
+}
+
+# What of a plan takes part in the Fonts reference checks: HKCU Fonts value names, and files in the font directory.
+function FontValueNames($Steps) { @($Steps | Where-Object { $_.action -ceq 'delete-registry-value' -and $_.key -eq $fontKey } | ForEach-Object { $_.name }) }
+function IsFontFile($Step) { $Step.action -ceq 'delete-file' -and $Step.kind -ceq 'file-created' -and [IO.Path]::GetDirectoryName($Step.path) -eq $fontDirectory }
 
 # Owned font effects no longer selected, reverted by the same plan as Uninstall:
 # values first, then files. A file some Fonts value still names is kept open and
 # reported; a refused plan or a locked file fails the run.
 function CollectFontGarbage($Selected) {
-    $ids = @(LedgerIds | Where-Object { $Selected -notcontains $_ -and @(OpenAttempt $_).Count })
+    $ids = @(LedgerIds | Where-Object { $Selected -notcontains $_ -and (IsFontEffect @(RecordsOf $_)[0]) -and @(OpenAttempt $_).Count })
     if (-not $ids.Count) { return }
     $records = @($ids | ForEach-Object { RecordsOf $_ })
     $observations = @{}
@@ -909,15 +977,10 @@ function CollectFontGarbage($Selected) {
         return
     }
     $steps = @(OrderedSteps $plan)
-    $names = @($steps | Where-Object { $_.action -ceq 'delete-registry-value' } | ForEach-Object { $_.name })
-    $table = @(FontReferenceTable $names)
-    foreach ($step in $steps) {
-        if ($step.action -ceq 'delete-file' -and @(FontReferences $table $step.path $step.expectSha256).Count) {
-            $script:gcKeptReferenced += $step.path
-            continue
-        }
-        UndoStep $step
-    }
+    $table = @(FontReferenceTable (FontValueNames $steps))
+    $keep = @($steps | Where-Object { (IsFontFile $_) -and @(FontReferences $table $_.path $_.expectSha256).Count })
+    $script:gcKeptReferenced += @($keep | ForEach-Object { $_.path })
+    UndoOwnedSteps @($steps | Where-Object { @($keep | ForEach-Object { $_.id }) -cnotcontains $_.id })
 }
 
 # Apply and Restore: recover, classify everything before the first effect, then
@@ -996,14 +1059,13 @@ function Uninstall {
     $steps = @()
     if ($plan.ok) {
         $steps = @(OrderedSteps $plan)
-        $names = @($steps | Where-Object { $_.action -ceq 'delete-registry-value' } | ForEach-Object { $_.name })
-        $table = @(FontReferenceTable $names)
-        foreach ($step in @($steps | Where-Object { $_.action -ceq 'delete-file' })) {
+        $table = @(FontReferenceTable (FontValueNames $steps))
+        foreach ($step in @($steps | Where-Object { IsFontFile $_ })) {
             $references = @(FontReferences $table $step.path $step.expectSha256)
             if ($references.Count) { $refused += "$($step.id): referenced by $($references -join ', ')" }
         }
     }
-    if ($Apply -and -not $refused.Count) { foreach ($step in $steps) { UndoStep $step } }
+    if ($Apply -and -not $refused.Count) { UndoOwnedSteps $steps }
     $open, $changedAfterClose = @(), @()
     foreach ($id in @(LedgerIds)) {
         $attempt = Get-EffectAttempt (RecordsOf $id)

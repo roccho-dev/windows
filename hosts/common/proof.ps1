@@ -350,6 +350,39 @@ Must ((Test-EffectStateEqual tree-extracted $tree @{ exists = $true; files = @{ 
     -not (Test-EffectStateEqual tree-extracted $tree @{ exists = $true; files = @{ 'a.txt' = (Sha a) }; other = @('e/') }) -and
     (Get-UnownedClass tree-extracted $tree @{ exists = $true; files = $tree.files; other = @('j') } $null).class -ceq 'preexisting-drift') 'tree other entries'
 Must ($null -ne (Get-EffectRecordProblem (PureRecord 1 intent tree-extracted 'C:\u\t' $absent @{ exists = $true; files = $tree.files; other = @('e/') } $null $null))) 'a desired tree has no other entries'
+# D1: a partly removed owned tree resumes while its files are exact and only inventory directories
+# are left empty; anything else is refused. The whole tree keeps its order.
+$treeOwned = @{ kind = 'tree-extracted'; target = 'C:\u\t'; desired = @{ exists = $true; files = @{ 'a.txt' = (Sha a); 'd/b.txt' = (Sha b); 'd/e/c.txt' = (Sha c) } } }
+function TreeSteps($Steps) { if ($null -eq $Steps) { 'refused' } else { @($Steps | ForEach-Object { $_.path.Replace('C:\u\t', 't') + $(if ($_.action -ceq 'delete-file') { '' } else { '/' }) }) -join ';' } }
+function Resume($Files, $Other) { TreeSteps (Get-TreeUndoSteps $treeOwned @{ exists = $true; files = $Files; other = $Other }) }
+Must ((TreeSteps @(Get-UndoSteps $treeOwned)) -ceq 't\a.txt;t\d\b.txt;t\d\e\c.txt;t\d\e/;t\d/;t/' -and
+    (Resume @{ 'd/b.txt' = (Sha b) } @('d/e/')) -ceq 't\d\b.txt;t\d\e/;t\d/;t/' -and (Resume @{} @('d/', 'd/e/')) -ceq 't\d\e/;t\d/;t/' -and
+    (Resume @{} @()) -ceq 't/') 'a partly removed tree resumes'
+foreach ($case in @(@(@{ 'a.txt' = (Sha x) }, @()), @(@{ 'x.txt' = (Sha a) }, @()), @(@{}, @('j')), @(@{}, @('f/')), @(@{}, @('d/e')))) {
+    Must ((Resume $case[0] $case[1]) -ceq 'refused') "a tree with $(@($case[0].Keys) + $case[1] -join ',') does not resume"
+}
+$treeRecords = @(Owned 1 t tree-extracted 'C:\u\t' $treeOwned.desired $null)
+$plan = Get-UninstallPlan $treeRecords @{ t = @{ exists = $true; files = @{ 'd/b.txt' = (Sha b) }; other = @() } }
+Must ($plan.ok -and ($plan.resumed -join ',') -ceq 't' -and @($plan.steps | Where-Object { $_.kind -ceq 'tree-extracted' -and $_.id -ceq 't' }).Count -eq 3 -and
+    -not (Get-UninstallPlan $treeRecords @{ t = @{ exists = $true; files = @{ 'a.txt' = (Sha x) }; other = @() } }).ok) 'the plan resumes a partly removed tree only'
+# D3: a COM server path the plan does not remove keeps the tree; unparseable data counts when it names the tree.
+$comTree = "$env:SystemDrive\u\Programs\noctty-1"
+function Guard($Data, $Removed) { [bool](Get-TreeReferenceProblem @(@{ label = 'HKCU\L'; id = 'v'; data = $Data }) $comTree $Removed) }
+Must ((Guard "`"$comTree\noctty\noctty.exe`" -Embedding" @()) -and (Guard '%SystemDrive%\u\Programs\NOCTTY-1\noctty\x.dll' @()) -and
+    -not (Guard "$comTree\noctty\x.dll" @('v')) -and -not (Guard "$($comTree)x\noctty.exe" @()) -and -not (Guard '{1D349824-21FB-46C7-ACF3-746EDC991D52}' @()) -and
+    (Guard "$comTree\noctty.exe`0x" @()) -and -not (Guard "C:\other`0x" @())) 'COM references to the tree'
+# F-1: font collection considers only font effects, never an owned Noctty tree, config or COM effect.
+. ([scriptblock]::Create([Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'win.ps1'), [ref]$null, [ref]$null).Find(
+    { param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'IsFontEffect' }, $false).Extent.Text))
+& {
+    $fontDirectory, $fontKey = 'C:\u\Fonts', 'HKCU\Software\Microsoft\Windows NT\CurrentVersion\Fonts'
+    $font = @(@{ kind = 'file-created'; target = "C:\u\Fonts\$(Sha a).ttf" }, @{ kind = 'registry-value'; target = $fontKey; name = 'X (TrueType)' })
+    $other = @(@{ kind = 'tree-extracted'; target = 'C:\u\Programs\noctty-1' }, @{ kind = 'file-created'; target = 'C:\u\noctty\config.ghostty' },
+        @{ kind = 'registry-value'; target = "HKCU\Software\Classes\CLSID\$noctty\LocalServer32"; name = '' },
+        @{ kind = 'registry-key-created'; target = "HKCU\Software\Classes\CLSID\$noctty" }, @{ kind = 'file-created'; target = 'C:\u\Fonts\sub\x.ttf' },
+        @{ kind = 'registry-key-created'; target = $fontKey })
+    Must (@($font | Where-Object { IsFontEffect $_ }).Count -eq 2 -and -not @($other | Where-Object { IsFontEffect $_ }).Count) 'font collection candidates'
+}
 
 # The create and recovery primitives, loaded alone from win.ps1 (no mode creates a Noctty effect
 # yet) and run against a scratch %LOCALAPPDATA% ($Scratch, never deleted), its own ledger and a
@@ -361,7 +394,8 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
     . (Join-Path $Root 'handoff-evaluate.ps1')
     $names = 'WriteRecord', 'RecordsOf', 'OpenAttempt', 'IntentTemp', 'CleanStaging', 'ResolveAttempt', 'RecoverId', 'Recovering',
         'CreateOwnedFile', 'CreateOwnedValue', 'CreateOwnedKey', 'CreateOwnedTree', 'Observe', 'ObserveNoctty', 'ObserveTree',
-        'ObserveKey', 'ObserveValue', 'ObserveFile', 'NocttyEffects', 'KeyEffect', 'ValueEffect', 'FileEffect'
+        'ObserveKey', 'ObserveValue', 'ObserveFile', 'NocttyEffects', 'KeyEffect', 'ValueEffect', 'FileEffect',
+        'OrderedSteps', 'UndoOwnedSteps', 'RemoveTarget', 'FontReferences', 'FontReferenceTable', 'NocttyReferences'
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'win.ps1'), [ref]$null, [ref]$null)
     foreach ($definition in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cin $names }, $false)) {
         . ([scriptblock]::Create($definition.Extent.Text))
@@ -381,12 +415,13 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
     function Staging($Effect) { $Effect.target + '.' + [guid]::NewGuid().ToString('N') + '.staging' }
     $manifest = [IO.File]::ReadAllText((Join-Path $Root 'manifest.json')) | ConvertFrom-Json
     $Mode, $localAppData, $ledgerDirectory, $zip = 'Apply', $Scratch, (Join-Path $Scratch 'ledger'), (Join-Path $Root 'payload\noctty.zip')
-    $fontDirectory, $fontKey = (Join-Path $Scratch 'fonts'), 'HKCU\Software\Microsoft\Windows NT\CurrentVersion\Fonts'
+    $fontDirectory, $fontSubkey = (Join-Path $Scratch 'fonts'), 'Software\Microsoft\Windows NT\CurrentVersion\Fonts'
+    $fontKey = 'HKCU\' + $fontSubkey
     $nocttyDirectory = Join-Path $Scratch ('Programs\noctty-' + $manifest.noctty.version)
     $nocttyConfig, $nocttyConfigText = (Join-Path $Scratch 'noctty\config.ghostty'), ('font-family = ' + $manifest.noctty.fontFamily + "`n")
     $clsid = '{' + [guid]::NewGuid().ToString().ToUpperInvariant() + '}'
     $nocttyRegistration = Get-NocttyRegistration @(@{ key = "Software\Classes\CLSID\$clsid\LocalServer32"; name = ''; data = 'proof' }) $nocttyDirectory $manifest.noctty.files
-    $script:ledgerRecords, $script:nextSeq, $script:recordsWritten, $script:copied, $script:changed = @(), 1, 0, 0, 0
+    $script:ledgerRecords, $script:nextSeq, $script:recordsWritten, $script:copied, $script:changed, $script:removed = @(), 1, 0, 0, 0, 0
     $null = New-Item -ItemType Directory -Path $ledgerDirectory, (Join-Path $Scratch 'Programs'), (Split-Path -Parent $nocttyConfig) -Force
     $selected = NocttyEffects
 
@@ -417,6 +452,19 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
     Must ((Phases $a) -ceq 'intent,void' -and -not (Test-Path -LiteralPath $stageA)) 'a partial staging directory is cleaned and voided'
     Must ((Phases $b) -ceq 'intent' -and (Test-Path -LiteralPath "$stageB\foreign.txt") -and (Test-Path -LiteralPath "$stageB\noctty\a.txt")) 'foreign staging content is kept'
     Must ((Phases $c) -ceq 'intent,commit') 'a renamed tree without its commit is confirmed'
+    # Undo order by kind and key depth, stable within an id; then a tree partly removed by hand resumes to empty, undone once.
+    $mixed = @{ steps = @(@{ id = 't'; kind = 'tree-extracted'; action = 'delete-file' }, @{ id = 't'; kind = 'tree-extracted'; action = 'remove-empty-directory' },
+        @{ id = 'f'; kind = 'file-created'; action = 'delete-file' }, @{ id = 'k1'; kind = 'registry-key-created'; action = 'delete-empty-key'; key = 'HKCU\A' },
+        @{ id = 'k2'; kind = 'registry-key-created'; action = 'delete-empty-key'; key = 'HKCU\A\B' }, @{ id = 'v'; kind = 'registry-value'; action = 'delete-registry-value' }) }
+    Must ((@(OrderedSteps $mixed | ForEach-Object { "$($_.id):$($_.action)" }) -join ',') -ceq
+        'v:delete-registry-value,k2:delete-empty-key,k1:delete-empty-key,f:delete-file,t:delete-file,t:remove-empty-directory') 'undo order'
+    Refused { OrderedSteps @{ steps = @(@{ id = 'x'; kind = 'file-replaced'; action = 'restore-file' }) } } 'Unsupported undo step*'
+    [IO.File]::Delete("$($c.target)\noctty\a.txt")
+    $observed = @{}; $observed[$c.id] = Observe $c
+    $plan = Get-UninstallPlan @(RecordsOf $c.id) $observed
+    Must ($plan.ok -and ($plan.resumed -join ',') -ceq $c.id) 'a partly removed tree resumes'
+    UndoOwnedSteps @(OrderedSteps $plan)
+    Must ((Phases $c) -ceq 'intent,commit,undone' -and -not (Test-Path -LiteralPath $c.target)) 'the resumed tree is removed exactly, undone once'
     # Keys and values: a missing parent or an existing key is refused before any intent; replays void and confirm.
     $shared = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Classes\CLSID')
     $sharedMade = $null -eq $shared
@@ -435,6 +483,19 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
         CreateOwnedValue $value
         Must ((Phases $key) -ceq 'intent,void,intent,commit' -and (Phases $server) -ceq 'intent,commit' -and
             (Phases $value) -ceq 'intent,void,intent,commit' -and (Observe $value).data -ceq 'proof') 'key and value creation and replay'
+        # The COM reader names the owned value; the plan removing it frees the tree.
+        $serverKey = $server.target -replace '^HKCU\\', ''
+        $refs = @(NocttyReferences @(, @('HKCU', 'CurrentUser', 'Default')) @($serverKey))
+        Must ($refs.Count -eq 1 -and $refs[0].id -ceq $value.id -and $refs[0].data -ceq 'proof' -and
+            $null -eq (Get-TreeReferenceProblem $refs $nocttyDirectory @($value.id))) 'the COM reference reader'
+        # A created key someone else wrote into is kept, and stays owned; the foreign value survives.
+        $foreign = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($serverKey, $true)
+        try { $foreign.SetValue('Foreign', 'x') } finally { $foreign.Close() }
+        $observed = @{}; foreach ($e in $value, $server, $key) { $observed[$e.id] = Observe $e }
+        $plan = Get-UninstallPlan (@(RecordsOf $value.id) + @(RecordsOf $server.id) + @(RecordsOf $key.id)) $observed
+        Must ($plan.ok -and (@(OrderedSteps $plan | ForEach-Object { $_.action }) -join ',') -ceq 'delete-registry-value,delete-empty-key,delete-empty-key') 'value, then keys deepest first'
+        Refused { UndoOwnedSteps @(OrderedSteps $plan) } '*holds foreign content*'
+        Must ((Phases $value) -like '*,undone' -and (Phases $server) -ceq 'intent,commit' -and (ObserveValue 'Foreign' $serverKey).exists) 'a key holding foreign content is kept'
     } finally {
         # Only what this block made, deepest first, never recursively.
         $open = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(($server.target -replace '^HKCU\\', ''), $true)
