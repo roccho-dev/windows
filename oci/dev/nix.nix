@@ -61,7 +61,7 @@
         grep=${pkgs.gnugrep}/bin/grep
         cipher_path=ciphertexts/dev-jev-api.oci-dev.sops.yaml
         usage() {
-          echo "usage: voice-ui-jev-dev --envs-sha <40-hex> --apps-sha <40-hex> --port <1024-65535>" >&2
+          echo "usage: voice-ui-jev-dev --envs-sha <40-hex> --apps-sha <40-hex> --port <1024-65535> [--host 127.0.0.1|0.0.0.0]" >&2
           exit 2
         }
         fail() {
@@ -75,19 +75,24 @@
           ${pkgs.nix}/bin/nix --extra-experimental-features 'nix-command flakes' "$@"
         }
 
-        envs_sha="" apps_sha="" port=""
-        [ "$#" -eq 6 ] || usage
+        # The child listens on loopback unless --host 0.0.0.0 is given explicitly, e.g. inside a container whose port is
+        # published only to the host's loopback. The parent environment never chooses it.
+        envs_sha="" apps_sha="" port="" host=""
+        { [ "$#" -eq 6 ] || [ "$#" -eq 8 ]; } || usage
         while [ "$#" -gt 0 ]; do
           case "$1" in
             --envs-sha) [ -z "$envs_sha" ] || usage; envs_sha=$2 ;;
             --apps-sha) [ -z "$apps_sha" ] || usage; apps_sha=$2 ;;
             --port) [ -z "$port" ] || usage; port=$2 ;;
+            --host) { [ -z "$host" ] && [ -n "$2" ]; } || usage; host=$2 ;;
             *) usage ;;
           esac
           shift 2
         done
         [[ $envs_sha =~ ^[0-9a-f]{40}$ && $apps_sha =~ ^[0-9a-f]{40}$ && $port =~ ^[1-9][0-9]{3,4}$ ]] || usage
         { [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; } || usage
+        [ -n "$host" ] || host=127.0.0.1
+        case $host in 127.0.0.1 | 0.0.0.0) ;; *) usage ;; esac
         [ ! -e /homeless-shelter ] || fail "/homeless-shelter exists; the child's HOME must not exist"
 
         # The ciphertext: at a commit on envs proposals, and exactly the one proposals carries now.
@@ -165,10 +170,10 @@
 
         # One foreground child whose environment is built from nothing (env -i). The key reaches it only through a pipe
         # from a builtin, never argv or a file; with lastpipe the launcher itself becomes the child.
-        echo "voice-ui-jev-dev: apps $apps_sha on 127.0.0.1:$port with PATH HOME LANG PORT HOST JEV_API_KEY"
+        echo "voice-ui-jev-dev: apps $apps_sha on $host:$port with PATH HOME LANG PORT HOST JEV_API_KEY"
         shopt -s lastpipe
         # shellcheck disable=SC2016
-        printf '%s' "$key" | exec "$cu/env" -i PATH="$cu" HOME=/homeless-shelter LANG=C.UTF-8 PORT="$port" HOST=127.0.0.1 \
+        printf '%s' "$key" | exec "$cu/env" -i PATH="$cu" HOME=/homeless-shelter LANG=C.UTF-8 PORT="$port" HOST="$host" \
           ${pkgs.bash}/bin/bash -c 'IFS= read -r -d "" JEV_API_KEY || true; export JEV_API_KEY; exec env -u PWD -u SHLVL -u OLDPWD -- "$0"' \
           "$program"
       '';
