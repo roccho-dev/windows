@@ -264,6 +264,36 @@ def noctty_inventory(archive_path: Path) -> dict[str, str]:
     return files
 
 
+# Adapter rules, not selection data (win.ps1 holds the same roots): a registration key is a
+# CLSID or Interface {guid} key or beneath it, so the shared roots are never among the keys
+# derived from it; {install} opens the data, optionally quoted, and names an inventory file.
+REGISTRATION_KEY = re.compile(r"Software\\Classes\\(CLSID|Interface)\\\{[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}\}"
+                              r"(\\[^\\\x00-\x1f]+)*")
+INSTALL_DATA = re.compile(r'("?)\{install\}\\([^"]+)\1')
+
+
+def noctty_registration(values: object, files: dict[str, str]) -> list[dict]:
+    """The HKCU String values of the default-terminal registration, each exactly {key, name,
+    data}; name '' is the default value. No two share key and name without case."""
+    if not isinstance(values, list) or not values:
+        raise ValueError("No Noctty registration")
+    seen = set()
+    for value in values:
+        if not isinstance(value, dict) or set(value) != {"key", "name", "data"} or \
+                not all(isinstance(field, str) for field in value.values()):
+            raise ValueError(f"Noctty registration value is not {{key, name, data}} strings: {value!r}")
+        key, name, data = value["key"], value["name"], value["data"]
+        install = INSTALL_DATA.fullmatch(data)
+        if (not REGISTRATION_KEY.fullmatch(key) or not data or re.search(r"[\x00-\x1f]", name + data)
+                or "{install}" in key + name or ("{install}" in data and not install)
+                or (install and install.group(2).replace("\\", "/") not in files)):
+            raise ValueError(f"Invalid Noctty registration value: {key} [{name}]")
+        if (key.casefold(), name.casefold()) in seen:
+            raise ValueError(f"Duplicate Noctty registration value: {key} [{name}]")
+        seen.add((key.casefold(), name.casefold()))
+    return values
+
+
 def archive(root: Path, destination: Path) -> None:
     seen = set()
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as result:
@@ -294,6 +324,7 @@ def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
     if selected["noctty"]["fontFamily"] not in {e["family"] for e in json.loads((fonts / "fonts.json").read_text(encoding="utf-8"))}:
         raise ValueError("Noctty font is not selected by common fonts")
     noctty_files = noctty_inventory(noctty)
+    registration = noctty_registration(selected["noctty"].get("registration"), noctty_files)
     packages = inventoried(selected.get("packages"))
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -312,7 +343,7 @@ def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
         write_json(root / "manifest.json", {"schemaVersion": 3, "source": source, "fonts": entries,
                    "noctty": {"version": selected["noctty"]["version"],
                               "fontFamily": selected["noctty"]["fontFamily"],
-                              "files": noctty_files},
+                              "files": noctty_files, "registration": registration},
                    "cloudflared": {"version": selected["cloudflared"]["version"], "file": "payload/cloudflared.exe",
                                    "sha256": files["payload/cloudflared.exe"]},
                    "packages": packages, "files": files})

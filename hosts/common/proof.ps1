@@ -378,9 +378,9 @@ function Snapshot {
         files = @($fonts | ForEach-Object { if (Test-Path -LiteralPath (FontPath $_)) { (Get-FileHash -LiteralPath (FontPath $_)).Hash } else { '-' } })
         values = @($fonts | ForEach-Object { [string](FontValue (ValueName $_)) }) } | ConvertTo-Json -Compress
 }
-# ---- G4/G3 measurement: printed evidence only; nothing here fails the proof ----
+# ---- G4/G3 measurement and gate ----
 # It runs before the font proof, so a later failure (e.g. a registered font Windows keeps
-# open) cannot suppress this evidence. The exact bundled Noctty registers itself for the
+# open) cannot suppress this evidence; its gate fails the proof only at the end. The exact bundled Noctty registers itself for the
 # default terminal on this disposable runner, and native RegistryKey snapshots show what it
 # changed. Values under HKCU\Software\Classes and HKCU\Console are printed in full, with no
 # noise subtracted: they are the evidence for the Nix list. Elsewhere only key, value name
@@ -538,6 +538,38 @@ try {
     $tree3 = FileSnapshot $install
     Say "noctty.com --version exit $($version.exit): $($version.output); install directory changes: $(@(SnapshotDiff $tree2 $tree3).Count)"
 
+    # The gate: the Classes/Console delta, less the vendor's own bookkeeping (the Noctty CLSID's
+    # noctty.default-terminal subtree, the CLSID descriptions, DelegationTerminal, which the legacy
+    # record owns, and the shared CLSID and Interface roots), is exactly manifest.noctty.registration
+    # bound to this install plus the keys derived from it; nothing else changed.
+    $wanted = @{}
+    foreach ($value in @($manifest.noctty.registration)) {
+        $parts = $value.key.Split('\')
+        for ($i = 4; $i -le $parts.Count; $i++) { $wanted[(($parts[0..($i - 1)] -join '\') + "$sep<key>").ToUpperInvariant()] = 'key' }
+        $wanted["$($value.key)$sep$($value.name)".ToUpperInvariant()] = 'String:' + $value.data.Replace('{install}', $g4Dir)
+    }
+    $bookkeeping = "SOFTWARE\CLASSES\CLSID\$noctty\NOCTTY.DEFAULT-TERMINAL"
+    $measured = @{}
+    foreach ($d in $vendorRegion) {
+        $key = $d.key.ToUpperInvariant()
+        if ($key -ceq $bookkeeping -or $key.StartsWith("$bookkeeping\") -or
+            ($key -cin @('SOFTWARE\CLASSES\CLSID', 'SOFTWARE\CLASSES\INTERFACE') -and $d.name -ceq '<key>') -or
+            ($key -cin @("SOFTWARE\CLASSES\CLSID\$noctty", "SOFTWARE\CLASSES\CLSID\$proxy") -and $d.name -ceq '') -or
+            ($key -ceq 'CONSOLE\%%STARTUP' -and $d.name -ceq 'DelegationTerminal' -and $d.change -ceq 'added' -and
+             $d.after -ceq "String:$noctty")) { continue }
+        $measured[$d.entry.ToUpperInvariant()] = $(if ($d.change -ceq 'added') { $d.after } else { "$($d.change) $($d.before) -> $($d.after)" })
+    }
+    $gate = @(foreach ($entry in @(@($wanted.Keys) + @($measured.Keys) | Sort-Object -Unique)) {
+        if ($measured[$entry] -cne $wanted[$entry]) { "HKCU\$($entry.Replace([string]$sep, ' ['))]: declared $($wanted[$entry]), measured $($measured[$entry])" }
+    })
+    if ($register.exit -ne 0) { $gate += "register exit $($register.exit)" }
+    foreach ($count in @(@('other HKCU', $other.Count), @('Noctty mentions outside Classes/Console', $mentions.Count), @('HKLM', $machine.Count),
+            @('install directory', $treeDiff.Count + @(SnapshotDiff $tree2 $tree3).Count), @('%LOCALAPPDATA%\noctty', $userDiff.Count))) {
+        if ($count[1]) { $gate += "$($count[0]) changes: $($count[1])" }
+    }
+    foreach ($line in $gate) { Say "GATE $line" }
+    Say "gate: $(@($wanted.Keys).Count) declared entries, $(@($measured.Keys).Count) measured after exclusions, $($gate.Count) problems"
+
     $unregister = Vendor (Join-Path $install 'noctty.com') '+unregister-default-terminal'
     $s3 = RegistrySnapshot 'CurrentUser' 'Default' @('')
     $remains = @(SnapshotDiff $s1 $s3 | Where-Object { Region $_.key })
@@ -547,7 +579,8 @@ try {
         classesConsoleChanges = $vendorRegion.Count; otherHkcuChanges = $other.Count; mentions = $mentions.Count
         hklmChanges = $machine.Count; installFileChanges = $treeDiff.Count + @(SnapshotDiff $tree2 $tree3).Count
         userNocttyFileChanges = $userDiff.Count; remainingAfterUnregister = $remains.Count; controlNoise = $noise.Count
-        windowsTerminal = $wtVersion; seededDelegationConsole = $true; startupKeyCreated = -not $startupSaved.keyExisted }
+        windowsTerminal = $wtVersion; seededDelegationConsole = $true; startupKeyCreated = -not $startupSaved.keyExisted
+        gate = $(if ($gate.Count) { $gate -join '; ' } else { 'pass' }) }
 } catch {
     $g4 = [ordered]@{ status = "measurement error: $($_.Exception.Message)" }
     Say $g4.status
@@ -948,6 +981,11 @@ if (-not ($resolved | Where-Object { $_ -like 'userknownhostsfile *windows-rent*
 MustReject { RunSsh 'RentSshTest' } 'RentSsh drift:*'
 $null = RunSsh 'RentSsh'
 $null = RunSsh 'RentSshTest'
+
+# The G4 gate, after every other proof has printed its evidence.
+if ($g4.status -cne 'measured' -or (Get-Field $g4 'gate') -cne 'pass' -or $g4.startupRestore -cne 'verified') {
+    throw "G4 gate failed: status $($g4.status); gate $(Get-Field $g4 'gate'); startup restore $($g4.startupRestore)"
+}
 
 [ordered]@{ source = $ExpectedSource; proof = 'PASS'; fonts = $first.fonts;
     secondApplyChanges = 0; ownedDriftRepaired = $true; unownedDriftRefused = $true; corruptionRejected = $true

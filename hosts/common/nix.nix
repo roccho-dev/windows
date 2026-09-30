@@ -124,6 +124,18 @@ let
     noctty = {
       version = nocttyVersion;
       fontFamily = "PlemolJP Console NF";
+      # The HKCU String values the default-terminal handoff needs, as the vendor registration
+      # wrote them on CI #58 (G4) without its own bookkeeping and descriptions; {install} is
+      # %LOCALAPPDATA%\Programs\noctty-<version>. win.ps1 derives the keys to create below the
+      # shared Software\Classes\CLSID and Interface roots, which are never owned.
+      registration = [
+        { key = ''Software\Classes\CLSID\{33368C6F-D328-410C-B225-26DC9F12C728}\LocalServer32''; name = ""; data = ''"{install}\noctty\noctty.exe"''; }
+        { key = ''Software\Classes\CLSID\{1D349824-21FB-46C7-ACF3-746EDC991D52}\InprocServer32''; name = ""; data = ''{install}\noctty\noctty-terminal-handoff-proxy.dll''; }
+        { key = ''Software\Classes\CLSID\{1D349824-21FB-46C7-ACF3-746EDC991D52}\InprocServer32''; name = "ThreadingModel"; data = "Both"; }
+        { key = ''Software\Classes\Interface\{59D55CCE-FC8A-48B4-ACE8-0A9286C6557F}\ProxyStubClsid32''; name = ""; data = "{1D349824-21FB-46C7-ACF3-746EDC991D52}"; }
+        { key = ''Software\Classes\Interface\{6F23DA90-15C5-4203-9DB0-64E73F1B1B00}\ProxyStubClsid32''; name = ""; data = "{1D349824-21FB-46C7-ACF3-746EDC991D52}"; }
+        { key = ''Software\Classes\Interface\{AA6B364F-4A50-4176-9002-0AE755E7B5EF}\ProxyStubClsid32''; name = ""; data = "{1D349824-21FB-46C7-ACF3-746EDC991D52}"; }
+      ];
     };
     cloudflared.version = cloudflaredVersion;
     packages = map (lock: lock // { inventory = "${inventory lock}"; }) packageLocks;

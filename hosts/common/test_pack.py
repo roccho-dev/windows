@@ -10,6 +10,18 @@ from fontTools.pens.ttGlyphPen import TTGlyphPen
 
 import pack
 
+PROXY = "{1D349824-21FB-46C7-ACF3-746EDC991D52}"
+# The six values nix.nix declares (CI #58 G4).
+REGISTRATION = [
+    {"key": "Software\\Classes\\CLSID\\{33368C6F-D328-410C-B225-26DC9F12C728}\\LocalServer32", "name": "",
+     "data": '"{install}\\noctty\\noctty.exe"'},
+    {"key": f"Software\\Classes\\CLSID\\{PROXY}\\InprocServer32", "name": "",
+     "data": "{install}\\noctty\\noctty-terminal-handoff-proxy.dll"},
+    {"key": f"Software\\Classes\\CLSID\\{PROXY}\\InprocServer32", "name": "ThreadingModel", "data": "Both"},
+] + [{"key": f"Software\\Classes\\Interface\\{iid}\\ProxyStubClsid32", "name": "", "data": PROXY}
+     for iid in ("{59D55CCE-FC8A-48B4-ACE8-0A9286C6557F}", "{6F23DA90-15C5-4203-9DB0-64E73F1B1B00}",
+                 "{AA6B364F-4A50-4176-9002-0AE755E7B5EF}")]
+
 
 class CompilerTests(unittest.TestCase):
     def setUp(self):
@@ -226,7 +238,8 @@ class CompilerTests(unittest.TestCase):
         cloudflared = self.root / "cloudflared.exe"
         cloudflared.write_bytes(b"MZ fixture: not the real client")
         choices = self.root / "choices.json"
-        choices.write_text(json.dumps({"noctty": {"version": "1.0", "fontFamily": "Test Font"},
+        choices.write_text(json.dumps({"noctty": {"version": "1.0", "fontFamily": "Test Font",
+                                                  "registration": REGISTRATION},
                                        "cloudflared": {"version": "2.0"},
                                        "packages": [self.lock(inventory=str(self.inventory()))]}))
         scripts = self.root / "scripts"
@@ -248,6 +261,7 @@ class CompilerTests(unittest.TestCase):
             self.assertEqual(manifest["schemaVersion"], 3)
             self.assertEqual(manifest["source"], "a" * 40)
             self.assertEqual(manifest["noctty"]["version"], "1.0")
+            self.assertEqual(manifest["noctty"]["registration"], REGISTRATION)
             self.assertEqual(manifest["cloudflared"], {"version": "2.0", "file": "payload/cloudflared.exe",
                                                        "sha256": pack.digest(cloudflared)})
             self.assertEqual(z.read("payload/cloudflared.exe"), cloudflared.read_bytes())
@@ -312,6 +326,33 @@ class CompilerTests(unittest.TestCase):
                 z.writestr(name, "" if name.endswith("/") else "fixture")
             with self.subTest(case=case), self.assertRaisesRegex(ValueError, pattern):
                 pack.distribution(fonts, archive, cloudflared, choices, scripts, "test", self.root / "out")
+
+    def test_noctty_registration(self):
+        files = {"noctty/noctty.exe": "1" * 64, "noctty/noctty-terminal-handoff-proxy.dll": "2" * 64}
+        self.assertEqual(pack.noctty_registration(REGISTRATION, files), REGISTRATION)
+        clsid = "Software\\Classes\\CLSID\\{33368C6F-D328-410C-B225-26DC9F12C728}"
+        value = {"key": clsid + "\\LocalServer32", "name": "", "data": '"{install}\\noctty\\noctty.exe"'}
+        for case, values in {"empty": [], "not a list": value,
+                             "extra field": [dict(value, type="String")], "not a string": [dict(value, data=1)],
+                             "shared root": [dict(value, key="Software\\Classes\\CLSID")],
+                             "other root": [dict(value, key="Software\\Classes\\AppID\\{33368C6F-D328-410C-B225-26DC9F12C728}")],
+                             "empty segment": [dict(value, key=clsid + "\\\\LocalServer32")],
+                             "install in key": [dict(value, key=clsid + "\\{install}")],
+                             "install in name": [dict(value, name="{install}")],
+                             "install not first": [dict(value, data="x {install}\\noctty\\noctty.exe")],
+                             "unbalanced quote": [dict(value, data='{install}\\noctty\\noctty.exe"')],
+                             "not an inventory file": [dict(value, data="{install}\\noctty\\noctty.com")],
+                             "empty data": [dict(value, data="")],
+                             "case duplicate": [value, dict(value, key=clsid + "\\localserver32", data="x")]}.items():
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                pack.noctty_registration(values, files)
+        fonts = self.payload()
+        noctty, cloudflared, choices, scripts = self.inputs()
+        selected = json.loads(choices.read_text())
+        del selected["noctty"]["registration"]
+        choices.write_text(json.dumps(selected))
+        with self.assertRaisesRegex(ValueError, "No Noctty registration"):
+            pack.distribution(fonts, noctty, cloudflared, choices, scripts, "test", self.root / "out")
 
     def test_cloudflared_must_be_selected_and_executable(self):
         fonts = self.payload()
