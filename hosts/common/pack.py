@@ -84,6 +84,15 @@ PACKAGE_KEYS = {"name", "version", "url", "format", "size", "sha256", "scope", "
                 "executable", "existing", "protected"}
 EXISTING_KEYS = {"uninstallKey", "displayName", "publisher", "installLocation", "executable"}
 TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*")
+# A version starts with a digit and holds no '-', so Programs/<name>-<version> splits one way
+# only (chromium-extra-1 is never Chromium's); win.ps1 Get-PackageAssetPath relies on it.
+VERSION = re.compile(r"[0-9][A-Za-z0-9.]*")
+# Byte counts win.ps1 reads from JSON under Windows PowerShell 5.1: kept exact as a double there.
+MAX_SIZE = 2**53 - 1
+
+
+def is_size(value: object) -> bool:
+    return type(value) is int and 0 < value <= MAX_SIZE
 
 
 def text(value: object, what: str) -> str:
@@ -117,7 +126,7 @@ def package_locks(packages: object) -> list[dict]:
         if not isinstance(package, dict) or set(package) - {"sha1"} != PACKAGE_KEYS:
             raise ValueError(f"Package lock keys differ from {sorted(PACKAGE_KEYS)} (+ optional sha1)")
         name, version = text(package["name"], "name"), text(package["version"], "version")
-        if not TOKEN.fullmatch(name) or not TOKEN.fullmatch(version) or name.casefold() in names:
+        if not TOKEN.fullmatch(name) or not VERSION.fullmatch(version) or name.casefold() in names:
             raise ValueError(f"Invalid or duplicate package: {name!r} {version!r}")
         names.add(name.casefold())
         if package["format"] not in ("zip", "7z"):
@@ -126,7 +135,7 @@ def package_locks(packages: object) -> list[dict]:
         if (not url.startswith("https://github.com/") or "/releases/download/" not in url
                 or not url.endswith("." + package["format"])):
             raise ValueError(f"Package URL is not a pinned release asset: {url}")
-        if type(package["size"]) is not int or package["size"] <= 0:
+        if not is_size(package["size"]):
             raise ValueError(f"Invalid package size for {name}")
         hex_digest(package["sha256"], 64, f"{name} sha256")
         if "sha1" in package:
@@ -210,13 +219,16 @@ def tree_inventory(root: Path, listed: list[str], required: str) -> dict[str, st
 
 
 def package_inventory(lock_path: Path, archive_path: Path, listing: Path, tree: Path, out: Path) -> None:
+    """The pinned inventory of one package: files (path -> sha256) and unpackedSize, the sum of
+    their byte sizes as extracted, which Restore's free-space gate adds to the asset size."""
     package, = package_locks([json.loads(lock_path.read_text(encoding="utf-8"))])
     verify_asset(package, archive_path)
-    write_json(out, tree_inventory(tree, listed_paths(listing.read_text(encoding="utf-8")), package["executable"]))
+    files = tree_inventory(tree, listed_paths(listing.read_text(encoding="utf-8")), package["executable"])
+    write_json(out, {"files": files, "unpackedSize": sum((tree / name).stat().st_size for name in files)})
 
 
 def inventoried(packages: object) -> list[dict]:
-    """Validated locks, each with the build-time inventory as `files` in place of its store path."""
+    """Validated locks, each with the build-time inventory's `files` and `unpackedSize` in place of its store path."""
     if not isinstance(packages, list):
         raise ValueError("Empty package selection")
     locks, inventories = [], []
@@ -225,14 +237,17 @@ def inventoried(packages: object) -> list[dict]:
             raise ValueError("Package lock has no inventory")
         locks.append({key: value for key, value in package.items() if key != "inventory"})
         inventories.append(json.loads(Path(package["inventory"]).read_text(encoding="utf-8")))
-    for lock, files in zip(package_locks(locks), inventories):
+    for lock, inventory in zip(package_locks(locks), inventories):
+        if not isinstance(inventory, dict) or set(inventory) != {"files", "unpackedSize"} or not is_size(inventory["unpackedSize"]):
+            raise ValueError(f"Invalid inventory for {lock['name']}")
+        files = inventory["files"]
         if (not isinstance(files, dict) or lock["executable"] not in files
                 or len({name.casefold() for name in files}) != len(files)
                 or any(windows_path(name) != name or not isinstance(sha, str) for name, sha in files.items())):
             raise ValueError(f"Invalid inventory for {lock['name']}")
         for sha in files.values():
             hex_digest(sha, 64, f"{lock['name']} inventory sha256")
-        lock["files"] = files
+        lock["files"], lock["unpackedSize"] = files, inventory["unpackedSize"]
     return locks
 
 

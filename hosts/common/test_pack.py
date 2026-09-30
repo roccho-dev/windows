@@ -110,6 +110,7 @@ class CompilerTests(unittest.TestCase):
     def test_package_lock_contract(self):
         self.assertEqual(pack.package_locks([self.lock()]), [self.lock()])
         self.assertEqual(pack.package_locks([self.lock(sha1="0" * 40)]), [self.lock(sha1="0" * 40)])
+        self.assertEqual(pack.package_locks([self.lock(size=pack.MAX_SIZE)]), [self.lock(size=pack.MAX_SIZE)])
         bad = {
             "empty": [],
             "not a list": {"packages": []},
@@ -122,6 +123,7 @@ class CompilerTests(unittest.TestCase):
             "installer": [self.lock(format="exe", url="https://github.com/e/f/releases/download/v1/f.exe")],
             "bool size": [self.lock(size=True)],
             "zero size": [self.lock(size=0)],
+            "size above 2**53 - 1": [self.lock(size=2**53)],
             "short sha": [self.lock(sha256="b63be7548792b4ad0dfe424d91cc693b478")],
             "upper sha": [self.lock(sha256="A" * 64)],
             "int sha": [self.lock(sha256=1)],
@@ -129,6 +131,8 @@ class CompilerTests(unittest.TestCase):
             "int name": [self.lock(name=1)],
             "slash name": [self.lock(name="a/b", directory="Programs/a/b-1.0")],
             "version traversal": [self.lock(version="1/..", directory="Programs/fixture-1/..")],
+            "version with a dash": [self.lock(version="1.0-rc1", directory="Programs/fixture-1.0-rc1")],
+            "version not a digit first": [self.lock(version="v1.0", directory="Programs/fixture-v1.0")],
             "machine scope": [self.lock(scope="machine")],
             "other effect": [self.lock(effect="registry-value")],
             "escape": [self.lock(directory="Programs/../fixture-1.0")],
@@ -218,15 +222,18 @@ class CompilerTests(unittest.TestCase):
         lock_path.write_text(json.dumps(self.lock(size=13, sha256=pack.digest(asset))))
         listing.write_text("--\n----------\nPath = bin/fixture.exe\n\nPath = readme\n")
         pack.package_inventory(lock_path, asset, listing, tree, out)
-        self.assertEqual(json.loads(out.read_text()), pack.tree_inventory(tree, ["bin/fixture.exe", "readme"],
-                                                                          "bin/fixture.exe"))
+        self.assertEqual(json.loads(out.read_text()),
+                         {"files": pack.tree_inventory(tree, ["bin/fixture.exe", "readme"], "bin/fixture.exe"),
+                          "unpackedSize": len(b"MZ fixture") + len(b"fixture")})
         lock_path.write_text(json.dumps(self.lock(size=13)))
         with self.assertRaisesRegex(ValueError, "differs"):
             pack.package_inventory(lock_path, asset, listing, tree, out)
 
-    def inventory(self, files=None):
-        path = self.root / "inventory.json"
-        path.write_text(json.dumps({"bin/fixture.exe": "1" * 64} if files is None else files))
+    def inventory(self, files=None, size=10, raw=None):
+        # One file per call: several cases are built before any of them is read.
+        path = self.root / f"inventory-{len(list(self.root.glob('inventory-*.json')))}.json"
+        files = {"bin/fixture.exe": "1" * 64} if files is None else files
+        path.write_text(json.dumps({"files": files, "unpackedSize": size} if raw is None else raw))
         return path
 
     def inputs(self):
@@ -266,7 +273,7 @@ class CompilerTests(unittest.TestCase):
                                                        "sha256": pack.digest(cloudflared)})
             self.assertEqual(z.read("payload/cloudflared.exe"), cloudflared.read_bytes())
             self.assertEqual(manifest["files"]["payload/cloudflared.exe"], pack.digest(cloudflared))
-            self.assertEqual(manifest["packages"], [self.lock(files={"bin/fixture.exe": "1" * 64})])
+            self.assertEqual(manifest["packages"], [self.lock(files={"bin/fixture.exe": "1" * 64}, unpackedSize=10)])
             self.assertNotIn("packages.dsc.json", z.namelist())
             self.assertEqual(set(manifest["files"]), set(z.namelist()) - {"manifest.json"})
             for name in ("handoff-proof.ps1", "handoff-evaluate.ps1", "package-view.ps1"):
@@ -293,7 +300,15 @@ class CompilerTests(unittest.TestCase):
                               "not a Windows path": self.lock(inventory=str(self.inventory({"bin/fixture.exe": "1" * 64,
                                                                                            "bin/a.": "1" * 64}))),
                               "case duplicate": self.lock(inventory=str(self.inventory({"bin/fixture.exe": "1" * 64,
-                                                                                       "BIN/fixture.exe": "1" * 64})))
+                                                                                       "BIN/fixture.exe": "1" * 64}))),
+                              "zero size": self.lock(inventory=str(self.inventory(size=0))),
+                              "size above 2**53 - 1": self.lock(inventory=str(self.inventory(size=2**53))),
+                              "bool size": self.lock(inventory=str(self.inventory(size=True))),
+                              "text size": self.lock(inventory=str(self.inventory(size="10"))),
+                              "no size": self.lock(inventory=str(self.inventory(raw={"files": {"bin/fixture.exe": "1" * 64}}))),
+                              "extra field": self.lock(inventory=str(self.inventory(raw={"files": {"bin/fixture.exe": "1" * 64},
+                                                                                         "unpackedSize": 10, "seed": {}}))),
+                              "flat map": self.lock(inventory=str(self.inventory(raw={"bin/fixture.exe": "1" * 64})))
                               }.items():
             selected["packages"] = [package]
             choices.write_text(json.dumps(selected))

@@ -48,6 +48,7 @@ let
   # to verify the lock and pin the extracted file inventory; Restore must fetch
   # and verify them again before any effect. Paths are relative to
   # %LOCALAPPDATA% with '/' separators and must be names Windows recreates exactly.
+  #   version     a digit first and no '-', so Programs/<name>-<version> splits one way only
   #   directory   the only owned effect: the inventoried per-file tree, current user only;
   #               no registry, shortcut, PATH or machine-scope effect. The inventory
   #               lists files only; an archive with a directory holding no file fails
@@ -110,7 +111,8 @@ let
     }
   ];
   # The fixed-output fetch checks sha256; pack.py checks size, sha1 and the
-  # archive listing, and inventories the tree 7-Zip extracts.
+  # archive listing, and inventories the tree 7-Zip extracts: each file's sha256
+  # and unpackedSize, the sum of their sizes (never written here by hand).
   inventory = lock: let
     archive = pkgs.fetchurl { inherit (lock) url sha256; };
   in pkgs.runCommand "package-inventory-${lock.name}" { nativeBuildInputs = [ python pkgs._7zz ]; } ''
