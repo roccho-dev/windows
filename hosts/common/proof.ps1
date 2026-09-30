@@ -344,6 +344,75 @@ foreach ($case in @(@('empty', @()), @('duplicate', @($row, (Variant @{ key = $r
     Must ($refused.problem -and -not @($refused.values).Count -and -not @($refused.keys).Count) "registration refuses: $($case[0])"
 }
 Must ([bool](Get-NocttyRegistration @($row) 'Programs\noctty-1' $files).problem) 'a relative install path is refused'
+# An observed tree's other entries (reparse points, empty directories, unsafe names) make it differ.
+$tree = @{ exists = $true; files = @{ 'a.txt' = (Sha a) } }
+Must ((Test-EffectStateEqual tree-extracted $tree @{ exists = $true; files = @{ 'A.TXT' = (Sha a) }; other = @() }) -and
+    -not (Test-EffectStateEqual tree-extracted $tree @{ exists = $true; files = @{ 'a.txt' = (Sha a) }; other = @('e/') }) -and
+    (Get-UnownedClass tree-extracted $tree @{ exists = $true; files = $tree.files; other = @('j') } $null).class -ceq 'preexisting-drift') 'tree other entries'
+Must ($null -ne (Get-EffectRecordProblem (PureRecord 1 intent tree-extracted 'C:\u\t' $absent @{ exists = $true; files = $tree.files; other = @('e/') } $null $null))) 'a desired tree has no other entries'
+
+# The Noctty effect primitives, loaded alone from win.ps1 (no mode uses them yet) and run on
+# synthetic targets: a fresh RUNNER_TEMP directory (never deleted) and a proof HKCU key.
+$winFunctions = 'FileEffect', 'ValueEffect', 'KeyEffect', 'NocttyEffects', 'ObserveFile', 'ObserveValue', 'ObserveTree', 'ObserveKey', 'ObserveNoctty'
+$winAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'win.ps1'), [ref]$null, [ref]$null)
+foreach ($definition in $winAst.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cin $winFunctions }, $false)) {
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+$effectRoot = Join-Path $env:RUNNER_TEMP ('noctty-effects-' + [guid]::NewGuid().ToString('N'))
+$localAppData = $effectRoot
+$nocttyDirectory, $nocttyConfig = "$effectRoot\Programs\noctty-$($manifest.noctty.version)", "$effectRoot\noctty\config.ghostty"
+$nocttyConfigText = 'font-family = ' + $manifest.noctty.fontFamily + "`n"
+$nocttyRegistration = Get-NocttyRegistration $manifest.noctty.registration $nocttyDirectory $manifest.noctty.files
+$selected = NocttyEffects
+$all = @($selected.tree, $selected.config, $selected.startup) + $selected.keys + $selected.values
+foreach ($effect in $all) {
+    $record = @{ ledger = 'effects'; schema = 1; seq = 1; phase = 'intent' }
+    foreach ($k in $effect.Keys) { $record[$k] = $effect[$k] }
+    Must ($null -eq (Get-EffectRecordProblem $record)) "Noctty effect $($effect.id) is a well-formed owned intent"
+}
+$configBytes = [Text.UTF8Encoding]::new($false).GetBytes($nocttyConfigText)
+Must (@($all | ForEach-Object { $_.id } | Sort-Object -Unique).Count -eq 19 -and $selected.startup.target -ceq 'HKCU\Console\%%Startup' -and
+    (@($selected.keys | ForEach-Object { $_.target } | Sort-Object) -join ';') -ceq (@($tenKeys | ForEach-Object { "HKCU\$_" } | Sort-Object) -join ';') -and
+    @($selected.values | Where-Object { $_.name -ceq 'ThreadingModel' -and $_.desired.data -ceq 'Both' }).Count -eq 1 -and
+    $selected.tree.desired.files.Count -eq @($manifest.noctty.files.PSObject.Properties).Count -and
+    $selected.config.desired.sha256 -ceq [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($configBytes)).ToLowerInvariant()) 'the 19 Noctty effects'
+# Observation: absent, then the exact extracted inventory and config; every anomaly differs.
+Must (-not $(ObserveNoctty $selected.tree).exists -and -not $(ObserveNoctty $selected.config).exists) 'absent Noctty targets'
+$null = New-Item -ItemType Directory -Path $nocttyDirectory, (Split-Path -Parent $nocttyConfig)
+Expand-Archive -LiteralPath (Join-Path $PSScriptRoot 'payload/noctty.zip') -DestinationPath $nocttyDirectory
+[IO.File]::WriteAllBytes($nocttyConfig, $configBytes)
+$exact = { (Test-EffectStateEqual tree-extracted $selected.tree.desired (ObserveNoctty $selected.tree)) }
+Must ((& $exact) -and (Test-EffectStateEqual file-created $selected.config.desired (ObserveNoctty $selected.config))) 'the extracted tree and config are exact'
+$extraDir, $junction, $extraFile = "$nocttyDirectory\noctty\empty", "$nocttyDirectory\noctty\link", "$nocttyDirectory\noctty\extra.txt"
+$null = New-Item -ItemType Directory -Path $extraDir
+Must (-not (& $exact) -and @((ObserveNoctty $selected.tree).other) -ccontains 'noctty/empty/') 'an empty directory differs'
+[IO.Directory]::Delete($extraDir, $false)
+$null = New-Item -ItemType Junction -Path $junction -Target $effectRoot
+Must (-not (& $exact) -and @((ObserveNoctty $selected.tree).other) -ccontains 'noctty/link') 'a junction differs and is not followed'
+[IO.Directory]::Delete($junction, $false)
+[IO.File]::WriteAllText($extraFile, 'proof')
+Must (-not (& $exact)) 'an extra file differs'
+[IO.File]::Delete($extraFile)
+Must ((& $exact)) 'the tree is exact again'
+MustReject { ObserveTree $nocttyConfig } 'Not a plain directory*'
+# Registry: a proof key and value are observed exactly; a real selected key is only read.
+$proofKey = 'Software\windows-iac-proof-' + [guid]::NewGuid().ToString('N')
+Must (-not (ObserveKey $proofKey).exists) 'an absent key'
+$created = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($proofKey)
+try { $created.SetValue('', 'proof', [Microsoft.Win32.RegistryValueKind]::String) } finally { $created.Close() }
+Must ((ObserveKey $proofKey).exists -and (Test-EffectStateEqual registry-value (ValueEffect '' 'proof' "HKCU\$proofKey").desired (ObserveValue '' $proofKey))) 'a present key and value'
+$created = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($proofKey, $true)
+try { $created.DeleteValue('') } finally { $created.Close() }
+[Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($proofKey)
+Must ((ObserveNoctty $selected.keys[0]).exists -is [bool] -and (ObserveNoctty $selected.values[0]).exists -is [bool]) 'selected registry targets are read'
+# The tree of another Noctty version stays readable; nothing else beside or beneath it is.
+Must (-not (ObserveNoctty @{ kind = 'tree-extracted'; target = "$effectRoot\Programs\noctty-0.9.1" }).exists) 'an older Noctty tree is observed'
+foreach ($foreign in @("$effectRoot\Programs\nocttyx-1", "$effectRoot\Programs\noctty-", "$effectRoot\Programs\noctty-1.",
+        "$effectRoot\Programs\noctty-1\sub", "$effectRoot\Other\noctty-1", "$effectRoot\Programs\x\..\noctty-1")) {
+    MustReject { ObserveNoctty @{ kind = 'tree-extracted'; target = $foreign } } '*is not a selected Noctty effect.'
+}
+MustReject { ObserveNoctty (KeyEffect 'Software\Classes\CLSID') } '*is not a selected Noctty effect.'
+MustReject { ObserveNoctty (ValueEffect 'Present' 'x' $selected.values[0].target) } '*is not a selected Noctty effect.'
 
 # ---- Owned fonts through the effect ledger (native files and HKCU values) ----
 $fonts = @($manifest.fonts)

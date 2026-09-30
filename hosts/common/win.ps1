@@ -484,9 +484,9 @@ function FileEffect([string]$Path, [string]$Sha) {
         prior = [ordered]@{ exists = $false }; desired = [ordered]@{ exists = $true; sha256 = $Sha.ToLowerInvariant() } }
 }
 
-function ValueEffect([string]$Name, [string]$Data) {
-    [ordered]@{ id = 'registry-value:' + ($fontKey + '|' + $Name).ToUpperInvariant(); kind = 'registry-value'
-        target = $fontKey; name = $Name
+function ValueEffect([string]$Name, [string]$Data, [string]$Key = $fontKey) {
+    [ordered]@{ id = 'registry-value:' + ($Key + '|' + $Name).ToUpperInvariant(); kind = 'registry-value'
+        target = $Key; name = $Name
         prior = [ordered]@{ exists = $false }; desired = [ordered]@{ exists = $true; type = 'String'; data = $Data } }
 }
 
@@ -498,14 +498,91 @@ function ObserveFile([string]$Path) {
 }
 
 # A value exactly as stored: its kind and its data without environment expansion.
-function ObserveValue([string]$Name) {
-    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($fontSubkey)
+function ObserveValue([string]$Name, [string]$Subkey = $fontSubkey) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($Subkey)
     if ($null -eq $key) { return [ordered]@{ exists = $false } }
     try {
         if ($key.GetValueNames() -notcontains $Name) { return [ordered]@{ exists = $false } }
         return [ordered]@{ exists = $true; type = [string]$key.GetValueKind($Name)
             data = $key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
     } finally { $key.Close() }
+}
+
+# ---- Owned Noctty effects (E1, E2, E4-E6): built and observed here, not used by any mode yet ----
+function KeyEffect([string]$Subkey) {
+    $target = 'HKCU\' + $Subkey
+    [ordered]@{ id = 'registry-key-created:' + $target.ToUpperInvariant(); kind = 'registry-key-created'; target = $target
+        prior = [ordered]@{ exists = $false }; desired = [ordered]@{ exists = $true } }
+}
+
+# The versioned tree with its exact inventory, the font configuration, the %%Startup key, the
+# keys derived from the registration (parents first; never the shared CLSID and Interface
+# roots) and its six values. Which of them this user owns is decided when they are classified.
+function NocttyEffects {
+    $files = @{}
+    foreach ($entry in $manifest.noctty.files.PSObject.Properties) { $files[$entry.Name] = ([string]$entry.Value).ToLowerInvariant() }
+    $config = [Security.Cryptography.SHA256]::Create().ComputeHash([Text.UTF8Encoding]::new($false).GetBytes($nocttyConfigText))
+    [ordered]@{
+        tree = [ordered]@{ id = 'tree-extracted:' + $nocttyDirectory.ToUpperInvariant(); kind = 'tree-extracted'; target = $nocttyDirectory
+            prior = [ordered]@{ exists = $false }; desired = [ordered]@{ exists = $true; files = $files } }
+        config = FileEffect $nocttyConfig (-join ($config | ForEach-Object { $_.ToString('x2') }))
+        startup = KeyEffect 'Console\%%Startup'
+        keys = @($nocttyRegistration.keys | ForEach-Object { KeyEffect $_ })
+        values = @($nocttyRegistration.values | ForEach-Object { ValueEffect $_.name $_.data ('HKCU\' + $_.key) })
+    }
+}
+
+# A tree exactly as it is, never following a reparse point: files maps each regular file's
+# '/'-path to its sha256, and other lists every reparse point, unsafe or case-repeated name and
+# directory with no file beneath it, so any of them makes the tree differ from an inventory.
+function ObserveTree([string]$Path) {
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return [ordered]@{ exists = $false } }
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Not a plain directory: $Path" }
+    $files, $other, $directories, $parents = @{}, @(), @(), @{}
+    $pending = [Collections.Generic.Stack[IO.DirectoryInfo]]::new()
+    $pending.Push($item)
+    while ($pending.Count) {
+        foreach ($entry in $pending.Pop().GetFileSystemInfos()) {
+            $relative = $entry.FullName.Substring($item.FullName.Length + 1).Replace('\', '/')
+            if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $files.ContainsKey($relative) -or
+                @($relative.Split('/') | Where-Object { -not (Test-PathSegment $_) }).Count) { $other += $relative }
+            elseif ($entry -is [IO.DirectoryInfo]) { $directories += $relative; $pending.Push($entry) }
+            else {
+                $files[$relative] = (Get-FileHash -LiteralPath $entry.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                $parts = $relative.Split('/')
+                for ($i = 1; $i -lt $parts.Count; $i++) { $parents[$parts[0..($i - 1)] -join '/'] = $true }
+            }
+        }
+    }
+    $other += @($directories | Where-Object { -not $parents.ContainsKey($_) } | ForEach-Object { "$_/" })
+    [ordered]@{ exists = $true; files = $files; other = $other }
+}
+
+function ObserveKey([string]$Subkey) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($Subkey)
+    if ($null -eq $key) { return [ordered]@{ exists = $false } }
+    $key.Close()
+    [ordered]@{ exists = $true }
+}
+
+# The current state of one selected Noctty effect, or of the tree of any Noctty version (an
+# owned older one must stay readable for collection and Uninstall); anything else stops the run.
+function ObserveNoctty($Effect) {
+    $kind, $target, $name = [string](Get-Field $Effect 'kind'), [string](Get-Field $Effect 'target'), (Get-Field $Effect 'name')
+    $selected = NocttyEffects
+    $subkey = $target -replace '^HKCU\\', ''
+    $leaf = [IO.Path]::GetFileName($target)
+    if ($kind -ceq 'tree-extracted' -and [IO.Path]::GetDirectoryName($target) -eq (Join-Path $localAppData 'Programs') -and
+        $leaf -cmatch '^noctty-[A-Za-z0-9][A-Za-z0-9.-]*$' -and (Test-PathSegment $leaf)) { return ObserveTree $target }
+    if ($kind -ceq 'file-created' -and $target -eq $selected.config.target) { return ObserveFile $target }
+    if ($kind -ceq 'registry-key-created' -and @(@($selected.startup) + $selected.keys | Where-Object { $_.target -eq $target }).Count) {
+        return ObserveKey $subkey
+    }
+    if ($kind -ceq 'registry-value' -and @($selected.values | Where-Object { $_.target -eq $target -and $_.name -eq $name }).Count) {
+        return ObserveValue $name $subkey
+    }
+    throw "$kind $target is not a selected Noctty effect."
 }
 
 # The current state of a recorded or selected effect. Anything but an owned font

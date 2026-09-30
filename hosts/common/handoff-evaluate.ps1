@@ -149,7 +149,9 @@ function Get-HandoffVerdict($Record, $Events, [string]$ExpectedTerminal) {
 #                   DWord and QWord data are the unsigned value on both sides:
 #                   observers convert the signed Int32/Int64 PowerShell reads
 #                   (e.g. -1 is 4294967295); a differing representation is drift.
-#   tree-extracted  files, a map of '/'-separated relative path -> sha256
+#   tree-extracted  files, a map of '/'-separated relative path -> sha256; an observed
+#                   tree may add other, the entries that are not such a file (reparse
+#                   points, directories without a file, unsafe names), empty in desired
 #   registry-key-created  nothing more: the key exists
 # Per kind, prior and desired must be:
 #   file-created, tree-extracted,
@@ -212,6 +214,7 @@ function Get-EffectStateProblem([string]$Kind, $State, [string]$Role) {
         }
         'tree-extracted' {
             if ($null -eq (ConvertTo-FileMap (Get-Field $State 'files'))) { return "$Role.files is not a safe path -> sha256 map." }
+            if (@(Get-Field $State 'other' | Where-Object { $null -ne $_ -and $_ -isnot [string] }).Count) { return "$Role.other is not a list of paths." }
         }
         'registry-key-created' { }
         default {
@@ -241,7 +244,8 @@ function Test-EffectStateEqual([string]$Kind, $Expected, $Actual) {
             foreach ($path in $want.Keys) {
                 if (-not $have.ContainsKey($path) -or $have[$path] -ne $want[$path]) { return $false }
             }
-            return $true
+            return (@(Get-Field $Expected 'other' | Where-Object { $null -ne $_ } | Sort-Object) -join '|') -eq
+                (@(Get-Field $Actual 'other' | Where-Object { $null -ne $_ } | Sort-Object) -join '|')
         }
         'registry-key-created' { return $true }
         default {
@@ -290,6 +294,7 @@ function Get-EffectRecordProblem($Record) {
     if ($kind -eq 'tree-extracted' -and (ConvertTo-FileMap (Get-Field $desired 'files')).Count -eq 0) {
         return 'desired.files is empty.'
     }
+    if ($kind -eq 'tree-extracted' -and @(Get-Field $desired 'other' | Where-Object { $null -ne $_ }).Count) { return 'desired.other is not empty.' }
     $observed = Get-Field $Record 'observed'
     if ($phase -ceq 'intent') {
         if ($null -ne $observed) { return 'an intent has no observed state.' }
