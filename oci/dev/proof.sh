@@ -104,7 +104,7 @@ jev_proof() {
           echo "names $(tr '\0' '\n' < /proc/$$/environ | cut -d= -f1 | sort | tr '\n' ' ')"
           echo "host $HOST"
           echo "core $(ulimit -c)"
-          echo "home $(ls -A "$HOME" | wc -l)"
+          echo "home $HOME $([ -e "$HOME" ] && echo present || echo absent)"
           echo "key $(printf %s "$JEV_API_KEY" | sha256sum | cut -d' ' -f1)"
           case "$(tr '\0' ' ' < /proc/$$/cmdline)" in *"$JEV_API_KEY"*) echo "argv key" ;; *) echo "argv clean" ;; esac
         } > /tmp/voice-ui-jev-proof-$PORT
@@ -130,11 +130,12 @@ NIX
   local port marker out="$fx/launch.out"
   port=$((20000 + RANDOM % 20000))
   marker=/tmp/voice-ui-jev-proof-$port
+  mkdir "$fx/tmp"
   launch_as() {
     local expect=$1 code=0
     shift
     rm -f "$marker"
-    env GH_TOKEN=fixture-gh GH_CONFIG_DIR=/nonexistent SOPS_AGE_KEY_FILE=/nonexistent HOST=0.0.0.0 SHELLOPTS=xtrace \
+    env TMPDIR="$fx/tmp" GH_TOKEN=fixture-gh GH_CONFIG_DIR=/nonexistent SOPS_AGE_KEY_FILE=/nonexistent HOST=0.0.0.0 SHELLOPTS=xtrace \
       'BASH_FUNC_leak%%=() { :; }' 'NOT-AN-IDENTIFIER=leak' "$launch" "$@" > "$out" 2>&1 || code=$?
     if grep -qF "$key" "$out"; then echo 'the key reached launcher output' >&2; return 1; fi
     if [ "$expect" = pass ]; then [ "$code" -eq 0 ] && [ -e "$marker" ]; else [ "$code" -ne 0 ] && [ ! -e "$marker" ]; fi \
@@ -146,7 +147,7 @@ NIX
   test "$(head -n 1 "$marker")" = "names HOME HOST JEV_API_KEY LANG PATH PORT "
   grep -qx 'host 127.0.0.1' "$marker"
   grep -qx 'core 0' "$marker"
-  grep -qx 'home 0' "$marker"
+  grep -qx 'home /homeless-shelter absent' "$marker"
   grep -qx "key $(printf %s "$key" | sha256sum | cut -d' ' -f1)" "$marker"
   grep -qx 'argv clean' "$marker"
   test "$(grep -n 'voice-ui-jev-dev: built ' "$out" | cut -d: -f1)" -lt "$(grep -n 'voice-ui-jev-dev: decrypt ' "$out" | cut -d: -f1)"
@@ -181,9 +182,10 @@ NIX
   launch_as red --envs-sha "$extra" --apps-sha "$apps_good" --port "$port"
   rm -f "$cipher"; absent=$(commit absent)
   launch_as red --envs-sha "$absent" --apps-sha "$apps_good" --port "$port"
+  test -z "$(ls -A "$fx/tmp")"
   rm -f "$marker"
   echo 'PASS jev tools (fixtures): production profile has only the two bounded tools and exact constants; same source;'
-  echo 'PASS jev launch: closed child environment, loopback, no core, fresh HOME, key never in argv or output, build before decrypt;'
+  echo 'PASS jev launch: closed child environment, loopback, no core, absent HOME, no temp left after any launch, key never in argv or output, build before decrypt;'
   echo 'PASS jev RED: arguments, stale/off/unknown envs commit, unbuildable apps, identity mode/missing/other, tamper, two recipients, extra field, absent'
 }
 jev_proof

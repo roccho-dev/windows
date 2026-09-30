@@ -88,10 +88,12 @@
         done
         [[ $envs_sha =~ ^[0-9a-f]{40}$ && $apps_sha =~ ^[0-9a-f]{40}$ && $port =~ ^[1-9][0-9]{3,4}$ ]] || usage
         { [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; } || usage
+        [ ! -e /homeless-shelter ] || fail "/homeless-shelter exists; the child's HOME must not exist"
 
         # The ciphertext: at a commit on envs proposals, and exactly the one proposals carries now.
-        # The scratch directory holds only public data and is left in place; nothing here deletes recursively.
+        # The scratch directory holds only public data; only this mktemp directory is removed, on exit and before the child.
         work=$("$cu/mktemp" -d)
+        trap '"$cu/rm" -rf -- "$work"' EXIT
         repo=$work/envs.git
         git_ init -q --bare "$repo"
         git_ -C "$repo" fetch -q --no-tags "$envs_remote" "+refs/heads/proposals:refs/heads/proposals" \
@@ -136,14 +138,14 @@
         key=$(SOPS_AGE_KEY_FILE=$identity ${pkgs.sops}/bin/sops --decrypt --input-type yaml --extract '["JEV_API_KEY"]' \
           "$cipher" 2>/dev/null) || fail "decryption failed"
         [ -n "$key" ] || fail "the decrypted key is empty"
+        "$cu/rm" -rf -- "$work"
 
         # One foreground child whose environment is built from nothing (env -i). The key reaches it only through a pipe
         # from a builtin, never argv or a file; with lastpipe the launcher itself becomes the child.
-        home=$("$cu/mktemp" -d)
         echo "voice-ui-jev-dev: apps $apps_sha on 127.0.0.1:$port with PATH HOME LANG PORT HOST JEV_API_KEY"
         shopt -s lastpipe
         # shellcheck disable=SC2016
-        printf '%s' "$key" | exec "$cu/env" -i PATH="$cu" HOME="$home" LANG=C.UTF-8 PORT="$port" HOST=127.0.0.1 \
+        printf '%s' "$key" | exec "$cu/env" -i PATH="$cu" HOME=/homeless-shelter LANG=C.UTF-8 PORT="$port" HOST=127.0.0.1 \
           ${pkgs.bash}/bin/bash -c 'IFS= read -r -d "" JEV_API_KEY || true; export JEV_API_KEY; exec env -u PWD -u SHLVL -u OLDPWD -- "$0"' \
           "$program"
       '';
