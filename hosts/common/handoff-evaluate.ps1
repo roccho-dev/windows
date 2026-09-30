@@ -83,30 +83,6 @@ function Compare-TerminalSelection($Hkcu, $Package, [string]$Note) {
     [ordered]@{ state = 'match'; failure = $null; gap = $null }
 }
 
-# True only when a DSC `config test` answer for packages.dsc.json shows every
-# package installed at exactly its pinned version: inDesiredState, _exist, an
-# actualState.version equal to the desired version, and no differing properties.
-# Restore skips the WinGet `set` only then, so no installer runs. Missing
-# properties read as $null (strict mode would otherwise throw) and fail the check.
-function PackagesSatisfied($Answer) {
-    $read = { param($Object, [string]$Name)
-        if ($null -eq $Object) { return $null }
-        $property = $Object.PSObject.Properties[$Name]
-        if ($null -eq $property) { return $null }
-        return $property.Value }
-    if ((& $read $Answer 'hadErrors') -ne $false) { return $false }
-    $results = @(& $read $Answer 'results' | Where-Object { $null -ne $_ })
-    foreach ($item in $results) {
-        $result = & $read $item 'result'
-        $actual, $desired = (& $read $result 'actualState'), (& $read $result 'desiredState')
-        if ((& $read $result 'inDesiredState') -ne $true -or (& $read $actual '_exist') -ne $true -or
-            -not (& $read $desired 'version') -or
-            [string](& $read $actual 'version') -ne [string](& $read $desired 'version') -or
-            @(& $read $result 'differingProperties' | Where-Object { $_ }).Count -gt 0) { return $false }
-    }
-    return $results.Count -gt 0
-}
-
 # Verdict for one probe record and the events of a trace spanning it. Contrary
 # evidence is 'failed'; missing or ambiguous evidence is 'unproven'.
 function Get-HandoffVerdict($Record, $Events, [string]$ExpectedTerminal) {

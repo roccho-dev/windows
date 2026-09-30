@@ -32,10 +32,6 @@ let
     licenseSource = toString (choice.licenseSource or choice.package.src);
   }) choices));
   python = pkgs.python3.withPackages (ps: [ ps.fonttools ]);
-  backend = pkgs.fetchurl {
-    url = "https://github.com/PowerShell/DSC/releases/download/v3.3.0/DSC-3.3.0-x86_64-pc-windows-msvc.zip";
-    sha256 = "3f8b27f648661903d066cc19d5a6e7a8c13bd07eb738d4d765ce7239619b8b5f";
-  };
   nocttyVersion = "1.3.131";
   noctty = pkgs.fetchurl {
     url = "https://github.com/amanthanvi/noctty/releases/download/v${nocttyVersion}/noctty-${nocttyVersion}-windows-x64-portable.zip";
@@ -136,7 +132,7 @@ let
     python ${./pack.py} fonts ${policy} "$out"
   '';
   dist = pkgs.runCommand "windows-dist" { nativeBuildInputs = [ python ]; } ''
-    python ${./pack.py} dist ${fonts} ${backend} ${noctty} ${cloudflared} ${windowsChoices} ${./.} ${pkgs.lib.escapeShellArg source} "$out"
+    python ${./pack.py} dist ${fonts} ${noctty} ${cloudflared} ${windowsChoices} ${./.} ${pkgs.lib.escapeShellArg source} "$out"
   '';
 in {
   inherit fonts dist;

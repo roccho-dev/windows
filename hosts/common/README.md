@@ -1,14 +1,17 @@
 # Common selection → Windows recovery
 
-Issue #7 implementation slice. `nix.nix` owns selections and pins; generated
-DSC configuration is not a second editable Spec. No custom DSC resource,
-WinGet catalog, per-product installer, or new top-level directory is added.
+Issue #7 implementation slice. `nix.nix` is the only authority for selections,
+pins and package locks; `win.ps1` is a small native Windows activation adapter
+that realizes them. No DSC backend, WinGet catalog, per-product installer, or new
+top-level directory is used. (The DSC `Microsoft.Windows/Registry` resource is a
+proof-of-concept example that Microsoft says not to use in production, so the
+bundled DSC backend and its generated document were removed.)
 
 ```text
 flake.lock + common/nix.nix
   ├─ common-fonts          selected TTF bytes and licenses, reusable by Linux
-  └─ windows-dist.zip     fonts + pinned noctty + pinned DSC + generated configs
-       └─ win.ps1         verify → realize files → DSC convergence
+  └─ windows-dist.zip     fonts + pinned noctty + cloudflared + locked package metadata
+       └─ win.ps1         verify → classify → owned effects through the effect ledger
 ```
 
 ## Build and use
@@ -21,31 +24,33 @@ nix build .#common-fonts --no-write-lock-file
 # result/share/fonts
 ```
 
-On a clean Windows 11 x64 installation with Windows PowerShell 5.1 and WinGet,
-verify the ZIP against a checksum from a
-trusted successful CI/release, extract into a fresh directory, then run:
+On a Windows 11 x64 installation with Windows PowerShell 5.1, verify the ZIP
+against a checksum from a trusted successful CI/release, extract into a fresh
+directory, then run:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Validate     # read-only
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Restore      # fonts, Noctty, and two packages
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Restore      # fonts, Noctty, packages (see below)
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RestoreTest  # fail on drift
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Uninstall    # dry run: lists what it would revert
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Uninstall -Apply  # reverts owned fonts
 ```
 
-`Restore` converges the selected fonts, the pinned noctty portable ZIP and its
-`font-family = PlemolJP Console NF` configuration, and the pinned WinGet package
-IDs/versions for Chromium and AutoHotkey. The
-selected Chromium WinGet manifest offers a current-user installer. The machine
-needs a network connection and a working WinGet source for those two packages;
-they are not redistributed in the ZIP. `Restore` runs the package DSC `test`
-first and skips `set` only when every package is installed at exactly its pinned
-version (`inDesiredState`, matching `actualState.version`, no differing
-properties); then no installer runs, so an open browser and its profile are left
-alone. The output reports `packagesSet` as `skipped`, `applied` or `notRun`, and
-`RestoreTest` fails on the same version drift. Windows Terminal is OS/Store-owned and is
-not installed or pinned: `Restore` and `RestoreTest` only assert version 1.24 or
-newer, because its OpenConsole is Noctty's console half. Noctty is included because its WinGet
-package is not published. The release ZIP can be downloaded again after a clean install; Nix
-is only needed to build it, not to apply it.
+`Restore` converges the selected fonts (owned, through the effect ledger below),
+the pinned noctty portable ZIP and its `font-family = PlemolJP Console NF`
+configuration, and checks the locked packages (Chromium and AutoHotkey). A
+package is `preexisting` whenever an HKCU or HKLM (64- or 32-bit) Uninstall entry
+has its declared key name, or its DisplayName and Publisher, wherever that entry
+points; it is `preexisting-match` only when DisplayVersion and the ProductVersion
+of the entry's own InstallLocation executable equal the lock, and is never
+written. Declared protected data (the Chromium `User Data` profile) without an
+entry is `preexisting-drift`, never absent. An absent package stops `Restore`
+before any download or effect: **clean package install is disabled** until the
+ledger covers it. `RestoreTest` fails on any package that is not
+`preexisting-match`. Windows Terminal is OS/Store-owned and is not installed or
+pinned: `Restore` and `RestoreTest` only assert version 1.24 or newer, because its
+OpenConsole is Noctty's console half. The release ZIP can be downloaded again
+after a clean install; Nix is only needed to build it, not to apply it.
 
 After installing the dependencies, `Restore` selects the Windows Terminal 1.24+
 OpenConsole console delegate and calls Noctty's `+register-default-terminal` for
@@ -56,8 +61,7 @@ any failure restores the previous delegate selection and fails `Restore`.
 mappings) and the same package-context pair, and fails if that pair differs or
 cannot be read; it writes no registry value. It does not start the Noctty COM
 server or open a window, but it starts a Windows PowerShell reader under a
-headless `conhost.exe` inside the Windows Terminal package (below) and still
-runs the DSC and WinGet resource tests. Every mode reports `registrationState`
+headless `conhost.exe` inside the Windows Terminal package (below). Every mode reports `registrationState`
 (`registered` or `unregistered`) and `handoffProof = "unproven"`:
 registration and COM activation are not evidence that a new console opens in
 Noctty, and `inDesiredState` never includes handoff. Windows Terminal remains installed
@@ -83,6 +87,15 @@ PowerShell 5.1 (Appx module for `Invoke-CommandInDesktopPackage`) and Windows
 Terminal; it does not use Windows Script Host, which on the development host
 had no `.js` script engine.
 `Apply` and `Test` are font-only CI proof modes and do not run this check.
+
+**Run `Restore`, `Apply` and `Uninstall` as the same user.** The effect ledger
+lives in that user's `%LOCALAPPDATA%`; another account (for example an elevated
+token of a different administrator) reads a different or no ledger and would
+see nothing owned. `Uninstall` reports its `identity` (SID, profile, elevated)
+and `ledgerFound`, and claims an empty owned range only when the ledger was
+found. Inside an app's registry silo the ledger and the font values may be
+virtualized too; font `Uninstall` performs no silo check (`siloCheck =
+"notPerformed"`), so its claim covers only what that process sees.
 
 Before its first change to `HKCU\Console\%%Startup`, `Restore` writes the prior
 `DelegationConsole`/`DelegationTerminal` values once to
@@ -189,17 +202,61 @@ file stay below the line and are kept once as `config.before-windows-rent`; it
 refuses a byte-order mark, an Include elsewhere, or an existing backup. Access
 credentials are never written here.
 
-`Apply` and `Test` retain their font-only meaning for the CI proof. They own
-selected content-addressed TTF files beneath the current user's
-`LocalApplicationData\Microsoft\Windows\Fonts` and corresponding HKCU font
-registrations. `Restore` also writes the selected noctty configuration and
-default-terminal registration, but
-does not replace Windows-owned UI fonts or restore old registry settings,
-accounts, profiles, or personal app data. The user directory is a runtime Binding, not common Spec.
-Each invocation puts the bundled backend first on `PATH` and in
-`DSC_RESOURCE_PATH`, but discovery is not confined to the bundle: the
-`Microsoft.WinGet/Package` resource is not bundled and is resolved from the
-machine's App Installer/WinGet installation.
+## Owned fonts and the effect ledger
+
+`Apply` (the CI font-only mode) and `Restore` own the selected content-addressed
+TTF files beneath the current user's `LocalApplicationData\Microsoft\Windows\Fonts`
+and their `HKCU\Software\Microsoft\Windows NT\CurrentVersion\Fonts` values
+`<full name> (TrueType)` (REG_SZ, the file's path), written natively. `Test` and
+`RestoreTest` read both back. `Restore` also writes the selected noctty
+configuration and default-terminal registration, which are **not** in the ledger
+yet (next slice), and does not replace Windows-owned UI fonts or restore old
+registry settings, accounts, profiles, or personal app data. The user directory
+is a runtime Binding, not common Spec.
+
+Every owned effect is recorded in `%LOCALAPPDATA%\windows-iac\ledger`, one file
+per record (`<seq>.json`, created new, written through and flushed) while
+`ledger\.lock` is held: an **intent** before the effect (a new font file names its
+temporary file there first), then a **commit** with the read-back state; reverting
+writes **undone**, and an interrupted intent that never took effect is closed
+**void**. Before anything else, each run recovers interrupted attempts from what
+it reads: an intent whose effect is present is committed, one whose target is
+still absent is voided (deleting only the temporary file that intent named), and
+a committed effect found reverted is closed undone. Anything else stops the run.
+Only what this code created is owned (the prior state is always absent), so:
+
+- A matching file or value that was already there is `preexisting` and never
+  written or removed; one that differs is reported as `Font drift` and left alone.
+- Owned drift (changed bytes or value) is repaired by reverting and owning again.
+- A value recorded for an older selection is reverted and owned again for the new
+  file; owned files no longer selected are collected afterwards (values first).
+  A file that any HKCU or HKLM Fonts value still names (by path, or by the same
+  bytes under another name) is kept and reported as `gcKeptReferenced`.
+- A file Windows has locked (a loaded font) is never deferred or forced: the run
+  fails and the file stays owned for the next run.
+
+`Uninstall` without `-Apply` changes nothing and lists the plan. With `-Apply` it
+builds the whole plan and a Fonts reference check first; if anything is refused
+(owned drift, an unhandled id, a file an unowned value names), nothing is removed.
+Otherwise it removes owned values, then owned files, each only while it is still
+exactly what was recorded, and closes each undone. It reports `ownedOpen` (0 when
+empty), `changedAfterClose` (closed targets that no longer read as their prior;
+reported, not a failure), `retained` (the ledger and provenance directories,
+which are state rather than effects) and `notInLedger` (Noctty, the
+default-terminal record and RentSsh, which it does not touch yet). `Apply` and a
+fonts-only `Uninstall` may run elevated on a disposable runner; `Restore` may not.
+
+**Torn record.** A power loss can tear only the highest-seq record, and every mode
+that reads the ledger then stops. Remove that one file by hand only if it is the
+highest `<seq>.json` **and** does not parse as JSON; then rerun, and recovery
+closes the attempt from the machine's state. A record that parses but is invalid
+is never removed: stop and investigate.
+**Stale lock.** A power loss can also leave `ledger\.lock`, and every writer then stops with "Another run holds the effect ledger lock"; delete that one file by hand only when no `win.ps1` (`powershell.exe`) process is running.
+
+**#14 (RentSsh).** The ledger owns only what it created (prior absent). A
+`prefix-inserted` or `file-replaced` effect cannot be moved to a new version by
+undo-then-rewrite, because the restored prior classifies as `preexisting-*`; #14
+must define an explicit transition record first.
 
 The ZIP checksum binds transported bytes. The embedded inventory detects
 post-extraction corruption, not publisher authenticity. The manifest records
@@ -207,14 +264,11 @@ the source commit; the Windows proof requires the expected exact commit.
 
 ## Failure and restoration
 
-A failed apply can leave partial state. Rerun the same artifact to converge,
-but corrupt registered/in-use font files may be locked by Windows and cause
-Apply to fail. This adapter does not stop OS services or reboot to unlock them.
-New font versions use new content-addressed filenames, avoiding in-place updates.
-
-Reapplying a prior artifact restores registrations for names it owns. This is
-**not transactional rollback or garbage collection**: removed family names and
-old content-addressed files are deliberately not deleted.
+A failed apply can leave partial state and an open ledger attempt; rerun the same
+artifact and recovery converges it. Corrupt registered/in-use font files may be
+locked by Windows and make the run fail; this adapter does not stop OS services
+or reboot to unlock them. New font versions use new content-addressed filenames,
+avoiding in-place updates.
 
 ## Proof boundaries
 
@@ -223,10 +277,15 @@ hash inventories, and empty/duplicate/unsafe-input rejection using synthetic
 fixtures. It is not native Windows evidence.
 
 `proof.ps1` runs only on disposable GitHub-hosted Windows runners. It requires
-exact source identity, repairs damaged bytes seeded before registration,
-applies twice with zero changes on the second apply, independently reads actual
-registry values, rejects and repairs registry drift, and rejects package
-corruption. It also requires every `win.ps1` answer to report
+exact source identity; checks the pure ledger classification for every kind;
+applies twice with one intent and one commit per owned file and value and zero
+changes on the second apply; independently reads the files and values back from
+`manifest.fonts`; repairs owned value and byte drift and refuses unowned drift;
+rejects package corruption; replays interrupted attempts (void, commit, undone,
+temporary files an intent named, a temporary file none named, a second writer, a
+torn record); keeps files a foreign value names; moves an owned value to a new
+selection and collects the old file; and uninstalls (dry run unchanged, locked
+file kept owned, then empty, then a no-op). It also requires every `win.ps1` answer to report
 `handoffProof = "unproven"` and `handoff-proof.ps1` to refuse the runner, so CI
 never claims a real default-terminal handoff. Negative controls must fail for
 their expected reason.
@@ -245,6 +304,10 @@ claim one workflow prematurely. Existing OCI definitions and #8 are unchanged.
 
 `%LOCALAPPDATA%\windows-iac\provenance\default-terminal.json` is new per-user
 state written by `Restore`; no current uninstall or rollback path removes it.
+`Uninstall` reverts owned fonts only: Noctty, its configuration and shortcut,
+the default-terminal registration and COM values, and clean package installs
+join the ledger in later slices, so `Restore`/`Uninstall` as a whole is not
+complete.
 
 Application/UI selection beyond noctty, Japanese/Nerd/Emoji rendering,
 font reload/relogin, Linux profile activation, and real-host

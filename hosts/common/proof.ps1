@@ -6,13 +6,41 @@ $ErrorActionPreference = 'Stop'
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
     throw 'Proof mutates disposable state and is restricted to GitHub-hosted runners.'
 }
-function Run([string]$Mode) {
-    (& (Join-Path $PSScriptRoot 'win.ps1') -Mode $Mode) | ConvertFrom-Json
+# win.ps1 runs as on a real host: a child Windows PowerShell 5.1 process with -File.
+# Success is exit code 0, nothing on stderr and exactly one JSON object on stdout.
+# A failure is rethrown with the child's error message, which 5.1 wraps at the
+# console width: its lines are rejoined up to the "At <script>:<line> char:<n>" line.
+$windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+function Win51([string[]]$Arguments) {
+    $ErrorActionPreference = 'Continue'  # the child's stderr is data here, not an error of this process
+    $PSNativeCommandUseErrorActionPreference = $false
+    $lines = @(& $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'win.ps1') @Arguments 2>&1)
+    $code = $LASTEXITCODE
+    $stdout = @($lines | Where-Object { $_ -isnot [Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() })
+    $stderr = @($lines | Where-Object { $_ -is [Management.Automation.ErrorRecord] } | ForEach-Object { $_.ToString() })
+    if ($code -ne 0) {
+        $message, $atPosition = '', $false
+        foreach ($line in $stderr) {
+            if ($line -match '^At .+ char:\d+\s*$') { $atPosition = $true }
+            if (-not $atPosition) { $message += $line }
+        }
+        if (-not $message.Trim()) { $message = "win.ps1 exited $code without an error message: $($stderr -join ' ')" }
+        throw [Management.Automation.RuntimeException]::new($message)
+    }
+    if ($stderr.Count) { throw "win.ps1 succeeded but wrote to stderr: $($stderr -join ' ')" }
+    if ($stdout.Count -ne 1) { throw "win.ps1 printed $($stdout.Count) output lines instead of one JSON object." }
+    try { $answer = $stdout[0] | ConvertFrom-Json } catch { throw "win.ps1 printed malformed JSON: $($stdout[0])" }
+    if ($answer -isnot [Management.Automation.PSCustomObject]) { throw "win.ps1 printed JSON that is not one object: $($stdout[0])" }
+    return $answer
 }
+function Run([string]$Mode) { Win51 @('-Mode', $Mode) }
+# A wrapped child message may gain or lose a space at a line break, so a pattern
+# that fails exactly is compared once more with all whitespace removed.
 function MustReject([scriptblock]$Action, [string]$Pattern) {
     try { $null = & $Action }
     catch {
-        if ($_.Exception.Message -notlike $Pattern) { throw }
+        $message = $_.Exception.Message
+        if ($message -notlike $Pattern -and ($message -replace '\s', '') -notlike ($Pattern -replace '\s', '')) { throw }
         return
     }
     throw 'Negative control unexpectedly passed.'
@@ -120,30 +148,6 @@ if ((Compare-TerminalSelection (& $pair $wtConsole $noctty) (& $pair $wtConsole 
     throw 'Selection mismatch does not name a virtualized local HKCU.'
 }
 $handoffCases++
-# Package pins: Restore skips the WinGet `set` only when PackagesSatisfied. The
-# base answer is the shape the Microsoft.WinGet/Package test returned on the
-# development host; each variation must make it unsatisfied.
-$observed = '{"hadErrors":false,"results":[{"name":"Chromium","result":{"inDesiredState":true,' +
-    '"desiredState":{"acceptAgreements":true,"id":"Hibbiki.Chromium","installMode":"silent","source":"winget","version":"154.0.8037.58"},' +
-    '"actualState":{"_exist":true,"_inDesiredState":true,"id":"Hibbiki.Chromium","source":"winget","useLatest":true,"version":"154.0.8037.58"},' +
-    '"differingProperties":[]}},{"name":"AutoHotkey","result":{"inDesiredState":true,' +
-    '"desiredState":{"id":"AutoHotkey.AutoHotkey","version":"2.0.28"},' +
-    '"actualState":{"_exist":true,"id":"AutoHotkey.AutoHotkey","version":"2.0.28"},"differingProperties":[]}}]}'
-function MustPin([bool]$Expected, [string]$Case, [scriptblock]$Change) {
-    $answer = $observed | ConvertFrom-Json
-    if ($Change) { & $Change $answer }
-    if ((PackagesSatisfied $answer) -ne $Expected) { throw "PackagesSatisfied is wrong for: $Case" }
-    $script:handoffCases++
-}
-MustPin $true 'observed pinned packages' $null
-MustPin $false 'newer installed version' { param($a) $a.results[0].result.actualState.version = '155.0.8100.10' }
-MustPin $false 'test not in desired state' { param($a) $a.results[1].result.inDesiredState = $false }
-MustPin $false 'differing property listed' { param($a) $a.results[0].result.differingProperties = @('version') }
-MustPin $false 'package absent' { param($a) $a.results[1].result.actualState._exist = $false }
-MustPin $false 'no installed version reported' { param($a) $a.results[0].result.actualState.PSObject.Properties.Remove('version') }
-MustPin $false 'no pinned version' { param($a) $a.results[0].result.desiredState.PSObject.Properties.Remove('version') }
-MustPin $false 'DSC reported errors' { param($a) $a.hadErrors = $true }
-MustPin $false 'no results' { param($a) $a.results = @() }
 
 # The package-context reader is shared by win.ps1; loading it only defines functions.
 . (Join-Path $PSScriptRoot 'package-view.ps1')
@@ -182,54 +186,287 @@ try {
 }
 $handoffCases++
 $manifest = Get-Content (Join-Path $PSScriptRoot 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
-$config = Get-Content (Join-Path $PSScriptRoot 'configuration.dsc.json') -Raw -Encoding utf8 | ConvertFrom-Json
 
-# Seed damaged bytes BEFORE registration: Windows may lock registered fonts.
-# This models an interrupted first installation, without stopping OS services.
-$installed = Join-Path $validated.fontDirectory $manifest.fonts[0].file
-if (Test-Path -LiteralPath $installed) { throw 'Proof requires a fresh disposable font target.' }
-$null = New-Item -ItemType Directory -Path $validated.fontDirectory -Force
-[IO.File]::WriteAllText($installed, 'negative-control')
+# The pure ledger classification (P1): the class of a reverted or never-effective
+# attempt is the same before and after its closing record, for every kind.
+$absent = @{ exists = $false }
+function Sha([string]$Char) { $Char * 64 }
+function PureRecord($Seq, $Phase, $Kind, $Target, $Prior, $Desired, $Observed, $Name) {
+    $r = @{ ledger = 'effects'; schema = 1; seq = $Seq; phase = $Phase; id = 'x'; kind = $Kind; target = $Target
+        prior = $Prior; desired = $Desired }
+    if ($null -ne $Observed) { $r.observed = $Observed }
+    if ($null -ne $Name) { $r.name = $Name }
+    $r
+}
+$pureKinds = @(
+    @('file-created', 'C:\u\f', $absent, @{ exists = $true; sha256 = (Sha a) }, $null),
+    @('tree-extracted', 'C:\u\t', $absent, @{ exists = $true; files = @{ 'a.txt' = (Sha a) } }, $null),
+    @('prefix-inserted', 'C:\u\p', @{ exists = $true; sha256 = (Sha b); backup = 'C:\u\p.bak' }, @{ exists = $true; sha256 = (Sha c); line = 'Include x' }, $null),
+    @('file-replaced', 'C:\u\r', @{ exists = $true; sha256 = (Sha b); backup = 'C:\u\r.bak' }, @{ exists = $true; sha256 = (Sha c) }, $null),
+    @('registry-value', 'HKCU\Software\W', $absent, @{ exists = $true; type = 'String'; data = 'new' }, 'v'),
+    @('registry-value', 'HKCU\Software\W', @{ exists = $true; type = 'String'; data = 'old' }, @{ exists = $true; type = 'String'; data = 'new' }, 'v'))
+foreach ($case in $pureKinds) {
+    $kind, $target, $prior, $desired, $name = $case
+    $committed = @((PureRecord 1 intent $kind $target $prior $desired $null $name), (PureRecord 2 commit $kind $target $prior $desired $desired $name))
+    $intent = @(PureRecord 1 intent $kind $target $prior $desired $null $name)
+    foreach ($selection in @(@('', $null), @($kind, $desired), @($kind, $prior))) {
+        foreach ($pair in @(@($committed, 'undone', 3), @($intent, 'void', 2))) {
+            $before = Get-EffectClass $pair[0] $prior $selection[0] $selection[1]
+            $after = Get-EffectClass ($pair[0] + @(PureRecord $pair[2] $pair[1] $kind $target $prior $desired $prior $name)) $prior $selection[0] $selection[1]
+            if ($before.resolution -ne $pair[1] -or $after.resolution -or $before.class -cne $after.class -or
+                $before.class -cnotin @('absent', 'preexisting-match', 'preexisting-drift')) {
+                throw "Closing a $kind attempt with $($pair[1]) changes its class ($($before.class) -> $($after.class))."
+            }
+        }
+    }
+}
+$plan = Get-UninstallPlan @((PureRecord 1 intent file-created 'C:\u\f' $absent @{ exists = $true; sha256 = (Sha a) } $null $null),
+    (PureRecord 2 commit file-created 'C:\u\f' $absent @{ exists = $true; sha256 = (Sha a) } @{ exists = $true; sha256 = (Sha a) } $null)) @{ x = $absent }
+if (-not $plan.ok -or @($plan.steps).Count -or ($plan.resolutions | ForEach-Object { $_.resolution }) -cne 'undone') {
+    throw 'A reverted owned effect is not closed undone by the uninstall plan.'
+}
+
+# ---- Owned fonts through the effect ledger (native files and HKCU values) ----
+$fonts = @($manifest.fonts)
+if ($fonts.Count -lt 2) { throw 'The proof needs at least two selected fonts.' }
+$fontDir = $validated.fontDirectory
+$fontSubkey = 'Software\Microsoft\Windows NT\CurrentVersion\Fonts'
+$ledgerDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'windows-iac\ledger'
+function FontPath($Font) { Join-Path $fontDir $Font.file }
+function ValueName($Font) { $Font.fullName + ' (TrueType)' }
+function FontValue([string]$Name) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($fontSubkey)
+    if ($null -eq $key) { return $null }
+    try { $key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) } finally { $key.Close() }
+}
+function SetFontValue([string]$Name, $Data) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($fontSubkey)
+    try { if ($null -eq $Data) { $key.DeleteValue($Name, $false) } else { $key.SetValue($Name, $Data, [Microsoft.Win32.RegistryValueKind]::String) } }
+    finally { $key.Close() }
+}
+function FileId([string]$Path) { 'file-created:' + $Path.ToUpperInvariant() }
+function ValueId([string]$Name) { 'registry-value:' + ('HKCU\' + $fontSubkey + '|' + $Name).ToUpperInvariant() }
+function Ledger {
+    if (-not (Test-Path -LiteralPath $ledgerDir)) { return @() }
+    @(Get-ChildItem -LiteralPath $ledgerDir -Filter '*.json' | Sort-Object Name | ForEach-Object { [IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json })
+}
+function Phases([string]$Id) { @(Ledger | Where-Object { $_.id -ceq $Id } | ForEach-Object { $_.phase }) -join ',' }
+# A record the proof writes itself, in the ledger's own format and next seq, to model an interrupted run.
+function Craft([hashtable]$Fields) {
+    $seq = 1 + [long](@(Ledger | ForEach-Object { [long]$_.seq }) + 0 | Measure-Object -Maximum).Maximum
+    $entry = [ordered]@{ ledger = 'effects'; schema = 1; seq = $seq }
+    foreach ($k in 'phase', 'id', 'kind', 'target', 'name', 'prior', 'desired', 'observed', 'temp') { if ($Fields.ContainsKey($k)) { $entry[$k] = $Fields[$k] } }
+    $stream = [IO.FileStream]::new((Join-Path $ledgerDir ('{0:D8}.json' -f $seq)), [IO.FileMode]::CreateNew)
+    try { $bytes = [Text.Encoding]::UTF8.GetBytes(($entry | ConvertTo-Json -Depth 8 -Compress)); $stream.Write($bytes, 0, $bytes.Length) }
+    finally { $stream.Dispose() }
+}
+function CraftFile([string]$Path, [string]$Sha, [string[]]$Phases) {
+    $desired = @{ exists = $true; sha256 = $Sha }
+    foreach ($phase in $Phases) {
+        $fields = @{ phase = $phase; id = (FileId $Path); kind = 'file-created'; target = $Path; prior = $absent; desired = $desired }
+        if ($phase -ceq 'commit') { $fields.observed = $desired }
+        Craft $fields
+    }
+}
+function CraftValue([string]$Name, [string]$Data, [string[]]$Phases) {
+    $desired = @{ exists = $true; type = 'String'; data = $Data }
+    foreach ($phase in $Phases) {
+        $fields = @{ phase = $phase; id = (ValueId $Name); kind = 'registry-value'; target = ('HKCU\' + $fontSubkey); name = $Name
+            prior = $absent; desired = $desired }
+        if ($phase -ceq 'commit') { $fields.observed = $desired }
+        Craft $fields
+    }
+}
+function Bytes([string]$Text) { [Text.Encoding]::UTF8.GetBytes($Text) }
+function ShaOf([byte[]]$Bytes) { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes)).ToLowerInvariant() }
+function RunUninstall([switch]$Apply) { Win51 @(@('-Mode', 'Uninstall') + @(if ($Apply) { '-Apply' })) }
+function AssertEmpty {
+    foreach ($font in $fonts) {
+        if ((Test-Path -LiteralPath (FontPath $font)) -or $null -ne (FontValue (ValueName $font))) { throw "Uninstall left $($font.fullName)." }
+    }
+}
+function Snapshot {
+    [ordered]@{ ledger = @(Get-ChildItem -LiteralPath $ledgerDir -Force | ForEach-Object { "$($_.Name)=$((Get-FileHash -LiteralPath $_.FullName).Hash)" })
+        files = @($fonts | ForEach-Object { if (Test-Path -LiteralPath (FontPath $_)) { (Get-FileHash -LiteralPath (FontPath $_)).Hash } else { '-' } })
+        values = @($fonts | ForEach-Object { [string](FontValue (ValueName $_)) }) } | ConvertTo-Json -Compress
+}
+foreach ($font in $fonts) {
+    if ((Test-Path -LiteralPath (FontPath $font)) -or $null -ne (FontValue (ValueName $font))) { throw 'Proof requires a fresh disposable font target.' }
+}
+if (Test-Path -LiteralPath $ledgerDir) { throw 'Proof requires no effect ledger yet.' }
+$n = $fonts.Count
 MustReject { Run 'Test' } 'Installed bytes differ:*'
+
+# A1: one intent and one commit per owned file and value; a second Apply writes nothing.
 $first = Run 'Apply'
-if ($first.copied -lt 1) { throw 'Preexisting corruption was not repaired.' }
+if ($first.copied -ne $n -or $first.changedProperties -ne $n -or $first.recordsWritten -ne 4 * $n -or @(Ledger).Count -ne 4 * $n) {
+    throw 'The first Apply did not own each font file and value exactly once.'
+}
 $second = Run 'Apply'
-if ($second.copied -ne 0 -or $second.changedProperties -ne 0) { throw 'Second apply changed state.' }
+if ($second.copied -ne 0 -or $second.changedProperties -ne 0 -or $second.removed -ne 0 -or $second.recordsWritten -ne 0) { throw 'Second apply changed state.' }
 MustNotClaimHandoff $first
 MustNotClaimHandoff (Run 'Test')
 
-# Independent provider readback uses the generated declaration, not a second Spec.
-for ($i = 0; $i -lt $manifest.fonts.Count; $i++) {
-    $resource = $config.resources[$i].properties
-    $path = 'Registry::' + ($resource.keyPath -replace '^HKCU\\', 'HKEY_CURRENT_USER\')
-    $actual = Get-ItemPropertyValue -LiteralPath $path -Name $resource.valueName
-    if ($actual -ne (Join-Path $first.fontDirectory $manifest.fonts[$i].file)) { throw 'Independent registry readback failed.' }
+# A2: independent readback from the selection (manifest.fonts), not from win.ps1.
+foreach ($font in $fonts) {
+    if ((Get-FileHash -LiteralPath (FontPath $font)).Hash -ne $font.sha256 -or (FontValue (ValueName $font)) -cne (FontPath $font)) {
+        throw "Independent readback failed for $($font.fullName)."
+    }
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($fontSubkey)
+    try { if ([string]$key.GetValueKind((ValueName $font)) -cne 'String') { throw 'A font value is not REG_SZ.' } } finally { $key.Close() }
 }
 
-# Drift must fail specifically because DSC reports nonconvergence, not any error.
-$resource = $config.resources[0].properties
-$key = 'Registry::' + ($resource.keyPath -replace '^HKCU\\', 'HKEY_CURRENT_USER\')
-Set-ItemProperty -LiteralPath $key -Name $resource.valueName -Value 'negative-control'
+# Owned drift is repaired by reverting and owning again: a changed value, then damaged bytes (A6, owned).
+SetFontValue (ValueName $fonts[0]) 'negative-control'
 MustReject { Run 'Test' } 'Registry drift:*'
-$null = Run 'Apply'
+$fixed = Run 'Apply'
+if ($fixed.changedProperties -ne 1 -or $fixed.removed -ne 1 -or (FontValue (ValueName $fonts[0])) -cne (FontPath $fonts[0])) { throw 'Owned value drift was not repaired.' }
+if ((Phases (ValueId (ValueName $fonts[0]))) -cne 'intent,commit,undone,intent,commit') { throw 'The value repair is not recorded as undone then owned again.' }
+[IO.File]::WriteAllText((FontPath $fonts[0]), 'negative-control')
+MustReject { Run 'Test' } 'Installed bytes differ:*'
+$fixed = Run 'Apply'
+if ($fixed.copied -ne 1 -or (Get-FileHash -LiteralPath (FontPath $fonts[0])).Hash -ne $fonts[0].sha256) { throw 'Owned damaged bytes were not repaired.' }
 $null = Run 'Test'
 
 # Valid JSON with altered bytes still fails the inventory before effects.
-$path = Join-Path $PSScriptRoot 'configuration.dsc.json'
-$original = [IO.File]::ReadAllBytes($path)
+$bundleFont = Join-Path $PSScriptRoot "share/fonts/truetype/$($fonts[0].file)"
+$original = [IO.File]::ReadAllBytes($bundleFont)
 try {
-    [IO.File]::AppendAllText($path, "`n")
+    [IO.File]::AppendAllText($bundleFont, "`n")
     MustReject { Run 'Validate' } 'Bundle content mismatch:*'
 }
-finally { [IO.File]::WriteAllBytes($path, $original) }
+finally { [IO.File]::WriteAllBytes($bundleFont, $original) }
 $null = Run 'Test'
+
+# A7/A12/A13: recovery of interrupted attempts, using only what an intent named.
+# A value intent that never took effect is voided.
+CraftValue 'Proof Void (TrueType)' 'C:\proof\void.ttf' @('intent')
+# A file intent whose file appeared is committed, then collected (unselected).
+$confirmBytes = Bytes 'proof: interrupted file that took effect'
+$confirmPath = Join-Path $fontDir ((ShaOf $confirmBytes) + '.ttf')
+CraftFile $confirmPath (ShaOf $confirmBytes) @('intent')
+[IO.File]::WriteAllBytes($confirmPath, $confirmBytes)
+# A file intent that crashed after writing its named temporary file: the temp is deleted and the intent voided.
+$tempBytes = Bytes 'proof: interrupted before rename'
+$tempTarget = Join-Path $fontDir ((ShaOf $tempBytes) + '.ttf')
+$namedTemp = $tempTarget + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+Craft @{ phase = 'intent'; id = (FileId $tempTarget); kind = 'file-created'; target = $tempTarget; prior = $absent
+    desired = @{ exists = $true; sha256 = (ShaOf $tempBytes) }; temp = $namedTemp }
+[IO.File]::WriteAllBytes($namedTemp, $tempBytes[0..3])
+# A value intent that took effect is committed, then collected (unselected).
+CraftValue 'Proof Confirm (TrueType)' 'C:\proof\confirm.ttf' @('intent')
+SetFontValue 'Proof Confirm (TrueType)' 'C:\proof\confirm.ttf'
+# An owned value removed before its undone record (a crash inside Uninstall) is closed undone, then owned again.
+SetFontValue (ValueName $fonts[1]) $null
+# A temporary file no intent names is never touched (A13).
+$foreignTemp = (FontPath $fonts[0]) + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+[IO.File]::WriteAllText($foreignTemp, 'proof: not named by any intent')
+$recovered = Run 'Apply'
+if ((Phases (ValueId 'Proof Void (TrueType)')) -cne 'intent,void' -or
+    (Phases (FileId $confirmPath)) -cne 'intent,commit,undone' -or (Test-Path -LiteralPath $confirmPath) -or
+    (Phases (FileId $tempTarget)) -cne 'intent,void' -or (Test-Path -LiteralPath $namedTemp) -or
+    (Phases (ValueId 'Proof Confirm (TrueType)')) -cne 'intent,commit,undone' -or $null -ne (FontValue 'Proof Confirm (TrueType)') -or
+    (Phases (ValueId (ValueName $fonts[1]))) -cne 'intent,commit,undone,intent,commit' -or (FontValue (ValueName $fonts[1])) -cne (FontPath $fonts[1]) -or
+    -not (Test-Path -LiteralPath $foreignTemp)) {
+    throw 'Interrupted attempts were not recovered exactly as recorded.'
+}
+$null = Run 'Test'
+# A second writer and a torn highest record stop every writer before any effect.
+$lock = [IO.FileStream]::new((Join-Path $ledgerDir '.lock'), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write,
+    [IO.FileShare]::None, 1, [IO.FileOptions]::DeleteOnClose)
+try { MustReject { Run 'Apply' } 'Another run holds the effect ledger lock*'; MustReject { RunUninstall -Apply } 'Another run holds the effect ledger lock*' }
+finally { $lock.Dispose() }
+$torn = Join-Path $ledgerDir ('{0:D8}.json' -f (1 + @(Ledger).Count))
+[IO.File]::WriteAllText($torn, '{"ledger":"effe')
+MustReject { Run 'Apply' } 'Torn or unreadable ledger record*'
+[IO.File]::Delete($torn)  # the documented manual step: only the highest record, only when it does not parse
+
+# A14: a foreign value naming an owned file keeps it: Uninstall refuses as a whole, GC keeps it open.
+SetFontValue 'Proof Foreign (TrueType)' (FontPath $fonts[0])
+$before = Snapshot
+MustReject { RunUninstall -Apply } '*referenced by HKCU Fonts\Proof Foreign (TrueType)*'
+if ((Snapshot) -cne $before) { throw 'A refused Uninstall changed state.' }
+SetFontValue 'Proof Foreign (TrueType)' $null
+$oldBytes = Bytes 'proof: owned file of an older selection'
+$oldPath = Join-Path $fontDir ((ShaOf $oldBytes) + '.ttf')
+[IO.File]::WriteAllBytes($oldPath, $oldBytes)
+CraftFile $oldPath (ShaOf $oldBytes) @('intent', 'commit')
+SetFontValue 'Proof Foreign (TrueType)' $oldPath
+$kept = Run 'Apply'
+if (@($kept.gcKeptReferenced) -notcontains $oldPath -or -not (Test-Path -LiteralPath $oldPath)) { throw 'GC removed a file a foreign value names.' }
+SetFontValue 'Proof Foreign (TrueType)' $null
+$collected = Run 'Apply'
+if ((Test-Path -LiteralPath $oldPath) -or (Phases (FileId $oldPath)) -cne 'intent,commit,undone') { throw 'GC did not collect the unreferenced old file.' }
+
+# A3: a dry run lists every owned file and value and changes nothing.
+$before = Snapshot
+$dry = RunUninstall
+if (@($dry.planned).Count -ne 2 * $n -or @($dry.refused).Count -or $dry.apply -or (Snapshot) -cne $before) { throw 'The Uninstall dry run is wrong or changed state.' }
+
+# A8: a locked file fails Uninstall after the values; it stays owned and nothing is deferred.
+$handle = [IO.File]::Open((FontPath $fonts[0]), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+try { MustReject { RunUninstall -Apply } 'Could not remove*' } finally { $handle.Dispose() }
+if (-not (Test-Path -LiteralPath (FontPath $fonts[0])) -or (Phases (FileId (FontPath $fonts[0]))) -notlike '*,commit') { throw 'The locked file was not kept owned.' }
+
+# A4: Uninstall empties the owned range; everything closed reads back as its prior; a second Uninstall does nothing.
+$uninstalled = RunUninstall -Apply
+if ($uninstalled.ownedOpen -ne 0 -or $uninstalled.changedAfterClose -ne 0 -or -not $uninstalled.ledgerFound -or
+    $uninstalled.identity.sid -notmatch '^S-1-' -or $uninstalled.siloCheck -cne 'notPerformed') { throw 'Uninstall did not empty the owned range.' }
+AssertEmpty
+$again = RunUninstall -Apply
+if (@($again.planned).Count -or $again.removed -or $again.recordsWritten) { throw 'A second Uninstall changed state.' }
+
+# A5: unowned values are never written or removed; a differing one fails Apply as drift.
+SetFontValue (ValueName $fonts[0]) 'C:\proof\foreign.ttf'
+SetFontValue (ValueName $fonts[1]) (FontPath $fonts[1])
+MustReject { Run 'Apply' } 'Font drift:*'
+if ((FontValue (ValueName $fonts[0])) -cne 'C:\proof\foreign.ttf') { throw 'A differing unowned value was written.' }
+if ((Phases (ValueId (ValueName $fonts[1]))) -notlike '*,undone') { throw 'An identical unowned value was recorded as owned.' }
+MustReject { RunUninstall -Apply } '*referenced by HKCU Fonts*'
+if ((FontValue (ValueName $fonts[1])) -cne (FontPath $fonts[1])) { throw 'An identical unowned value changed.' }
+SetFontValue (ValueName $fonts[0]) $null
+SetFontValue (ValueName $fonts[1]) $null
+$null = Run 'Apply'
+$null = Run 'Test'
+$null = RunUninstall -Apply
+AssertEmpty
+
+# A10: an owned value recorded for an older selection is reverted and owned again; the old file is collected.
+$oldBytes = Bytes 'proof: font bytes of the previous release'
+$oldPath = Join-Path $fontDir ((ShaOf $oldBytes) + '.ttf')
+[IO.File]::WriteAllBytes($oldPath, $oldBytes)
+CraftFile $oldPath (ShaOf $oldBytes) @('intent', 'commit')
+CraftValue (ValueName $fonts[0]) $oldPath @('intent', 'commit')
+SetFontValue (ValueName $fonts[0]) $oldPath
+$updated = Run 'Apply'
+if ((FontValue (ValueName $fonts[0])) -cne (FontPath $fonts[0]) -or (Test-Path -LiteralPath $oldPath) -or
+    (Phases (ValueId (ValueName $fonts[0]))) -notlike '*,intent,commit,undone,intent,commit' -or
+    (Phases (FileId $oldPath)) -cne 'intent,commit,undone') { throw 'The owned value was not moved to the new selection.' }
+$null = Run 'Test'
+$final = RunUninstall -Apply
+if ($final.ownedOpen -ne 0 -or $final.changedAfterClose -ne 0) { throw 'Uninstall after an update did not return to the original prior.' }
+AssertEmpty
+if (-not (Test-Path -LiteralPath $foreignTemp)) { throw 'A temporary file no intent named was removed.' }
+[IO.File]::Delete($foreignTemp)
+
+# A11: an id this version does not handle stops Uninstall (reporting who ran it) and Apply.
+$strangerPath = Join-Path $env:RUNNER_TEMP 'proof-unhandled.bin'
+[IO.File]::WriteAllText($strangerPath, 'proof')
+$strangerSha = (Get-FileHash -LiteralPath $strangerPath).Hash.ToLowerInvariant()
+Craft @{ phase = 'intent'; id = (FileId $strangerPath); kind = 'file-created'; target = $strangerPath; prior = $absent; desired = @{ exists = $true; sha256 = $strangerSha } }
+Craft @{ phase = 'commit'; id = (FileId $strangerPath); kind = 'file-created'; target = $strangerPath; prior = $absent
+    desired = @{ exists = $true; sha256 = $strangerSha }; observed = @{ exists = $true; sha256 = $strangerSha } }
+MustReject { RunUninstall -Apply } 'Uninstall refused for S-1-*does not handle*'
+MustReject { Run 'Apply' } '*does not handle*'
 
 # Rent SSH client, bound explicitly with synthetic values (a live binding comes from envs and the rent's own host key).
 # It proves the pinned client, the generated OpenSSH configuration and the Include handling; it never connects.
 $bind = @{ Hostname = 'rent.example.invalid'; HostKey = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGNpLXN5bnRoZXRpYy1ob3N0LWtleS1ub3QtcmVhbA=='
     Identity = (Join-Path $env:RUNNER_TEMP 'rent-ci-identity') }
 [IO.File]::WriteAllText($bind.Identity, 'synthetic identity path; never used to connect')
-function RunSsh([string]$Mode, [hashtable]$With = $bind) { (& (Join-Path $PSScriptRoot 'win.ps1') -Mode $Mode @With) | ConvertFrom-Json }
+function RunSsh([string]$Mode, [hashtable]$With = $bind) {
+    Win51 @(@('-Mode', $Mode) + @($With.Keys | Sort-Object | ForEach-Object { "-$_"; [string]$With[$_] }))
+}
 $sshDir = Join-Path $env:USERPROFILE '.ssh'
 $userConfig = Join-Path $sshDir 'config'
 if (Test-Path -LiteralPath (Join-Path $sshDir 'windows-rent')) { throw 'Proof requires a fresh disposable SSH profile.' }
@@ -279,8 +516,9 @@ $null = RunSsh 'RentSsh'
 $null = RunSsh 'RentSshTest'
 
 [ordered]@{ source = $ExpectedSource; proof = 'PASS'; fonts = $first.fonts;
-    secondApplyChanges = 0; preexistingCorruptionRepaired = $true;
-    registryDriftRejected = $true; corruptionRejected = $true;
+    secondApplyChanges = 0; ownedDriftRepaired = $true; unownedDriftRefused = $true; corruptionRejected = $true
+    ledger = 'intent/commit per owned font file and value; crash recovery, lock, torn record, GC, update, Uninstall (dry run, locked file, references) proven on synthetic state'
+    uninstallEmptiedOwnedFonts = $true;
     rentSsh = "cloudflared $($manifest.cloudflared.version) client, strict config, Include preserved and idempotent, drift repaired"
     winReportsHandoffUnproven = $true; handoffProbeRefusedOnRunner = $true; handoffEvaluatorCases = $handoffCases;
-    scope = 'current-user file, registry and SSH-client convergence; not rendering, default-terminal handoff, real-host UX or a Cloudflare connection' } | ConvertTo-Json
+    scope = 'current-user owned fonts, registry and SSH-client convergence; not Restore/Uninstall of Noctty, the default terminal or packages, rendering, default-terminal handoff, real-host UX or a Cloudflare connection' } | ConvertTo-Json

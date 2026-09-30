@@ -218,10 +218,6 @@ class CompilerTests(unittest.TestCase):
         return path
 
     def inputs(self):
-        backend = self.root / "dsc.zip"
-        with zipfile.ZipFile(backend, "w") as z:
-            z.writestr("dsc.exe", "not executable: packaging fixture only")
-            z.writestr("LICENSE.txt", "test license")
         noctty = self.root / "noctty.zip"
         with zipfile.ZipFile(noctty, "w") as z:
             z.writestr("noctty/noctty.exe", "fixture application")
@@ -238,13 +234,13 @@ class CompilerTests(unittest.TestCase):
         for name in ("win.ps1", "proof.ps1", "handoff-proof.ps1", "handoff-evaluate.ps1",
                      "package-view.ps1", "README.md"):
             (scripts / name).write_text("fixture")
-        return backend, noctty, cloudflared, choices, scripts
+        return noctty, cloudflared, choices, scripts
 
     def test_distribution_is_deterministic_and_complete(self):
         fonts = self.payload()
-        backend, noctty, cloudflared, choices, scripts = self.inputs()
+        noctty, cloudflared, choices, scripts = self.inputs()
         for out in ("one", "two"):
-            pack.distribution(fonts, backend, noctty, cloudflared, choices, scripts, "a" * 40, self.root / out)
+            pack.distribution(fonts, noctty, cloudflared, choices, scripts, "a" * 40, self.root / out)
         first, second = [self.root / out / "windows-dist.zip" for out in ("one", "two")]
         self.assertEqual(first.read_bytes(), second.read_bytes())
         with zipfile.ZipFile(first) as z:
@@ -263,15 +259,17 @@ class CompilerTests(unittest.TestCase):
                 self.assertIn(name, manifest["files"])
             for name, sha in manifest["files"].items():
                 self.assertEqual(pack.hashlib.sha256(z.read(name)).hexdigest(), sha)
-            config = json.loads(z.read("configuration.dsc.json"))
-            self.assertEqual(config["resources"][0]["type"], "Microsoft.Windows/Registry")
-            self.assertIn("envvar('WINDOWS_IAC_FONT_DIR')", config["resources"][0]["properties"]["valueData"]["String"])
+            # Nix is the only authority and win.ps1 the native adapter: no DSC backend or document.
+            self.assertNotIn("backend", manifest)
+            self.assertNotIn("configuration.dsc.json", z.namelist())
+            self.assertFalse([n for n in z.namelist() if n.casefold().endswith("dsc.exe")])
+            self.assertEqual(manifest["fonts"][0]["fullName"], "Test Font")
             self.assertNotIn(str(self.root), json.dumps(manifest))
             self.assertNotIn("WinGet", json.dumps(manifest))
 
     def test_packages_need_a_valid_inventory(self):
         fonts = self.payload()
-        backend, noctty, cloudflared, choices, scripts = self.inputs()
+        noctty, cloudflared, choices, scripts = self.inputs()
         selected = json.loads(choices.read_text())
         for case, package in {"no inventory": self.lock(),
                               "no executable": self.lock(inventory=str(self.inventory({"readme": "1" * 64}))),
@@ -286,28 +284,28 @@ class CompilerTests(unittest.TestCase):
             selected["packages"] = [package]
             choices.write_text(json.dumps(selected))
             with self.subTest(case=case), self.assertRaises(ValueError):
-                pack.distribution(fonts, backend, noctty, cloudflared, choices, scripts, "test", self.root / "out")
+                pack.distribution(fonts, noctty, cloudflared, choices, scripts, "test", self.root / "out")
 
-    def test_backend_zip_traversal_fails(self):
+    def test_noctty_zip_traversal_fails(self):
         fonts = self.payload()
-        backend, noctty, cloudflared, choices, scripts = self.inputs()
-        with zipfile.ZipFile(backend, "w") as z:
-            z.writestr("../dsc.exe", "fixture")
+        noctty, cloudflared, choices, scripts = self.inputs()
+        with zipfile.ZipFile(noctty, "a") as z:
+            z.writestr("../noctty.exe", "fixture")
         with self.assertRaisesRegex(ValueError, "Unsafe"):
-            pack.distribution(fonts, backend, noctty, cloudflared, choices, scripts, "test", self.root / "out")
+            pack.distribution(fonts, noctty, cloudflared, choices, scripts, "test", self.root / "out")
 
     def test_cloudflared_must_be_selected_and_executable(self):
         fonts = self.payload()
-        backend, noctty, cloudflared, choices, scripts = self.inputs()
+        noctty, cloudflared, choices, scripts = self.inputs()
         cloudflared.write_bytes(b"#!/bin/sh\n")
         with self.assertRaisesRegex(ValueError, "not a Windows executable"):
-            pack.distribution(fonts, backend, noctty, cloudflared, choices, scripts, "test", self.root / "out")
+            pack.distribution(fonts, noctty, cloudflared, choices, scripts, "test", self.root / "out")
         cloudflared.write_bytes(b"MZ fixture")
         selected = json.loads(choices.read_text())
         del selected["cloudflared"]
         choices.write_text(json.dumps(selected))
         with self.assertRaisesRegex(ValueError, "No cloudflared version"):
-            pack.distribution(fonts, backend, noctty, cloudflared, choices, scripts, "test", self.root / "out")
+            pack.distribution(fonts, noctty, cloudflared, choices, scripts, "test", self.root / "out")
 
 
 if __name__ == "__main__":

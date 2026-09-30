@@ -1,7 +1,8 @@
-"""Compile pinned Windows selections into a portable, deterministic DSC distribution.
+"""Compile pinned Windows selections into a portable, deterministic distribution.
 
 This module does not choose products, versions, URLs, or host/site values.
-Those inputs belong to nix.nix; Windows effects belong to win.ps1.
+Those inputs belong to nix.nix; Windows effects belong to win.ps1, the native
+activation adapter.
 """
 from __future__ import annotations
 
@@ -77,21 +78,6 @@ def prepare_fonts(policy: list[dict], out: Path) -> None:
     if not entries:
         raise ValueError("An empty selection cannot prove activation")
     write_json(out / "fonts.json", entries)
-
-
-def configuration(entries: list[dict]) -> dict:
-    return {
-        "$schema": "https://aka.ms/dsc/schemas/v3/bundled/config/document.json",
-        "resources": [{
-            "name": entry["fullName"],
-            "type": "Microsoft.Windows/Registry",
-            "properties": {
-                "keyPath": "HKCU\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts",
-                "valueName": entry["fullName"] + " (TrueType)",
-                "valueData": {"String": "[concat(envvar('WINDOWS_IAC_FONT_DIR'), '\\', '" + entry["file"] + "')]"},
-            },
-        } for entry in entries],
-    }
 
 
 PACKAGE_KEYS = {"name", "version", "url", "format", "size", "sha256", "scope", "effect", "directory",
@@ -287,7 +273,7 @@ def archive(root: Path, destination: Path) -> None:
             result.writestr(info, path.read_bytes(), compresslevel=9)
 
 
-def distribution(fonts: Path, backend: Path, noctty: Path, cloudflared: Path, choices: Path,
+def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
                  scripts: Path, source: str, out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
     selected = json.loads(choices.read_text(encoding="utf-8"))
@@ -305,28 +291,15 @@ def distribution(fonts: Path, backend: Path, noctty: Path, cloudflared: Path, ch
         entries = json.loads((fonts / "fonts.json").read_text(encoding="utf-8"))
         if not entries:
             raise ValueError("Empty font payload")
-        with zipfile.ZipFile(backend) as upstream:
-            seen = set()
-            for entry in upstream.infolist():
-                name = relative(entry.filename)
-                if name.casefold() in seen or (entry.external_attr >> 16) & 0o170000 == 0o120000:
-                    raise ValueError(f"Duplicate path or symlink in backend: {name}")
-                seen.add(name.casefold())
-                upstream.extract(entry, root / "backend")
-        executables = list((root / "backend").rglob("dsc.exe"))
-        if len(executables) != 1:
-            raise ValueError("Expected exactly one pinned dsc.exe")
         for name in ("win.ps1", "proof.ps1", "handoff-proof.ps1", "handoff-evaluate.ps1",
                      "package-view.ps1", "README.md"):
             shutil.copyfile(scripts / name, root / name)
-        write_json(root / "configuration.dsc.json", configuration(entries))
         (root / "payload").mkdir()
         shutil.copyfile(noctty, root / "payload/noctty.zip")
         # The pinned official client, installed only by the explicit RentSsh mode, never by Restore.
         shutil.copyfile(cloudflared, root / "payload/cloudflared.exe")
         files = {p.relative_to(root).as_posix(): digest(p) for p in sorted(root.rglob("*")) if p.is_file()}
-        write_json(root / "manifest.json", {"schemaVersion": 3, "source": source,
-                   "backend": executables[0].relative_to(root).as_posix(), "fonts": entries,
+        write_json(root / "manifest.json", {"schemaVersion": 3, "source": source, "fonts": entries,
                    "noctty": {"version": selected["noctty"]["version"],
                               "fontFamily": selected["noctty"]["fontFamily"],
                               "files": noctty_files},
@@ -345,7 +318,7 @@ if __name__ == "__main__":
     font_parser.add_argument("policy", type=Path)
     font_parser.add_argument("out", type=Path)
     dist_parser = sub.add_parser("dist")
-    for argument in ("fonts", "backend", "noctty", "cloudflared", "choices", "scripts"):
+    for argument in ("fonts", "noctty", "cloudflared", "choices", "scripts"):
         dist_parser.add_argument(argument, type=Path)
     dist_parser.add_argument("source")
     dist_parser.add_argument("out", type=Path)
@@ -362,5 +335,5 @@ if __name__ == "__main__":
     elif args.command == "inventory":
         package_inventory(args.lock, args.archive, args.listing, args.tree, args.out)
     else:
-        distribution(args.fonts, args.backend, args.noctty, args.cloudflared, args.choices,
+        distribution(args.fonts, args.noctty, args.cloudflared, args.choices,
                      args.scripts, args.source, args.out)
