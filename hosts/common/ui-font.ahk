@@ -16,7 +16,7 @@ Values := Map("caption", "CaptionFont", "smCaption", "SmCaptionFont", "menu", "M
     "message", "MessageFont", "icon", "IconFont")
 Order := ["caption", "smCaption", "menu", "status", "message", "icon"]
 Metrics := "HKCU\Control Panel\Desktop\WindowMetrics"
-OnError((failure, *) => Done(1, "", failure.Message))  ; never an error dialog: the caller has no window
+OnError((failure, *) => Done(1, "", Describe(failure)))  ; never an error dialog: the caller has no window
 
 try {
     if A_Args.Length = 1 && A_Args[1] == "get"
@@ -25,8 +25,12 @@ try {
         SetFaces(A_Args[2])
     Done(1, "", "usage: get | set <face> <slot>=<expected face>...")
 } catch as failure {
-    Done(1, "", failure.Message)
+    Done(1, "", Describe(failure))
 }
+
+; One line for the caller's stderr: the error, what raised it, and where.
+Describe(failure) => !(failure is Error) ? "thrown: " String(failure)
+    : failure.Message (failure.What != "" ? " (" failure.What ")" : "") " at " failure.File ":" failure.Line
 
 Done(code, out, err := "") {
     if out != ""
@@ -63,17 +67,17 @@ Hex(buffer, at, length) {
 }
 
 ; lfFaceName is WCHAR[32] at byte 28 of the 92-byte LOGFONTW: hex characters 57 to 184.
-FaceOf(hex) {
+FaceOf(logfontHex) {
     face := ""
     loop 32 {
-        unit := Integer("0x" SubStr(hex, 57 + (A_Index - 1) * 4 + 2, 2) SubStr(hex, 57 + (A_Index - 1) * 4, 2))
+        unit := Integer("0x" SubStr(logfontHex, 57 + (A_Index - 1) * 4 + 2, 2) SubStr(logfontHex, 57 + (A_Index - 1) * 4, 2))
         if !unit
             break
         face .= Chr(unit)
     }
     return face
 }
-Rest(hex) => SubStr(hex, 1, 56) SubStr(hex, 185)
+Rest(logfontHex) => SubStr(logfontHex, 1, 56) SubStr(logfontHex, 185)
 
 PutFace(live, slot, face) {
     buffer := slot == "icon" ? live.icon : live.ncm, at := Offsets[slot] + 28
@@ -88,10 +92,10 @@ Snapshot(live) {
     slots := Map(), others := Map()
     for slot in Order {
         buffer := slot == "icon" ? live.icon : live.ncm
-        hex := Hex(buffer, Offsets[slot], 92)
+        fontHex := Hex(buffer, Offsets[slot], 92)  ; not "hex": names ignore case, so a local hex would shadow Hex()
         persisted := ""
         try persisted := StrUpper(RegRead(Metrics, Values[slot]))
-        slots[slot] := {face: FaceOf(hex), live: hex, persisted: persisted}
+        slots[slot] := {face: FaceOf(fontHex), live: fontHex, persisted: persisted}
     }
     loop reg, Metrics, "V" {
         if !IsFontValue(A_LoopRegName)
