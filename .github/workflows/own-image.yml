@@ -185,7 +185,11 @@ jobs:
           image=$(docker image inspect ghcr.io/roccho-dev/windows-own:nix --format '{{.Id}}')
           next=$(docker image inspect ghcr.io/roccho-dev/windows-own:next --format '{{.Id}}')
           d="$(mktemp -d)"
-          trap 'status=$?; [ "$status" -eq 0 ] || docker logs own-smoke 2>&1 | tail -n 40 || true; docker rm -f own-smoke own-hold >/dev/null 2>&1 || true; docker volume rm own-smoke-home own-smoke-work own-smoke-nix own-smoke-empty own-smoke-foreign >/dev/null 2>&1 || true; rm -rf "$d"' EXIT
+          # Every file this step writes under $d; the exit trap removes exactly these, then the empty directory.
+          d_files=(after head1 key key.pub known_hosts out)
+          # Removes one of those regular files; a link or other type is kept and fails the step.
+          plain() { if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then echo "kept unexpected entry $1" >&2; return 1; fi; rm -f -- "$1"; }
+          trap 'status=$?; [ "$status" -eq 0 ] || docker logs own-smoke 2>&1 | tail -n 40 || true; docker rm -f own-smoke own-hold >/dev/null 2>&1 || true; docker volume rm own-smoke-home own-smoke-work own-smoke-nix own-smoke-empty own-smoke-foreign >/dev/null 2>&1 || true; for f in "${d_files[@]}"; do plain "$d/$f" || exit 1; done; rmdir -- "$d" || { echo "kept $d: unexpected entries" >&2; exit 1; }' EXIT
           fail() { echo "FAIL $*" >&2; exit 1; }
           ssh-keygen -q -t ed25519 -N '' -f "$d/key"
           for v in home work nix empty foreign; do docker volume create "own-smoke-$v" >/dev/null; done
@@ -211,6 +215,14 @@ jobs:
           seed "$image" nix | grep -qE "^own-nix-seed ok volume=own-smoke-nix roots=$roots copied=[1-9][0-9]*$" || fail 'fresh seed'
           test "$(docker run --rm -v own-smoke-nix:/n "$image" /bin/ls -A /n | tr '\n' ' ')" = 'store var ' || fail 'unexpected top-level entries'
           seed "$image" nix | grep -qxF "own-nix-seed ok volume=own-smoke-nix roots=$roots copied=0" || fail 'reseed was not a no-op'
+          # An interrupted copy leaves its staging directory: the seed refuses, writes nothing and never deletes it.
+          docker run --rm -v own-smoke-nix:/n "$image" /bin/bash -c 'install -d -m 700 /n/.own-seed.interrupt && echo foreign > /n/.own-seed.interrupt/partial'
+          before=$(listing)
+          if seed "$image" nix > "$d/out" 2>&1; then fail 'seeded over an interrupted staging directory'; fi
+          grep -qF '/seed/.own-seed.interrupt is left from an interrupted seed; not deleting it' "$d/out" || fail 'interrupted staging refusal'
+          test "$(listing)" = "$before" || fail 'a seed refused for an interrupted staging directory wrote'
+          docker run --rm -v own-smoke-nix:/n "$image" /bin/bash -c 'f=/n/.own-seed.interrupt/partial; [ -f $f ] && [ ! -L $f ] && [ "$(cat $f)" = foreign ] && rm -- $f && rmdir -- ${f%/*}'
+          seed "$image" nix | grep -qxF "own-nix-seed ok volume=own-smoke-nix roots=$roots copied=0" || fail 'seed after inspecting the staging directory'
           docker run --rm -v own-smoke-foreign:/f "$image" /bin/bash -c 'echo x > /f/x'
           if seed "$image" foreign > "$d/out" 2>&1; then fail 'seeded a foreign volume'; fi
           grep -qF '/seed is neither empty nor an own /nix volume' "$d/out" || fail 'foreign volume refusal'

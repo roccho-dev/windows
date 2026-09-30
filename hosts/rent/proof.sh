@@ -14,12 +14,18 @@ p="rent-dev-proof-$$"
 c=$p
 repos=$p-repos state=$p-state nixv=$p-nix empty=$p-empty
 evidence=$(mktemp -d)
+# Every file this proof writes under $evidence; cleanup removes exactly these, then the empty directories.
+dist_files=(windows-dist.zip windows-dist.zip.sha256 packages.dsc.json manifest.json)
+# Removes one of those regular files; a link or other type is kept and fails.
+plain() { if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then echo "kept unexpected entry $1" >&2; return 1; fi; rm -f -- "$1"; }
 cleanup() {
   code=$?
   if [ "$code" -ne 0 ]; then docker logs "$c" 2>&1 | tail -n 60 || true; fi
   docker rm -f "$c" >/dev/null 2>&1 || true
   docker volume rm "$repos" "$state" "$nixv" "$empty" >/dev/null 2>&1 || true
-  rm -rf "$evidence"
+  for f in empty seed seed1 partial "${dist_files[@]/#/dist/}"; do plain "$evidence/$f" || code=1; done
+  if [ -d "$evidence/dist" ]; then rmdir -- "$evidence/dist" || code=1; fi
+  rmdir -- "$evidence" || { echo "kept $evidence: unexpected entries" >&2; code=1; }
   exit "$code"
 }
 trap cleanup EXIT
@@ -76,7 +82,15 @@ if docker run --rm --name "$c" -v "$repos:/work/repos" -v "$state:/var/lib/rent"
 fi
 grep -qF "rent-nix: this image is not seeded into $nixv" "$evidence/partial" || fail 'partial seed not refused'
 seed "$base" | grep -qxF "rent-nix-seed ok volume=$nixv roots=$base_roots copied=0" || fail 'completing a partial seed'
-echo 'PASS seed (empty /nix cannot start; refusals write nothing; fresh, idempotent and partial-complete seed)'
+# An interrupted copy leaves its staging directory: the seed refuses, writes nothing and never deletes it.
+docker run --rm -v "$nixv:/seed" "$base" /bin/bash -c 'install -d -m 700 /seed/.rent-seed.interrupt && echo foreign > /seed/.rent-seed.interrupt/partial'
+listing() { docker run --rm -v "$nixv:/n" "$base" /bin/bash -c 'cd /n && find . -printf "%p %s %T@\n" | LC_ALL=C sort | sha256sum'; }
+before=$(listing)
+seed_refused '/seed/.rent-seed.interrupt is left from an interrupted seed; not deleting it' -v "$nixv:/seed" -e "RENT_NIX_VOLUME=$nixv"
+test "$(listing)" = "$before" || fail 'a seed refused for an interrupted staging directory wrote'
+docker run --rm -v "$nixv:/seed" "$base" /bin/bash -c 'f=/seed/.rent-seed.interrupt/partial; [ -f $f ] && [ ! -L $f ] && [ "$(cat $f)" = foreign ] && rm -- $f && rmdir -- ${f%/*}'
+seed "$base" | grep -qxF "rent-nix-seed ok volume=$nixv roots=$base_roots copied=0" || fail 'seed after inspecting the staging directory'
+echo 'PASS seed (empty /nix cannot start; refusals write nothing; fresh, idempotent and partial-complete seed; interrupted staging kept and refused)'
 
 start() {
   docker run -d --name "$c" --network "$2" -v "$repos:/work/repos" -v "$state:/var/lib/rent" --mount "$(nixmount "$nixv")" \
@@ -118,7 +132,9 @@ build() {
   dev 'cd repo; nix build $1 --no-write-lock-file .#windows-dist .#checks.x86_64-linux.windows-dist --out-link ../dist' _ "$opts"
   # The exact archive and its packer-written checksum leave the container byte for byte; the runner verifies and
   # reads them with its own tools, so no flake registry, network or test-only package is involved.
-  rm -rf "$evidence/dist" && mkdir "$evidence/dist"
+  for f in "${dist_files[@]}"; do plain "$evidence/dist/$f" || fail "unexpected entry in the evidence dist directory"; done
+  mkdir -p "$evidence/dist"
+  test -z "$(ls -A "$evidence/dist")" || fail 'unexpected entries in the evidence dist directory'
   for f in windows-dist.zip windows-dist.zip.sha256; do
     docker exec "$c" /bin/cat "/work/repos/proof/dist/$f" > "$evidence/dist/$f"
   done

@@ -336,7 +336,12 @@ jobs:
           docker load < result
           docker load < result-1
           key_dir="$(mktemp -d)"
-          trap 'status=$?; [ "$status" -eq 0 ] || { docker logs rent-smoke 2>&1 | tail -n 40; docker logs rent-cand 2>&1 | tail -n 40; } || true; docker rm -f rent-smoke rent-refuse rent-cand >/dev/null 2>&1 || true; docker volume rm rent-smoke-repos rent-smoke-state rent-smoke-nix rent-smoke-home rent-smoke-old rent-smoke-import >/dev/null 2>&1 || true; rm -rf "$key_dir"' EXIT
+          # Every file this step writes under $key_dir; the exit trap removes exactly these, then the empty directory.
+          key_files=(answer cand cand-visible cf-help cf-version closure cmdlines gate gh host.pub import imported key key.pub
+            known_hosts logs modes mountinfo mountlib.sh procs refuse start-real start-stub visible)
+          # Removes one of those regular files; a link or other type is kept and fails the step.
+          plain() { if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then echo "kept unexpected entry $1" >&2; return 1; fi; rm -f -- "$1"; }
+          trap 'status=$?; [ "$status" -eq 0 ] || { docker logs rent-smoke 2>&1 | tail -n 40; docker logs rent-cand 2>&1 | tail -n 40; } || true; docker rm -f rent-smoke rent-refuse rent-cand >/dev/null 2>&1 || true; docker volume rm rent-smoke-repos rent-smoke-state rent-smoke-nix rent-smoke-home rent-smoke-old rent-smoke-import >/dev/null 2>&1 || true; for f in "${key_files[@]}"; do plain "$key_dir/$f" || exit 1; done; rmdir -- "$key_dir" || { echo "kept $key_dir: unexpected entries" >&2; exit 1; }' EXIT
           test "$(docker image inspect --format '{{json .Config.Volumes}}' "$image")" = null
           test "$(docker image inspect --format '{{json .Config.Volumes}}' "$real")" = null
           # The stub image differs from the published one only in the cloudflared store path rent-start runs.
@@ -359,11 +364,21 @@ jobs:
           if docker run --rm "$real" /bin/grep -qi tailscale /bin/rent-start; then echo 'rent-start mentions tailscale' >&2; exit 1; fi
           # A synthetic token: random, so any appearance in output is a leak. It proves nothing about Cloudflare.
           tok="ci-synthetic-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-          # slot VOLUME MODE OWNER CONTENT-COMMAND: (re)place the token slot as envs would, through a one-shot container.
+          # slot VOLUME PRIOR MODE OWNER CONTENT-COMMAND: (re)place the token slot as envs would, through a one-shot
+          # container. PRIOR is what the previous case left (absent, file, link to /etc/hostname, or empty dir); only that
+          # is removed, and anything else (a FIFO, another link, a non-empty dir) is kept and the slot fails.
           slot() {
             docker run --rm -v "$1:/s" -e "TOK=$tok" "$image" /bin/bash -c "set -eu
-              rm -rf /s/cloudflared/token; install -d -m 700 -o 0 -g 0 /s/cloudflared; $4
-              if [ -e /s/cloudflared/token ] && [ ! -L /s/cloudflared/token ]; then chmod $2 /s/cloudflared/token; chown $3 /s/cloudflared/token; fi"
+              t=/s/cloudflared/token
+              case $2 in
+                absent) if [ -e \$t ] || [ -L \$t ]; then echo 'token slot: unexpected entry kept' >&2; exit 1; fi ;;
+                file) if [ -L \$t ] || [ ! -f \$t ]; then echo 'token slot: not the expected file; kept' >&2; exit 1; fi; rm -f \$t ;;
+                link) if [ \"\$(readlink \$t || true)\" != /etc/hostname ]; then echo 'token slot: not the expected link; kept' >&2; exit 1; fi; rm -f \$t ;;
+                dir) if [ -L \$t ] || [ ! -d \$t ] || [ -n \"\$(ls -A \$t)\" ]; then echo 'token slot: not the expected empty directory; kept' >&2; exit 1; fi; rmdir \$t ;;
+                *) exit 2 ;;
+              esac
+              install -d -m 700 -o 0 -g 0 /s/cloudflared; $5
+              if [ -e /s/cloudflared/token ] && [ ! -L /s/cloudflared/token ]; then chmod $3 /s/cloudflared/token; chown $4 /s/cloudflared/token; fi"
           }
           ssh-keygen -q -t ed25519 -N '' -f "$key_dir/key"
           docker volume create rent-smoke-repos
@@ -447,6 +462,17 @@ jobs:
           if grep -q synthetic "$key_dir/import"; then echo 'import printed file contents' >&2; exit 1; fi
           # An identical rerun (as after an interruption) is a no-op; a differing target is never overwritten.
           state_import :ro > /dev/null
+          # A staging directory left by an interrupted import is refused before any write and never deleted.
+          import_listing() { docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c 'cd /s && find . -printf "%p %s %T@\n" | LC_ALL=C sort | sha256sum'; }
+          docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c \
+            'install -d -m 700 /s/dev/codex/.import-auth.json.interrupt && echo foreign > /s/dev/codex/.import-auth.json.interrupt/auth.json'
+          before=$(import_listing)
+          if state_import :ro > "$key_dir/import" 2>&1; then echo 'imported over an interrupted staging directory' >&2; exit 1; fi
+          grep -qF '/var/lib/rent/dev/codex/.import-auth.json.interrupt is left from an interrupted import; not deleting it' "$key_dir/import"
+          test "$(import_listing)" = "$before"
+          docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c \
+            'f=/s/dev/codex/.import-auth.json.interrupt/auth.json; [ -f $f ] && [ ! -L $f ] && [ "$(cat $f)" = foreign ] && rm -- $f && rmdir -- ${f%/*}'
+          state_import :ro > /dev/null
           docker run --rm -v rent-smoke-old:/o "$image" /bin/bash -c 'echo changed >> /o/.codex/auth.json'
           if state_import :ro > "$key_dir/import" 2>&1; then echo 'overwrote a differing target' >&2; exit 1; fi
           grep -qF 'already exists and differs from its source' "$key_dir/import"
@@ -486,7 +512,7 @@ jobs:
               echo 'tailscale present' >&2; exit 1
             fi
           }
-          slot rent-smoke-state 600 0:0 'printf "%s\n" "$TOK" > /s/cloudflared/token'
+          slot rent-smoke-state absent 600 0:0 'printf "%s\n" "$TOK" > /s/cloudflared/token'
           run "${env_args[@]}"
           for attempt in {1..30}; do
             if docker exec rent-smoke /bin/cat /var/lib/rent/ssh/ssh_host_ed25519_key.pub > "$key_dir/host.pub" 2>/dev/null; then break; fi
@@ -617,14 +643,30 @@ jobs:
             if grep -qE 'rent-transport ok|rent-start ok|tunnel|sshd' "$key_dir/gate"; then echo "a service started despite: $want" >&2; exit 1; fi
             if grep -qF "$tok" "$key_dir/gate"; then echo "token printed for: $want" >&2; exit 1; fi
           }
-          gate 'is missing' 600 0:0 ':'
-          gate 'must be a regular file' 600 0:0 'ln -s /etc/hostname /s/cloudflared/token'
-          gate 'must be a regular file' 600 0:0 'mkdir /s/cloudflared/token'
-          gate 'must be owned 0:0 with mode 600' 644 0:0 'printf "%s\n" "$TOK" > /s/cloudflared/token'
-          gate 'must be owned 0:0 with mode 600' 600 1000:1000 'printf "%s\n" "$TOK" > /s/cloudflared/token'
-          gate 'must hold 1 to 4096 bytes' 600 0:0 ': > /s/cloudflared/token'
-          gate 'must hold 1 to 4096 bytes' 600 0:0 'head -c 4097 /dev/zero | tr "\0" x > /s/cloudflared/token'
-          gate 'is blank' 600 0:0 'printf "  \n\t\n" > /s/cloudflared/token'
+          # Each case names what the previous one left in the slot.
+          gate 'is missing' file 600 0:0 ':'
+          gate 'must be a regular file' absent 600 0:0 'ln -s /etc/hostname /s/cloudflared/token'
+          gate 'must be a regular file' link 600 0:0 'mkdir /s/cloudflared/token'
+          gate 'must be owned 0:0 with mode 600' dir 644 0:0 'printf "%s\n" "$TOK" > /s/cloudflared/token'
+          gate 'must be owned 0:0 with mode 600' file 600 1000:1000 'printf "%s\n" "$TOK" > /s/cloudflared/token'
+          gate 'must hold 1 to 4096 bytes' file 600 0:0 ': > /s/cloudflared/token'
+          gate 'must hold 1 to 4096 bytes' file 600 0:0 'head -c 4097 /dev/zero | tr "\0" x > /s/cloudflared/token'
+          gate 'is blank' file 600 0:0 'printf "  \n\t\n" > /s/cloudflared/token'
+          # The slot keeps what it did not expect and fails: a FIFO, a link to another target, a non-empty directory.
+          # Each foreign entry is made by the test, checked unchanged, then removed by the test by its exact type.
+          kept() {
+            if slot rent-smoke-state "$1" 600 0:0 ':' > "$key_dir/gate" 2>&1; then echo "token slot removed $2" >&2; exit 1; fi
+            grep -qF 'token slot:' "$key_dir/gate"
+            docker run --rm -v rent-smoke-state:/s "$image" /bin/bash -c "set -eu; t=/s/cloudflared/token; $3"
+          }
+          slot rent-smoke-state file 600 0:0 'mkfifo /s/cloudflared/token'
+          kept absent 'a FIFO' '[ -p $t ]'
+          kept file 'a FIFO' '[ -p $t ] && rm -f $t'
+          slot rent-smoke-state absent 600 0:0 'ln -s /etc/passwd /s/cloudflared/token'
+          kept link 'a foreign link' '[ "$(readlink $t)" = /etc/passwd ] && rm -f $t'
+          slot rent-smoke-state absent 600 0:0 'mkdir /s/cloudflared/token && echo foreign > /s/cloudflared/token/f'
+          kept dir 'a non-empty directory' '[ "$(cat $t/f)" = foreign ] && rm -f $t/f && rmdir $t'
+          slot rent-smoke-state absent 600 0:0 ':'
       - name: Prove rent development continues across seed, upgrade, replacement, GC and rollback
         run: |
           set -euo pipefail

@@ -169,7 +169,17 @@ try {
     }
     $read = Get-Content -LiteralPath $readerAnswer -Raw | ConvertFrom-Json
     if ((@($read.PSObject.Properties.Name) -join ',') -ne 'console,terminal') { throw 'The package reader answer has the wrong shape.' }
-} finally { Remove-Item -LiteralPath $readerDir -Recurse -Force }
+} finally {
+    # Exactly the reader's known files, then the directory itself, never recursively: anything else keeps it and fails.
+    foreach ($name in 'view.ps1', 'view.json', 'view.json.partial') {
+        $path = Join-Path $readerDir $name
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        if ($null -eq $item) { continue }
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Kept unexpected entry $path." }
+        [IO.File]::Delete($path)
+    }
+    [IO.Directory]::Delete($readerDir, $false)
+}
 $handoffCases++
 $manifest = Get-Content (Join-Path $PSScriptRoot 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
 $config = Get-Content (Join-Path $PSScriptRoot 'configuration.dsc.json') -Raw -Encoding utf8 | ConvertFrom-Json
