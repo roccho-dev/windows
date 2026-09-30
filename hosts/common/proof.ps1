@@ -57,6 +57,22 @@ function MustReject([scriptblock]$Action, [string]$Pattern) {
 }
 $validated = Run 'Validate'
 if ($validated.source -ne $ExpectedSource -or $ExpectedSource -notmatch '^[0-9a-f]{40}$') { throw 'Source mismatch.' }
+# An app appearance is optional: the same bundle validates with apps that have none, and with no apps at all. A copy of the
+# listed files gets each variant's manifest.json (outside the inventory), run as the real one is (5.1, -File).
+foreach ($variant in 'without appearance', 'without apps') {
+    $copy = Join-Path $env:RUNNER_TEMP ('optional-apps-' + [guid]::NewGuid().ToString('N'))
+    $variantManifest = Get-Content (Join-Path $PSScriptRoot 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    foreach ($name in $variantManifest.files.PSObject.Properties.Name) {
+        $target = Join-Path $copy $name
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination $target
+    }
+    $variantManifest.apps = if ($variant -ceq 'without apps') { @() } else { @($variantManifest.apps | ForEach-Object { $_.PSObject.Properties.Remove('appearance'); $_ }) }
+    [IO.File]::WriteAllText((Join-Path $copy 'manifest.json'), ($variantManifest | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+    $variantLines = @(& $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $copy 'win.ps1') -Mode Validate 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw "win.ps1 -Mode Validate fails $variant`: $($variantLines -join ' ')" }
+    Write-Host "Validate $variant`: exit 0"
+}
 # The run identity is a record, not text (a [string] script parameter of the same name once flattened it).
 if ($validated.identity.sid -notmatch '^S-1-' -or $validated.identity.elevated -isnot [bool]) { throw 'win.ps1 reported no run identity record.' }
 # No win.ps1 mode may claim a real default-terminal handoff, and the host-only
@@ -293,7 +309,9 @@ Must ((Get-AppAction @() $app) -ceq 'install' -and (Get-AppAction @(@{ name = 'O
 # existing theme gets its three font leaves and loses only the Faces it has; the undo removes a created theme only
 # while nobody changed it, and otherwise restores each leaf, keeping a recoloured theme valid; everything else of the
 # user config is compared, the font leaves aside.
-$appearance = @($manifest.apps | Where-Object { $null -ne $_.PSObject.Properties['appearance'] })[0].appearance
+$appearanceApp = @($manifest.apps) | Where-Object { $null -ne $_.PSObject.Properties['appearance'] } | Select-Object -First 1
+if ($null -eq $appearanceApp) { throw 'The proof needs the ChatGPT app''s appearance in the manifest.' }
+$appearance = $appearanceApp.appearance
 $plexCss, $monoCss = '"IBM Plex Sans JP"', '"PlemolJP Console NF"'
 $appFonts = [ordered]@{ ui = $plexCss; code = $monoCss; content = $plexCss }
 Must ($appearance.fonts.ui -ceq $plexCss -and $appearance.fonts.content -ceq $plexCss -and $appearance.fonts.code -ceq $monoCss -and
@@ -358,6 +376,14 @@ $caseKeys = [Collections.Generic.Dictionary[string, object]]::new([StringCompare
 Must ((Get-AppConfigRest $fontOnly $keys @('appearanceLightChromeTheme')) -ceq $restBefore -and (Get-AppConfigRest $reordered $keys @()) -ceq $restBefore -and
     (Get-AppConfigRest $fontOnly $keys @()) -cne $restBefore -and (Get-AppConfigRest $otherLeaf $keys @()) -cne $restBefore -and (Get-AppConfigRest $mode $keys @()) -cne $restBefore -and
     (ConvertTo-CanonicalJson $caseKeys) -ceq '{"A":2,"a":3,"b":1}') 'app config rest: only the font leaves and a created theme are set aside'
+# Numbers compare by kind and exact value: floats round-trip ('R', not G15), 60 is not 60.0, int64 max stays exact; the
+# layers' serde numbers keep integer or float and their range.
+function SerdeNumber([string]$Text) { ConvertFrom-LayerNumbers ('{"$serde_json::private::Number":"' + $Text + '"}' | ConvertFrom-Json) }
+Must ((ConvertTo-CanonicalJson (0.1 + 0.2)) -cne (ConvertTo-CanonicalJson 0.3) -and (ConvertTo-CanonicalJson 60) -ceq '60' -and (ConvertTo-CanonicalJson 60.0) -ceq '60.0' -and
+    (ConvertTo-CanonicalJson ([long]::MaxValue)) -ceq '9223372036854775807' -and (ConvertTo-CanonicalJson ([double][long]::MaxValue)) -cne '9223372036854775807' -and
+    (ConvertTo-CanonicalJson (SerdeNumber '60')) -ceq '60' -and (ConvertTo-CanonicalJson (SerdeNumber '60.0')) -ceq '60.0' -and
+    (ConvertTo-CanonicalJson (SerdeNumber '9223372036854775807')) -ceq '9223372036854775807' -and (ConvertTo-CanonicalJson (SerdeNumber '18446744073709551615')) -ceq '18446744073709551615' -and
+    (ConvertTo-CanonicalJson (SerdeNumber '0.30000000000000004')) -ceq (ConvertTo-CanonicalJson (0.1 + 0.2)) -and (ConvertTo-CanonicalJson ([decimal]::Parse('60.0', [Globalization.CultureInfo]::InvariantCulture))) -ceq '60.0') 'canonical numbers keep kind and exact value'
 Must ((@(Get-CssFamilies '"IBM Plex Sans JP", ''Segoe UI'' , monospace') -join '|') -ceq 'IBM Plex Sans JP|Segoe UI|monospace') 'CSS families of an app font'
 # P1b-lite: the plan groups the ledger by id in one pass and validates each id once (Get-EffectAttempt), with the
 # plan unchanged: interleaved attempts; a reverted and a voided id kept; a malformed id refused; ids that differ
@@ -2030,12 +2056,29 @@ function UiOnlyFaces($Before, [string[]]$Slots, [string]$Face) {
     foreach ($name in @($Before.Keys) + @($now.Keys)) { if (@($uiValues.Values) -notcontains $name -and $Before[$name] -cne $now[$name]) { return $false } }
     return $true
 }
+# Fixture (this runner only; restored after A27): every persisted font gets lfQuality 5, as on a real host whose SPI GET
+# reports 0 for the same fonts. Setting faces must keep both, and must not treat the difference as drift.
+function HexQuality([string]$Hex) { $Hex.Substring(52, 2) }
+function HexNoQuality([string]$Hex) { $r = HexRest $Hex; $r.Substring(0, 52) + $r.Substring(54) }
+function SetSlotHex([string]$Slot, [string]$Hex) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Control Panel\Desktop\WindowMetrics', $true)
+    try { $key.SetValue($uiValues[$Slot], [Convert]::FromHexString($Hex), [Microsoft.Win32.RegistryValueKind]::Binary) } finally { $key.Close() }
+}
+$uiOriginal = Metrics
+foreach ($slot in $uiSlots) { $hex = SlotHex $uiOriginal $slot; SetSlotHex $slot ($hex.Substring(0, 52) + '05' + $hex.Substring(54)) }
 $uiBefore = Metrics
 $uiGet = UiRun @('get')
 $uiLive = if ($uiGet.exit -eq 0) { $uiGet.stdout | ConvertFrom-Json } else { $null }
-Write-Host "A31 baseline: $(@($uiSlots | ForEach-Object { "$_='$(HexFace (SlotHex $uiBefore $_))'" }) -join ', '); get exit $($uiGet.exit) $(Tail $uiGet.stderr)"
+function LiveKept {
+    $now = UiRun @('get')
+    if ($now.exit -ne 0) { return $false }
+    $slots = ($now.stdout | ConvertFrom-Json).slots
+    -not @($uiSlots | Where-Object { (HexRest $slots.$_.live) -cne (HexRest $uiLive.slots.$_.live) }).Count
+}
+Write-Host "A31 baseline: $(@($uiSlots | ForEach-Object { "$_='$(HexFace (SlotHex $uiBefore $_))' quality persisted $(HexQuality (SlotHex $uiOriginal $_))->$(HexQuality (SlotHex $uiBefore $_)) live $(if ($null -ne $uiLive) { HexQuality $uiLive.slots.$_.live })" }) -join ', '); get exit $($uiGet.exit) $(Tail $uiGet.stderr)"
 Must ($null -ne $uiLive -and -not @($uiSlots | Where-Object { $s = $uiLive.slots.$_
-        $s.persisted -cne (SlotHex $uiBefore $_) -or (HexRest $s.live) -cne (HexRest $s.persisted) -or $s.face -cne (HexFace $s.persisted) }).Count) 'A31: ui-font.ahk get reads each live LOGFONTW, equal to its persisted value but for nothing (offsets and DPI agree)'
+        $s.persisted -cne (SlotHex $uiBefore $_) -or (HexNoQuality $s.live) -cne (HexNoQuality $s.persisted) -or $s.face -cne (HexFace $s.persisted) -or
+        (HexQuality $s.persisted) -cne '05' -or (HexQuality $s.live) -cnotin @('00', '05') }).Count) 'A31: ui-font.ahk get reads each live LOGFONTW, equal to its persisted value but for lfQuality (offsets and DPI agree)'
 $uiBase = @{}
 foreach ($slot in $uiSlots) { $uiBase[$slot] = HexFace (SlotHex $uiBefore $slot) }
 if (@($uiBase.Values) -ccontains $uiFace) { throw "Proof requires no UI font slot naming $uiFace on this runner yet." }
@@ -2044,6 +2087,14 @@ MustReject { Win51 @('-Mode', 'Apply', '-Typography', '-Packages', 'AutoHotkey')
 # The interpreter refuses a slot whose face is not the expected one, writing nothing.
 $uiRefused = UiRun @('set', $uiFace, 'caption=Not The Caption Face')
 Must ($uiRefused.exit -eq 2 -and (MetricsText (Metrics)) -ceq (MetricsText $uiBefore)) 'A31: ui-font.ahk refuses an unexpected face and writes nothing'
+# A persisted height other than the live one is drift beyond lfQuality: refused, nothing written.
+$captionHex = SlotHex $uiBefore 'caption'
+SetSlotHex 'caption' ('D8FFFFFF' + $captionHex.Substring(8))
+$uiHeight = UiRun @('set', $uiFace, "caption=$(HexFace $captionHex)")
+$heightNow = Metrics
+SetSlotHex 'caption' $captionHex
+Must ($uiHeight.exit -eq 2 -and (SlotHex $heightNow 'caption') -ceq ('D8FFFFFF' + $captionHex.Substring(8)) -and
+    -not @(@($uiBefore.Keys) + @($heightNow.Keys) | Where-Object { $_ -cne 'CaptionFont' -and $uiBefore[$_] -cne $heightNow[$_] }).Count) 'A31: ui-font.ahk refuses a persisted height that differs from the live one, writing nothing'
 # A crash after the five NONCLIENTMETRICS slots took the face and before the icon slot: six intents, one set of five.
 # Recovery commits the five and voids the icon; the icon is then written anew.
 $mark = LastSeq
@@ -2057,7 +2108,7 @@ UiSet $uiFace $ncm
 $typographyRun = Win51 @('-Mode', 'Apply', '-Typography')
 Must ($typographyRun.uiFont.face -ceq $uiFace -and $typographyRun.nocttyPlan -ceq 'notEvaluated' -and
     -not @($uiSlots | Where-Object { $_ -cne 'icon' -and (Phases (UiId $_)) -cne 'intent,commit' }).Count -and (Phases (UiId 'icon')) -ceq 'intent,void,intent,commit' -and
-    (UiOnlyFaces $uiBefore $uiSlots $uiFace)) 'A31: Apply -Typography recovers the interrupted set and writes the rest; only the six faces changed'
+    (UiOnlyFaces $uiBefore $uiSlots $uiFace) -and (LiveKept)) 'A31: Apply -Typography recovers the interrupted set and writes the rest; only the six faces changed, persisted lfQuality 5 and the live fonts kept'
 $mark = LastSeq
 $null = Win51 @('-Mode', 'Apply', '-Typography')
 Must ((NewRecords $mark @($uiSlots | ForEach-Object { UiId $_ })) -eq 0) 'A31: a second Apply -Typography writes nothing'
@@ -2137,6 +2188,8 @@ AssertEmpty
 # value is exactly the baseline again and each slot's attempt is closed undone.
 Must ((MetricsText (Metrics)) -ceq (MetricsText $uiBefore) -and (Phases (UiId 'icon')) -ceq 'intent,void,intent,commit,undone' -and
     -not @($uiSlots | Where-Object { $_ -cne 'icon' -and (Phases (UiId $_)) -cne 'intent,commit,undone' }).Count) 'A31: Uninstall restores the UI font slots exactly'
+foreach ($slot in $uiSlots) { SetSlotHex $slot (SlotHex $uiOriginal $slot) }  # the fixture's lfQuality 5 goes; the runner's own bytes are back
+Must ((MetricsText (Metrics)) -ceq (MetricsText $uiOriginal)) 'A31: the runner''s WindowMetrics are its own again'
 
 # ---- A29 (b3b): the locked Chromium, installed for real (downloaded once), owned, first run, and removed ----
 # Here A27 has removed the stand-in 154 tree and every owned effect; the proof's stand-in profile keeps its restored

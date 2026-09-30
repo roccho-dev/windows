@@ -389,9 +389,10 @@ machine-wide Noctty), set that family as the face of the six Win32 UI font slots
 exact preexisting) `AutoHotkey64.exe` whose SHA-256 is the lock's. No compiler,
 `Add-Type`, input, hook or window is involved. Only `lfFaceName` changes: before writing,
 the script requires each slot's persisted `HKCU\Control Panel\Desktop\WindowMetrics` value to equal its
-live LOGFONTW, and each slot it sets to hold the face the ledger expects. Otherwise
-it refuses and writes nothing. Afterwards every other byte of the six fonts and every
-other WindowMetrics value must be unchanged, or it puts all of them back and fails.
+live LOGFONTW, except that lfQuality may be 0 live and 5 persisted, as on a real host where SPI's GET reports the
+quality it renders with. It also requires each slot it sets to hold the face the ledger expects. Otherwise it refuses
+and writes nothing. It writes the persisted LOGFONTs as they are, face aside, so the persisted quality is kept. Afterwards every other byte of the six live fonts and, separately, of the six persisted ones, and every other
+WindowMetrics value, must be unchanged, or it puts all of them back and fails.
 Sizes, weights and the DPI are never written. The live and persisted units agree at
 100% scaling; at other scalings that precheck may refuse, which is safe but
 unproven.
@@ -436,6 +437,7 @@ NF, each written as a quoted CSS family, in both the light and dark themes.
   - An absent theme is created whole from the app's own defaults (`jq` of
     26.928.1915.0, with `accentSource = "chatgpt"`). A theme with fonts alone is one the
     app drops.
+- **Errors:** a refusal by the service is reported by method and JSON-RPC error code only; its message, which may quote a config line, and the service's stderr are never printed.
 - **Refusals:** a theme another config layer sets, one the app would reject, and a
   read-only or repeated user layer are refused. A stale version is refused by the
   service, and nothing is written.
@@ -578,7 +580,8 @@ first run on the default `User Data` and Win+R itself are proven only by the VM 
 Windows 11 VM, as an unelevated user in an Explorer-launched session, Win+R `chromium`
 after `Restore` starts the owned `chrome.exe` (positive), and the same Win+R after
 `Uninstall` finds nothing (negative).
-A31 (UI font faces, while AutoHotkey is owned) first runs `ui-font.ahk get`. It
+A31 (UI font faces, while AutoHotkey is owned) first gives the runner's persisted fonts lfQuality 5, as a fixture it
+removes afterwards, and runs `ui-font.ahk get`. A persisted height other than the live one is refused without a write. It
 requires each live LOGFONTW to equal the runner's persisted value, and the script
 to refuse an unexpected face without writing. It then models a crash after the five
 NONCLIENTMETRICS slots took the face (six intents, one set of five). `Apply

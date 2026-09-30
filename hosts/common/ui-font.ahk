@@ -7,9 +7,12 @@
 ;   get                                  one JSON line: each slot's face, live LOGFONT and persisted value (hex)
 ;   set <face> <slot>=<expected face>... each named slot must have its expected face now; only lfFaceName changes
 ; set refuses (exit 2, nothing written) unless every slot's persisted HKCU WindowMetrics value equals its live
-; LOGFONT, so writing the live structure back cannot move a size or weight. Afterwards every slot, every other
-; WindowMetrics value and every LOGFONT byte but the named faces must be unchanged; otherwise the live structures
-; and the persisted values are put back (exit 3). Exit 0: done, the new state on stdout; 1: any other failure.
+; LOGFONT but for the face, or differs only in lfQuality, live 0 and persisted 5 (SPI's GET reports the quality it
+; renders with; the persisted value keeps the one set). It writes the persisted LOGFONTs as they are (in the live
+; NONCLIENTMETRICS for the other metrics), only the named faces changed, so neither a size nor that quality moves.
+; Afterwards every live and, independently, every persisted LOGFONT byte but the named faces, and every other
+; WindowMetrics value, must be unchanged; otherwise the same persisted structures and values are put back (exit 3).
+; Exit 0: done, the new state on stdout; 1: any other failure.
 
 Offsets := Map("caption", 24, "smCaption", 124, "menu", 224, "status", 316, "message", 408, "icon", 0)
 Values := Map("caption", "CaptionFont", "smCaption", "SmCaptionFont", "menu", "MenuFont", "status", "StatusFont",
@@ -78,6 +81,24 @@ FaceOf(logfontHex) {
     return face
 }
 Rest(logfontHex) => SubStr(logfontHex, 1, 56) SubStr(logfontHex, 185)
+; lfQuality is byte 26: hex characters 53 and 54.
+Quality(logfontHex) => SubStr(logfontHex, 53, 2)
+Agrees(live, persisted) => Rest(live) == Rest(persisted) || SubStr(Rest(live), 1, 52) SubStr(Rest(live), 55) == SubStr(Rest(persisted), 1, 52) SubStr(Rest(persisted), 55)
+    && Quality(live) == "00" && Quality(persisted) == "05"
+
+; The structures to write: the live NONCLIENTMETRICS with each of its five fonts replaced by the persisted bytes, and the
+; persisted icon font.
+Compose(live, was) {
+    ncm := Buffer(504, 0), icon := Buffer(92, 0)
+    loop 504
+        NumPut("UChar", NumGet(live.ncm, A_Index - 1, "UChar"), ncm, A_Index - 1)
+    for slot in Order {
+        target := slot == "icon" ? icon : ncm
+        loop 92
+            NumPut("UChar", Integer("0x" SubStr(was.slots[slot].persisted, A_Index * 2 - 1, 2)), target, Offsets[slot] + A_Index - 1)
+    }
+    return {ncm: ncm, icon: icon}
+}
 
 PutFace(live, slot, face) {
     buffer := slot == "icon" ? live.icon : live.ncm, at := Offsets[slot] + 28
@@ -129,14 +150,14 @@ SetFaces(face) {
     }
     before := Read(), was := Snapshot(before)
     for slot in Order {
-        if was.slots[slot].persisted == "" || Rest(was.slots[slot].persisted) != Rest(was.slots[slot].live)
+        if StrLen(was.slots[slot].persisted) != 184 || !Agrees(was.slots[slot].live, was.slots[slot].persisted)
             || FaceOf(was.slots[slot].persisted) !== was.slots[slot].face
             Done(2, "", "HKCU WindowMetrics " Values[slot] " does not match the live " slot " font; nothing written")
     }
     for slot, face0 in expected
         if was.slots[slot].face !== face0
             Done(2, "", slot " face is '" was.slots[slot].face "', not the expected '" face0 "'; nothing written")
-    live := Read(), ncm := false, icon := false
+    original := Compose(before, was), live := Compose(before, was), ncm := false, icon := false
     for slot in expected {
         PutFace(live, slot, face)
         if slot == "icon"
@@ -148,7 +169,7 @@ SetFaces(face) {
     now := Snapshot(Read())
     problem := Differs(was, now, expected, face)
     if problem != "" {
-        Write(before, ncm, icon)
+        Write(original, ncm, icon)
         for slot in Order
             RegWrite(was.slots[slot].persisted, "REG_BINARY", Metrics, Values[slot])
         for name, typed in was.others {

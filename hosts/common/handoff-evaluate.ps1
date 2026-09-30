@@ -226,9 +226,20 @@ function ConvertTo-CanonicalJson($Value, [string]$Path = '', $Omit = $null) {
     if ($null -eq $Value) { return 'null' }
     if ($Value -is [bool]) { if ($Value) { return 'true' } else { return 'false' } }
     if ($Value -is [string]) { return (ConvertTo-Json -InputObject $Value -Compress) }
-    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [single]) {
-        return ([IFormattable]$Value).ToString($null, [Globalization.CultureInfo]::InvariantCulture)
+    # Numbers keep their kind: an integer is digits; a float is its round-trip text ('R'; the Framework's default is G15,
+    # which merges different doubles) with '.0' when it has no '.' or exponent, so 60 and 60.0 differ; a decimal (JSON
+    # read by Windows PowerShell 5.1) is its exact text, integral or with its scale, as the JSON wrote it.
+    $culture = [Globalization.CultureInfo]::InvariantCulture
+    if ($Value -is [byte] -or $Value -is [int16] -or $Value -is [int] -or $Value -is [long] -or $Value -is [uint16] -or $Value -is [uint32] -or $Value -is [uint64] -or $Value -is [sbyte]) {
+        return ([IFormattable]$Value).ToString('D', $culture)
     }
+    if ($Value -is [decimal]) { return $Value.ToString($culture) }
+    if ($Value -is [double] -or $Value -is [single]) {
+        $text = ([IFormattable]$Value).ToString('R', $culture)
+        if ($text -notmatch '[.EeN]|Infinity') { $text += '.0' }
+        return $text
+    }
+    if ($Value -is [Numerics.BigInteger]) { return $Value.ToString($culture) }
     $pairs = $null  # assigned in each branch: an if-expression would unroll one pair, and an empty object to $null
     if ($Value -is [Collections.IDictionary]) { $pairs = @(foreach ($key in $Value.Keys) { , @([string]$key, $Value[$key]) }) }
     elseif ($Value -is [Management.Automation.PSCustomObject]) { $pairs = @(foreach ($property in $Value.PSObject.Properties) { , @($property.Name, $property.Value) }) }
@@ -258,8 +269,13 @@ function ConvertFrom-LayerNumbers($Value) {
         $properties = @($Value.PSObject.Properties)
         if ($properties.Count -eq 1 -and $properties[0].Name -ceq '$serde_json::private::Number' -and $properties[0].Value -is [string]) {
             $text, $culture = $properties[0].Value, [Globalization.CultureInfo]::InvariantCulture
-            $long = 0L
-            if ([long]::TryParse($text, [Globalization.NumberStyles]::AllowLeadingSign, $culture, [ref]$long)) { return $long }
+            # Integer text stays an integer (long, else an unsigned or larger one as decimal); anything else is a float.
+            if ($text -match '^-?[0-9]+\z') {
+                $long, $decimal = 0L, [decimal]0
+                if ([long]::TryParse($text, [Globalization.NumberStyles]::AllowLeadingSign, $culture, [ref]$long)) { return $long }
+                if ([decimal]::TryParse($text, [Globalization.NumberStyles]::AllowLeadingSign, $culture, [ref]$decimal)) { return $decimal }
+                throw "A config number is out of range: $($text.Length) digits."
+            }
             return [double]::Parse($text, [Globalization.NumberStyles]::Float, $culture)
         }
         foreach ($property in $properties) { $property.Value = ConvertFrom-LayerNumbers $property.Value }

@@ -1156,7 +1156,8 @@ function UiFontEffects {
 # classed preexisting-match. Nothing is installed here (Restore installs packages first).
 function UiFontInterpreter {
     if ($null -ne $script:uiInterpreter) { return $script:uiInterpreter }
-    $package = @($manifest.packages | Where-Object { $_.name -ceq $typography.interpreter })[0]
+    $package = $manifest.packages | Where-Object { $_.name -ceq (Get-Field $typography 'interpreter') } | Select-Object -First 1
+    if ($null -eq $package) { throw 'This distribution selects no UI font interpreter.' }
     $state = ClassifyPackage $package
     if ($state.class -cnotin @('owned-match', 'preexisting-match')) {
         throw "The UI font interpreter $($package.name) $($package.version) is $($state.class)$(if ($state.reason) { ": $($state.reason)" }); Restore installs it."
@@ -1260,13 +1261,15 @@ function ConvergeApps {
 # A running app keeps its theme in memory until it restarts, and writes the whole theme itself when the user
 # changes appearance, which then wins (owned-drift here). Nothing here starts, stops or restarts the app.
 $script:appFontDrift, $script:appRead = @(), $null
-$appearanceApp = @($apps | Where-Object { $null -ne (Get-Field $_ 'appearance') })[0]
+# $null when no app is preconfigured (Select-Object: under strict mode an index into an empty list throws).
+$appearanceApp = $apps | Where-Object { $null -ne (Get-Field $_ 'appearance') } | Select-Object -First 1
 function IsAppFontEffect($Record) { (Get-Field $Record 'kind') -ceq 'app-theme-fonts' }
 function AppFontsPresent { @(AppStates | Where-Object { $_.app.package -ceq $appearanceApp.package -and $_.action -ceq 'present' }).Count -eq 1 }
 
 # The present app's bundled codex.exe (Get-AppAction: exactly one package of that name and publisher).
 function AppServerExe {
-    $state = @(AppStates | Where-Object { $_.app.package -ceq $appearanceApp.package })[0]
+    if ($null -eq $appearanceApp) { throw 'This distribution preconfigures no app.' }
+    $state = AppStates | Where-Object { $_.app.package -ceq $appearanceApp.package } | Select-Object -First 1
     if ($null -eq $state -or $state.action -cne 'present') { throw "$($appearanceApp.name) is not installed (one package $($appearanceApp.package) of publisher $($appearanceApp.publisherId)); its config service is unavailable." }
     $exe = Join-Path $state.found[0].installLocation 'app\resources\codex.exe'
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "$exe is missing." }
@@ -1309,8 +1312,8 @@ function AppSend($Session, $Message) {
     $Session.process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
     $Session.process.StandardInput.BaseStream.Flush()
 }
-# One request and its answer; notifications and other messages are skipped. An error answer stops the run with the
-# service's message only, never a line of output.
+# One request and its answer; notifications and other messages are skipped. An error answer stops the run naming only the
+# method and the JSON-RPC error code: no message, line of output or stderr is ever printed.
 function AppCall($Session, [string]$Method, $Params) {
     $Session.next++
     $id = $Session.next
@@ -1326,7 +1329,8 @@ function AppCall($Session, [string]$Method, $Params) {
         try { $message = $line | ConvertFrom-Json } catch { throw "The $($appearanceApp.name) config service answered $Method with a line that is not JSON." }
         if ($null -ne (Get-Field $message 'method') -or [string](Get-Field $message 'id') -cne [string]$id) { continue }
         $failure = Get-Field $message 'error'
-        if ($null -ne $failure) { throw "The $($appearanceApp.name) config service refused ${Method}: $(Get-Field $failure 'message')" }
+        # Never the service's message: a config parse error quotes the offending TOML line, which may hold a secret.
+        if ($null -ne $failure) { throw "The $($appearanceApp.name) config service refused $Method (error $([string](Get-Field $failure 'code'))); details not printed." }
         return (Get-Field $message 'result')
     }
 }
@@ -1340,7 +1344,7 @@ function ReadAppConfig($Session) {
     $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }  # not $home: that is $HOME
     if ($users.Count -gt 1) { throw 'The Codex config has more than one user layer; nothing is written.' }
     if ($users.Count -eq 0 -and (Test-Path -LiteralPath (Join-Path $codexHome 'config.toml'))) { throw 'The Codex config service reads no user layer beside an existing config.toml; nothing is written.' }
-    if ($users.Count -and $null -ne (Get-Field $users[0] 'disabledReason')) { throw "The Codex user config is disabled: $(Get-Field $users[0] 'disabledReason')" }
+    if ($users.Count -and $null -ne (Get-Field $users[0] 'disabledReason')) { throw 'The Codex user config layer is disabled (read-only); reason not printed; nothing is written.' }
     [pscustomobject]@{ effective = (Get-Field $read 'config')
         user = $(if ($users.Count) { ConvertFrom-LayerNumbers (Get-Field $users[0] 'config') } else { $null })
         version = $(if ($users.Count) { [string](Get-Field $users[0] 'version') } else { $null })
@@ -1403,6 +1407,10 @@ function UndoAppFonts($Step, $Session) {
         $edits = Get-AppFontUndoEdits $Step $theme
         $whole = @($edits | Where-Object { $_.keyPath -ceq "desktop.$($Step.theme)" }).Count -gt 0
         $null = WriteAppConfig $Session $read $edits @($Step.theme) @(if ($whole) { $Step.theme })
+        # 26.928.1915.0 keeps the emptied fonts table, and the app reads missing ui and code as null; a service that dropped
+        # the table would leave a theme the app discards whole, colors included: that is reported, never left silent.
+        $left = AppTheme $script:appRead $Step.theme
+        if ($null -ne $left -and (Get-AppThemeProblem $left)) { $script:appFontDrift += "desktop.$($Step.theme) is no longer a theme the app accepts after its fonts were removed" }
     } finally { if ($own) { CloseAppSession $Session } }
 }
 
