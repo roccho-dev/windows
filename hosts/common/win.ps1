@@ -204,12 +204,13 @@ if ($Mode -eq 'Restore' -and
 }
 $fontDirectory = Join-Path $localAppData 'Microsoft\Windows\Fonts'
 $nocttyDirectory = Join-Path $localAppData ('Programs\noctty-' + $manifest.noctty.version)
-$nocttyExe = Join-Path $nocttyDirectory 'noctty\noctty.exe'
-$nocttyCom = Join-Path $nocttyDirectory 'noctty\noctty.com'
 $nocttyConfig = Join-Path $localAppData 'noctty\config.ghostty'
+# Never created, written or removed; Uninstall only reports whether one exists.
 $nocttyShortcut = Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs\noctty.lnk'
 $nocttyConfigText = 'font-family = ' + $manifest.noctty.fontFamily + "`n"
 $terminalStartup = 'HKCU:\Console\%%Startup'
+$startupSubkey = 'Console\%%Startup'
+$registryViews = @(@('HKCU', 'CurrentUser', 'Default'), @('HKLM', 'LocalMachine', 'Registry64'), @('HKLM32', 'LocalMachine', 'Registry32'))
 $windowsTerminalConsole = '{2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}'
 $nocttyTerminal = '{33368C6F-D328-410C-B225-26DC9F12C728}'
 # The six HKCU COM values the handoff needs, from Nix, with {install} bound to this user's directory.
@@ -217,26 +218,6 @@ $nocttyRegistration = Get-NocttyRegistration (Get-Field $manifest.noctty 'regist
 if ($nocttyRegistration.problem) { throw "Invalid Noctty registration in manifest: $($nocttyRegistration.problem)" }
 $terminalProvenance = Join-Path $localAppData 'windows-iac\provenance\default-terminal.json'
 $packageStates = @()
-
-function TestNocttyFiles {
-    if (-not (Test-Path -LiteralPath $nocttyDirectory -PathType Container)) { return $false }
-    foreach ($entry in $manifest.noctty.files.PSObject.Properties) {
-        $relative = $entry.Name
-        if ($relative -notmatch '^noctty/[^:]+' -or $relative -match '(\\|(^|/)\.\.(/|$))') {
-            throw "Unsafe noctty path: $relative"
-        }
-        $path = Join-Path $nocttyDirectory ($relative.Replace('/', '\'))
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
-            (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $entry.Value) { return $false }
-    }
-    return $true
-}
-
-function TestNoctty {
-    return (TestNocttyFiles) -and (Test-Path -LiteralPath $nocttyConfig -PathType Leaf) -and
-        ([IO.File]::ReadAllText($nocttyConfig) -ceq $nocttyConfigText) -and
-        (Test-Path -LiteralPath $nocttyShortcut -PathType Leaf)
-}
 
 if ($Mode -eq 'RentSsh' -or $Mode -eq 'RentSshTest') {
     # Windows OpenSSH to the rent through Cloudflare Access: the pinned client as ProxyCommand, strict host checking
@@ -320,14 +301,6 @@ if ($Mode -eq 'RentSsh' -or $Mode -eq 'RentSshTest') {
         client = $clientExe; config = $rentConfig; knownHosts = $rentKnownHosts; userConfig = $userConfig;
         inDesiredState = $true } | ConvertTo-Json -Compress
     return
-}
-
-function RestoreRegistryString([string]$Path, [string]$Name, [object]$Value) {
-    if ($null -eq $Value) {
-        Remove-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction SilentlyContinue
-    } else {
-        $null = New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType String -Force
-    }
 }
 
 # Registration only: the registry state that selects Noctty. It is not evidence
@@ -416,14 +389,15 @@ function TestNocttyActivation {
 # the highest seq, and every mode that reads the ledger stops on it (README). The
 # ledger and provenance directories are retained state, not effects. This version
 # owns only what it created (the prior is always absent): font files beneath the
-# user font directory and their HKCU Fonts values. Noctty and the default-terminal
-# registration are not in the ledger yet.
+# user font directory and their HKCU Fonts values, and the Noctty tree, configuration,
+# %%Startup key and COM keys and values. The %%Startup selection values belong to the
+# older default-terminal record (RecordPriorTerminal), not to the ledger.
 $ledgerDirectory = Join-Path $localAppData 'windows-iac\ledger'
 $fontSubkey = 'Software\Microsoft\Windows NT\CurrentVersion\Fonts'
 $fontKey = 'HKCU\' + $fontSubkey
 $script:ledgerRecords, $script:nextSeq, $script:ledgerLock = @(), 1, $null
 $script:copied, $script:changed, $script:removed, $script:recordsWritten = 0, 0, 0, 0
-$script:fontDrift, $script:sharedCreated, $script:gcKeptReferenced = @(), @(), @()
+$script:fontDrift, $script:sharedCreated, $script:gcKeptReferenced, $script:nocttyDrift = @(), @(), @(), @()
 
 function ReadLedger {
     $script:ledgerRecords, $script:nextSeq = @(), 1
@@ -508,7 +482,7 @@ function ObserveValue([string]$Name, [string]$Subkey = $fontSubkey) {
     } finally { $key.Close() }
 }
 
-# ---- Owned Noctty effects (E1, E2, E4-E6): built and observed here, not used by any mode yet ----
+# ---- Owned Noctty effects (E1, E2, E4-E6): built and observed here, converged by PlanNoctty/ApplyNoctty ----
 function KeyEffect([string]$Subkey) {
     $target = 'HKCU\' + $Subkey
     [ordered]@{ id = 'registry-key-created:' + $target.ToUpperInvariant(); kind = 'registry-key-created'; target = $target
@@ -983,11 +957,10 @@ function CollectFontGarbage($Selected) {
     UndoOwnedSteps @($steps | Where-Object { @($keep | ForEach-Object { $_.id }) -cnotcontains $_.id })
 }
 
-# Apply and Restore: recover, classify everything before the first effect, then
-# create or re-own each file and, once its file is exactly the selection, its
-# value; then collect unselected owned fonts.
+# Apply and Restore, after recovery and PlanNoctty: classify every font effect before the
+# first effect, then create or re-own each file and, once its file is exactly the
+# selection, its value; then collect unselected owned fonts.
 function ConvergeFonts {
-    RecoverLedger
     $effects = @(FontEffects)
     foreach ($effect in $effects) {
         foreach ($item in @($effect.file, $effect.value)) {
@@ -1032,6 +1005,215 @@ function AssertFonts {
     }
 }
 
+# ---- Noctty and the default-terminal selection -------------------------------
+function SharedDirectory([string]$Path) {
+    if (Test-Path -LiteralPath $Path -PathType Container) { return }
+    $null = New-Item -ItemType Directory -Path $Path
+    $script:sharedCreated += $Path
+}
+
+function SharedKey([string]$Subkey) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($Subkey)
+    if ($null -eq $key) { $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($Subkey); $script:sharedCreated += "HKCU\$Subkey" }
+    $key.Close()
+}
+
+# The %%Startup selection as { console; terminal }, $null for an absent value.
+function StartupPair {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($startupSubkey)
+    if ($null -eq $key) { return [ordered]@{ console = $null; terminal = $null } }
+    try { [ordered]@{ console = $key.GetValue('DelegationConsole'); terminal = $key.GetValue('DelegationTerminal') } } finally { $key.Close() }
+}
+
+# The rollback of the selection this distribution wrote (Get-LegacyTerminalPlan); 'none' without
+# a record, and an unreadable record reads as malformed, which is refused.
+function LegacyPlan {
+    if (-not (Test-Path -LiteralPath $terminalProvenance)) {
+        return [ordered]@{ action = 'none'; reason = 'There is no default-terminal record.'; steps = @() }
+    }
+    $record = try { Get-Content -LiteralPath $terminalProvenance -Raw -Encoding utf8 | ConvertFrom-Json } catch { @{} }
+    Get-LegacyTerminalPlan $record (StartupPair)
+}
+
+# Restores the values a plan names (the record's 'restore', or one run's rollback), Terminal
+# first, each only while it still holds what was written.
+function RestoreLegacy($Plan) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($startupSubkey, $true)
+    try {
+        foreach ($step in $Plan.steps) {
+            if ($key.GetValue($step.name) -ne $step.expect) { throw "Refusing to restore $($step.name): it changed since it was read." }
+            if ($null -eq $step.value) { $key.DeleteValue($step.name, $false) }
+            else { $key.SetValue($step.name, $step.value, [Microsoft.Win32.RegistryValueKind]::String) }
+            $script:changed++
+        }
+    } finally { $key.Close() }
+}
+
+# Why a machine-wide Noctty is present (Get-MachineNocttyReason), from both HKLM views: the
+# registration's CLSID keys and every Uninstall DisplayName. Read-only.
+function MachineNocttyReason {
+    $clsids, $names = @(), @()
+    foreach ($view in 'Registry64', 'Registry32') {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine', $view)
+        try {
+            foreach ($clsid in @($nocttyRegistration.keys | Where-Object { $_ -match '^Software\\Classes\\CLSID\\[^\\]+$' })) {
+                $key = $base.OpenSubKey($clsid)
+                if ($null -ne $key) { $key.Close(); $clsids += "$view\$clsid" }
+            }
+            $uninstall = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
+            if ($null -eq $uninstall) { continue }
+            try {
+                foreach ($name in $uninstall.GetSubKeyNames()) {
+                    $entry = $uninstall.OpenSubKey($name)
+                    if ($null -eq $entry) { continue }
+                    try { $names += [string]$entry.GetValue('DisplayName') } finally { $entry.Close() }
+                }
+            } finally { $uninstall.Close() }
+        } finally { $base.Close() }
+    }
+    Get-MachineNocttyReason $clsids $names
+}
+
+# Apply and Restore, before any effect: every owned Noctty effect is classified, and the run
+# stops on a machine-wide Noctty, a malformed default-terminal record, an indeterminate target,
+# a tree that differs from the pinned inventory (owned or not; it is never overwritten), or a
+# COM registration (the six values, the K-rule) that is neither entirely preexisting and exact
+# nor entirely absent or owned, or, when it will be written, a COM key holding anything else.
+# Restore also stops on Windows Terminal older than 1.24 and on a
+# package view that contradicts this process's HKCU (only 'mismatch'; a gap is not fatal).
+function PlanNoctty([switch]$Restore) {
+    $machine = MachineNocttyReason
+    if ($machine) { throw "A machine-wide Noctty is present ($machine); nothing was changed." }
+    if ((LegacyPlan).reason -ceq 'Malformed default-terminal record.') { throw "Unreadable default-terminal provenance: $terminalProvenance" }
+    $effects, $classes = (NocttyEffects), @{}
+    foreach ($effect in @($effects.tree, $effects.config, $effects.startup) + $effects.keys + $effects.values) {
+        $state = Classify $effect
+        if ($state.class -ceq 'indeterminate') { throw "Noctty effect $($effect.id) is indeterminate: $($state.reason)" }
+        $classes[$effect.id] = $state
+    }
+    $tree = $classes[$effects.tree.id]
+    if ($tree.class -cin @('owned-drift', 'preexisting-drift') -or
+        ($tree.class -ceq 'owned-match' -and -not (Test-EffectStateEqual 'tree-extracted' $tree.recorded $effects.tree.desired))) {
+        throw "$nocttyDirectory differs from the pinned Noctty ($($tree.class)) and is never overwritten; nothing was changed."
+    }
+    $values = @($effects.values | ForEach-Object { $classes[$_.id].class })
+    $com = if (-not @($values | Where-Object { $_ -cne 'preexisting-match' }).Count) { 'preexisting' }
+        elseif (-not @($values | Where-Object { $_ -cnotin @('absent', 'owned-match', 'owned-drift') }).Count) { 'converge' }
+        else { throw "The Noctty COM registration is partly foreign or differs ($($values -join ', ')); nothing was changed." }
+    # A COM key this run may write into, owned or not, holds only the declared values and keys
+    # (the same rule as A3), so no value of ours joins someone else's registration.
+    if ($com -ceq 'converge') {
+        $declared = @($nocttyRegistration.keys | ForEach-Object { [ordered]@{ action = 'delete-empty-key'; key = "HKCU\$_" } }) +
+            @($nocttyRegistration.values | ForEach-Object { [ordered]@{ action = 'delete-registry-value'; key = "HKCU\$($_.key)"; name = $_.name } })
+        $contents = @{}
+        foreach ($key in $nocttyRegistration.keys) { $contents["HKCU\$key"] = ObserveKeyContent $key }
+        $foreign = @(Get-ForeignKeyContent $declared $contents @{})
+        if ($foreign.Count) { throw "$($foreign -join '; '); nothing was changed." }
+    }
+    if ($Restore) {
+        if (-not (TestTerminalPackage)) { throw 'Noctty default-terminal handoff requires Windows Terminal 1.24 or newer; nothing was changed.' }
+        $view = Test-PackageTerminalSelection
+        if ($view.state -eq 'mismatch') { throw "$($view.failure) Nothing was changed." }
+    }
+    [pscustomobject]@{ effects = $effects; classes = $classes; com = $com }
+}
+
+# Creates what the plan found absent, in order: the tree, the configuration, the %%Startup key,
+# then, unless the registration is entirely preexisting, the COM keys top-down and the six
+# values. A configuration that differs from the selection is reported and never written. Shared
+# parents (Programs, %LOCALAPPDATA%\noctty, the CLSID and Interface roots) are created as needed
+# and listed, never owned.
+function ApplyNoctty($Plan) {
+    $effects, $classes = $Plan.effects, $Plan.classes
+    if ($classes[$effects.tree.id].class -ceq 'absent') {
+        SharedDirectory (Split-Path -Parent $effects.tree.target)
+        CreateOwnedTree $effects.tree (BundlePath 'payload/noctty.zip')
+    }
+    $config, $bytes = $classes[$effects.config.id], [Text.UTF8Encoding]::new($false).GetBytes($nocttyConfigText)
+    switch ($config.class) {
+        'absent' { SharedDirectory (Split-Path -Parent $nocttyConfig); CreateOwnedFile $effects.config $bytes }
+        'owned-match' {
+            if (-not (Test-EffectStateEqual 'file-created' $config.recorded $effects.config.desired)) {
+                UndoOwned $config.open (Observe $effects.config) -Replacing
+                CreateOwnedFile $effects.config $bytes
+            }
+        }
+        'preexisting-match' { }
+        default { $script:nocttyDrift += "$nocttyConfig differs from the selection ($($config.class)); not written" }
+    }
+    if ($classes[$effects.startup.id].class -ceq 'absent') { CreateOwnedKey $effects.startup }
+    if ($Plan.com -ceq 'converge') {
+        SharedKey 'Software\Classes\CLSID'
+        SharedKey 'Software\Classes\Interface'
+        foreach ($key in $effects.keys) { if ($classes[$key.id].class -ceq 'absent') { CreateOwnedKey $key } }
+        foreach ($value in $effects.values) { ConvergeEffect $value "$($value.target)\$($value.name)" { CreateOwnedValue $value } }
+    }
+}
+
+# Selects Noctty in %%Startup, DelegationConsole then DelegationTerminal, writing only a value
+# that differs (A4), after the write-once record of the prior selection. With -Check (Restore)
+# the registration, COM activation and the package view must then confirm it. If a write or a
+# check fails, only the values this run wrote go back to what this run read just before
+# (Get-SelectionRollbackSteps), Terminal first, and only while they still hold what it wrote; the
+# write-once record's older prior is Uninstall's, not this rollback's.
+function SelectNoctty([switch]$Check) {
+    $pair = StartupPair
+    $wanted = [ordered]@{ DelegationConsole = @($pair.console, $windowsTerminalConsole); DelegationTerminal = @($pair.terminal, $nocttyTerminal) }
+    $writes = @($wanted.Keys | Where-Object { $wanted[$_][0] -ne $wanted[$_][1] })
+    if ($writes.Count) { RecordPriorTerminal $pair.console $pair.terminal }
+    try {
+        if ($writes.Count) {
+            $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($startupSubkey, $true)
+            try { foreach ($name in $writes) { $key.SetValue($name, $wanted[$name][1], [Microsoft.Win32.RegistryValueKind]::String); $script:changed++ } }
+            finally { $key.Close() }
+        }
+        if ($Check) {
+            if (-not (TestNocttyRegistration)) { throw 'The Noctty default-terminal registration is incomplete.' }
+            if (-not (TestNocttyActivation)) { throw 'Noctty COM activation failed.' }
+            AssertActualSelection
+        }
+    } catch {
+        $failure = $_
+        if ($writes.Count) {
+            $written = @{}
+            foreach ($name in $writes) { $written[$name] = $wanted[$name][1] }
+            $rollback = Get-SelectionRollbackSteps $pair $written (StartupPair)
+            if (-not $rollback.ok) { throw "$($failure.Exception.Message) The selection was not restored: $($rollback.reason)" }
+            RestoreLegacy $rollback
+        }
+        throw $failure
+    }
+}
+
+# The tree, exactly the pinned inventory, and the configuration, exactly its text; a Start-menu
+# shortcut is neither created nor checked.
+function TestNoctty {
+    $effects = NocttyEffects
+    (Test-EffectStateEqual 'tree-extracted' $effects.tree.desired (ObserveTree $nocttyDirectory)) -and
+        (Test-EffectStateEqual 'file-created' $effects.config.desired (ObserveFile $nocttyConfig))
+}
+
+# Value and subkey names of an HKCU key now (empty when it is absent), for A3.
+function ObserveKeyContent([string]$Subkey) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($Subkey)
+    if ($null -eq $key) { return [ordered]@{ values = @(); subkeys = @() } }
+    try { [ordered]@{ values = @($key.GetValueNames()); subkeys = @($key.GetSubKeyNames()) } } finally { $key.Close() }
+}
+
+# The COM->tree guard for the owned trees a plan removes: no Noctty server path in HKCU or either
+# HKLM view that the plan does not remove may name one (Get-TreeReferenceProblem).
+function TreeReferenceProblems($Steps) {
+    $trees = @($Steps | Where-Object { $_.kind -ceq 'tree-extracted' } | ForEach-Object { $_.id } | Sort-Object -Unique -CaseSensitive)
+    if (-not $trees.Count) { return }
+    $servers = @($nocttyRegistration.values | ForEach-Object { $_.key } | Where-Object { $_ -match '\\(LocalServer32|InprocServer32)$' } | Sort-Object -Unique)
+    $references = @(NocttyReferences $registryViews $servers)
+    $removed = @($Steps | Where-Object { $_.action -ceq 'delete-registry-value' } | ForEach-Object { $_.id })
+    foreach ($id in $trees) {
+        $problem = Get-TreeReferenceProblem $references ([string](Get-Field @(RecordsOf $id)[0] 'target')) $removed
+        if ($problem) { "${id}: $problem" }
+    }
+}
+
 # Not $Identity: that is the RentSsh key-file parameter, a [string] in the same
 # script scope (variable names ignore case), which would flatten this record.
 function RunIdentity {
@@ -1040,9 +1222,13 @@ function RunIdentity {
         elevated = ([Security.Principal.WindowsPrincipal]$current).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
 }
 
-# Uninstall: every recorded id must be an owned font effect this version handles;
-# the whole plan and a Fonts reference preflight (ignoring values the plan
-# removes) come before any step, and anything refused means nothing runs.
+# Uninstall: every recorded id must be an owned effect this version handles. Everything is
+# planned before any step, and anything refused means nothing runs: the ledger plan; the
+# rollback of the default-terminal selection; while owned COM values would go, a rollback that
+# can restore and leaves Noctty unselected; A3 (a created key the plan removes may hold nothing
+# the plan does not remove); the COM->tree guard; and the Fonts reference preflight. -Apply then
+# restores the selection (Terminal first), reads it again and stops if Noctty is still selected,
+# undoes values, keys and files, checks the guard again, and removes owned trees last.
 function Uninstall {
     $found = Test-Path -LiteralPath $ledgerDirectory -PathType Container
     if ($Apply -and $found) { LockLedger }
@@ -1056,7 +1242,7 @@ function Uninstall {
     }
     $plan = Get-UninstallPlan $script:ledgerRecords $observations
     $refused = @($plan.refused | ForEach-Object { "$($_.id): $($_.reason)" })
-    $steps = @()
+    $steps, $com, $legacy = @(), @(), (LegacyPlan)
     if ($plan.ok) {
         $steps = @(OrderedSteps $plan)
         $table = @(FontReferenceTable (FontValueNames $steps))
@@ -1064,8 +1250,24 @@ function Uninstall {
             $references = @(FontReferences $table $step.path $step.expectSha256)
             if ($references.Count) { $refused += "$($step.id): referenced by $($references -join ', ')" }
         }
+        $com = @($steps | Where-Object { $_.action -ceq 'delete-registry-value' -and $_.key -ne $fontKey })
+        if ($com.Count) {
+            if ($legacy.action -cin @('refuse', 'report')) { $refused += "default-terminal record: $($legacy.reason)" }
+            $terminal = @(@($legacy.steps | Where-Object { $_.name -ceq 'DelegationTerminal' } | ForEach-Object { $_.value }) + @((StartupPair).terminal))[0]
+            if ($terminal -eq $nocttyTerminal) { $refused += 'Noctty stays the selected default terminal, so its COM registration is kept.' }
+        }
+        $contents, $alsoRemoved = @{}, @{ ('HKCU\' + $startupSubkey) = @($legacy.steps | Where-Object { $null -eq $_.value } | ForEach-Object { $_.name }) }
+        foreach ($step in @($steps | Where-Object { $_.action -ceq 'delete-empty-key' })) { $contents[$step.key] = ObserveKeyContent ($step.key -replace '^HKCU\\', '') }
+        $refused += @(Get-ForeignKeyContent $steps $contents $alsoRemoved) + @(TreeReferenceProblems $steps)
     }
-    if ($Apply -and -not $refused.Count) { UndoOwnedSteps $steps }
+    if ($Apply -and -not $refused.Count) {
+        if ($legacy.action -ceq 'restore') { RestoreLegacy $legacy }
+        if ($com.Count -and (StartupPair).terminal -eq $nocttyTerminal) { throw 'Noctty is still the selected default terminal; its COM registration and tree are kept.' }
+        UndoOwnedSteps @($steps | Where-Object { $_.kind -cne 'tree-extracted' })
+        $late = @(TreeReferenceProblems $steps)
+        if ($late.Count) { throw "Owned Noctty trees are kept: $($late -join '; ')" }
+        UndoOwnedSteps @($steps | Where-Object { $_.kind -ceq 'tree-extracted' })
+    }
     $open, $changedAfterClose = @(), @()
     foreach ($id in @(LedgerIds)) {
         $attempt = Get-EffectAttempt (RecordsOf $id)
@@ -1076,14 +1278,14 @@ function Uninstall {
     }
     $answer = [ordered]@{ mode = $Mode; apply = [bool]$Apply; source = $manifest.source; identity = $script:runIdentity
         ledgerFound = $found; siloCheck = 'notPerformed'
-        scope = 'owned fonts visible to this process; Noctty, default-terminal, packages and RentSsh are not in the ledger yet'
+        scope = 'owned fonts and Noctty effects visible to this process, and the default-terminal selection this distribution wrote; packages and RentSsh are not in the ledger yet'
         planned = @($steps | ForEach-Object { "$($_.action) $(if ($_.Contains('path')) { $_.path } else { "$($_.key)\$($_.name)" })" })
-        resolutions = @($plan.resolutions | ForEach-Object { "$($_.id): $($_.resolution)" })
+        resolutions = @($plan.resolutions | ForEach-Object { "$($_.id): $($_.resolution)" }); resumed = @($plan.resumed)
+        defaultTerminal = $legacy.action
         refused = $refused; removed = $script:removed; recordsWritten = $script:recordsWritten
         ownedOpen = $open.Count; changedAfterClose = $changedAfterClose.Count
         retained = @($ledgerDirectory, (Split-Path -Parent $terminalProvenance))
-        notInLedger = [ordered]@{ nocttyDirectory = (Test-Path -LiteralPath $nocttyDirectory)
-            nocttyConfig = (Test-Path -LiteralPath $nocttyConfig); nocttyShortcut = (Test-Path -LiteralPath $nocttyShortcut)
+        notInLedger = [ordered]@{ nocttyShortcut = (Test-Path -LiteralPath $nocttyShortcut)
             defaultTerminalRecord = (Test-Path -LiteralPath $terminalProvenance)
             rentSsh = (Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.ssh\windows-rent')) }
         registrationState = $(if (TestNocttyRegistration) { 'registered' } else { 'unregistered' }); handoffProof = 'unproven' }
@@ -1102,60 +1304,29 @@ try {
         })
     }
     if ($Mode -eq 'Restore') {
-        # Before any Restore effect: an unknown owner stops, and a clean install
-        # (fetch and verify every asset, then extract) runs first or not at all.
+        # Before any Restore effect: an unknown package owner stops.
         $unknown = @($packageStates | Where-Object { $_.state.class -ceq 'indeterminate' })
         if ($unknown.Count) { throw "Package state unknown: $(@($unknown | ForEach-Object { $_.state.reason }) -join '; ')" }
-        $absent = @($packageStates | Where-Object { $_.state.class -ceq 'absent' } | ForEach-Object { $_.package })
-        if ($absent.Count) { InstallPackages $absent }
     }
-    $ledgerFound = $false
+    $ledgerFound, $nocttyPlan = $false, $null
     if ($Mode -eq 'Apply' -or $Mode -eq 'Restore') {
-        # Owned fonts through the effect ledger (native files and HKCU values).
+        # Owned fonts and Noctty through the effect ledger (native files, trees and HKCU keys and
+        # values): recovery, then every Noctty and font effect is classified before the first
+        # one; fonts, then Noctty (tree, configuration, keys, values), then the selection.
         $ledgerFound = Test-Path -LiteralPath $ledgerDirectory -PathType Container
         LockLedger
         $null = ReadLedger
+        RecoverLedger
+        $nocttyPlan = PlanNoctty -Restore:($Mode -eq 'Restore')
+        # Packages only after every refusal the plan can make: a clean install (fetch and verify
+        # every asset, then extract) runs here or not at all; it is disabled until S-A2.
+        $absent = @($packageStates | Where-Object { $_.state.class -ceq 'absent' } | ForEach-Object { $_.package })
+        if ($absent.Count) { InstallPackages $absent }
         ConvergeFonts
         if ($script:fontDrift.Count) { throw "Font drift: $($script:fontDrift -join '; ')" }
-    }
-    if ($Mode -eq 'Restore') {
-        if (-not (Test-Path -LiteralPath $nocttyDirectory -PathType Container)) {
-            $null = New-Item -ItemType Directory -Path $nocttyDirectory -Force
-            Expand-Archive -LiteralPath (BundlePath 'payload/noctty.zip') -DestinationPath $nocttyDirectory
-        }
-        if (-not (TestNocttyFiles)) { throw 'Noctty files differ; close noctty and repair the versioned directory.' }
-        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $nocttyConfig) -Force
-        [IO.File]::WriteAllText($nocttyConfig, $nocttyConfigText, [Text.UTF8Encoding]::new($false))
-        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $nocttyShortcut) -Force
-        $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($nocttyShortcut)
-        $shortcut.TargetPath = $nocttyExe
-        $shortcut.WorkingDirectory = Join-Path $nocttyDirectory 'noctty'
-        $shortcut.Save()
-        if (-not (TestTerminalPackage)) { throw 'Noctty default-terminal handoff requires Windows Terminal 1.24 or newer.' }
-        if (-not (Test-Path -LiteralPath $terminalStartup)) {
-            $null = New-Item -Path $terminalStartup
-        }
-        $startup = Get-Item -LiteralPath $terminalStartup
-        $previousConsole = $startup.GetValue('DelegationConsole')
-        $previousTerminal = $startup.GetValue('DelegationTerminal')
-        RecordPriorTerminal $previousConsole $previousTerminal
-        $registered = $false
-        try {
-            $null = New-ItemProperty -LiteralPath $terminalStartup -Name DelegationConsole -Value $windowsTerminalConsole -PropertyType String -Force
-            $null = & $nocttyCom +register-default-terminal
-            if ($LASTEXITCODE -ne 0) { throw "Noctty default-terminal registration failed: $LASTEXITCODE" }
-            $registered = $true
-            if (-not (TestNocttyRegistration)) { throw 'Noctty default-terminal registration is incomplete.' }
-            if (-not (TestNocttyActivation)) { throw 'Noctty COM activation failed after registration.' }
-            # Before success: a registration the package cannot see is rolled back below.
-            AssertActualSelection
-        } catch {
-            $failure = $_
-            if ($registered) { $null = & $nocttyCom +unregister-default-terminal }
-            RestoreRegistryString $terminalStartup 'DelegationConsole' $previousConsole
-            RestoreRegistryString $terminalStartup 'DelegationTerminal' $previousTerminal
-            throw $failure
-        }
+        ApplyNoctty $nocttyPlan
+        SelectNoctty -Check:($Mode -eq 'Restore')
+        if ($script:nocttyDrift.Count) { throw "Noctty drift: $($script:nocttyDrift -join '; ')" }
     }
     if ($Mode -ne 'Validate') { AssertFonts }
     if ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest') {
@@ -1176,6 +1347,8 @@ try {
         removed = $script:removed; recordsWritten = $script:recordsWritten; ledgerFound = $ledgerFound
         sharedCreated = @($script:sharedCreated); gcKeptReferenced = @($script:gcKeptReferenced)
         noctty = $manifest.noctty.version
+        nocttyPlan = $(if ($nocttyPlan) { [ordered]@{ tree = $nocttyPlan.classes[$nocttyPlan.effects.tree.id].class
+            config = $nocttyPlan.classes[$nocttyPlan.effects.config.id].class; com = $nocttyPlan.com } } else { 'notEvaluated' })
         packages = @($manifest.packages | ForEach-Object {
             $name = $_.name
             $state = @($packageStates | Where-Object { $_.package.name -ceq $name })

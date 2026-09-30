@@ -33,12 +33,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Validate
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Restore      # fonts, Noctty, packages (see below)
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RestoreTest  # fail on drift
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Uninstall    # dry run: lists what it would revert
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Uninstall -Apply  # reverts owned fonts
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Uninstall -Apply  # reverts owned fonts and Noctty, restores the selection
 ```
 
-`Restore` converges the selected fonts (owned, through the effect ledger below),
-the pinned noctty portable ZIP and its `font-family = PlemolJP Console NF`
-configuration, and checks the locked packages (Chromium and AutoHotkey). A
+`Restore` converges the selected fonts and the pinned noctty portable ZIP, its
+`font-family = PlemolJP Console NF` configuration and its default-terminal
+registration (all owned through the effect ledger below), and checks the locked packages (Chromium and AutoHotkey). A
 package is `preexisting` whenever an HKCU or HKLM (64- or 32-bit) Uninstall entry
 has its declared key name, or its DisplayName and Publisher, wherever that entry
 points; it is `preexisting-match` only when DisplayVersion and the ProductVersion
@@ -52,13 +52,18 @@ pinned: `Restore` and `RestoreTest` only assert version 1.24 or newer, because i
 OpenConsole is Noctty's console half. The release ZIP can be downloaded again
 after a clean install; Nix is only needed to build it, not to apply it.
 
-After installing the dependencies, `Restore` selects the Windows Terminal 1.24+
-OpenConsole console delegate and calls Noctty's `+register-default-terminal` for
-the current user. `Restore` then checks the registration, one COM activation,
-and the delegate pair as read from inside the Windows Terminal package (below);
-any failure restores the previous delegate selection and fails `Restore`.
-`RestoreTest` checks registry state (delegate pair, COM class and proxy DLL
-mappings) and the same package-context pair, and fails if that pair differs or
+`Restore` registers Noctty natively; it never runs Noctty's own
+`+register-default-terminal` (only the CI measurement below does). It owns the
+six COM values and the keys it creates (see "Owned Noctty" below), then writes
+`HKCU\Console\%%Startup` `DelegationConsole` (the Windows Terminal 1.24+
+OpenConsole) and `DelegationTerminal` (Noctty), each only when it differs. It then
+checks the registration, one COM activation, and the delegate pair as read from
+inside the Windows Terminal package (below); if any of that fails after a write,
+only the values this run wrote go back to what this run found just before (not to
+the older prior in the record below, which is `Uninstall`'s), and only while they
+still hold what it wrote; then `Restore` fails.
+`RestoreTest` checks registry state (delegate pair and the six COM values) and
+the same package-context pair, and fails if that pair differs or
 cannot be read; it writes no registry value. It does not start the Noctty COM
 server or open a window, but it starts a Windows PowerShell reader under a
 headless `conhost.exe` inside the Windows Terminal package (below). Every mode reports `registrationState`
@@ -86,7 +91,9 @@ The package-context reader needs Windows
 PowerShell 5.1 (Appx module for `Invoke-CommandInDesktopPackage`) and Windows
 Terminal; it does not use Windows Script Host, which on the development host
 had no `.js` script engine.
-`Apply` and `Test` are font-only CI proof modes and do not run this check.
+`Apply` (the CI proof mode) converges the same fonts, Noctty and selection as
+`Restore` without packages, the Windows Terminal version, COM activation and this
+check; `Test` checks fonts only.
 
 **Run `Restore`, `Apply` and `Uninstall` as the same user.** The effect ledger
 lives in that user's `%LOCALAPPDATA%`; another account (for example an elevated
@@ -97,15 +104,16 @@ found. Inside an app's registry silo the ledger and the font values may be
 virtualized too; font `Uninstall` performs no silo check (`siloCheck =
 "notPerformed"`), so its claim covers only what that process sees.
 
-Before its first change to `HKCU\Console\%%Startup`, `Restore` writes the prior
-`DelegationConsole`/`DelegationTerminal` values once to
+Before its first change to `HKCU\Console\%%Startup`, `Apply`/`Restore` writes the
+prior `DelegationConsole`/`DelegationTerminal` values once to
 `LocalApplicationData\windows-iac\provenance\default-terminal.json`. The record
-is never replaced; an unreadable record fails `Restore`, and
-`priorSelectsNoctty = true` marks a record taken when Noctty was already
-selected, whose true original is unknown. **Rollback from this record is not
-implemented yet**: no mode reads it, and Noctty's `+unregister-default-terminal`
-effect on COM/Interface keys is unverified. Until then, restore the recorded
-pair by hand and keep the record.
+is never replaced; an unreadable record stops `Apply`/`Restore` before any effect,
+and `priorSelectsNoctty = true` marks a record taken when Noctty was already
+selected, whose true original is unknown. `Uninstall -Apply` restores from it only
+values that still hold what was written,
+`DelegationTerminal` first, so a half-restored pair resumes; a value changed by
+anyone else, or an unknown original, is refused and never guessed. The record is
+kept afterwards.
 
 ### Default-terminal handoff proof (host only)
 
@@ -204,15 +212,14 @@ credentials are never written here.
 
 ## Owned fonts and the effect ledger
 
-`Apply` (the CI font-only mode) and `Restore` own the selected content-addressed
+`Apply` (the CI proof mode) and `Restore` own the selected content-addressed
 TTF files beneath the current user's `LocalApplicationData\Microsoft\Windows\Fonts`
 and their `HKCU\Software\Microsoft\Windows NT\CurrentVersion\Fonts` values
 `<full name> (TrueType)` (REG_SZ, the file's path), written natively. `Test` and
-`RestoreTest` read both back. `Restore` also writes the selected noctty
-configuration and default-terminal registration, which are **not** in the ledger
-yet (next slice), and does not replace Windows-owned UI fonts or restore old
-registry settings, accounts, profiles, or personal app data. The user directory
-is a runtime Binding, not common Spec.
+`RestoreTest` read both back. The same ledger owns Noctty (below). Nothing here
+replaces Windows-owned UI fonts or restores old registry settings, accounts,
+profiles, or personal app data. The user directory is a runtime Binding, not
+common Spec.
 
 Every owned effect is recorded in `%LOCALAPPDATA%\windows-iac\ledger`, one file
 per record (`<seq>.json`, created new, written through and flushed) while
@@ -235,16 +242,67 @@ Only what this code created is owned (the prior state is always absent), so:
 - A file Windows has locked (a loaded font) is never deferred or forced: the run
   fails and the file stays owned for the next run.
 
+### Owned Noctty
+
+`Apply`/`Restore` classify every Noctty effect before the first effect of the
+run, then (after fonts) create only what is absent, in this order:
+
+1. the tree `%LOCALAPPDATA%\Programs\noctty-<version>`, extracted from the bundled
+   ZIP only after every entry name is checked against the pinned inventory, into
+   a staging directory its intent names, compared exactly, then renamed;
+2. `%LOCALAPPDATA%\noctty\config.ghostty` (`font-family = …`);
+3. the `HKCU\Console\%%Startup` key, if missing;
+4. the COM keys derived from the six values in `nix.nix` (below
+   `Software\Classes\CLSID\{…}` and `…\Interface\{…}`, parents first; an existing
+   key is never owned, and the shared `CLSID`/`Interface` roots never are), then
+   the six REG_SZ values; then the selection above.
+
+Shared parents they need (`Programs`, `%LOCALAPPDATA%\noctty`, the two roots)
+are created as needed, listed in `sharedCreated`, and never removed. No Start-menu
+shortcut is created; an existing one is untouched. The run stops before any
+effect on: a machine-wide Noctty (either CLSID in HKLM, or an HKLM Uninstall
+entry naming it); a tree that differs from the inventory, owned or not (an extra,
+missing or changed file, a junction, an empty directory), which is never
+overwritten; or a COM registration that is neither entirely present and exact
+(then nothing is written for it) nor entirely absent or owned (**K-rule**: one
+foreign or differing value, or a mix, refuses), or, when the registration will be
+written, an existing COM key holding any value or subkey other than the declared
+ones (an existing empty key is fine, and never owned). An unrecorded tree or value that
+exactly matches is `preexisting-match`: left alone and never owned (A2), so an
+exact pre-ledger Noctty (as on the development host) is not written. A differing
+configuration is reported as `Noctty drift` and never written. Version drift (a
+registration naming another version's tree) is a differing value: it refuses.
+If a running Noctty ever writes into its own tree, that tree reads as drift and
+`RestoreTest` fails for that site; this is recorded, not hidden (unmeasured: G3).
+After a version change, the older version's owned tree stays until `Uninstall`,
+which removes it too; `Apply`/`Restore` do not collect it. In `Restore`, package
+installation (disabled until S-A2) comes after this plan, so no package changes
+before a Noctty refusal.
+
+The vendor registration also writes bookkeeping keys (`…\{Noctty}\noctty.default-terminal`
+with `Present = 0` markers) and two CLSID description strings. They are **not**
+written here, on the reading that COM never reads them; this stays conditional on
+the VM proof below.
+
 `Uninstall` without `-Apply` changes nothing and lists the plan. With `-Apply` it
-builds the whole plan and a Fonts reference check first; if anything is refused
-(owned drift, an unhandled id, a file an unowned value names), nothing is removed.
-Otherwise it removes owned values, then owned files, each only while it is still
-exactly what was recorded, and closes each undone. It reports `ownedOpen` (0 when
-empty), `changedAfterClose` (closed targets that no longer read as their prior;
-reported, not a failure), `retained` (the ledger and provenance directories,
-which are state rather than effects) and `notInLedger` (Noctty, the
-default-terminal record and RentSsh, which it does not touch yet). `Apply` and a
-fonts-only `Uninstall` may run elevated on a disposable runner; `Restore` may not.
+plans everything first; if anything is refused (owned drift other than a partly
+removed tree, an unhandled id, a file an unowned Fonts value names, a created key
+holding a value or subkey the plan does not remove (**A3**), an unowned COM
+server path naming an owned tree, or, while owned COM values would go, a
+selection record that cannot restore or would leave Noctty selected), nothing is
+removed. Otherwise it restores the selection (above), reads it again and stops if
+Noctty is still selected, then removes owned values, created keys (deepest first,
+only while empty), owned files, and last owned trees (file by file, then empty
+directories, never recursively), checking the COM guard again just before. A tree
+left partly removed (a crash, or a file locked by a running `noctty.exe`) is
+resumed by the next `Uninstall` (`resumed`). A key someone else writes into
+between the check and its removal would lose that value with it (a small window;
+A3 refuses it at plan time). It reports `ownedOpen` (0 when empty),
+`changedAfterClose` (closed targets that no longer read as their prior; reported,
+not a failure), `defaultTerminal` (the rollback action), `retained` (the ledger
+and provenance directories, which are state rather than effects) and
+`notInLedger` (an existing shortcut, the default-terminal record and RentSsh).
+`Apply` and `Uninstall` may run elevated on a disposable runner; `Restore` may not.
 
 **Torn record.** A power loss can tear only the highest-seq record, and every mode
 that reads the ledger then stops. Remove that one file by hand only if it is the
@@ -285,7 +343,20 @@ rejects package corruption; replays interrupted attempts (void, commit, undone,
 temporary files an intent named, a temporary file none named, a second writer, a
 torn record); keeps files a foreign value names; moves an owned value to a new
 selection and collects the old file; and uninstalls (dry run unchanged, locked
-file kept owned, then empty, then a no-op). It also requires every `win.ps1` answer to report
+file kept owned, then empty, then a no-op), all with Noctty converged by the same
+`Apply` (A22). For Noctty (A15-A21) it checks the order of the owned effects and
+an independent readback of the tree, configuration, keys, six values and
+selection; a differing owned or unowned tree refused before any effect; a
+half-restored selection and a partly removed tree resumed by `Uninstall`; an
+interrupted extraction voided and its staging cleaned; A3, the K-rule (one value
+exact or foreign with the rest absent) and the COM guard (six exact unowned
+values naming an owned tree) refusing before any removal; a differing user
+configuration kept; and an exact unowned tree left alone. The create and undo
+primitives also run in a Windows PowerShell 5.1 child on synthetic targets. The
+G4 gate measures the vendor's own registration against the six values. A
+`Restore` rollback after a failed activation or package check is not exercised
+on CI (`Restore` refuses the elevated runner, whose Windows Terminal is 1.23).
+It also requires every `win.ps1` answer to report
 `handoffProof = "unproven"` and `handoff-proof.ps1` to refuse the runner, so CI
 never claims a real default-terminal handoff. Negative controls must fail for
 their expected reason.
@@ -302,12 +373,18 @@ proven target-owned smoke tests and publication still need composition into the
 final single `ci.yml` with the open OCI stack. Do not discard existing proof to
 claim one workflow prematurely. Existing OCI definitions and #8 are unchanged.
 
-`%LOCALAPPDATA%\windows-iac\provenance\default-terminal.json` is new per-user
-state written by `Restore`; no current uninstall or rollback path removes it.
-`Uninstall` reverts owned fonts only: Noctty, its configuration and shortcut,
-the default-terminal registration and COM values, and clean package installs
-join the ledger in later slices, so `Restore`/`Uninstall` as a whole is not
-complete.
+`%LOCALAPPDATA%\windows-iac\provenance\default-terminal.json` is per-user state;
+rollback reads it and nothing removes it. Clean package installs join the ledger
+in a later slice (S-A2), so a clean `Restore` still stops at the package gate and
+`Restore`/`Uninstall` as a whole is not complete.
+
+**Required on a VM before the native registration is accepted (unproven here):**
+from an unelevated, Explorer-launched shell with Windows Terminal 1.24 or newer,
+`Restore` (COM activation and the package-context pair), the handoff proof above
+(a new console opens in this Noctty), and one GUI start and close of Noctty
+showing no write inside its tree (G3). These also gate leaving out the vendor's
+bookkeeping keys and descriptions; if handoff fails without them, they become
+owned values.
 
 Application/UI selection beyond noctty, Japanese/Nerd/Emoji rendering,
 font reload/relogin, Linux profile activation, and real-host

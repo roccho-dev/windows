@@ -383,6 +383,31 @@ Must ((Guard "`"$comTree\noctty\noctty.exe`" -Embedding" @()) -and (Guard '%Syst
         @{ kind = 'registry-key-created'; target = $fontKey })
     Must (@($font | Where-Object { IsFontEffect $_ }).Count -eq 2 -and -not @($other | Where-Object { IsFontEffect $_ }).Count) 'font collection candidates'
 }
+# A3: a created key the plan removes may hold only what the plan, or the selection rollback, removes.
+$a3Steps = @([ordered]@{ action = 'delete-registry-value'; key = 'HKCU\A\B'; name = '' }, [ordered]@{ action = 'delete-empty-key'; key = 'HKCU\A\B' },
+    [ordered]@{ action = 'delete-empty-key'; key = 'HKCU\A' }, [ordered]@{ action = 'delete-empty-key'; key = 'HKCU\Console\%%Startup' })
+$a3Clean = @{ 'HKCU\A\B' = @{ values = @(''); subkeys = @() }; 'HKCU\A' = @{ values = @(); subkeys = @('b') }
+    'HKCU\Console\%%Startup' = @{ values = @('DelegationConsole'); subkeys = @() } }
+$a3Dirty = @{ 'HKCU\A\B' = @{ values = @('', 'X'); subkeys = @() }; 'HKCU\A' = @{ values = @(); subkeys = @('B', 'C') }
+    'HKCU\Console\%%Startup' = @{ values = @('DelegationConsole'); subkeys = @() } }
+Must (-not @(Get-ForeignKeyContent $a3Steps $a3Clean @{ 'HKCU\Console\%%Startup' = @('DelegationConsole') }).Count -and
+    @(Get-ForeignKeyContent $a3Steps $a3Dirty @{}).Count -eq 3) 'A3: foreign key content'
+# A failed run's rollback: only what this run wrote, back to what it read just before (not the
+# write-once record's older prior), Terminal first; a planned write that never landed is skipped
+# (a failure between the two writes); a value changed by anyone else refuses it.
+function Sel($Console, $Terminal) { @{ console = $Console; terminal = $Terminal } }
+function Rollback($Before, $Written, $Current) {
+    $r = Get-SelectionRollbackSteps $Before $Written $Current
+    if (-not $r.ok) { 'refused' } else { @($r.steps | ForEach-Object { "$($_.name)=$($_.value)" }) -join ';' }
+}
+$both = @{ DelegationConsole = $wtConsole; DelegationTerminal = $noctty }
+Must ((Rollback (Sel $wtConsole $terminal) @{ DelegationTerminal = $noctty } (Sel $wtConsole $noctty)) -ceq "DelegationTerminal=$terminal" -and  # the user's own choice
+    (Rollback (Sel $null $null) $both (Sel $wtConsole $noctty)) -ceq 'DelegationTerminal=;DelegationConsole=' -and          # both landed
+    (Rollback (Sel $null $null) $both (Sel $wtConsole $null)) -ceq 'DelegationConsole=' -and                              # only the first landed
+    (Rollback (Sel $null $null) $both (Sel $null $null)) -ceq '' -and                                                     # neither landed
+    (Rollback (Sel $null $null) $both (Sel $wtConsole $terminal)) -ceq 'refused' -and                                     # a foreign Terminal
+    (Rollback (Sel $null $null) $both (Sel $terminal $noctty)) -ceq 'refused' -and                                       # a foreign Console
+    (Rollback (Sel $wtConsole $noctty) @{} (Sel $wtConsole $noctty)) -ceq '') 'selection rollback of one run'
 
 # The create and recovery primitives, loaded alone from win.ps1 (no mode creates a Noctty effect
 # yet) and run against a scratch %LOCALAPPDATA% ($Scratch, never deleted), its own ledger and a
@@ -395,7 +420,8 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
     $names = 'WriteRecord', 'RecordsOf', 'OpenAttempt', 'IntentTemp', 'CleanStaging', 'ResolveAttempt', 'RecoverId', 'Recovering',
         'CreateOwnedFile', 'CreateOwnedValue', 'CreateOwnedKey', 'CreateOwnedTree', 'Observe', 'ObserveNoctty', 'ObserveTree',
         'ObserveKey', 'ObserveValue', 'ObserveFile', 'NocttyEffects', 'KeyEffect', 'ValueEffect', 'FileEffect',
-        'OrderedSteps', 'UndoOwnedSteps', 'RemoveTarget', 'FontReferences', 'FontReferenceTable', 'NocttyReferences'
+        'OrderedSteps', 'UndoOwnedSteps', 'RemoveTarget', 'FontReferences', 'FontReferenceTable', 'NocttyReferences',
+        'SelectNoctty', 'StartupPair', 'RecordPriorTerminal', 'TestNocttyRegistration', 'TestNocttyActivation', 'AssertActualSelection', 'RestoreLegacy'
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'win.ps1'), [ref]$null, [ref]$null)
     foreach ($definition in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cin $names }, $false)) {
         . ([scriptblock]::Create($definition.Extent.Text))
@@ -506,6 +532,31 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
         $shared.Close()
         if ($sharedMade -and $empty) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey('Software\Classes\CLSID', $false) }
     }
+    # Restore's selection rollback, on the real %%Startup (put back afterwards): the check fails
+    # because this scratch registration is absent. Only what the run wrote goes back to what it
+    # read, even though the write-once record holds an older prior (nothing selected).
+    $startupSubkey, $terminalStartup = 'Console\%%Startup', 'HKCU:\Console\%%Startup'
+    $windowsTerminalConsole, $nocttyTerminal = '{2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}', '{33368C6F-D328-410C-B225-26DC9F12C728}'
+    $terminalProvenance, $userTerminal = (Join-Path $Scratch 'provenance\default-terminal.json'), '{E12CFF52-A866-4C77-9A90-F570A7AA2C6B}'
+    $startup, $saved = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($startupSubkey), @{}
+    foreach ($name in 'DelegationConsole', 'DelegationTerminal') {
+        if ($startup.GetValueNames() -contains $name) { $saved[$name] = @($startup.GetValueKind($name), $startup.GetValue($name, $null, 'DoNotExpandEnvironmentNames')) }
+    }
+    try {
+        RecordPriorTerminal $null $null
+        $startup.SetValue('DelegationConsole', $windowsTerminalConsole, 'String')
+        $startup.SetValue('DelegationTerminal', $userTerminal, 'String')
+        Refused { SelectNoctty -Check } '*registration is incomplete*'
+        Must ((StartupPair).console -ceq $windowsTerminalConsole -and (StartupPair).terminal -ceq $userTerminal) 'a failed check restores the selection this run found'
+        $startup.DeleteValue('DelegationConsole'); $startup.DeleteValue('DelegationTerminal')
+        Refused { SelectNoctty -Check } '*registration is incomplete*'
+        Must ($null -eq (StartupPair).console -and $null -eq (StartupPair).terminal) 'both values this run wrote are removed again'
+    } finally {
+        foreach ($name in 'DelegationConsole', 'DelegationTerminal') {
+            if ($saved.Contains($name)) { $startup.SetValue($name, $saved[$name][1], $saved[$name][0]) } else { $startup.DeleteValue($name, $false) }
+        }
+        $startup.Close()
+    }
     CreateOwnedFile $selected.config ([Text.UTF8Encoding]::new($false).GetBytes($nocttyConfigText))
     Must ((Phases $selected.config) -ceq 'intent,commit') 'the config is created from bytes'
     if ($Real) {
@@ -614,6 +665,11 @@ function Ledger {
     @(Get-ChildItem -LiteralPath $ledgerDir -Filter '*.json' | Sort-Object Name | ForEach-Object { [IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json })
 }
 function Phases([string]$Id) { @(Ledger | Where-Object { $_.id -ceq $Id } | ForEach-Object { $_.phase }) -join ',' }
+# Apply now also converges Noctty, so font counts are taken over font records only.
+function IsFontRecord($Record) {
+    ($Record.kind -ceq 'file-created' -and [IO.Path]::GetDirectoryName($Record.target) -eq $fontDir) -or
+        ($Record.kind -ceq 'registry-value' -and $Record.target -ceq ('HKCU\' + $fontSubkey))
+}
 # A record the proof writes itself, in the ledger's own format and next seq, to model an interrupted run.
 function Craft([hashtable]$Fields) {
     $seq = 1 + [long](@(Ledger | ForEach-Object { [long]$_.seq }) + 0 | Measure-Object -Maximum).Maximum
@@ -1019,6 +1075,8 @@ foreach ($font in $fonts) {
 }
 if (Test-Path -LiteralPath $ledgerDir) { throw 'Proof requires no effect ledger yet.' }
 $n = $fonts.Count
+$shortcut = Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs\noctty.lnk'
+$shortcutBefore = Test-Path -LiteralPath $shortcut
 # A6 (owned): an Apply interrupted after committing fonts[0]'s file and before its value left
 # that owned file unregistered, and its bytes were then damaged. Only an unregistered file can
 # be damaged here: Windows keeps a registered per-user font file open without write sharing.
@@ -1028,10 +1086,12 @@ CraftFile (FontPath $fonts[0]) $fonts[0].sha256.ToLowerInvariant() @('intent', '
 MustReject { Run 'Test' } 'Installed bytes differ:*'
 
 # A1: the first Apply reverts and owns fonts[0]'s damaged file again, then owns every other file
-# and every value from no record at all (one intent and one commit each); a second Apply writes nothing.
+# and every value from no record at all (one intent and one commit each); a second Apply writes
+# nothing. The same Apply creates the Noctty tree and configuration (the two other copies, A15).
 $first = Run 'Apply'
-if ($first.copied -ne $n -or $first.changedProperties -ne $n -or $first.removed -ne 1 -or $first.recordsWritten -ne 4 * $n + 1 -or
-    @(Ledger).Count -ne 4 * $n + 3 -or (Get-FileHash -LiteralPath (FontPath $fonts[0])).Hash -ne $fonts[0].sha256 -or
+if ($first.copied -ne $n + 2 -or $first.removed -ne 1 -or @(Ledger | Where-Object { IsFontRecord $_ }).Count -ne 4 * $n + 3 -or
+    @($fonts | Where-Object { (Phases (ValueId (ValueName $_))) -cne 'intent,commit' }).Count -or
+    (Get-FileHash -LiteralPath (FontPath $fonts[0])).Hash -ne $fonts[0].sha256 -or
     (Phases (FileId (FontPath $fonts[0]))) -cne 'intent,commit,undone,intent,commit') {
     throw 'The first Apply did not repair the owned damaged file and own each other font file and value exactly once.'
 }
@@ -1048,6 +1108,150 @@ foreach ($font in $fonts) {
     $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($fontSubkey)
     try { if ([string]$key.GetValueKind((ValueName $font)) -cne 'String') { throw 'A font value is not REG_SZ.' } } finally { $key.Close() }
 }
+
+# ---- A15-A21: owned Noctty and the default-terminal selection, native (the vendor is not called) ----
+# Checked independently from the manifest. Everything the proof itself writes (an unowned tree,
+# configuration or COM values) it removes again one entry at a time, never recursively.
+$realLocal = [Environment]::GetFolderPath('LocalApplicationData')
+$realTree, $realConfig = (Join-Path $realLocal ('Programs\noctty-' + $manifest.noctty.version)), (Join-Path $realLocal 'noctty\config.ghostty')
+$bound = Get-NocttyRegistration $manifest.noctty.registration $realTree $manifest.noctty.files
+$treeId, $configId = ('tree-extracted:' + $realTree.ToUpperInvariant()), ('file-created:' + $realConfig.ToUpperInvariant())
+$keyIds = @($bound.keys | ForEach-Object { 'registry-key-created:' + "HKCU\$_".ToUpperInvariant() })
+$valueIds = @($bound.values | ForEach-Object { 'registry-value:' + "HKCU\$($_.key)|$($_.name)".ToUpperInvariant() })
+function KeyExists([string]$Subkey) { $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($Subkey); if ($null -eq $k) { return $false }; $k.Close(); $true }
+function ComValue($Row) {
+    $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($Row.key)
+    if ($null -eq $k) { return $null }
+    try { if ($k.GetValueNames() -contains $Row.name) { "$($k.GetValueKind($Row.name)):$($k.GetValue($Row.name, $null, 'DoNotExpandEnvironmentNames'))" } } finally { $k.Close() }
+}
+function Selection { $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Console\%%Startup'); try { "$($k.GetValue('DelegationConsole'))|$($k.GetValue('DelegationTerminal'))" } finally { $k.Close() } }
+function TreeExact {
+    $files = @($manifest.noctty.files.PSObject.Properties)
+    @(Get-ChildItem -LiteralPath $realTree -Recurse -Force -File).Count -eq $files.Count -and
+        -not @($files | Where-Object { (Get-FileHash -LiteralPath (Join-Path $realTree $_.Name.Replace('/', '\'))).Hash -ne $_.Value }).Count
+}
+function LastSeq { [long](@(Ledger | ForEach-Object { [long]$_.seq }) + 0 | Measure-Object -Maximum).Maximum }
+function NewRecords([long]$Since, $Ids) { @(Ledger | Where-Object { [long]$_.seq -gt $Since -and $Ids -ccontains $_.id }).Count }
+# Unowned COM values the proof writes itself, creating missing keys parents first; it returns the keys it made.
+function PutComValues($Rows) {
+    foreach ($k in $bound.keys) {
+        if (-not (KeyExists $k) -and @($Rows | Where-Object { $_.key -eq $k -or $_.key.StartsWith("$k\") }).Count) { [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($k).Close(); $k }
+    }
+    foreach ($row in $Rows) { $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($row.key, $true); try { $k.SetValue($row.name, $row.data, 'String') } finally { $k.Close() } }
+}
+function DropComValues($Rows, $Made) {
+    foreach ($row in $Rows) { $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($row.key, $true); if ($k) { try { $k.DeleteValue($row.name, $false) } finally { $k.Close() } } }
+    foreach ($k in @($Made | Sort-Object { $_.Length } -Descending)) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($k, $false) }
+}
+function RemoveProofTree([string]$Path) {
+    foreach ($file in @(Get-ChildItem -LiteralPath $Path -Recurse -Force -File)) { [IO.File]::Delete($file.FullName) }
+    foreach ($dir in @(Get-ChildItem -LiteralPath $Path -Recurse -Force -Directory | Sort-Object { $_.FullName.Length } -Descending)) { [IO.Directory]::Delete($dir.FullName, $false) }
+    [IO.Directory]::Delete($Path, $false)
+}
+
+# A15: the first Apply owned the tree, the configuration, each COM key it had to create (keys that
+# existed, such as those the vendor left in G4, are never owned) and the six values, in that
+# order, keys parents first; everything reads back exactly; the selection was written once, with
+# its record; no shortcut was made; the second Apply wrote nothing (A4).
+$owned = @($keyIds | Where-Object { (Phases $_) -ceq 'intent,commit' })
+$order = @(@($treeId, $configId) + $owned + $valueIds | ForEach-Object { $id = $_; [long]@(Ledger | Where-Object { $_.id -ceq $id -and $_.phase -ceq 'intent' })[-1].seq })
+Must ((Phases $treeId) -ceq 'intent,commit' -and (Phases $configId) -ceq 'intent,commit' -and $first.nocttyPlan.com -ceq 'converge' -and
+    -not @($valueIds | Where-Object { (Phases $_) -cne 'intent,commit' }).Count -and
+    -not @($keyIds | Where-Object { (Phases $_) -cnotin @('', 'intent,commit') }).Count -and
+    -not @(1..($order.Count - 1) | Where-Object { $order[$_] -le $order[$_ - 1] }).Count) 'A15: owned Noctty effects, in order'
+Must ((TreeExact) -and [IO.File]::ReadAllText($realConfig) -ceq ('font-family = ' + $manifest.noctty.fontFamily + "`n") -and
+    -not @($bound.values | Where-Object { (ComValue $_) -cne "String:$($_.data)" }).Count -and -not @($bound.keys | Where-Object { -not (KeyExists $_) }).Count -and
+    (Selection) -ceq "$wtConsole|$noctty" -and (Test-Path -LiteralPath (Join-Path $realLocal 'windows-iac\provenance\default-terminal.json')) -and
+    (Test-Path -LiteralPath $shortcut) -eq $shortcutBefore -and $first.registrationState -ceq 'registered') 'A15: independent readback'
+
+# A16: an owned tree that differs (a file removed) is never overwritten: Apply stops before any effect.
+[IO.File]::Delete((Join-Path $realTree 'noctty\noctty.com'))
+$count = @(Ledger).Count
+MustReject { Run 'Apply' } '*differs from the pinned Noctty (owned-drift)*'
+Must (@(Ledger).Count -eq $count) 'A16: a differing owned tree stops Apply before any effect'
+
+# A17: Uninstall restores only the selection value still as written (Terminal already put back by
+# hand: a half state), then resumes the partly removed tree; everything owned is gone.
+$startupKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Console\%%Startup', $true)
+try { $startupKey.DeleteValue('DelegationTerminal') } finally { $startupKey.Close() }
+$gone = RunUninstall -Apply
+Must ((@($gone.resumed) -join ',') -ceq $treeId -and $gone.defaultTerminal -ceq 'restore' -and (Selection) -ceq '|' -and $gone.ownedOpen -eq 0 -and
+    $gone.changedAfterClose -eq 0 -and -not (Test-Path -LiteralPath $realTree) -and -not (Test-Path -LiteralPath $realConfig) -and
+    -not @($bound.values | Where-Object { $null -ne (ComValue $_) }).Count -and -not @($owned | ForEach-Object { $_.Substring(26) } | Where-Object { KeyExists $_ }).Count) 'A17: selection half state and a resumed tree'
+AssertEmpty
+
+# A18: an extraction interrupted with part of the inventory staged is voided and its staging
+# directory cleaned by the next Apply, which then extracts the tree exactly.
+$files = @{}
+foreach ($entry in $manifest.noctty.files.PSObject.Properties) { $files[$entry.Name] = ([string]$entry.Value).ToLowerInvariant() }
+$staging = "$realTree.$([guid]::NewGuid().ToString('N')).staging"
+Craft @{ phase = 'intent'; id = $treeId; kind = 'tree-extracted'; target = $realTree; prior = $absent; desired = @{ exists = $true; files = $files }; temp = $staging }
+$null = New-Item -ItemType Directory -Path "$staging\noctty"
+[IO.File]::WriteAllText("$staging\noctty\noctty.com", 'interrupted')
+$null = Run 'Apply'
+Must ((Phases $treeId) -clike '*,intent,void,intent,commit' -and -not (Test-Path -LiteralPath $staging) -and (TreeExact)) 'A18: crash recovery of the tree'
+
+# A19: A3 - a created COM key holding a foreign value refuses Uninstall before any removal.
+$ownedKeyId = @($keyIds | Where-Object { (Phases $_) -clike '*intent,commit' })[0]
+$ownedKey = @(Ledger | Where-Object { $_.id -ceq $ownedKeyId })[0].target.Substring(5)
+$foreign = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($ownedKey, $true)
+try { $foreign.SetValue('ProofForeign', 'x') } finally { $foreign.Close() }
+$count, $selected = @(Ledger).Count, (Selection)
+MustReject { RunUninstall -Apply } '*holds foreign content*'
+Must (@(Ledger).Count -eq $count -and (Selection) -ceq $selected -and -not @($bound.values | Where-Object { $null -eq (ComValue $_) }).Count -and (TreeExact)) 'A19: A3 refuses before any removal'
+$foreign = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($ownedKey, $true)
+try { $foreign.DeleteValue('ProofForeign') } finally { $foreign.Close() }
+$null = RunUninstall -Apply
+# K-rule: one of the six present (exact, then foreign) with the others absent stops Apply before any effect.
+$threading = @($bound.values | Where-Object { $_.name -ceq 'ThreadingModel' })
+$made = @(PutComValues $threading)
+$count = @(Ledger).Count
+MustReject { Run 'Apply' } '*partly foreign*'
+$null = @(PutComValues @([ordered]@{ key = $threading[0].key; name = 'ThreadingModel'; data = 'Apartment' }))
+MustReject { Run 'Apply' } '*partly foreign*'
+Must (@(Ledger).Count -eq $count -and -not (Test-Path -LiteralPath $realTree)) 'A19: the K-rule stops a mixed or foreign registration'
+DropComValues $threading $made
+# A preexisting COM key holding someone else's value is never written into: Apply stops before any effect.
+[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($bound.keys[0]).Close()
+$foreign = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($bound.keys[0], $true)
+try { $foreign.SetValue('ProofForeign', 'x') } finally { $foreign.Close() }
+MustReject { Run 'Apply' } '*holds foreign content*'
+Must (@(Ledger).Count -eq $count -and -not (Test-Path -LiteralPath $realTree)) 'A19: a foreign preexisting COM key stops Apply'
+$foreign = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($bound.keys[0], $true)
+try { $foreign.DeleteValue('ProofForeign') } finally { $foreign.Close() }
+[Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($bound.keys[0], $false)
+# All six present and exact (unowned): nothing is written for them and the tree is owned; since
+# they name the tree and the plan does not remove them, the COM->tree guard refuses Uninstall.
+$made = @(PutComValues $bound.values)
+$mark = LastSeq
+$pre = Run 'Apply'
+Must ($pre.nocttyPlan.com -ceq 'preexisting' -and (NewRecords $mark $valueIds) -eq 0 -and (NewRecords $mark @($treeId)) -eq 2) 'A19: an exact preexisting registration is left alone'
+MustReject { RunUninstall -Apply } '*names*'
+Must ((TreeExact) -and -not @($bound.values | Where-Object { $null -eq (ComValue $_) }).Count) 'A19: the COM->tree guard refuses before any removal'
+DropComValues $bound.values $made
+$null = RunUninstall -Apply
+
+# A20: a user configuration that differs is never written or removed; Apply reports it as drift.
+[IO.File]::WriteAllText($realConfig, "font-family = user`n")
+MustReject { Run 'Apply' } 'Noctty drift:*'
+$null = RunUninstall -Apply
+Must ([IO.File]::ReadAllText($realConfig) -ceq "font-family = user`n") 'A20: a differing unowned configuration is kept'
+[IO.File]::Delete($realConfig)
+
+# A21: A2 - an unrecorded tree exactly the inventory is preexisting-match, left alone and kept by
+# Uninstall; one that differs stops Apply before any effect.
+Expand-Archive -LiteralPath (Join-Path $PSScriptRoot 'payload/noctty.zip') -DestinationPath $realTree
+$mark = LastSeq
+$pre = Run 'Apply'
+Must ($pre.nocttyPlan.tree -ceq 'preexisting-match' -and (NewRecords $mark @($treeId)) -eq 0) 'A21: an exact unowned tree is not owned'
+$null = RunUninstall -Apply
+[IO.File]::AppendAllText((Join-Path $realTree 'noctty\noctty.com'), 'x')
+$count = @(Ledger).Count
+MustReject { Run 'Apply' } '*differs from the pinned Noctty (preexisting-drift)*'
+Must ((Test-Path -LiteralPath $realTree) -and @(Ledger).Count -eq $count) 'A21: a differing unowned tree is never overwritten'
+RemoveProofTree $realTree
+# A22: the font proof below runs with Noctty owned again, converged by the same Apply.
+$null = Run 'Apply'
 
 # Owned value drift is repaired by reverting and owning again (registry only; damaged bytes are A6 above).
 SetFontValue (ValueName $fonts[0]) 'negative-control'
@@ -1130,7 +1334,8 @@ if ((Test-Path -LiteralPath $oldPath) -or (Phases (FileId $oldPath)) -cne 'inten
 # A3: a dry run lists every owned file and value and changes nothing.
 $before = Snapshot
 $dry = RunUninstall
-if (@($dry.planned).Count -ne 2 * $n -or @($dry.refused).Count -or $dry.apply -or (Snapshot) -cne $before) { throw 'The Uninstall dry run is wrong or changed state.' }
+$fontPlanned = @($dry.planned | Where-Object { $_ -like "* $fontDir\*" -or $_ -like "* HKCU\$fontSubkey\*" })
+if ($fontPlanned.Count -ne 2 * $n -or @($dry.refused).Count -or $dry.apply -or (Snapshot) -cne $before) { throw 'The Uninstall dry run is wrong or changed state.' }
 
 # A8: a locked file fails Uninstall after the values; it stays owned and nothing is deferred.
 $handle = [IO.File]::Open((FontPath $fonts[0]), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
@@ -1269,4 +1474,5 @@ if ($g4.status -cne 'measured' -or (Get-Field $g4 'gate') -cne 'pass' -or $g4.st
     rentSsh = "cloudflared $($manifest.cloudflared.version) client, strict config, Include preserved and idempotent, drift repaired"
     winReportsHandoffUnproven = $true; handoffProbeRefusedOnRunner = $true; handoffEvaluatorCases = $handoffCases;
     g4Measurement = $g4; s20Measurement = $s20;
-    scope = 'current-user owned fonts, registry and SSH-client convergence; not Restore/Uninstall of Noctty, the default terminal or packages, rendering, default-terminal handoff, real-host UX or a Cloudflare connection' } | ConvertTo-Json
+    noctty = 'native owned tree, configuration, COM keys and values and the default-terminal selection through Apply and Uninstall (A15-A21)'
+    scope = 'current-user owned fonts, Noctty and SSH-client convergence on an elevated runner with Windows Terminal 1.23; not Restore (activation, package view, rollback), packages, rendering, default-terminal handoff, real-host UX or a Cloudflare connection' } | ConvertTo-Json

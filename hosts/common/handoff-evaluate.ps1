@@ -486,6 +486,24 @@ function Get-TreeUndoSteps($Record, $Current) {
     return ,$steps
 }
 
+# A3, at plan time: one reason for each created key an uninstall plan removes ($Steps) that
+# would still hold a value or subkey the plan does not remove. $Contents maps each such key
+# ('HKCU\...') to its { values; subkeys } names now; $AlsoRemoved maps a key to value names
+# another plan removes first (the default-terminal rollback). Names compare ignoring case.
+function Get-ForeignKeyContent($Steps, $Contents, $AlsoRemoved) {
+    $keys = @($Steps | Where-Object { $_.action -ceq 'delete-empty-key' } | ForEach-Object { [string]$_.key })
+    foreach ($key in $keys) {
+        $removedValues = @($Steps | Where-Object { $_.action -ceq 'delete-registry-value' -and [string]$_.key -eq $key } | ForEach-Object { [string]$_.name }) +
+            @(Get-Field $AlsoRemoved $key | Where-Object { $null -ne $_ })
+        $removedKeys = @($keys | Where-Object { $_.StartsWith($key + '\', [StringComparison]::OrdinalIgnoreCase) } |
+            ForEach-Object { $_.Substring($key.Length + 1) } | Where-Object { -not $_.Contains('\') })
+        $content = Get-Field $Contents $key
+        $foreign = @(@(Get-Field $content 'values' | Where-Object { $null -ne $_ -and $removedValues -notcontains $_ } | ForEach-Object { "value '$_'" }) +
+            @(Get-Field $content 'subkeys' | Where-Object { $null -ne $_ -and $removedKeys -notcontains $_ } | ForEach-Object { "subkey $_" }))
+        if ($foreign.Count) { "$key holds foreign content the plan does not remove: $($foreign -join ', ')" }
+    }
+}
+
 # Why an owned tree may not be removed, or $null: a reference ($References, each { label; id;
 # data }, such as a COM server path) the plan does not remove ($RemovedIds) names $Tree or a
 # path beneath it. data is read as Windows reads it: environment variables expanded, a leading
@@ -764,6 +782,27 @@ function Get-UninstallPlan($Records, $Observations) {
     }
     if ($refused.Count) { $steps = @() }
     [ordered]@{ ok = ($refused.Count -eq 0); steps = $steps; refused = $refused; kept = $kept; resolutions = $resolutions; resumed = $resumed }
+}
+
+# Rollback of the %%Startup values one run wrote, when that same run then fails. $Before is the
+# pair it read just before writing ({ console; terminal }, $null for an absent value), $Written
+# maps each value name it planned to write (DelegationConsole, DelegationTerminal) to that value,
+# and $Current is the pair now. A planned value that now holds what was written goes back to
+# $Before, DelegationTerminal first ($null deletes it); one that still holds $Before is skipped
+# (its write never landed); any other value refuses the whole rollback (ok false, no steps), so
+# nothing written by anyone else is overwritten, and values not planned are never touched. This
+# is not the write-once record, whose prior is from before the first change (Uninstall restores it).
+function Get-SelectionRollbackSteps($Before, $Written, $Current) {
+    $steps = @()
+    foreach ($value in @(@('DelegationTerminal', 'terminal'), @('DelegationConsole', 'console'))) {
+        $name, $field = $value
+        $wrote, $now, $was = (Get-Field $Written $name), (Get-Field $Current $field), (Get-Field $Before $field)
+        if ($null -eq $wrote) { continue }
+        if ($now -is [string] -and $now -eq $wrote) { $steps += [ordered]@{ name = $name; expect = $wrote; value = $was } }
+        elseif (($null -eq $now -and $null -eq $was) -or ($now -is [string] -and $was -is [string] -and $now -eq $was)) { continue }
+        else { return [ordered]@{ ok = $false; reason = "$name changed after this run wrote it."; steps = @() } }
+    }
+    [ordered]@{ ok = $true; reason = $null; steps = $steps }
 }
 
 # Rollback plan from the older default-terminal record win.ps1 writes once to
