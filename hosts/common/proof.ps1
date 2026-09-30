@@ -47,6 +47,8 @@ function MustReject([scriptblock]$Action, [string]$Pattern) {
 }
 $validated = Run 'Validate'
 if ($validated.source -ne $ExpectedSource -or $ExpectedSource -notmatch '^[0-9a-f]{40}$') { throw 'Source mismatch.' }
+# The run identity is a record, not text (a [string] script parameter of the same name once flattened it).
+if ($validated.identity.sid -notmatch '^S-1-' -or $validated.identity.elevated -isnot [bool]) { throw 'win.ps1 reported no run identity record.' }
 # No win.ps1 mode may claim a real default-terminal handoff, and the host-only
 # handoff proof must refuse to run on a runner.
 function MustNotClaimHandoff($Answer) {
@@ -448,6 +450,19 @@ if ($final.ownedOpen -ne 0 -or $final.changedAfterClose -ne 0) { throw 'Uninstal
 AssertEmpty
 if (-not (Test-Path -LiteralPath $foreignTemp)) { throw 'A temporary file no intent named was removed.' }
 [IO.File]::Delete($foreignTemp)
+
+# A malformed attempt (void after commit) is reported by the dry run and refused by -Apply; nothing changes.
+$badBytes = Bytes 'proof: malformed attempt'
+$badPath = Join-Path $fontDir ((ShaOf $badBytes) + '.ttf')
+$firstBad = 1 + @(Ledger).Count
+CraftFile $badPath (ShaOf $badBytes) @('intent', 'commit')
+Craft @{ phase = 'void'; id = (FileId $badPath); kind = 'file-created'; target = $badPath; prior = $absent
+    desired = @{ exists = $true; sha256 = (ShaOf $badBytes) }; observed = $absent }
+$before = Snapshot
+MustReject { RunUninstall } 'Uninstall refused; nothing was removed:*A committed attempt cannot be voided*'
+MustReject { RunUninstall -Apply } 'Uninstall refused for S-1-*A committed attempt cannot be voided*'
+if ((Snapshot) -cne $before) { throw 'Uninstall changed state while refusing a malformed ledger.' }
+foreach ($seq in $firstBad..($firstBad + 2)) { [IO.File]::Delete((Join-Path $ledgerDir ('{0:D8}.json' -f $seq))) }  # the proof's own crafted records
 
 # A11: an id this version does not handle stops Uninstall (reporting who ran it) and Apply.
 $strangerPath = Join-Path $env:RUNNER_TEMP 'proof-unhandled.bin'

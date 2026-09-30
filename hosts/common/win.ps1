@@ -535,8 +535,9 @@ function OpenAttempt([string]$Id) {
     if ($attempt.problem) { throw "Effect ledger id ${Id}: $($attempt.problem)" }
     if ($attempt.closed) { return @() }
     $open = @($attempt.records)
-    $prior = Get-Field (Get-Field @($open)[0] 'prior') 'exists'
-    if ($open.Count -and $prior) { throw "Effect ledger id $Id owns a target that existed before; this version owns only what it created." }
+    if ($open.Count -and (Get-Field (Get-Field $open[0] 'prior') 'exists')) {
+        throw "Effect ledger id $Id owns a target that existed before; this version owns only what it created."
+    }
     return $open
 }
 
@@ -821,7 +822,9 @@ function AssertFonts {
     }
 }
 
-function Identity {
+# Not $Identity: that is the RentSsh key-file parameter, a [string] in the same
+# script scope (variable names ignore case), which would flatten this record.
+function RunIdentity {
     $current = [Security.Principal.WindowsIdentity]::GetCurrent()
     [ordered]@{ sid = $current.User.Value; profile = $env:USERPROFILE
         elevated = ([Security.Principal.WindowsPrincipal]$current).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
@@ -839,7 +842,7 @@ function Uninstall {
         if ($Apply -and $found) { RecoverLedger }
         foreach ($id in @(LedgerIds)) { $observations[$id] = Observe @(RecordsOf $id)[0] }
     } catch {
-        throw "Uninstall refused for $($script:identity.sid) (elevated: $($script:identity.elevated)): $($_.Exception.Message)"
+        throw "Uninstall refused for $($script:runIdentity.sid) (elevated: $($script:runIdentity.elevated)): $($_.Exception.Message)"
     }
     $plan = Get-UninstallPlan $script:ledgerRecords $observations
     $refused = @($plan.refused | ForEach-Object { "$($_.id): $($_.reason)" })
@@ -857,11 +860,12 @@ function Uninstall {
     $open, $changedAfterClose = @(), @()
     foreach ($id in @(LedgerIds)) {
         $attempt = Get-EffectAttempt (RecordsOf $id)
-        if (-not $attempt.closed -and @($attempt.records).Count) { $open += $id; continue }
+        # A malformed id has no attempt records; it stays open (the plan already refused it).
+        if ($attempt.problem -or (-not $attempt.closed -and @($attempt.records).Count)) { $open += $id; continue }
         $first = @($attempt.records)[0]
         if (-not (Test-EffectStateEqual ([string](Get-Field $first 'kind')) (Get-Field $first 'prior') (Observe $first))) { $changedAfterClose += $id }
     }
-    $answer = [ordered]@{ mode = $Mode; apply = [bool]$Apply; source = $manifest.source; identity = $script:identity
+    $answer = [ordered]@{ mode = $Mode; apply = [bool]$Apply; source = $manifest.source; identity = $script:runIdentity
         ledgerFound = $found; siloCheck = 'notPerformed'
         scope = 'owned fonts visible to this process; Noctty, default-terminal, packages and RentSsh are not in the ledger yet'
         planned = @($steps | ForEach-Object { "$($_.action) $(if ($_.Contains('path')) { $_.path } else { "$($_.key)\$($_.name)" })" })
@@ -878,7 +882,7 @@ function Uninstall {
     if ($refused.Count) { throw "Uninstall refused; nothing was removed: $($refused -join '; ')" }
 }
 
-$script:identity = Identity
+$script:runIdentity = RunIdentity
 try {
     if ($Mode -eq 'Uninstall') { Uninstall; return }
     # Packages are read, never downloaded or extracted, outside Restore; Validate,
@@ -958,7 +962,7 @@ try {
     }
     # inDesiredState covers the declared state this mode tested. Handoff is never
     # part of it: this script does not launch or observe a console.
-    [ordered]@{ mode = $Mode; source = $manifest.source; fontDirectory = $fontDirectory; identity = $script:identity
+    [ordered]@{ mode = $Mode; source = $manifest.source; fontDirectory = $fontDirectory; identity = $script:runIdentity
         fonts = @($manifest.fonts).Count; copied = $script:copied; changedProperties = $script:changed
         removed = $script:removed; recordsWritten = $script:recordsWritten; ledgerFound = $ledgerFound
         sharedCreated = @($script:sharedCreated); gcKeptReferenced = @($script:gcKeptReferenced)
