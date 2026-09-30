@@ -98,6 +98,9 @@ function AssertPackageShape($Package) {
     foreach ($foreign in @($existing.installLocation) + @($protected)) {
         if (PathsOverlap $Package.directory $foreign) { throw "Package directory overlaps an unowned path: $name" }
     }
+    # A seed goes into the owned tree beside the executable, from a bundle file of its exact hash.
+    $problem = Get-SeedProblem $Package $manifest.files
+    if ($problem) { throw "Invalid package seed in manifest: ${name}: $problem" }
 }
 
 foreach ($package in $manifest.packages) { AssertPackageShape $package }
@@ -1265,38 +1268,78 @@ function TreeReferenceProblems($Steps) {
 # ---- Locked packages: one owned tree per package through the effect ledger ----------
 $script:packageDrift = @()
 
-# The owned effect of one locked package: its tree Programs\<name>-<version> with the pinned inventory.
+# The owned effect of one locked package: its tree Programs\<name>-<version> with the pinned inventory
+# and, for a seeded package, its seed (never in the archive; the listing is checked against the
+# inventory alone).
 function PackageEffect($Package) {
     $target = Join-Path $localAppData $Package.directory.Replace('/', '\')
     $files = @{}
     foreach ($entry in $Package.files.PSObject.Properties) { $files[$entry.Name] = ([string]$entry.Value).ToLowerInvariant() }
+    $seed = Get-Field $Package 'seed'
+    if ($null -ne $seed) { $files[$seed.path] = $seed.sha256 }
     [ordered]@{ id = 'tree-extracted:' + $target.ToUpperInvariant(); kind = 'tree-extracted'; target = $target
         prior = [ordered]@{ exists = $false }; desired = [ordered]@{ exists = $true; files = $files } }
+}
+
+# O1, read-only: for a seeded package, the Preferences its seed would overwrite, or $null. Chromium's
+# first run, which happens for a User Data without its 'First Run' sentinel, writes the seed over an
+# existing Default\Preferences. Nothing here writes the profile or starts Chromium.
+function SeedHazard($Package) {
+    if ($null -eq (Get-Field $Package 'seed')) { return $null }
+    foreach ($data in @($Package.protected)) {
+        $root = Join-Path $localAppData $data.Replace('/', '\')
+        $preferences = Join-Path $root 'Default\Preferences'
+        if ((Test-Path -LiteralPath $preferences) -and -not (Test-Path -LiteralPath (Join-Path $root 'First Run'))) { return $preferences }
+    }
+    return $null
+}
+
+# Writes a package's seed into its staging tree from $Source, the bundle file, whose bytes must still be
+# the manifest's (length and SHA-256): a new file (the archive never holds one), flushed to disk before
+# the staging tree is compared with the inventory and the seed.
+function WriteSeed($Seed, [string]$Source, [string]$Staging) {
+    $bytes = [IO.File]::ReadAllBytes($Source)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { $sha = -join ($hasher.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) } finally { $hasher.Dispose() }
+    if ($bytes.Length -ne $Seed.size -or $sha -cne $Seed.sha256) { throw "The bundled seed $Source is not the manifest's." }
+    $out = [IO.FileStream]::new((Join-Path $Staging $Seed.path.Replace('/', '\')), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $out.Write($bytes, 0, $bytes.Length); $out.Flush($true) } finally { $out.Dispose() }
 }
 
 # Read-only class of one package after recovery (Get-PackageClass): the ledger decides ownership
 # of its tree; an Uninstall entry that may be this product (HKCU or HKLM, either view) is never
 # taken over and, beside an owned tree, is a conflict; an unrecorded tree is preexisting (A2);
-# protected data without this package's install history (R1) is someone else's. An attempt left
-# unrecovered (a read-only mode) is indeterminate.
+# protected data without this package's install history (R1) is someone else's; an owned tree
+# written for another inventory or seed is owned-drift (C1); a profile a seed would overwrite (O1)
+# stops an install and an owned tree's convergence. An attempt left unrecovered (a read-only mode) is
+# indeterminate.
 function ClassifyPackage($Package) {
     $effect = PackageEffect $Package
     $entries = @(FindUninstallEntries $Package.existing)
     $problems = @(foreach ($entry in $entries) { foreach ($problem in @(ExistingProblems $entry $Package)) { "$($entry.view)\$($entry.key): $problem" } })
-    $tree = Get-EffectClass $null (ObserveTree $effect.target) $effect.kind $effect.desired (AttemptOf $effect.id)
+    $attempt = AttemptOf $effect.id
+    $tree = Get-EffectClass $null (ObserveTree $effect.target) $effect.kind $effect.desired $attempt
     $treeClass = if ($tree.resolution) { 'indeterminate' } else { $tree.class }
+    $recorded = if (@($attempt.records).Count -and -not $attempt.closed) { Get-Field @($attempt.records)[0] 'desired' } else { $null }
+    $changed = $null -ne $recorded -and -not (Test-EffectStateEqual $effect.kind $recorded $effect.desired)
+    $hazard = SeedHazard $Package
     $present = @(@($Package.protected) | Where-Object { Test-Path -LiteralPath (Join-Path $localAppData $_.Replace('/', '\')) })
     # R1 history matters only when protected data exists; it reads the whole ledger once, so only then.
     $history = if ($present.Count) { Test-PackageHistory $script:ledgerRecords $Package.name (Join-Path $localAppData 'Programs') } else { $false }
-    $class = Get-PackageClass $treeClass $entries.Count $problems ($present.Count -gt 0) $history
+    $class = Get-PackageClass $treeClass $entries.Count $problems ($present.Count -gt 0) $history $changed ($null -ne $hazard)
     $reason = if ($class.conflict) { "an external install is registered beside the owned tree, sharing its data ($(@($entries | ForEach-Object { "$($_.view)\$($_.key)" }) -join ', '))" }
+        elseif ($class.hazard) {
+            "$hazard exists in a profile without its First Run sentinel, so Chromium's next start would overwrite it with this package's seed; " +
+                $(if ($class.class -ceq 'preexisting-drift') { 'nothing is installed' } else { 'do not start this Chromium; Uninstall removes the owned tree with its seed and never the profile' })
+        }
         elseif ($class.class -ceq 'preexisting-drift' -and $entries.Count) { $problems -join '; ' }
         elseif ($class.class -ceq 'preexisting-drift' -and $treeClass -ceq 'preexisting-drift') { "$($effect.target) exists without this ledger and differs from the pinned inventory; it is never overwritten" }
         elseif ($class.class -ceq 'preexisting-drift') { "protected data exists without this package's install history: $($present -join ', ')" }
+        elseif ($class.changed) { "the owned $($effect.target) was installed for another inventory or seed than this selection; Uninstall removes it, then it can be installed again" }
         elseif ($class.class -ceq 'owned-drift') { "the owned $($effect.target) differs from the pinned inventory; Uninstall removes it, then it can be installed again" }
         elseif ($class.class -ceq 'indeterminate') { $(if ($tree.reason) { $tree.reason } else { 'an interrupted attempt is not recovered yet' }) }
     [pscustomobject]@{ package = $Package; effect = $effect; class = $class.class; install = $class.install; converged = $class.converged
-        conflict = $class.conflict; reason = $reason }
+        conflict = $class.conflict; hazard = $class.hazard; reason = $reason }
 }
 
 # The packages this run converges or checks: every lock for Restore and RestoreTest, those named by -Packages for Apply.
@@ -1339,7 +1382,9 @@ function PackageInUse($Package, [string]$Tree) {
 
 # Before any effect: an indeterminate or owned-drift package stops the run, a clean install is refused
 # where its extraction is not proven yet (only ZIP until the 7z proof), and every install must fit its
-# volume and path limits (Get-PackageSpaceProblem), the earlier installs' space reserved.
+# volume and path limits (Get-PackageSpaceProblem), the earlier installs' space reserved. A profile a
+# seed would overwrite (O1), like R1's foreign profile, only keeps the package from installing or
+# converging: it is package drift after the other effects, and nothing is written for that package.
 function PreflightPackages($States) {
     $blocked = @(foreach ($state in $States) {
         $label = "$($state.package.name) $($state.package.version)"
@@ -1355,15 +1400,16 @@ function PreflightPackages($States) {
         $free = [long]([IO.DriveInfo]::new($volume).AvailableFreeSpace) - [long]$reserved[$volume]
         $problem = Get-PackageSpaceProblem $state.package $state.effect.target $free
         if ($problem) { throw "$($state.package.name) cannot be installed; nothing was changed: $problem" }
-        $reserved[$volume] = [long]$reserved[$volume] + [long]$state.package.size + [long]$state.package.unpackedSize + 64MB
+        $reserved[$volume] = [long]$reserved[$volume] + [long](Get-PackageSpaceNeed $state.package)
     }
 }
 
 # Installs one absent package: intent (package, staging) -> curl to the derived <staging>.asset (HTTPS
 # only, redirects too) -> length, SHA-256 and SHA-1 checked under a handle that keeps writers out until
-# extraction ends -> the `tar -tf` listing checked against the inventory -> `tar -xf` into staging -> the
-# asset deleted -> staging exactly the inventory (no reparse point, extra or missing file) -> one
-# same-volume rename -> commit. A failure is recovered at once when it can be (asset and staging removed).
+# extraction ends -> the `tar -tf` listing checked against the inventory alone -> `tar -xf` into staging ->
+# the asset deleted -> a seeded package's seed written from the bundle (WriteSeed) -> staging exactly the
+# inventory and the seed (no reparse point, extra or missing file) -> one same-volume rename -> commit. A
+# failure is recovered at once when it can be (asset and staging, seed included, removed).
 function InstallPackage($State) {
     $package, $effect = $State.package, $State.effect
     $programs = Join-Path $localAppData 'Programs'
@@ -1393,6 +1439,8 @@ function InstallPackage($State) {
             $null = Invoke-Native $tar @('-xf', $asset, '-C', $staging) 600
         } finally { $stream.Dispose() }
         [IO.File]::Delete($asset)
+        $seed = Get-Field $package 'seed'
+        if ($null -ne $seed) { WriteSeed $seed (BundlePath $seed.file) $staging }
         if (-not (Test-EffectStateEqual 'tree-extracted' $effect.desired (ObserveTree $staging))) { throw "Staged $staging differs from the inventory." }
         [IO.Directory]::Move($staging, $effect.target)
         WriteRecord 'commit' $effect (ObserveTree $effect.target)

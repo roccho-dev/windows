@@ -527,7 +527,8 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
         'ObserveKey', 'ObserveValue', 'ObserveFile', 'NocttyEffects', 'KeyEffect', 'ValueEffect', 'FileEffect',
         'OrderedSteps', 'UndoOwnedSteps', 'RemoveTarget', 'FontReferences', 'FontReferenceTable', 'NocttyReferences',
         'SelectNoctty', 'StartupPair', 'RecordPriorTerminal', 'TestNocttyRegistration', 'TestNocttyActivation', 'AssertActualSelection', 'RestoreLegacy',
-        'StepText', 'IsPackageTree', 'RemovePackageAsset', 'IndexRecord', 'ReadLedger', 'LedgerIds', 'NewLedgerIndex', 'AttemptOf'
+        'StepText', 'IsPackageTree', 'RemovePackageAsset', 'IndexRecord', 'ReadLedger', 'LedgerIds', 'NewLedgerIndex', 'AttemptOf',
+        'PackageEffect', 'SeedHazard', 'WriteSeed'
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'win.ps1'), [ref]$null, [ref]$null)
     foreach ($definition in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cin $names }, $false)) {
         . ([scriptblock]::Create($definition.Extent.Text))
@@ -609,10 +610,19 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
         -not (Test-PackageHistory (@(@{ ledger = 'effects'; schema = 1; seq = 2; phase = 'intent'; id = 'noise' }) + $records[0..1]) 'Chromium' $programsHere)) 'P3 in this edition'
     # S2-2b1 package primitives (clean install stays disabled). The class table: the ledger keeps ownership; an
     # external Uninstall entry is never taken over and beside an owned tree is a conflict; R1 for protected data.
-    function PClass($Tree, $Entries = 0, $Problems = @(), $Protected = $false, $History = $false) {
-        $c = Get-PackageClass $Tree $Entries $Problems $Protected $History
+    function PClass($Tree, $Entries = 0, $Problems = @(), $Protected = $false, $History = $false, $Changed = $false, $Hazard = $false) {
+        $c = Get-PackageClass $Tree $Entries $Problems $Protected $History $Changed $Hazard
         "$($c.class)|$([int]$c.conflict)|$([int]$c.install)|$([int]$c.converged)"
     }
+    # C1: an owned tree recorded for another inventory or seed is owned-drift. O1: a profile the seed would
+    # overwrite blocks an install (preexisting-drift) and never lets an owned tree converge; it does not touch
+    # classes the package does not own (an external or unrecorded install, R1's foreign profile).
+    Must ((PClass 'owned-match' 0 @() $false $false $true) -ceq 'owned-drift|0|0|0' -and (PClass 'owned-drift' 0 @() $false $false $true) -ceq 'owned-drift|0|0|0' -and
+        (PClass 'absent' 0 @() $false $false $true) -ceq 'absent|0|1|0' -and (PClass 'preexisting-match' 1 @() $false $false $true) -ceq 'preexisting-match|0|0|1' -and
+        (PClass 'absent' 0 @() $true $true $false $true) -ceq 'preexisting-drift|0|0|0' -and (PClass 'owned-match' 0 @() $true $true $false $true) -ceq 'owned-match|0|0|0' -and
+        (PClass 'absent' 1 @() $true $true $false $true) -ceq 'preexisting-match|0|0|1' -and (PClass 'absent' 0 @() $true $false $false $true) -ceq 'preexisting-drift|0|0|0' -and
+        (Get-PackageClass 'owned-match' 0 @() $true $true $true $true).hazard -and (Get-PackageClass 'owned-match' 0 @() $false $false $true $false).changed -and
+        -not (Get-PackageClass 'preexisting-match' 1 @() $true $true $false $true).hazard -and -not (Get-PackageClass 'owned-drift' 0 @() $false $false $true $false).changed) 'C1 and O1 in the class table'
     Must ((PClass 'owned-match') -ceq 'owned-match|0|0|1' -and (PClass 'owned-match' 1) -ceq 'owned-match|1|0|0' -and
         (PClass 'owned-drift' 1 @('x')) -ceq 'owned-drift|1|0|0' -and (PClass 'owned-drift') -ceq 'owned-drift|0|0|0' -and
         (PClass 'absent' 1) -ceq 'preexisting-match|0|0|1' -and (PClass 'absent' 2 @('DisplayVersion is 1')) -ceq 'preexisting-drift|0|0|0' -and
@@ -652,8 +662,12 @@ public static string[] Split(string cmd) {
     # Capacity and path bounds: size + unpackedSize + seed + 64 MiB; a file path below 260 and a directory below 248, under staging.
     $small = @{ size = 100; unpackedSize = 50; files = @{ 'bbbbbbbb.txt' = $shaA } }
     $need = [long]150 + 64MB
+    $seeded = @{ size = 100; unpackedSize = 50; files = $small.files; seed = @{ path = 'initial_preferences'; size = 5 } }
     Must ($null -eq (Get-PackageSpaceProblem $small 'C:\p\x-1' $need) -and $null -ne (Get-PackageSpaceProblem $small 'C:\p\x-1' ($need - 1)) -and
-        $null -eq (Get-PackageSpaceProblem $small 'C:\p\x-1' ($need + 5) 5) -and $null -ne (Get-PackageSpaceProblem $small 'C:\p\x-1' ($need + 4) 5) -and
+        $null -eq (Get-PackageSpaceProblem $seeded 'C:\p\x-1' ($need + 5)) -and $null -ne (Get-PackageSpaceProblem $seeded 'C:\p\x-1' ($need + 4)) -and
+        (Get-PackageSpaceNeed $seeded) -eq $need + 5 -and (Get-PackageSpaceNeed $small) -eq $need -and
+        $null -eq (Get-PackageSpaceProblem @{ size = 1; unpackedSize = 1; files = @{ 'a' = $shaA }; seed = @{ path = 'd/f'; size = 1 } } ('C:\' + 'p' * 201) $need) -and
+        $null -ne (Get-PackageSpaceProblem @{ size = 1; unpackedSize = 1; files = @{ 'a' = $shaA }; seed = @{ path = 'd/f'; size = 1 } } ('C:\' + 'p' * 202) $need) -and
         $null -eq (Get-PackageSpaceProblem $small ('C:\' + 'p' * 202) $need) -and $null -ne (Get-PackageSpaceProblem $small ('C:\' + 'p' * 203) $need) -and
         $null -eq (Get-PackageSpaceProblem @{ size = 1; unpackedSize = 1; files = @{ 'd/f' = $shaA } } ('C:\' + 'p' * 201) $need) -and
         $null -ne (Get-PackageSpaceProblem @{ size = 1; unpackedSize = 1; files = @{ 'd/f' = $shaA } } ('C:\' + 'p' * 202) $need)) 'capacity and path bounds'
@@ -661,7 +675,10 @@ public static string[] Split(string cmd) {
             @{ size = 1.5; unpackedSize = 1; files = $small.files }, @{ size = 1; unpackedSize = 1; files = @{} }, @{ size = 1; unpackedSize = 1 })) {
         Must ($null -ne (Get-PackageSpaceProblem $bad 'C:\p\x-1' ([long]1TB))) 'an invalid package or free space is refused'
     }
-    Must ($null -ne (Get-PackageSpaceProblem $small 'C:\p\x-1' ([long]1TB) -1) -and $null -ne (Get-PackageSpaceProblem $small 'C:\p\x-1' 1.0e12)) 'an invalid seed or free space is refused'
+    Must (-not @(@{ path = 'initial_preferences'; size = 0 }, @{ path = 'initial_preferences'; size = '5' }, @{ path = '../x'; size = 5 }, @{ size = 5 } | Where-Object {
+            $null -eq (Get-PackageSpaceProblem @{ size = 100; unpackedSize = 50; files = $small.files; seed = $_ } 'C:\p\x-1' ([long]1TB)) }).Count -and
+        $null -eq (Get-PackageSpaceNeed @{ size = 100; unpackedSize = 50; seed = @{ size = -1 } }) -and
+        $null -ne (Get-PackageSpaceProblem $small 'C:\p\x-1' 1.0e12)) 'an invalid seed or free space is refused'
     # The asset: exact length, SHA-256 and (when locked) SHA-1; hashes compare as lowercase hex only.
     $abc = [Text.Encoding]::UTF8.GetBytes('abc')
     $abc256 = -join ([Security.Cryptography.SHA256]::Create().ComputeHash($abc) | ForEach-Object { $_.ToString('x2') })
@@ -696,6 +713,76 @@ public static string[] Split(string cmd) {
     RecoverId $pkgTree.id
     Must ((Phases $pkgTree) -ceq 'intent,void' -and @(RecordsOf $pkgTree.id)[0].package -ceq 'AutoHotkey' -and -not (Test-Path -LiteralPath "$pkgStage.asset") -and
         -not (Test-Path -LiteralPath $pkgStage) -and (Test-Path -LiteralPath "$pkgStage.asset.foreign")) 'a package intent is recovered with its derived asset'
+    # S2-3b, the Chromium seed. The built bundle's seed is the six font preferences of the manifest's roles, and
+    # usable (Get-SeedProblem); every broken form is refused.
+    $chromium = @($manifest.packages | Where-Object { $_.name -ceq 'Chromium' })[0]
+    $seedSource = Join-Path $Root $chromium.seed.file.Replace('/', '\')
+    $family = @{}; foreach ($font in $manifest.fonts) { $family[$font.role] = $font.family }
+    $fontPrefs = ([IO.File]::ReadAllText($seedSource) | ConvertFrom-Json).webkit.webprefs.fonts
+    Must ((Get-FileHash -LiteralPath $seedSource).Hash -eq $chromium.seed.sha256 -and (Get-Item -LiteralPath $seedSource).Length -eq $chromium.seed.size -and
+        (@($fontPrefs.PSObject.Properties.Name | Sort-Object) -join ',') -ceq 'fixed,sansserif,standard' -and
+        -not @('standard', 'sansserif', 'fixed' | Where-Object { (@($fontPrefs.$_.PSObject.Properties.Name | Sort-Object) -join ',') -cne 'Jpan,Zyyy' }).Count -and
+        -not @('standard', 'sansserif' | ForEach-Object { $fontPrefs.$_.Zyyy, $fontPrefs.$_.Jpan } | Where-Object { $_ -cne $family['ui'] }).Count -and
+        $fontPrefs.fixed.Zyyy -ceq $family['terminal'] -and $fontPrefs.fixed.Jpan -ceq $family['terminal'] -and
+        $null -eq (Get-SeedProblem $chromium $manifest.files)) 'the bundled seed: six font preferences from the roles'
+    function SeedVariant([hashtable]$Change, $Files = $chromium.files, $Protected = $chromium.protected) {
+        $seed = @{ path = $chromium.seed.path; file = $chromium.seed.file; sha256 = $chromium.seed.sha256; size = $chromium.seed.size }
+        foreach ($key in $Change.Keys) { $seed[$key] = $Change[$key] }
+        @{ executable = $chromium.executable; files = $Files; protected = $Protected; seed = $seed }
+    }
+    function WithFile([string]$Name) { $files = @{ $Name = $shaA }; foreach ($p in $chromium.files.PSObject.Properties) { $files[$p.Name] = $p.Value }; $files }
+    $seedBad = @((SeedVariant @{ path = 'Chrome-bin/Initial_Preferences' }), (SeedVariant @{ path = 'initial_preferences' }),
+        (SeedVariant @{ path = 'Chrome-bin/master_preferences' }), (SeedVariant @{ sha256 = (Sha 'other') }), (SeedVariant @{ sha256 = $chromium.seed.sha256.ToUpperInvariant() }),
+        (SeedVariant @{ size = 0 }), (SeedVariant @{ size = '1' }), (SeedVariant @{ file = 'payload/noctty.zip' }), (SeedVariant @{ file = '../x' }),
+        (SeedVariant @{} (WithFile 'Chrome-bin/initial_preferences')), (SeedVariant @{} (WithFile 'chrome-bin/Master_Preferences')),
+        (SeedVariant @{} (WithFile 'Chrome-bin/initial_preferences/x')), (SeedVariant @{} $chromium.files @()),
+        (SeedVariant @{} $chromium.files @('Chromium/User Data', 'Chromium/Other')))
+    $accepted = @($seedBad | Where-Object { $null -eq (Get-SeedProblem $_ $manifest.files) })
+    Must ($accepted.Count -eq 0 -and $null -eq (Get-SeedProblem (SeedVariant @{}) $manifest.files)) "every broken seed is refused ($($accepted.Count) accepted)"
+    # The owned tree is the inventory and the seed, so a tree recorded from the inventory alone is another selection (C1).
+    $chromiumEffect = PackageEffect $chromium
+    Must ($chromiumEffect.desired.files.Count -eq @($chromium.files.PSObject.Properties).Count + 1 -and
+        $chromiumEffect.desired.files[$chromium.seed.path] -ceq $chromium.seed.sha256 -and
+        -not (Test-EffectStateEqual 'tree-extracted' @{ exists = $true; files = $chromium.files } $chromiumEffect.desired)) 'the owned tree: the inventory and the seed'
+    # A small seeded stand-in: the archive listing is checked against the inventory alone (a seed in the archive is
+    # refused); staging is the owned tree only once WriteSeed has written the verified bundle bytes, as a new file.
+    $mini = [pscustomobject]@{ name = 'Chromium'; version = '9.9'; directory = 'Programs/chromium-9.9'; executable = 'Chrome-bin/chrome.exe'
+        files = [pscustomobject]@{ 'Chrome-bin/chrome.exe' = (Sha 'exe') }; protected = @('Chromium/User Data'); seed = $chromium.seed }
+    $miniEffect = PackageEffect $mini
+    $listing = @(ConvertFrom-TarListing @('Chrome-bin/', 'Chrome-bin/chrome.exe', '') $mini.files)
+    Must ($null -eq (Get-ZipEntryProblem $listing $mini.files) -and $null -ne (Get-ZipEntryProblem $listing $miniEffect.desired.files) -and
+        $null -ne (Get-ZipEntryProblem @($listing + 'Chrome-bin/initial_preferences') $mini.files)) 'the listing is the inventory alone'
+    $miniStage = Staging $miniEffect
+    $null = New-Item -ItemType Directory -Path "$miniStage\Chrome-bin"
+    [IO.File]::WriteAllText("$miniStage\Chrome-bin\chrome.exe", 'exe')
+    $forged = Join-Path $Scratch "forged-seed-$([guid]::NewGuid().ToString('N'))"
+    [IO.File]::WriteAllText($forged, '{"webkit":{}}')
+    Must (-not (Test-EffectStateEqual 'tree-extracted' $miniEffect.desired (ObserveTree $miniStage))) 'staging without its seed is not the owned tree'
+    Refused { WriteSeed $chromium.seed $forged $miniStage } '*is not the manifest''s*'
+    Must (-not (Test-Path -LiteralPath "$miniStage\Chrome-bin\initial_preferences")) 'a seed differing from the manifest writes nothing'
+    WriteSeed $chromium.seed $seedSource $miniStage
+    Must ((Test-EffectStateEqual 'tree-extracted' $miniEffect.desired (ObserveTree $miniStage)) -and
+        (Get-FileHash -LiteralPath "$miniStage\Chrome-bin\initial_preferences").Hash -eq $chromium.seed.sha256) 'staging with its seed is exactly the owned tree'
+    Refused { WriteSeed $chromium.seed $seedSource $miniStage } '*exists*'
+    # Interrupted after the seed was written: recovery voids the intent and removes the seed with the staging.
+    WriteRecord 'intent' $miniEffect $null $miniStage 'Chromium'
+    RecoverId $miniEffect.id
+    Must ((Phases $miniEffect) -ceq 'intent,void' -and -not (Test-Path -LiteralPath $miniStage)) 'an interrupted seeded install is voided, its seed removed with the staging'
+    # O1, read-only, on a scratch profile: Default\Preferences without the First Run sentinel is found; an empty
+    # profile, the sentinel, or a package without a seed is not; the profile is only read.
+    $savedLocal = $localAppData
+    try {
+        $localAppData = Join-Path $Scratch "o1-$([guid]::NewGuid().ToString('N'))"
+        $userData = Join-Path $localAppData 'Chromium\User Data'
+        $null = New-Item -ItemType Directory -Path "$userData\Default"
+        $empty = SeedHazard $chromium
+        [IO.File]::WriteAllText("$userData\Default\Preferences", '{"proof":1}')
+        $found, $unseeded = (SeedHazard $chromium), (SeedHazard ([pscustomobject]@{ protected = @('Chromium/User Data') }))
+        [IO.File]::WriteAllText("$userData\First Run", '')
+        $sentinel = SeedHazard $chromium
+        Must ($null -eq $empty -and $found -ceq "$userData\Default\Preferences" -and $null -eq $unseeded -and $null -eq $sentinel -and
+            [IO.File]::ReadAllText("$userData\Default\Preferences") -ceq '{"proof":1}') 'O1: Preferences without First Run is found, and only read'
+    } finally { $localAppData = $savedLocal }
     # Interruptions: (a) part of the inventory staged -> cleaned and voided; (b) a file the inventory
     # does not name -> kept, and the intent stays open; (c) renamed but not committed -> confirmed.
     $a, $b, $c = (Tree 'noctty-crash-a' $two), (Tree 'noctty-crash-b' $two), (Tree 'noctty-crash-c' $two)
@@ -1806,6 +1893,39 @@ Must ((Phases $crash.id) -ceq 'intent' -and (Test-Path -LiteralPath "$($crash.st
 [IO.File]::Delete("$($crash.staging)\foreign.txt")
 $null = Run 'Apply'
 Must ((Phases $crash.id) -ceq 'intent,void' -and -not (Test-Path -LiteralPath $crash.staging)) 'A25: recovery completes once the foreign file is gone'
+# A28 (S2-3b, Chromium never downloaded; the profile is only read). Before an install: with this package's
+# history (a closed attempt of an older version), a restored profile its seed would overwrite (O1:
+# Default\Preferences without First Run) keeps Chromium from installing, reported as package drift after the
+# other effects, which are converged already, so nothing at all is written; with First Run beside it, only the
+# 7z refusal is left.
+$olderTree = Join-Path $programsDir 'chromium-153.0.1'
+$olderId, $olderDesired = ('tree-extracted:' + $olderTree.ToUpperInvariant()), @{ exists = $true; files = @{ 'Chrome-bin/chrome.exe' = ('a' * 64) } }
+Craft @{ phase = 'intent'; id = $olderId; kind = 'tree-extracted'; target = $olderTree; prior = $absent; desired = $olderDesired; package = 'Chromium' }
+Craft @{ phase = 'commit'; id = $olderId; kind = 'tree-extracted'; target = $olderTree; prior = $absent; desired = $olderDesired; observed = $olderDesired }
+Craft @{ phase = 'undone'; id = $olderId; kind = 'tree-extracted'; target = $olderTree; prior = $absent; desired = $olderDesired; observed = $absent }
+$preferences, $sentinel = (Join-Path $chromiumProfile 'Default\Preferences'), (Join-Path $chromiumProfile 'First Run')
+$restored = '{"proof":"a profile restored by hand"}'
+$null = New-Item -ItemType Directory -Path (Split-Path -Parent $preferences)
+[IO.File]::WriteAllText($preferences, $restored)
+$mark = LastSeq
+MustReject { ApplyPackages 'Chromium' } '*Package drift: Chromium preexisting-drift*without its First Run sentinel*nothing is installed*'
+[IO.File]::WriteAllText($sentinel, '')
+MustReject { ApplyPackages 'Chromium' } '*clean install from a 7z asset is not enabled yet*'
+Must ((LastSeq) -eq $mark -and -not (Test-Path -LiteralPath $chromiumTree) -and [IO.File]::ReadAllText($preferences) -ceq $restored) 'A28: O1 before an install, nothing written'
+# An owned Chromium tree recorded for another selection (a stand-in holding only a stand-in executable, as if
+# written before the seed) is owned-drift (C1), which stops the run before any effect; the O1 reason comes first.
+$standIn = Join-Path $chromiumTree $chromium.executable.Replace('/', '\')
+$null = New-Item -ItemType Directory -Path (Split-Path -Parent $standIn)
+[IO.File]::WriteAllText($standIn, 'a stand-in, not Chromium')
+$standInDesired = @{ exists = $true; files = @{ $chromium.executable = (Get-FileHash -LiteralPath $standIn).Hash.ToLowerInvariant() } }
+Craft @{ phase = 'intent'; id = $chromiumId; kind = 'tree-extracted'; target = $chromiumTree; prior = $absent; desired = $standInDesired; package = 'Chromium' }
+Craft @{ phase = 'commit'; id = $chromiumId; kind = 'tree-extracted'; target = $chromiumTree; prior = $absent; desired = $standInDesired; observed = $standInDesired }
+$mark = LastSeq
+MustReject { ApplyPackages 'Chromium' } '*Packages stop the run before any effect: Chromium 154*installed for another inventory or seed*'
+[IO.File]::Delete($sentinel)
+MustReject { ApplyPackages 'Chromium' } '*Packages stop the run before any effect: Chromium 154*without its First Run sentinel*do not start this Chromium*'
+Must ((LastSeq) -eq $mark -and (Phases $chromiumId) -ceq 'intent,commit' -and (Test-Path -LiteralPath $standIn) -and
+    [IO.File]::ReadAllText($preferences) -ceq $restored) 'A28: C1 stops an owned Chromium before any effect; the profile is only read'
 # A27: Uninstall leaves everything alone while a package executable is in use; closed, it removes every owned
 # effect, the package tree too, and never the protected profile.
 $count = @(Ledger).Count
@@ -1813,8 +1933,11 @@ $handle = [IO.File]::Open((Join-Path $ahkTree $ahk.executable.Replace('/', '\'))
 try { MustReject { RunUninstall -Apply } '*is in use*' } finally { $handle.Dispose() }
 Must (@(Ledger).Count -eq $count -and (AhkExact)) 'A27: an in-use package stops Uninstall before any removal'
 $gone = RunUninstall -Apply
-Must ($gone.ownedOpen -eq 0 -and -not (Test-Path -LiteralPath $ahkTree) -and (Test-Path -LiteralPath "$chromiumProfile\proof.txt")) 'A27: Uninstall removes the package tree, never the profile'
+Must ($gone.ownedOpen -eq 0 -and -not (Test-Path -LiteralPath $ahkTree) -and -not (Test-Path -LiteralPath $chromiumTree) -and
+    (Test-Path -LiteralPath "$chromiumProfile\proof.txt") -and [IO.File]::ReadAllText($preferences) -ceq $restored) 'A27: Uninstall removes the package trees, never the profile'
 AssertEmpty
+[IO.File]::Delete($preferences)
+[IO.Directory]::Delete((Split-Path -Parent $preferences), $false)
 [IO.File]::Delete("$chromiumProfile\proof.txt")
 [IO.Directory]::Delete($chromiumProfile, $false)
 [IO.Directory]::Delete((Split-Path -Parent $chromiumProfile), $false)

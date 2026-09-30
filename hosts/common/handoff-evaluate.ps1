@@ -747,23 +747,58 @@ function Get-PackageAssetPath($Record, [string]$Programs) {
 #   $Entries    how many HKCU/HKLM Uninstall entries may be this product (FindUninstallEntries),
 #               and $Problems their ExistingProblems (none when every entry is exactly the lock)
 #   $Protected  whether declared protected data exists; $History, Test-PackageHistory
+#   $Changed    the owned tree's recorded desired state is not this selection's (C1: same version,
+#               another inventory or seed)
+#   $Hazard     O1: the package's seed would overwrite a profile's Preferences on Chromium's next start
 # The ledger decides ownership: an owned tree stays owned-match or owned-drift, removable by
-# Uninstall, whatever else appears. An external entry is never taken over and marks the package
-# external: beside an owned tree it is a conflict (two installs share one profile), reported as
-# drift after the other effects, with nothing new written. Without an owned tree, an entry makes
-# it preexisting-match or -drift; then an unrecorded tree decides (A2); then protected data
-# without history is foreign (R1); otherwise it is absent, the only class that installs.
-function Get-PackageClass([string]$TreeClass, [int]$Entries, [string[]]$Problems, [bool]$Protected, [bool]$History) {
+# Uninstall, whatever else appears; one written for another selection is owned-drift. An external
+# entry is never taken over and marks the package external: beside an owned tree it is a conflict
+# (two installs share one profile), reported as drift after the other effects, with nothing new
+# written. Without an owned tree, an entry makes it preexisting-match or -drift; then an unrecorded
+# tree decides (A2); then protected data without history is foreign (R1); otherwise it is absent,
+# the only class that installs. A hazard beside an owned or absent tree is never converged, and an
+# absent one becomes preexisting-drift: nothing is installed.
+function Get-PackageClass([string]$TreeClass, [int]$Entries, [string[]]$Problems, [bool]$Protected, [bool]$History, [bool]$Changed, [bool]$Hazard) {
     $external = $Entries -gt 0
     $class = if ($TreeClass -cin @('owned-match', 'owned-drift', 'indeterminate')) { $TreeClass }
         elseif ($external) { $(if (@($Problems | Where-Object { $_ }).Count) { 'preexisting-drift' } else { 'preexisting-match' }) }
         elseif ($TreeClass -cin @('preexisting-match', 'preexisting-drift')) { $TreeClass }
         elseif ($TreeClass -ceq 'absent') { $(if ($Protected -and -not $History) { 'preexisting-drift' } else { 'absent' }) }
         else { 'indeterminate' }
+    $changed = $Changed -and $class -ceq 'owned-match'
+    if ($changed) { $class = 'owned-drift' }
+    $hazard = $Hazard -and $class -cin @('absent', 'owned-match', 'owned-drift')
+    if ($hazard -and $class -ceq 'absent') { $class = 'preexisting-drift' }
     $conflict = $external -and $class -cin @('owned-match', 'owned-drift')
-    [ordered]@{ class = $class; external = $external; conflict = $conflict
+    [ordered]@{ class = $class; external = $external; conflict = $conflict; changed = $changed; hazard = $hazard
         install = ($class -ceq 'absent')
-        converged = ($class -cin @('owned-match', 'preexisting-match') -and -not $conflict) }
+        converged = ($class -cin @('owned-match', 'preexisting-match') -and -not $conflict -and -not $hazard) }
+}
+
+# Why a package's seed (pack.py: Chromium's initial_preferences, added to its owned tree) cannot be
+# used, or $null when it has none or it can: its path is initial_preferences in the executable's
+# directory, where the inventory holds neither it nor the legacy master_preferences, and holds nothing
+# beneath it; file is a bundle file ($BundleFiles, manifest.files) with exactly its SHA-256; size is a
+# byte count; and the package declares exactly one protected path, the profile directory O1 reads.
+function Get-SeedProblem($Package, $BundleFiles) {
+    $seed = Get-Field $Package 'seed'
+    if ($null -eq $seed) { return $null }
+    $f = Get-Fields $seed @('path', 'file', 'sha256', 'size')
+    $executable, $files = [string](Get-Field $Package 'executable'), (ConvertTo-FileMap (Get-Field $Package 'files'))
+    if ($f.path -isnot [string] -or -not (Test-RelativePath $f.path) -or $f.file -isnot [string] -or -not (Test-RelativePath $f.file) -or
+        $f.sha256 -isnot [string] -or $f.sha256 -cnotmatch '^[0-9a-f]{64}\z' -or -not (Test-ByteCount $f.size) -or $null -eq $files) {
+        return 'The seed is not {path, file, sha256, size}.'
+    }
+    $directory = { param($Path) if ($Path.Contains('/')) { $Path.Substring(0, $Path.LastIndexOf('/') + 1) } else { '' } }
+    if ($f.path -cne ((& $directory $executable) + 'initial_preferences')) { return "The seed is not initial_preferences beside $executable." }
+    $legacy = (& $directory $executable) + 'master_preferences'
+    if (@($files.Keys | Where-Object { $_ -eq $f.path -or $_ -eq $legacy -or $_.StartsWith($f.path + '/', [StringComparison]::OrdinalIgnoreCase) }).Count) {
+        return 'The inventory holds the seed, its legacy name or a path beneath it.'
+    }
+    $bundled = Get-Field $BundleFiles $f.file
+    if ($bundled -isnot [string] -or $bundled -cne $f.sha256) { return "The seed file $($f.file) is not a bundle file with that SHA-256." }
+    if (@(Get-Field $Package 'protected').Count -ne 1) { return 'A seeded package declares exactly one protected profile directory.' }
+    return $null
 }
 
 # The archive entry names of a `tar -tf` listing ($Lines), normalized for Get-ZipEntryProblem:
@@ -803,24 +838,31 @@ function Join-NativeArguments([string[]]$Arguments) {
 # A byte count as win.ps1 reads it from JSON: a positive integer no larger than 2^53 - 1.
 function Test-ByteCount($Value) { ($Value -is [int] -or $Value -is [long]) -and $Value -gt 0 -and $Value -le 9007199254740991 }
 
+# The bytes one install needs on its volume: the asset, the unpacked inventory, its seed (if it has
+# one) and 64 MiB of ledger headroom; $null when a count is invalid.
+function Get-PackageSpaceNeed($Package) {
+    $size, $unpacked, $seed = (Get-Field $Package 'size'), (Get-Field $Package 'unpackedSize'), (Get-Field $Package 'seed')
+    $seedSize = Get-Field $seed 'size'
+    if (-not (Test-ByteCount $size) -or -not (Test-ByteCount $unpacked) -or ($null -ne $seed -and -not (Test-ByteCount $seedSize))) { return $null }
+    return [long]$size + [long]$unpacked + [long]$(if ($null -ne $seed) { $seedSize } else { 0 }) + 64MB
+}
+
 # Why one package cannot be installed at $Target with $Free bytes free on its volume, or $null:
-# the asset, the unpacked inventory and $Seed (0 until seeds exist) plus 64 MiB of ledger
-# headroom must fit, and every path the install creates must stay below the Windows PowerShell
-# 5.1 limits (a file path below 260 characters, a directory below 248), measured under the
-# staging directory (<target>.<guid32>.staging, the longest form) and for its asset file.
-function Get-PackageSpaceProblem($Package, [string]$Target, $Free, $Seed = 0) {
-    $size, $unpacked = (Get-Field $Package 'size'), (Get-Field $Package 'unpackedSize')
-    $files = ConvertTo-FileMap (Get-Field $Package 'files')
-    if (-not (Test-ByteCount $size) -or -not (Test-ByteCount $unpacked) -or -not ($Seed -is [int] -or $Seed -is [long]) -or $Seed -lt 0 -or
-        -not ($Free -is [int] -or $Free -is [long]) -or $null -eq $files -or $files.Count -eq 0 -or -not $Target) {
-        return 'The package size, inventory, target or free space is invalid.'
+# Get-PackageSpaceNeed must fit, and every path the install creates (its inventory and seed) must
+# stay below the Windows PowerShell 5.1 limits (a file path below 260 characters, a directory below
+# 248), measured under the staging directory (<target>.<guid32>.staging, the longest form) and for
+# its asset file.
+function Get-PackageSpaceProblem($Package, [string]$Target, $Free) {
+    $need, $files, $seed = (Get-PackageSpaceNeed $Package), (ConvertTo-FileMap (Get-Field $Package 'files')), (Get-Field $Package 'seed')
+    if ($null -eq $need -or -not ($Free -is [int] -or $Free -is [long]) -or $null -eq $files -or $files.Count -eq 0 -or -not $Target -or
+        ($null -ne $seed -and -not (Test-RelativePath ([string](Get-Field $seed 'path'))))) {
+        return 'The package size, inventory, seed, target or free space is invalid.'
     }
-    $need = [long]$size + [long]$unpacked + [long]$Seed + 64MB
     if ([long]$Free -lt $need) { return "Needs $need bytes free on the volume of $Target; $Free are." }
     $staging = $Target + '.' + ('0' * 32) + '.staging'
     $directories = @{ $staging = $true }
     $longest = "$staging.asset"
-    foreach ($name in $files.Keys) {
+    foreach ($name in @($files.Keys) + @(if ($null -ne $seed) { [string](Get-Field $seed 'path') })) {
         $path = $staging + '\' + $name.Replace('/', '\')
         if ($path.Length -gt $longest.Length) { $longest = $path }
         $parent = [IO.Path]::GetDirectoryName($path)

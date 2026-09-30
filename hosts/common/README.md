@@ -311,7 +311,7 @@ an unrecorded tree is `preexisting-match` only when it is exactly the pinned
 inventory; declared protected data (the Chromium `User Data` profile) is someone
 else's, `preexisting-drift`, unless the ledger shows this package was once
 installed and committed here (R1). Only `absent` installs. An indeterminate or
-owned-drift package, too little space (asset + `unpackedSize` + 64 MiB) or a path
+owned-drift package, too little space (asset + `unpackedSize` + seed + 64 MiB) or a path
 at the Windows PowerShell 5.1 limits stops the run before any effect.
 
 An install writes its intent first, then downloads the locked URL with the inbox
@@ -331,25 +331,34 @@ refused before any effect until its own CI proof; nothing registers App Paths ye
 so an owned Chromium would not be launchable by name (required before PR-A is done);
 a read-only file in an extracted tree would make `Uninstall` fail (recorded, not hidden).
 
-**Chromium font seed (built, not yet written).** `pack.py` generates
+**Chromium font seed.** `pack.py` generates
 `payload/chromium/initial_preferences` from the lock's `seed` roles: exactly the six
 preferences `webkit.webprefs.fonts.{standard,sansserif,fixed}.{Zyyy,Jpan}`, IBM Plex Sans
 JP proportional and PlemolJP Console NF fixed (every TTF of a role must carry that
 typographic family). The manifest records its `path` beside `chrome.exe` in the owned
 tree, `file`, `sha256` and `size`; the archive may hold no `initial_preferences` or
-`master_preferences` there, and the seed is outside `files` and `unpackedSize`. No mode
-writes it yet; an owned clean install must write it before Chromium's clean install is
-enabled. Chromium reads it only on a first run, for a `User Data` without its first-run
-sentinel, and then **overwrites that profile's existing `Preferences`**. Boundary (the
-goal): a profile present at `Restore` stays untouched. Today that holds only because
-Chromium's 7z clean install is refused and no mode launches Chromium: R1 alone would
-still install when the ledger shows this package's history but `User Data` has no
-first-run sentinel. Before that refusal is lifted, S2-3b must install only without
-`User Data` or with that history and the sentinel. A partial `User Data` restored by
-hand later without its sentinel is outside automated prevention; S2-3b is to detect it
-at the next `Restore`/`RestoreTest`, before Chromium is launched. Neither gate exists
-yet. Sites that set fonts in CSS, serif, other scripts, and Chromium's and
-Windows' own UI are unaffected; a later user setting prevails, and sync may.
+`master_preferences` there, and the seed is outside `files` and `unpackedSize`. An
+install lists the archive against the inventory alone, then, after extraction, writes
+the seed into staging as a new, flushed file from the bundle (length and SHA-256
+checked again); the staged tree must be exactly the inventory and the seed, which
+recovery and `Uninstall` remove with the tree. An owned tree recorded for another
+inventory or seed of the same version is `owned-drift` (Uninstall, then install again).
+Nothing installs Chromium until its 7z clean install is enabled (b3). Chromium reads the
+seed only on a first run, for a `User Data` without its `First Run` sentinel, and then
+**overwrites that profile's existing `Preferences`**. So every mode reads, and never
+writes, `User Data\First Run` and `User Data\Default\Preferences` (no mode starts
+Chromium): while `Default\Preferences` exists without `First Run`, an install is
+refused (besides R1, which refuses any profile without this package's history), and
+an owned seeded tree never converges. Like R1, this writes nothing for Chromium and
+fails as package drift after the other effects (`RestoreTest` fails too), saying not
+to start that Chromium; only an owned-drift tree (C1) stops the run before any
+effect. `Uninstall` removes the tree with its seed, never the profile. Boundary: a profile present at `Restore` is not
+installed over; a partial `User Data` restored by hand after the install and started
+before the next `Restore`/`RestoreTest` is outside automated prevention. Only
+`Default` is checked; other profiles, and this build's own first-run behaviour, are
+unproven until the VM run. Sites that set fonts in CSS, serif, other scripts, and
+Chromium's and Windows' own UI are unaffected; a later user setting prevails, and sync
+may.
 
 **Torn record.** A power loss can tear only the highest-seq record, and every mode
 that reads the ledger then stops. Remove that one file by hand only if it is the
@@ -403,13 +412,19 @@ primitives also run in a Windows PowerShell 5.1 child on synthetic targets. The
 G4 gate measures the vendor's own registration against the six values. A
 `Restore` rollback after a failed activation or package check is not exercised
 on CI (`Restore` refuses the elevated runner, whose Windows Terminal is 1.23).
-For packages (A23-A27, AutoHotkey downloaded once, Chromium never) it checks the
+For packages (A23-A28, AutoHotkey downloaded once, Chromium never) it checks the
 `-Packages` contract, the Chromium 7z refusal and R1 before any effect, an external
 entry never taken over (alone or beside the owned tree), a clean AutoHotkey install
 owned exactly with no asset or staging left and a second Apply writing nothing,
 an owned older version collected, interrupted installs recovered (asset and
 staging removed; foreign staging content kept), and `Uninstall` refusing while the
-executable is in use, then removing the tree but not the profile.
+executable is in use, then removing the tree but not the profile. For the Chromium
+seed (A28 and the primitives) it checks the bundled bytes against the font roles, every
+malformed seed refused, the listing against the inventory alone, a staging tree exact
+only after the verified seed is written (a differing one writes nothing), recovery
+removing the seed, and, with the profile only read, O1 keeping Chromium from installing
+(package drift, nothing written) and C1 stopping a stand-in owned tree before any effect. A real seeded Chromium install and its
+first run are not exercised until b3 and the VM run.
 It also requires every `win.ps1` answer to report
 `handoffProof = "unproven"` and `handoff-proof.ps1` to refuse the runner, so CI
 never claims a real default-terminal handoff. Negative controls must fail for
