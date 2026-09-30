@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Linux OCI proof only. Uses disposable resources, no credentials and no publication.
-# Run from the repository root after nix build .#dev-image.
+# Run from the repository root after nix build .#dev-image. With --jev-only it runs only the fixture Jev proof below
+# and needs neither the image nor Docker; the full proof in CI always runs it first.
 set -euo pipefail
-image_archive=${1:?usage: proof.sh IMAGE_ARCHIVE}
+mode=full
+if [ "${1:-}" = --jev-only ] && [ "$#" -eq 1 ]; then mode=jev; else image_archive=${1:?usage: proof.sh IMAGE_ARCHIVE | --jev-only}; fi
 apps_rev=cab6e3fce426af842c3e154fecb3660f2495e664
 prefix="windows-dev-proof-$(date +%s)-$$"
 core="$prefix-core"
@@ -39,13 +41,15 @@ git_clear() {
 # Everything the Jev proof creates under $evidence/jev, including the fixture test identity.
 jev_clear() {
   local fx=$evidence/jev r
-  for r in envs apps neg; do if [ -e "$fx/$r/.git" ]; then git_clear "$fx/$r" || return 1; fi; done
+  for r in envs apps ops neg; do if [ -e "$fx/$r/.git" ]; then git_clear "$fx/$r" || return 1; fi; done
   plain "$fx/envs/side" && plain "$fx/envs/ciphertexts/dev-jev-api.oci-dev.sops.yaml" &&
     empty "$fx/envs/ciphertexts" && empty "$fx/envs" &&
     plain "$fx/apps/flake.nix" && plain "$fx/apps/flake.lock" && empty "$fx/apps" &&
+    plain "$fx/ops/flake.nix" && plain "$fx/ops/flake.lock" && empty "$fx/ops" &&
     plain "$fx/neg/file" && empty "$fx/neg" &&
     plain "$fx/age/oci-dev.key" && plain "$fx/age/kept" && empty "$fx/age" &&
-    plain "$fx/launch.out" && plain "$fx/scratch-clear.sh" && empty "$fx/tmp" && empty "$fx"
+    plain "$fx/launch.out" && plain "$fx/ops.out" && plain "$fx/ops.err" && plain "$fx/scratch-clear.sh" &&
+    empty "$fx/tmp" && empty "$fx"
 }
 cleanup() {
   code=$?
@@ -70,29 +74,38 @@ jev_proof() {
   local fx="$evidence/jev" pkgs='import (builtins.getFlake (toString ./.)).inputs.nixpkgs { system = "x86_64-linux"; }'
   mkdir "$fx"
 
-  # Production: exactly the two bounded tools on the profile, the three real constants, no raw crypto binary.
-  local profile prod_launch prod_init
+  # Production: exactly the three bounded tools on the profile, the four real constants, no raw crypto binary.
+  local profile prod_launch prod_init prod_ops
   profile=$("${nx[@]}" build --no-link --print-out-paths --no-write-lock-file .#dev-profile)
   prod_launch=$(readlink -f "$profile/bin/voice-ui-jev-dev")
   prod_init=$(readlink -f "$profile/bin/jev-age-init")
-  for raw in sops age age-keygen; do test ! -e "$profile/bin/$raw"; done
+  prod_ops=$(readlink -f "$profile/bin/ops-jev")
+  for raw in sops age age-keygen jev; do test ! -e "$profile/bin/$raw"; done
   grep -qxF "envs_remote=https://github.com/roccho-dev/envs" "$prod_launch"
   grep -qxF "apps_remote=https://github.com/roccho-dev/apps" "$prod_launch"
   grep -qxF "identity=/work/repos/.auth/roccho-dev/age/oci-dev.key" "$prod_launch"
   grep -qxF "identity=/work/repos/.auth/roccho-dev/age/oci-dev.key" "$prod_init"
-  if grep -qE '^[[:space:]]*set -(x|o xtrace)' "$prod_launch" "$prod_init"; then echo 'a jev tool enables xtrace' >&2; return 1; fi
+  grep -qxF "envs_remote=https://github.com/roccho-dev/envs" "$prod_ops"
+  grep -qxF "ops_remote=https://github.com/roccho-dev/ops" "$prod_ops"
+  grep -qxF "identity=/work/repos/.auth/roccho-dev/age/oci-dev.key" "$prod_ops"
+  if grep -qE '^[[:space:]]*(apps_remote|port|host)=' "$prod_ops"; then echo 'ops-jev carries apps constants' >&2; return 1; fi
+  if grep -qE '^[[:space:]]*set -(x|o xtrace)' "$prod_launch" "$prod_init" "$prod_ops"; then echo 'a jev tool enables xtrace' >&2; return 1; fi
 
-  # Fixture instance: the same source with only the three constants changed.
-  local tools launch init
+  # Fixture instance: the same source with only the four constants changed.
+  local tools launch init ops
   tools="(import ./oci/dev/nix.nix { pkgs = $pkgs; }).jevTools {
-    envsRemote = \"file://$fx/envs\"; appsRemote = \"file://$fx/apps\"; identity = \"$fx/age/oci-dev.key\"; }"
+    envsRemote = \"file://$fx/envs\"; appsRemote = \"file://$fx/apps\"; opsRemote = \"file://$fx/ops\";
+    identity = \"$fx/age/oci-dev.key\"; }"
   launch=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($tools).launch")/bin/voice-ui-jev-dev
   init=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($tools).init")/bin/jev-age-init
-  same() { grep -vE '^(envs_remote|apps_remote|identity)=' "$1" | sha256sum; }
+  ops=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($tools).ops")/bin/ops-jev
+  same() { grep -vE '^(envs_remote|apps_remote|ops_remote|identity)=' "$1" | sha256sum; }
   test "$(same "$launch")" = "$(same "$prod_launch")"
   test "$(same "$init")" = "$(same "$prod_init")"
+  test "$(same "$ops")" = "$(same "$prod_ops")"
   test "$launch" != "$prod_launch"
   test "$init" != "$prod_init"
+  test "$ops" != "$prod_ops"
 
   # jev-age-init: refuses an unsafe parent and any overwrite, writes 0600, prints only the public recipient.
   local recipient other
@@ -146,6 +159,7 @@ jev_proof() {
     apps.x86_64-linux.dev = {
       type = "app";
       program = "${nixpkgs.legacyPackages.x86_64-linux.writeShellScript "voice-ui-jev-proof-stub" ''
+        ls -1 /proc/$$/fd > /tmp/voice-ui-jev-proof-$PORT.fds
         {
           echo "names $(tr '\0' '\n' < /proc/$$/environ | cut -d= -f1 | sort | tr '\n' ' ')"
           echo "host $HOST"
@@ -172,17 +186,59 @@ NIX
   g -C "$fx/apps" commit -q -m broken
   apps_bad=$(g -C "$fx/apps" rev-parse HEAD)
 
+  # Fixture ops remote: a stub jev that reads its whole request from stdin, records only names, digests and its open
+  # descriptors, prints exactly one JSON line, and exits 3 when the request asks for it; and one that cannot build.
+  local ops_flake ops_good ops_bad
+  ops_flake=$(cat <<'NIX'
+{
+  inputs.nixpkgs.url = "path:NIXPKGS";
+  outputs = { nixpkgs, ... }: {
+    packages.x86_64-linux.jev = nixpkgs.legacyPackages.x86_64-linux.writeShellScriptBin "jev" ''
+      ls -1 /proc/$$/fd > /tmp/ops-jev-proof.fds
+      input=$(cat)
+      names=$(tr '\0' '\n' < /proc/$$/environ | cut -d= -f1 | sort | tr '\n' ' ')
+      home="$HOME $([ -e "$HOME" ] && echo present || echo absent)"
+      key=$(printf %s "$JEV_API_KEY" | sha256sum | cut -d' ' -f1)
+      req=$(printf %s "$input" | sha256sum | cut -d' ' -f1)
+      case "$(tr '\0' ' ' < /proc/$$/cmdline)" in *"$JEV_API_KEY"*) argv=key ;; *) argv=clean ;; esac
+      printf '{"names":"%s","home":"%s","core":"%s","key":"%s","request":"%s","argv":"%s"}\n' \
+        "$names" "$home" "$(ulimit -c)" "$key" "$req" "$argv"
+      case "$input" in *'"exit":3'*) exit 3 ;; esac
+    '';
+  };
+}
+NIX
+)
+  fixture_init "$fx/ops" work
+  printf '%s\n' "${ops_flake//NIXPKGS/$nixpkgs_src}" > "$fx/ops/flake.nix"
+  g -C "$fx/ops" add flake.nix
+  (cd "$fx/ops" && "${nx[@]}" flake lock)
+  g -C "$fx/ops" add -A
+  g -C "$fx/ops" commit -q -m stub
+  ops_good=$(g -C "$fx/ops" rev-parse HEAD)
+  printf '{ outputs = _: throw "no jev package"; }\n' > "$fx/ops/flake.nix"
+  g -C "$fx/ops" add -A
+  g -C "$fx/ops" commit -q -m broken
+  ops_bad=$(g -C "$fx/ops" rev-parse HEAD)
+
   # Every launch runs with a hostile parent environment; no outcome may print the key.
   local port marker out="$fx/launch.out"
   port=$((20000 + RANDOM % 20000))
   marker=/tmp/voice-ui-jev-proof-$port
   mkdir "$fx/tmp"
+  # The child's open descriptors, apart from 255 (a bash script's own file): only stdin, stdout and stderr. Every
+  # launch below also holds descriptors 7 and 9 in the caller, so a descriptor the caller leaves open must not leak.
+  only_stdio() {
+    local got
+    got=$(grep -vxF 255 "$1" | tr '\n' ' ')
+    [ "$got" = "0 1 2 " ] || { echo "child descriptors are '$got', expected '0 1 2 '" >&2; return 1; }
+  }
   launch_as() {
     local expect=$1 code=0
     shift
-    rm -f "$marker"
+    rm -f "$marker" "$marker.fds"
     env TMPDIR="$fx/tmp" GH_TOKEN=fixture-gh GH_CONFIG_DIR=/nonexistent SOPS_AGE_KEY_FILE=/nonexistent HOST=0.0.0.0 SHELLOPTS=xtrace \
-      'BASH_FUNC_leak%%=() { :; }' 'NOT-AN-IDENTIFIER=leak' "$launch" "$@" > "$out" 2>&1 || code=$?
+      'BASH_FUNC_leak%%=() { :; }' 'NOT-AN-IDENTIFIER=leak' "$launch" "$@" > "$out" 2>&1 7< /dev/null 9< /dev/null || code=$?
     if grep -qF "$key" "$out"; then echo 'the key reached launcher output' >&2; return 1; fi
     if [ "$expect" = pass ]; then [ "$code" -eq 0 ] && [ -e "$marker" ]; else [ "$code" -ne 0 ] && [ ! -e "$marker" ]; fi \
       || { cat "$out" >&2; echo "voice-ui-jev-dev: expected $expect, exit $code: $*" >&2; return 1; }
@@ -196,7 +252,16 @@ NIX
   grep -qx 'home /homeless-shelter absent' "$marker"
   grep -qx "key $(printf %s "$key" | sha256sum | cut -d' ' -f1)" "$marker"
   grep -qx 'argv clean' "$marker"
+  only_stdio "$marker.fds"
   test "$(grep -n 'voice-ui-jev-dev: built ' "$out" | cut -d: -f1)" -lt "$(grep -n 'voice-ui-jev-dev: decrypt ' "$out" | cut -d: -f1)"
+  # An explicit --host alone chooses the listen address, in any position; the hostile HOST above never does.
+  launch_as pass --host 0.0.0.0 "${args[@]}"
+  test "$(head -n 1 "$marker")" = "names HOME HOST JEV_API_KEY LANG PATH PORT "
+  grep -qx 'host 0.0.0.0' "$marker"
+  grep -qx 'argv clean' "$marker"
+  grep -qF "on 0.0.0.0:$port with" "$out"
+  launch_as pass "${args[@]}" --host 127.0.0.1
+  grep -qx 'host 127.0.0.1' "$marker"
 
   # Arguments: exactly three flags, exact SHAs, an unprivileged port.
   launch_as red --envs-sha "$good" --apps-sha "$apps_good"
@@ -204,6 +269,11 @@ NIX
   launch_as red --envs-sha "${good^^}" --apps-sha "$apps_good" --port "$port"
   launch_as red --envs-sha "$good" --apps-sha "$apps_good" --port 80
   launch_as red --envs-sha "$good" --apps-sha "$apps_good" --port 70000
+  # The host: only 127.0.0.1 or 0.0.0.0, once, with a value.
+  for h in localhost :: 192.0.2.1 '' 127.0.0.2; do launch_as red "${args[@]}" --host "$h"; done
+  launch_as red "${args[@]}" --host
+  launch_as red "${args[@]}" --host 0.0.0.0 --host 0.0.0.0
+  launch_as red --envs-sha "$good" --apps-sha "$apps_good" --host 0.0.0.0 --host 127.0.0.1
   # The envs commit: stale ancestor, off proposals, or unknown.
   launch_as red --envs-sha "$stale" --apps-sha "$apps_good" --port "$port"
   launch_as red --envs-sha "$off" --apps-sha "$apps_good" --port "$port"
@@ -228,6 +298,50 @@ NIX
   launch_as red --envs-sha "$extra" --apps-sha "$apps_good" --port "$port"
   rm -f "$cipher"; absent=$(commit absent)
   launch_as red --envs-sha "$absent" --apps-sha "$apps_good" --port "$port"
+  encrypt "$recipient" > "$cipher"; good=$(commit current-again)
+
+  # ops-jev: the caller's stdin is the child's request, the child's single stdout line and exit status are the caller's,
+  # the launcher speaks only on stderr, and every outcome runs with the same hostile parent. No outcome prints the key.
+  local ops_fds=/tmp/ops-jev-proof.fds ops_out="$fx/ops.out" ops_err="$fx/ops.err" request
+  request='{"type":"noul","text":"fixture","question":"fixture?"}'
+  ops_as() {
+    local expect=$1 input=$2 code=0
+    shift 2
+    rm -f "$ops_fds"
+    printf '%s' "$input" | env TMPDIR="$fx/tmp" GH_TOKEN=fixture-gh GH_CONFIG_DIR=/nonexistent SOPS_AGE_KEY_FILE=/nonexistent \
+      JEV_API_KEY=parent-leak SHELLOPTS=xtrace 'BASH_FUNC_leak%%=() { :; }' 'NOT-AN-IDENTIFIER=leak' \
+      "$ops" "$@" > "$ops_out" 2> "$ops_err" 7< /dev/null 9< /dev/null || code=$?
+    if grep -qF "$key" "$ops_out" "$ops_err"; then echo 'the key reached ops-jev output' >&2; return 1; fi
+    if grep -qF 'ops-jev:' "$ops_out"; then echo 'ops-jev wrote its own messages to stdout' >&2; return 1; fi
+    case $expect in
+      pass | exit3)
+        [ "$code" -eq "$([ "$expect" = pass ] && echo 0 || echo 3)" ] && [ "$(wc -l < "$ops_out")" -eq 1 ] && [ -e "$ops_fds" ] ;;
+      red) [ "$code" -ne 0 ] && [ ! -s "$ops_out" ] && [ ! -e "$ops_fds" ] ;;
+    esac || { cat "$ops_err" >&2; echo "ops-jev: expected $expect, exit $code: $*" >&2; return 1; }
+  }
+  local ops_args=(--envs-sha "$good" --ops-sha "$ops_good") digest
+  digest=$(printf %s "$key" | sha256sum | cut -d' ' -f1)
+  ops_as pass "$request" "${ops_args[@]}"
+  test "$(cat "$ops_out")" = "{\"names\":\"HOME JEV_API_KEY LANG PATH \",\"home\":\"/homeless-shelter absent\",\"core\":\"0\",\"key\":\"$digest\",\"request\":\"$(printf %s "$request" | sha256sum | cut -d' ' -f1)\",\"argv\":\"clean\"}"
+  only_stdio "$ops_fds"
+  test "$(grep -n 'ops-jev: built ' "$ops_err" | cut -d: -f1)" -lt "$(grep -n 'ops-jev: decrypt ' "$ops_err" | cut -d: -f1)"
+  ops_as pass "$request" --ops-sha "$ops_good" --envs-sha "$good"
+  ops_as exit3 '{"type":"noul","exit":3}' "${ops_args[@]}"
+  # Arguments: exactly the two flags, exact SHAs; no apps flag, port, host, attribute or extra argument.
+  ops_as red "$request" --envs-sha "$good"
+  ops_as red "$request" "${ops_args[@]}" --port 20000
+  ops_as red "$request" "${ops_args[@]}" jev
+  ops_as red "$request" --envs-sha "$good" --apps-sha "$ops_good"
+  ops_as red "$request" --envs-sha "$good" --ops-sha "${ops_good^^}"
+  ops_as red "$request" --envs-sha "$good" --envs-sha "$good"
+  # The shared currentness, identity and build-before-decrypt boundary.
+  ops_as red "$request" --envs-sha "$stale" --ops-sha "$ops_good"
+  ops_as red "$request" --envs-sha "$off" --ops-sha "$ops_good"
+  ops_as red "$request" --envs-sha "$good" --ops-sha "$ops_bad"
+  if grep -q 'ops-jev: decrypt' "$ops_err"; then echo 'ops-jev decrypted before its program was built' >&2; return 1; fi
+  ops_as red "$request" --envs-sha "$good" --ops-sha "$(printf unknown | sha256sum | cut -c1-40)"
+  chmod 0644 "$fx/age/oci-dev.key"; ops_as red "$request" "${ops_args[@]}"; chmod 0600 "$fx/age/oci-dev.key"
+  rm -f "$ops_fds"
   test -z "$(ls -A "$fx/tmp")"
   # scratch_clear as built into the launcher: it removes exactly the scratch the launcher writes, and keeps and refuses
   # anything else (here a loose object and a foreign pack name).
@@ -287,14 +401,16 @@ NIX
   plain "$fx/unexpected"
   jev_clear
   test ! -e "$fx"
-  rm -f "$marker"
-  echo 'PASS jev tools (fixtures): production profile has only the two bounded tools and exact constants; same source;'
-  echo 'PASS jev launch: closed child environment, loopback, no core, absent HOME, no temp left after any launch, key never in argv or output, build before decrypt;'
+  rm -f "$marker" "$marker.fds"
+  echo 'PASS jev tools (fixtures): production profile has only the three bounded tools and exact constants; same source;'
+  echo 'PASS jev launch: closed child environment, loopback unless --host 0.0.0.0 is explicit, no core, absent HOME, only stdio descriptors, no temp left after any launch, key never in argv or output, build before decrypt;'
+  echo 'PASS ops-jev: caller stdin is the request, one stdout JSON line, exit status passed through, launcher messages on stderr only, PATH HOME LANG JEV_API_KEY only, only stdio descriptors, build before decrypt, RED on arguments/stale/off/unbuildable/unknown/identity;'
   echo 'PASS jev scratch: removed file by file before the child, never recursively; unexpected entries and types kept and refused;'
   echo 'PASS jev fixtures: Git-verified objects and known files removed, foreign entries kept and refused; no fixture or test identity left;'
-  echo 'PASS jev RED: arguments, stale/off/unknown envs commit, unbuildable apps, identity mode/missing/other, tamper, two recipients, extra field, absent'
+  echo 'PASS jev RED: arguments, host, stale/off/unknown envs commit, unbuildable apps, identity mode/missing/other, tamper, two recipients, extra field, absent'
 }
 jev_proof
+[ "$mode" = full ] || exit 0
 
 docker load < "$image_archive"
 # Tags select the just-loaded artifact once; every subsequent run pins its immutable ID.
