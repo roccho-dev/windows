@@ -99,12 +99,17 @@
         scratch_clear() {
           [ -e "$work" ] || return 0
           local f d
+          # Only regular files are removed; a link, FIFO, directory or other type at a known name is kept.
           for f in "$repo"/objects/pack/*; do
             [[ ''${f##*/} =~ ^pack-[0-9a-f]{40}([0-9a-f]{24})?\.(pack|idx|rev)$ ]] || continue
+            if [ -L "$f" ] || [ ! -f "$f" ]; then return 1; fi
             "$cu/rm" -f -- "$f"
           done
-          "$cu/rm" -f -- "$work/cipher.yaml" "$repo/HEAD" "$repo/config" "$repo/FETCH_HEAD" "$repo/packed-refs" \
-            "$repo/refs/heads/proposals"
+          for f in "$work/cipher.yaml" "$repo/HEAD" "$repo/config" "$repo/FETCH_HEAD" "$repo/packed-refs" \
+            "$repo/refs/heads/proposals"; do
+            if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then return 1; fi
+            "$cu/rm" -f -- "$f"
+          done
           for d in "$repo/objects/pack" "$repo/objects/info" "$repo/objects" "$repo/refs/heads" "$repo/refs/tags" \
             "$repo/refs" "$repo" "$work"; do
             [ ! -e "$d" ] || "$cu/rmdir" -- "$d" 2>/dev/null || return 1

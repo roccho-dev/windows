@@ -9,6 +9,44 @@ core="$prefix-core"
 nix_volume="$prefix-nix"
 work_volume="$prefix-work"
 evidence=$(mktemp -d)
+# Cleanup removes only what this proof created, one entry at a time, never recursively: a regular file at a known name,
+# an empty directory, and a fixture Git object whose content Git verifies against its own name. Any other type or
+# content is kept and the cleanup fails.
+plain() {
+  if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then echo "kept unexpected entry $1" >&2; return 1; fi
+  rm -f -- "$1"
+}
+empty() {
+  if [ -e "$1" ] || [ -L "$1" ]; then rmdir -- "$1" || { echo "kept non-empty or unexpected $1" >&2; return 1; }; fi
+}
+# A fixture repository made with --template=, without reflogs or automatic GC, so .git holds only these names.
+git_clear() {
+  local g=$1/.git f o t
+  for f in "$g"/objects/[0-9a-f][0-9a-f]/*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    o=${f#"$g"/objects/}; o=${o%%/*}${o#*/}
+    if ! [[ $o =~ ^[0-9a-f]{40}$ ]] || [ -L "$f" ] || [ ! -f "$f" ]; then echo "kept unexpected object entry $f" >&2; return 1; fi
+    t=$(git -C "$1" cat-file -t "$o" 2>/dev/null) || { echo "kept unreadable object $f" >&2; return 1; }
+    [ "$(git -C "$1" cat-file "$t" "$o" | git hash-object -t "$t" --stdin)" = "$o" ] \
+      || { echo "kept object whose content differs from its name $f" >&2; return 1; }
+    rm -f -- "$f"
+  done
+  for f in HEAD config index COMMIT_EDITMSG refs/heads/proposals refs/heads/side refs/heads/work; do plain "$g/$f" || return 1; done
+  for f in "$g"/objects/[0-9a-f][0-9a-f]; do empty "$f" || return 1; done
+  for f in objects/info objects/pack objects refs/heads refs/tags refs; do empty "$g/$f" || return 1; done
+  empty "$g"
+}
+# Everything the Jev proof creates under $evidence/jev, including the fixture test identity.
+jev_clear() {
+  local fx=$evidence/jev r
+  for r in envs apps neg; do if [ -e "$fx/$r/.git" ]; then git_clear "$fx/$r" || return 1; fi; done
+  plain "$fx/envs/side" && plain "$fx/envs/ciphertexts/dev-jev-api.oci-dev.sops.yaml" &&
+    empty "$fx/envs/ciphertexts" && empty "$fx/envs" &&
+    plain "$fx/apps/flake.nix" && plain "$fx/apps/flake.lock" && empty "$fx/apps" &&
+    plain "$fx/neg/file" && empty "$fx/neg" &&
+    plain "$fx/age/oci-dev.key" && plain "$fx/age/kept" && empty "$fx/age" &&
+    plain "$fx/launch.out" && plain "$fx/scratch-clear.sh" && empty "$fx/tmp" && empty "$fx"
+}
 cleanup() {
   code=$?
   if [ "$code" -ne 0 ]; then
@@ -17,10 +55,9 @@ cleanup() {
   fi
   docker rm -f "$core" >/dev/null 2>&1 || true
   docker volume rm "$nix_volume" "$work_volume" >/dev/null 2>&1 || true
-  rm -f -- "$evidence/page" "$evidence/before"
-  # The Jev fixtures are throwaway Git repositories whose object files cannot be named in advance; they stay in this
-  # disposable temporary directory rather than being deleted recursively.
-  rmdir -- "$evidence" 2>/dev/null || echo "kept $evidence (Jev fixture repositories)" >&2
+  plain "$evidence/page" && plain "$evidence/before" || code=1
+  if [ -e "$evidence/jev" ]; then jev_clear || code=1; fi
+  empty "$evidence" || code=1
   exit "$code"
 }
 trap cleanup EXIT
@@ -76,6 +113,12 @@ jev_proof() {
   key="fixture-jev-$RANDOM$RANDOM$RANDOM"
   sops=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($pkgs).sops")/bin/sops
   g() { git -c user.name=proof -c user.email=proof@invalid "$@"; }
+  # No template, reflog or automatic GC: .git keeps only the names git_clear enumerates.
+  fixture_init() {
+    g init -q --template= -b "$2" "$1"
+    g -C "$1" config core.logAllRefUpdates false
+    g -C "$1" config gc.auto 0
+  }
   commit() {
     g -C "$fx/envs" add -A
     g -C "$fx/envs" commit -q -m "$1"
@@ -85,7 +128,7 @@ jev_proof() {
     printf '{"JEV_API_KEY":"%s"}\n' "$key" \
       | SOPS_AGE_RECIPIENTS="$1" "$sops" --encrypt --input-type json --output-type yaml /dev/stdin
   }
-  g init -q -b proposals "$fx/envs"
+  fixture_init "$fx/envs" proposals
   mkdir "$fx/envs/ciphertexts"
   cipher="$fx/envs/ciphertexts/dev-jev-api.oci-dev.sops.yaml"
   encrypt "$recipient" > "$cipher"; stale=$(commit stale)
@@ -117,7 +160,7 @@ jev_proof() {
 }
 NIX
 )
-  g init -q -b work "$fx/apps"
+  fixture_init "$fx/apps" work
   printf '%s\n' "${flake//NIXPKGS/$nixpkgs_src}" > "$fx/apps/flake.nix"
   g -C "$fx/apps" add flake.nix
   (cd "$fx/apps" && "${nx[@]}" flake lock)
@@ -190,29 +233,65 @@ NIX
   # anything else (here a loose object and a foreign pack name).
   sed -n '/^scratch_clear() {$/,/^}$/p' "$launch" > "$fx/scratch-clear.sh"
   grep -q '^scratch_clear() {$' "$fx/scratch-clear.sh"
+  # scratch_case KIND ENTRY: plant a foreign file, FIFO or link at ENTRY (none for clean); the launcher's own
+  # scratch_clear must keep it and fail, and after the test removes its own plant, remove everything.
   scratch_case() {
-    local expect=$1 extra=$2 cu work repo p code=0
+    local kind=$1 extra=$2 cu work repo p code=0
     cu=$(dirname "$(readlink -f "$(command -v rmdir)")")
     work=$(mktemp -d -p "$fx") repo=$work/envs.git p=pack-$(printf '%040d' 0)
     mkdir -p "$repo/objects/pack" "$repo/objects/info" "$repo/refs/heads" "$repo/refs/tags"
     touch "$work/cipher.yaml" "$repo/HEAD" "$repo/config" "$repo/FETCH_HEAD" "$repo/refs/heads/proposals" \
       "$repo/objects/pack/$p.pack" "$repo/objects/pack/$p.idx" "$repo/objects/pack/$p.rev"
-    if [ -n "$extra" ]; then mkdir -p "$(dirname "$repo/$extra")"; echo foreign > "$repo/$extra"; fi
+    case $kind in
+      clean) ;;
+      file) mkdir -p "$(dirname "$repo/$extra")"; echo foreign > "$repo/$extra" ;;
+      fifo) rm -f "$repo/$extra"; mkfifo "$repo/$extra" ;;
+      link) rm -f "$repo/$extra"; ln -s /etc/hostname "$repo/$extra" ;;
+    esac
     # shellcheck disable=SC1091
     (source "$fx/scratch-clear.sh"; scratch_clear) || code=$?
-    if [ "$expect" = clean ]; then
-      [ "$code" -eq 0 ] && [ ! -e "$work" ] || { echo 'scratch_clear left or refused the launcher scratch' >&2; return 1; }
-    else
-      [ "$code" -ne 0 ] && [ "$(cat "$repo/$extra")" = foreign ] || { echo "scratch_clear removed or accepted $extra" >&2; return 1; }
+    if [ "$kind" != clean ]; then
+      case $kind in
+        file) [ "$code" -ne 0 ] && [ "$(cat "$repo/$extra")" = foreign ] ;;
+        fifo) [ "$code" -ne 0 ] && [ -p "$repo/$extra" ] ;;
+        link) [ "$code" -ne 0 ] && [ "$(readlink "$repo/$extra")" = /etc/hostname ] ;;
+      esac || { echo "scratch_clear removed or accepted $kind $extra" >&2; return 1; }
+      rm -f -- "$repo/$extra"
+      case $extra in objects/ab/*) rmdir -- "$repo/objects/ab" ;; esac
+      code=0
+      # shellcheck disable=SC1091
+      (source "$fx/scratch-clear.sh"; scratch_clear) || code=$?
     fi
+    [ "$code" -eq 0 ] && [ ! -e "$work" ] || { echo "scratch_clear left or refused the launcher scratch ($kind)" >&2; return 1; }
   }
   scratch_case clean ''
-  scratch_case kept objects/ab/cdef0123456789abcdef0123456789abcdef01
-  scratch_case kept objects/pack/pack-foreign.pack
+  scratch_case file objects/ab/cdef0123456789abcdef0123456789abcdef01
+  scratch_case file objects/pack/pack-foreign.pack
+  scratch_case fifo HEAD
+  scratch_case link HEAD
+  # git_clear on a fixture repository: a foreign file at an object-shaped name is kept and refused; once the test's own
+  # plant is gone, only Git-verified objects and fixed names are removed and nothing remains.
+  local neg=$fx/neg planted
+  fixture_init "$neg" proposals
+  echo neg > "$neg/file"; g -C "$neg" add file; g -C "$neg" commit -q -m neg
+  planted=$neg/.git/objects/00/$(printf '%038d' 0)
+  mkdir -p "${planted%/*}"; echo foreign > "$planted"
+  if git_clear "$neg"; then echo 'git_clear removed a foreign object-shaped file' >&2; return 1; fi
+  test "$(cat "$planted")" = foreign
+  plain "$planted"
+  git_clear "$neg" && plain "$neg/file" && empty "$neg"
+  # The whole Jev fixture area, including the test identity: an unexpected entry is kept and refused; then all is gone.
+  echo foreign > "$fx/unexpected"
+  if jev_clear 2>/dev/null; then echo 'jev_clear accepted an unexpected entry' >&2; return 1; fi
+  test "$(cat "$fx/unexpected")" = foreign
+  plain "$fx/unexpected"
+  jev_clear
+  test ! -e "$fx"
   rm -f "$marker"
   echo 'PASS jev tools (fixtures): production profile has only the two bounded tools and exact constants; same source;'
   echo 'PASS jev launch: closed child environment, loopback, no core, absent HOME, no temp left after any launch, key never in argv or output, build before decrypt;'
-  echo 'PASS jev scratch: removed file by file before the child, never recursively; unexpected entries kept and refused;'
+  echo 'PASS jev scratch: removed file by file before the child, never recursively; unexpected entries and types kept and refused;'
+  echo 'PASS jev fixtures: Git-verified objects and known files removed, foreign entries kept and refused; no fixture or test identity left;'
   echo 'PASS jev RED: arguments, stale/off/unknown envs commit, unbuildable apps, identity mode/missing/other, tamper, two recipients, extra field, absent'
 }
 jev_proof

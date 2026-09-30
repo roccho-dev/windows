@@ -171,7 +171,13 @@ try {
     if ((@($read.PSObject.Properties.Name) -join ',') -ne 'console,terminal') { throw 'The package reader answer has the wrong shape.' }
 } finally {
     # Exactly the reader's known files, then the directory itself, never recursively: anything else keeps it and fails.
-    foreach ($name in 'view.ps1', 'view.json', 'view.json.partial') { [IO.File]::Delete((Join-Path $readerDir $name)) }
+    foreach ($name in 'view.ps1', 'view.json', 'view.json.partial') {
+        $path = Join-Path $readerDir $name
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        if ($null -eq $item) { continue }
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Kept unexpected entry $path." }
+        [IO.File]::Delete($path)
+    }
     [IO.Directory]::Delete($readerDir, $false)
 }
 $handoffCases++
