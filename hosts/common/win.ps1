@@ -81,8 +81,8 @@ function AssertPackageShape($Package) {
     $executable, $files = (Get-Field $Package 'executable'), (ConvertTo-FileMap (Get-Field $Package 'files'))
     $protected = $null  # assigned directly: a function or if-expression would unroll a one-element array
     if ($null -ne $Package.PSObject.Properties['protected']) { $protected = $Package.PSObject.Properties['protected'].Value }
-    if ($name -isnot [string] -or $name -cnotmatch '^[A-Za-z0-9][A-Za-z0-9.-]*$' -or
-        $version -isnot [string] -or $version -cnotmatch '^[A-Za-z0-9][A-Za-z0-9.-]*$' -or
+    if ($name -isnot [string] -or $name -cnotmatch '^[A-Za-z0-9][A-Za-z0-9.-]*\z' -or
+        $version -isnot [string] -or $version -cnotmatch '^[0-9][A-Za-z0-9.]*\z' -or
         (Get-Field $Package 'directory') -cne ('Programs/' + $name.ToLowerInvariant() + '-' + $version) -or
         -not (TestWindowsRelative $executable) -or $null -eq $files -or -not $files.ContainsKey($executable) -or
         @('uninstallKey', 'displayName', 'publisher', 'installLocation', 'executable' |
@@ -396,11 +396,20 @@ $ledgerDirectory = Join-Path $localAppData 'windows-iac\ledger'
 $fontSubkey = 'Software\Microsoft\Windows NT\CurrentVersion\Fonts'
 $fontKey = 'HKCU\' + $fontSubkey
 $script:ledgerRecords, $script:nextSeq, $script:ledgerLock = @(), 1, $null
+# The same records by id (ordinal, so ids differing only in case stay apart and LedgerIds refuses
+# them), filled wherever ledgerRecords grows: a lookup no longer scans the whole ledger.
+$script:ledgerById = [Collections.Generic.Dictionary[string, Collections.Generic.List[object]]]::new([StringComparer]::Ordinal)
+function IndexRecord($Record) {
+    $id = [string](Get-Field $Record 'id')
+    if (-not $script:ledgerById.ContainsKey($id)) { $script:ledgerById[$id] = [Collections.Generic.List[object]]::new() }
+    $script:ledgerById[$id].Add($Record)
+}
 $script:copied, $script:changed, $script:removed, $script:recordsWritten = 0, 0, 0, 0
 $script:fontDrift, $script:sharedCreated, $script:gcKeptReferenced, $script:nocttyDrift = @(), @(), @(), @()
 
 function ReadLedger {
     $script:ledgerRecords, $script:nextSeq = @(), 1
+    $script:ledgerById.Clear()
     if (-not (Test-Path -LiteralPath $ledgerDirectory -PathType Container)) { return $false }
     foreach ($item in @(Get-ChildItem -LiteralPath $ledgerDirectory -Force)) {
         if ($item.Name -ceq '.lock' -and -not $item.PSIsContainer) { continue }
@@ -412,6 +421,7 @@ function ReadLedger {
             throw "Torn or unreadable ledger record $($item.FullName). Only the highest-seq record, and only if it does not parse as JSON, may be removed by hand (README)."
         }
         $script:ledgerRecords += $record
+        IndexRecord $record
         if ($seq -ge $script:nextSeq) { $script:nextSeq = $seq + 1 }
     }
     return $true
@@ -429,26 +439,38 @@ function LockLedger {
 }
 
 # Appends one record for an effect: intent (with the temporary path it will use,
-# named before that file exists), commit, void or undone (with the observed state).
-# The pure checks refuse a malformed record, including an observation that is not
-# the desired (commit) or prior (void, undone) state.
-function WriteRecord([string]$Phase, $Effect, $Observed, [string]$Temp) {
+# named before that file exists, and for a package tree the locked package name, R1),
+# commit, void or undone (with the observed state). The pure checks refuse a malformed
+# record, including an observation that is not the desired (commit) or prior (void, undone) state.
+function WriteRecord([string]$Phase, $Effect, $Observed, [string]$Temp, [string]$Package) {
     $entry = [ordered]@{ ledger = 'effects'; schema = 1; seq = $script:nextSeq; phase = $Phase
         id = Get-Field $Effect 'id'; kind = Get-Field $Effect 'kind'; target = Get-Field $Effect 'target' }
     if ($entry.kind -ceq 'registry-value') { $entry.name = Get-Field $Effect 'name' }
     $entry.prior, $entry.desired = (Get-Field $Effect 'prior'), (Get-Field $Effect 'desired')
     if ($Phase -cne 'intent') { $entry.observed = $Observed }
     if ($Temp) { $entry.temp = $Temp }
+    if ($Package) {
+        if ($Phase -cne 'intent' -or $entry.kind -cne 'tree-extracted') { throw 'Only a tree intent names its package.' }
+        $entry.package = $Package
+    }
     $entry.utc, $entry.source, $entry.mode = [DateTime]::UtcNow.ToString('o'), $manifest.source, $Mode
     $problem = Get-EffectRecordProblem $entry
     if ($problem) { throw "Refusing to write a malformed ledger record for $($entry.id): $problem" }
+    # A package intent names exactly one locked package, and its own staging directory must yield
+    # that package's derived asset path (Get-PackageAssetPath), so recovery can find what it downloaded.
+    if ($Package -and (@($manifest.packages | Where-Object { $_.name -ceq $Package }).Count -ne 1 -or
+            -not (Get-PackageAssetPath $entry (Join-Path $localAppData 'Programs')))) {
+        throw "Refusing a package intent for $($entry.id): $Package is not the locked package of this tree and staging directory."
+    }
     $json = $entry | ConvertTo-Json -Depth 8 -Compress
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
     $path = Join-Path $ledgerDirectory ('{0:D8}.json' -f $script:nextSeq)
     $stream = [IO.FileStream]::new($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None,
         4096, [IO.FileOptions]::WriteThrough)
     try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
-    $script:ledgerRecords += ($json | ConvertFrom-Json)
+    $record = $json | ConvertFrom-Json
+    $script:ledgerRecords += $record
+    IndexRecord $record
     $script:nextSeq++
     $script:recordsWritten++
 }
@@ -583,24 +605,34 @@ function NocttyReferences($Views, [string[]]$Subkeys) {
     }
 }
 
-# The current state of a recorded or selected effect: an owned font file or HKCU Fonts value,
-# or a Noctty effect (ObserveNoctty). Anything else is outside this version and stops the run.
+# True for the tree of any version of a locked package: exactly %LOCALAPPDATA%\Programs\
+# <lock name, lowercase>-<version>, the version a digit first and holding no '-' (so an owned
+# older version stays readable for collection and Uninstall, and chromium-extra-1 is not Chromium's).
+function IsPackageTree([string]$Target) {
+    $leaf = [IO.Path]::GetFileName($Target)
+    [IO.Path]::GetDirectoryName($Target) -eq (Join-Path $localAppData 'Programs') -and (Test-PathSegment $leaf) -and
+        @($manifest.packages | Where-Object { $leaf -cmatch ('^' + [regex]::Escape($_.name.ToLowerInvariant()) + '-[0-9][A-Za-z0-9.]*\z') }).Count -gt 0
+}
+
+# The current state of a recorded or selected effect: an owned font file or HKCU Fonts value, a
+# package tree, or a Noctty effect (ObserveNoctty). Anything else is outside this version and stops the run.
 function Observe($Effect) {
     $kind, $target = [string](Get-Field $Effect 'kind'), [string](Get-Field $Effect 'target')
     if ($kind -ceq 'file-created' -and [IO.Path]::GetDirectoryName($target) -eq $fontDirectory -and
         [IO.Path]::GetFileName($target) -match '^[0-9a-f]{64}\.ttf$') { return ObserveFile $target }
     if ($kind -ceq 'registry-value' -and $target -eq $fontKey) { return ObserveValue ([string](Get-Field $Effect 'name')) }
+    if ($kind -ceq 'tree-extracted' -and (IsPackageTree $target)) { return ObserveTree $target }
     if ($kind -cne 'file-created' -or $target -eq $nocttyConfig) { return ObserveNoctty $Effect }
     throw "The effect ledger holds $kind $target, which this version (owned fonts only) does not handle."
 }
 
 function LedgerIds {
-    $ids = @($script:ledgerRecords | ForEach-Object { [string](Get-Field $_ 'id') } | Sort-Object -Unique -CaseSensitive)
+    $ids = @($script:ledgerById.Keys | Sort-Object -Unique -CaseSensitive)
     if (@($ids | Sort-Object -Unique).Count -ne $ids.Count) { throw 'Two effect ledger ids differ only in case.' }
     return $ids
 }
 
-function RecordsOf([string]$Id) { @($script:ledgerRecords | Where-Object { [string](Get-Field $_ 'id') -ceq $Id }) }
+function RecordsOf([string]$Id) { if ($script:ledgerById.ContainsKey($Id)) { @($script:ledgerById[$Id]) } else { @() } }
 
 # The open attempt of an id (its records), or an empty list.
 function OpenAttempt([string]$Id) {
@@ -633,11 +665,25 @@ function CleanStaging($Intent) {
     }
 }
 
+# Removes the one download file a package tree intent may have left beside its staging
+# directory (Get-PackageAssetPath), only as a regular file; a package intent from which no
+# asset path derives stops the run.
+function RemovePackageAsset($Intent) {
+    $asset = Get-PackageAssetPath $Intent (Join-Path $localAppData 'Programs')
+    if (-not $asset) { throw "A package intent names no valid asset path: $(Get-Field $Intent 'id')" }
+    $item = Get-Item -LiteralPath $asset -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return }
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Not a plain asset file: $asset" }
+    [IO.File]::Delete($asset)
+}
+
 # Closes or confirms an open attempt: first the temporary files or staging directories its
-# own intents named, then a commit, void or undone record carrying the observed state.
+# own intents named (and a package intent's derived asset), then a commit, void or undone
+# record carrying the observed state.
 function ResolveAttempt($Open, [string]$Phase) {
     foreach ($intent in @($Open | Where-Object { (Get-Field $_ 'phase') -ceq 'intent' })) {
         $temp = IntentTemp $intent
+        if ($null -ne (Get-Field $intent 'package')) { RemovePackageAsset $intent }
         if (-not $temp -or -not (Test-Path -LiteralPath $temp)) { continue }
         if ((Get-Field $intent 'kind') -ceq 'tree-extracted') { CleanStaging $intent }
         elseif (Test-Path -LiteralPath $temp -PathType Leaf) { [IO.File]::Delete($temp) }

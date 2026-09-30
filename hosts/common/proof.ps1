@@ -420,8 +420,8 @@ Must ((Rollback (Sel $wtConsole $terminal) @{ DelegationTerminal = $noctty } (Se
     (Rollback (Sel $wtConsole $noctty) @{} (Sel $wtConsole $noctty)) -ceq '') 'selection rollback of one run'
 # S2-1 R1: protected data is ours only after a committed attempt whose intent names exactly this package (any version).
 $pkgDesired = @{ exists = $true; files = @{ 'Chrome-bin/chrome.exe' = (Sha a); 'Chrome-bin/d/x.dll' = (Sha b) } }
-function PackageRecords($Seq, [string]$Leaf, $Package, [string[]]$Phases) {
-    $target = "C:\u\Programs\$Leaf"
+function PackageRecords($Seq, [string]$Leaf, $Package, [string[]]$Phases, [string]$Parent = 'C:\u\Programs') {
+    $target = "$Parent\$Leaf"
     foreach ($phase in $Phases) {
         $r = PureRecord $Seq $phase tree-extracted $target $absent $pkgDesired $(switch ($phase) { 'intent' { $null } 'commit' { $pkgDesired } default { $absent } }) $null
         $r.id = 'tree-extracted:' + $target.ToUpperInvariant()
@@ -429,15 +429,32 @@ function PackageRecords($Seq, [string]$Leaf, $Package, [string[]]$Phases) {
         $Seq++; $r
     }
 }
-Must ((Test-PackageHistory @(PackageRecords 1 'chromium-153' 'Chromium' @('intent', 'commit', 'undone')) 'Chromium') -and                 # an older version, removed
-    (Test-PackageHistory @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit')) 'Chromium') -and                              # open
-    (Test-PackageHistory (@(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'void')) + @(PackageRecords 3 'chromium-154' 'Chromium' @('intent', 'commit'))) 'Chromium') -and
-    -not (Test-PackageHistory @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'void')) 'Chromium') -and                          # void only
-    -not (Test-PackageHistory @(PackageRecords 1 'chromium-extra-1' 'Chromium-extra' @('intent', 'commit')) 'Chromium') -and              # another package
-    -not (Test-PackageHistory @(PackageRecords 1 'chromium-154' $null @('intent', 'commit')) 'Chromium') -and                               # no package field
-    -not (Test-PackageHistory @(PackageRecords 1 'chromium-154' 'chromium' @('intent', 'commit')) 'Chromium') -and                          # not exactly the name
-    -not (Test-PackageHistory (@(PackageRecords 1 'chromium-154' 'Other' @('intent', 'commit', 'undone')) + @(PackageRecords 4 'chromium-154' 'Chromium' @('intent', 'void'))) 'Chromium') -and
-    -not (Test-PackageHistory @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit')) '')) 'R1 package history'
+$programs = 'C:\u\Programs'
+function Hist($Records, [string]$Package = 'Chromium', [string]$Within = $programs) { Test-PackageHistory $Records $Package $Within }
+Must ((Hist @(PackageRecords 1 'chromium-153' 'Chromium' @('intent', 'commit', 'undone'))) -and                 # an older version, removed
+    (Hist @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit'))) -and                              # open
+    (Hist (@(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'void')) + @(PackageRecords 3 'chromium-154' 'Chromium' @('intent', 'commit')))) -and
+    (Hist @(PackageRecords 1 'chromium-153' 'Chromium' @('intent', 'commit', 'undone')) 'Chromium' "$programs\") -and   # a trailing '\' on Programs
+    -not (Hist @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'void'))) -and                          # void only
+    -not (Hist @(PackageRecords 1 'chromium-extra-1' 'Chromium-extra' @('intent', 'commit'))) -and              # another package
+    -not (Hist @(PackageRecords 1 'chromium-154' $null @('intent', 'commit'))) -and                               # no package field
+    -not (Hist @(PackageRecords 1 'chromium-154' 'chromium' @('intent', 'commit'))) -and                          # not exactly the name
+    -not (Hist (@(PackageRecords 1 'chromium-154' 'Other' @('intent', 'commit', 'undone')) + @(PackageRecords 4 'chromium-154' 'Chromium' @('intent', 'void')))) -and
+    -not (Hist @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit')) '')) 'R1 package history'
+# The reader's own guard (R's reproduced false positives): a Chromium intent on another package's tree, the right
+# name in the wrong folder, or no Programs at all proves nothing; a package field on a commit is a malformed record.
+$onNoctty = @(PackageRecords 1 'noctty-1.3.131' 'Chromium' @('intent', 'commit'))
+$onAutoHotkey = @(PackageRecords 1 'autohotkey-2.0.28' 'Chromium' @('intent', 'commit'))
+$elsewhere = @(PackageRecords 1 'chromium-154.0.8037.58' 'Chromium' @('intent', 'commit') 'C:\elsewhere')
+$packageOnCommit = @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit')); $packageOnCommit[1].package = 'Chromium'
+Must (-not (Hist $onNoctty) -and -not (Hist $onAutoHotkey) -and -not (Hist $elsewhere) -and -not (Hist $packageOnCommit) -and
+    -not (Hist @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit')) 'Chromium' '') -and
+    $null -ne (Get-EffectRecordProblem $onNoctty[0]) -and $null -ne (Get-EffectRecordProblem $onAutoHotkey[0]) -and
+    $null -eq (Get-EffectRecordProblem $elsewhere[0]) -and $null -ne (Get-EffectRecordProblem $packageOnCommit[1]) -and
+    (Test-PackageTarget "$programs\chromium-154" 'Chromium' $programs) -and -not (Test-PackageTarget "$programs\x\chromium-154" 'Chromium' $programs) -and
+    (Test-PackageTarget 'C:\elsewhere\chromium-154' 'Chromium') -and -not (Test-PackageTarget 'C:\elsewhere\chromium-154' 'Chromium' $programs) -and
+    -not (Test-PackageTarget "$programs\chromium-154" 'Chromium' '') -and -not (Test-PackageTarget "$programs\chromium-154" 'Chromium' $null) -and
+    -not (Test-PackageTarget "$programs\chromium-154" 1 $programs)) 'R1 reader guard'
 # Only a valid history counts: a malformed closing record, a commit of another effect, or a repeated
 # seq (within the id or across the ledger) makes a committed-looking attempt prove nothing.
 $malformed = @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit', 'undone')); $malformed[2].schema = 2
@@ -445,8 +462,8 @@ $changed = @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit'))
 $changed[1].desired = @{ exists = $true; files = @{ 'Chrome-bin/chrome.exe' = (Sha c) } }; $changed[1].observed = $changed[1].desired
 $repeated = @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit')); $repeated[1].seq = 1
 $shared = @(PackageRecords 1 'chromium-154' 'Chromium' @('intent', 'commit')) + @(PackageRecords 2 'autohotkey-2.0.28' 'AutoHotkey' @('intent'))
-Must (@($malformed, $changed, $repeated, $shared | Where-Object { Test-PackageHistory $_ 'Chromium' }).Count -eq 0 -and
-    (Test-PackageHistory $malformed[0..1] 'Chromium')) 'R1 history must be valid as a whole'
+Must (@($malformed, $changed, $repeated, $shared | Where-Object { Hist $_ }).Count -eq 0 -and
+    (Hist $malformed[0..1])) 'R1 history must be valid as a whole'
 # D-c: the asset file is derived from a valid package intent's staging directory, beside it, and nothing else.
 function AssetIntent([string]$Target, $Package, [string]$Temp) {
     $r = PureRecord 1 intent tree-extracted $Target $absent $pkgDesired $null $null
@@ -490,7 +507,7 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
         'ObserveKey', 'ObserveValue', 'ObserveFile', 'NocttyEffects', 'KeyEffect', 'ValueEffect', 'FileEffect',
         'OrderedSteps', 'UndoOwnedSteps', 'RemoveTarget', 'FontReferences', 'FontReferenceTable', 'NocttyReferences',
         'SelectNoctty', 'StartupPair', 'RecordPriorTerminal', 'TestNocttyRegistration', 'TestNocttyActivation', 'AssertActualSelection', 'RestoreLegacy',
-        'StepText'
+        'StepText', 'IsPackageTree', 'RemovePackageAsset', 'IndexRecord', 'ReadLedger', 'LedgerIds'
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'win.ps1'), [ref]$null, [ref]$null)
     foreach ($definition in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cin $names }, $false)) {
         . ([scriptblock]::Create($definition.Extent.Text))
@@ -517,6 +534,7 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
     $clsid = '{' + [guid]::NewGuid().ToString().ToUpperInvariant() + '}'
     $nocttyRegistration = Get-NocttyRegistration @(@{ key = "Software\Classes\CLSID\$clsid\LocalServer32"; name = ''; data = 'proof' }) $nocttyDirectory $manifest.noctty.files
     $script:ledgerRecords, $script:nextSeq, $script:recordsWritten, $script:copied, $script:changed, $script:removed = @(), 1, 0, 0, 0, 0
+    $script:ledgerById = [Collections.Generic.Dictionary[string, Collections.Generic.List[object]]]::new([StringComparer]::Ordinal)
     $null = New-Item -ItemType Directory -Path $ledgerDirectory, (Join-Path $Scratch 'Programs'), (Split-Path -Parent $nocttyConfig) -Force
     $selected = NocttyEffects
 
@@ -561,7 +579,98 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
         $record
     })
     $records[0].package = 'Chromium'; $records[2].schema = 2
-    Must ((Test-PackageHistory $records[0..1] 'Chromium') -and -not (Test-PackageHistory $records 'Chromium')) 'R1 package history in this edition'
+    $programsHere = Join-Path $Scratch 'Programs'
+    Must ((Test-PackageHistory $records[0..1] 'Chromium' $programsHere) -and -not (Test-PackageHistory $records 'Chromium' $programsHere) -and
+        -not (Test-PackageHistory $records[0..1] 'Chromium' (Join-Path $Scratch 'Other')) -and -not (Test-PackageHistory $records[0..1] 'Chromium' '')) 'R1 package history in this edition'
+    # S2-2b1 package primitives (clean install stays disabled). The class table: the ledger keeps ownership; an
+    # external Uninstall entry is never taken over and beside an owned tree is a conflict; R1 for protected data.
+    function PClass($Tree, $Entries = 0, $Problems = @(), $Protected = $false, $History = $false) {
+        $c = Get-PackageClass $Tree $Entries $Problems $Protected $History
+        "$($c.class)|$([int]$c.conflict)|$([int]$c.install)|$([int]$c.converged)"
+    }
+    Must ((PClass 'owned-match') -ceq 'owned-match|0|0|1' -and (PClass 'owned-match' 1) -ceq 'owned-match|1|0|0' -and
+        (PClass 'owned-drift' 1 @('x')) -ceq 'owned-drift|1|0|0' -and (PClass 'owned-drift') -ceq 'owned-drift|0|0|0' -and
+        (PClass 'absent' 1) -ceq 'preexisting-match|0|0|1' -and (PClass 'absent' 2 @('DisplayVersion is 1')) -ceq 'preexisting-drift|0|0|0' -and
+        (PClass 'preexisting-match' 1 @('x')) -ceq 'preexisting-drift|0|0|0' -and (PClass 'preexisting-match') -ceq 'preexisting-match|0|0|1' -and
+        (PClass 'preexisting-drift') -ceq 'preexisting-drift|0|0|0' -and (PClass 'absent' 0 @() $true $false) -ceq 'preexisting-drift|0|0|0' -and
+        (PClass 'absent' 0 @() $true $true) -ceq 'absent|0|1|0' -and (PClass 'absent') -ceq 'absent|0|1|0' -and
+        (PClass 'absent' 1 @() $true $true) -ceq 'preexisting-match|0|0|1' -and (PClass 'indeterminate' 1) -ceq 'indeterminate|0|0|0' -and
+        (PClass 'bogus') -ceq 'indeterminate|0|0|0') 'the package class table'
+    # tar listings: directories with or without a trailing '/', CRLF, the end-of-listing blank line; anything else refused.
+    $tarFiles = @{ 'Chrome-bin/chrome.exe' = $shaA; 'Chrome-bin/154.0.8037.58/chrome.dll' = $shaA; 'README' = $shaA }
+    $tarGood = @(@('Chrome-bin/', 'Chrome-bin/154.0.8037.58/', 'Chrome-bin/154.0.8037.58/chrome.dll', 'Chrome-bin/chrome.exe', 'README', ''),
+        @('Chrome-bin', 'Chrome-bin/154.0.8037.58', 'Chrome-bin/154.0.8037.58/chrome.dll', "Chrome-bin/chrome.exe`r", 'README'),
+        @('README', 'Chrome-bin/chrome.exe', 'Chrome-bin/154.0.8037.58/chrome.dll'))
+    $tarBad = @(@('README/', 'Chrome-bin/chrome.exe', 'Chrome-bin/154.0.8037.58/chrome.dll'), @('./README', 'Chrome-bin/chrome.exe', 'Chrome-bin/154.0.8037.58/chrome.dll'),
+        @('chrome-bin/', 'README', 'Chrome-bin/chrome.exe', 'Chrome-bin/154.0.8037.58/chrome.dll'), @('README', 'Chrome-bin/chrome.exe'),
+        @('README', 'Chrome-bin/chrome.exe', 'Chrome-bin/154.0.8037.58/chrome.dll', 'extra.txt'), @('README', 'Chrome-bin/chrome.exe', 'Chrome-bin/154.0.8037.58/chrome.dll', 'Chrome-bin/x/'),
+        @('README', 'README', 'Chrome-bin/chrome.exe', 'Chrome-bin/154.0.8037.58/chrome.dll'), @('Chrome-bin\chrome.exe', 'README', 'Chrome-bin/154.0.8037.58/chrome.dll'))
+    Must (-not @($tarGood | Where-Object { $null -ne (Get-ZipEntryProblem @(ConvertFrom-TarListing $_ $tarFiles) $tarFiles) }).Count -and
+        -not @($tarBad | Where-Object { $null -eq (Get-ZipEntryProblem @(ConvertFrom-TarListing $_ $tarFiles) $tarFiles) }).Count) 'tar listings, strictly'
+    # Native quoting, checked by Windows' own CommandLineToArgvW in this edition.
+    if (-not ('W.ArgvProbe' -as [type])) {
+        Add-Type -Namespace W -Name ArgvProbe -MemberDefinition @'
+[DllImport("shell32.dll", SetLastError = true)] static extern System.IntPtr CommandLineToArgvW([MarshalAs(UnmanagedType.LPWStr)] string cmd, out int count);
+[DllImport("kernel32.dll")] static extern System.IntPtr LocalFree(System.IntPtr mem);
+public static string[] Split(string cmd) {
+    int n; System.IntPtr p = CommandLineToArgvW(cmd, out n);
+    try { var r = new string[n]; for (int i = 0; i < n; i++) { r[i] = Marshal.PtrToStringUni(Marshal.ReadIntPtr(p, i * System.IntPtr.Size)); } return r; }
+    finally { LocalFree(p); }
+}
+'@
+    }
+    $tricky = @('plain', 'with space', 'C:\Users\John Smith\a.7z', 'trail\', 'trail space\', 'q"uote', 'back\"q', 'back\\"q', '', "tab`tx", '=https', '-o',
+        '\\server\share\', 'a\\b', '"', '\"', 'https://github.com/a/b/releases/download/v1/chrome.7z')
+    $split = @([W.ArgvProbe]::Split('x ' + (Join-NativeArguments $tricky)))
+    Must ($split.Count -eq $tricky.Count + 1 -and -not @(0..($tricky.Count - 1) | Where-Object { $split[$_ + 1] -cne $tricky[$_] }).Count) 'native arguments round-trip'
+    Refused { Join-NativeArguments @("a$([char]0)b") } '*NUL*'
+    # Capacity and path bounds: size + unpackedSize + seed + 64 MiB; a file path below 260 and a directory below 248, under staging.
+    $small = @{ size = 100; unpackedSize = 50; files = @{ 'bbbbbbbb.txt' = $shaA } }
+    $need = [long]150 + 64MB
+    Must ($null -eq (Get-PackageSpaceProblem $small 'C:\p\x-1' $need) -and $null -ne (Get-PackageSpaceProblem $small 'C:\p\x-1' ($need - 1)) -and
+        $null -eq (Get-PackageSpaceProblem $small 'C:\p\x-1' ($need + 5) 5) -and $null -ne (Get-PackageSpaceProblem $small 'C:\p\x-1' ($need + 4) 5) -and
+        $null -eq (Get-PackageSpaceProblem $small ('C:\' + 'p' * 202) $need) -and $null -ne (Get-PackageSpaceProblem $small ('C:\' + 'p' * 203) $need) -and
+        $null -eq (Get-PackageSpaceProblem @{ size = 1; unpackedSize = 1; files = @{ 'd/f' = $shaA } } ('C:\' + 'p' * 201) $need) -and
+        $null -ne (Get-PackageSpaceProblem @{ size = 1; unpackedSize = 1; files = @{ 'd/f' = $shaA } } ('C:\' + 'p' * 202) $need)) 'capacity and path bounds'
+    foreach ($bad in @(@{ size = $true; unpackedSize = 1; files = $small.files }, @{ size = 1; unpackedSize = [long]9007199254740992; files = $small.files },
+            @{ size = 1.5; unpackedSize = 1; files = $small.files }, @{ size = 1; unpackedSize = 1; files = @{} }, @{ size = 1; unpackedSize = 1 })) {
+        Must ($null -ne (Get-PackageSpaceProblem $bad 'C:\p\x-1' ([long]1TB))) 'an invalid package or free space is refused'
+    }
+    Must ($null -ne (Get-PackageSpaceProblem $small 'C:\p\x-1' ([long]1TB) -1) -and $null -ne (Get-PackageSpaceProblem $small 'C:\p\x-1' 1.0e12)) 'an invalid seed or free space is refused'
+    # The asset: exact length, SHA-256 and (when locked) SHA-1; hashes compare as lowercase hex only.
+    $abc = [Text.Encoding]::UTF8.GetBytes('abc')
+    $abc256 = -join ([Security.Cryptography.SHA256]::Create().ComputeHash($abc) | ForEach-Object { $_.ToString('x2') })
+    $abc1 = -join ([Security.Cryptography.SHA1]::Create().ComputeHash($abc) | ForEach-Object { $_.ToString('x2') })
+    $assetLock = @{ size = 3; sha256 = $abc256; sha1 = $abc1 }
+    $assetBad = @(@(4, $abc256, $abc1), @(3, $abc1, $abc1), @(3, $abc256, $abc256.Substring(0, 40).Replace('a', 'b')), @(3, "$abc256`n", $abc1),
+        @('3', $abc256, $abc1), @(3, "0x$abc256", $abc1))
+    Must ($null -eq (Get-AssetProblem $assetLock 3 $abc256.ToUpperInvariant() $abc1) -and $null -eq (Get-AssetProblem @{ size = 3; sha256 = $abc256 } ([long]3) $abc256 '') -and
+        -not @($assetBad | Where-Object { $null -eq (Get-AssetProblem $assetLock $_[0] $_[1] $_[2]) }).Count -and
+        (Get-AssetProblem @{ size = 3; sha256 = $abc256.ToUpperInvariant() } 3 $abc256 '') -ceq 'The lock is invalid.') 'exact asset checks'
+    # Owned package trees (any version) are observed; only a tree intent names its package; recovery of an
+    # interrupted package intent removes its one derived asset and its staging, and nothing beside them.
+    Must ((IsPackageTree (Join-Path $Scratch 'Programs\autohotkey-2.0.28')) -and (IsPackageTree (Join-Path $Scratch 'Programs\chromium-153.0.1')) -and
+        -not (IsPackageTree (Join-Path $Scratch 'Programs\chromium-extra-1')) -and -not (IsPackageTree (Join-Path $Scratch 'Programs\x\chromium-1')) -and
+        -not (IsPackageTree (Join-Path $Scratch 'Programs\chromium-1.')) -and -not (IsPackageTree (Join-Path $Scratch 'Programs\noctty-1'))) 'package trees Observe reads'
+    $pkgTree = Tree 'autohotkey-9.9' $two
+    $pkgStage = Staging $pkgTree
+    Refused { WriteRecord 'commit' $pkgTree $pkgTree.desired $null 'AutoHotkey' } 'Only a tree intent names its package.'
+    # A package intent names exactly the locked package of its own tree and staging directory; nothing is written otherwise.
+    $nocttyLike = Tree 'noctty-1' $two
+    $before = $script:nextSeq
+    foreach ($bad in @(@($pkgTree, 'Chromium', $pkgStage), @($pkgTree, 'autohotkey', $pkgStage), @($pkgTree, 'Noctty', $pkgStage),
+            @($nocttyLike, 'AutoHotkey', (Staging $nocttyLike)), @($pkgTree, 'AutoHotkey', $null))) {
+        Refused { WriteRecord 'intent' $bad[0] $null $bad[2] $bad[1] } 'Refusing*package*'
+    }
+    Must ($script:nextSeq -eq $before) 'refused package intents write nothing'
+    WriteRecord 'intent' $pkgTree $null $pkgStage 'AutoHotkey'
+    [IO.File]::WriteAllText("$pkgStage.asset", 'partial download')
+    [IO.File]::WriteAllText("$pkgStage.asset.foreign", 'not derived')
+    $null = New-Item -ItemType Directory -Path "$pkgStage\noctty"
+    [IO.File]::WriteAllText("$pkgStage\noctty\a.txt", 'a')
+    RecoverId $pkgTree.id
+    Must ((Phases $pkgTree) -ceq 'intent,void' -and @(RecordsOf $pkgTree.id)[0].package -ceq 'AutoHotkey' -and -not (Test-Path -LiteralPath "$pkgStage.asset") -and
+        -not (Test-Path -LiteralPath $pkgStage) -and (Test-Path -LiteralPath "$pkgStage.asset.foreign")) 'a package intent is recovered with its derived asset'
     # Interruptions: (a) part of the inventory staged -> cleaned and voided; (b) a file the inventory
     # does not name -> kept, and the intent stays open; (c) renamed but not committed -> confirmed.
     $a, $b, $c = (Tree 'noctty-crash-a' $two), (Tree 'noctty-crash-b' $two), (Tree 'noctty-crash-c' $two)
@@ -669,6 +778,27 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
             -not (Test-Path ($selected.tree.target + '.*.staging'))) 'the bundled Noctty is extracted exactly, through staging'
         Refused { CreateOwnedTree $selected.tree $zip } '*it exists*'
     }
+    # The ledger index answers exactly what a full scan of ledgerRecords answers (the same records, same order, same ids),
+    # after this block's writes and again after ReadLedger rebuilds it from disk; ids that differ only in case stay apart.
+    function ScanIds { @($script:ledgerRecords | ForEach-Object { [string](Get-Field $_ 'id') } | Sort-Object -Unique -CaseSensitive) }
+    function IndexAgrees {
+        $ids = @(ScanIds)
+        (@(LedgerIds) -join '|') -ceq ($ids -join '|') -and -not @($ids | Where-Object {
+            $id = $_
+            $indexed, $scanned = @(RecordsOf $id), @($script:ledgerRecords | Where-Object { [string](Get-Field $_ 'id') -ceq $id })
+            $indexed.Count -ne $scanned.Count -or @(for ($i = 0; $i -lt $indexed.Count; $i++) { if (-not [object]::ReferenceEquals($indexed[$i], $scanned[$i])) { $i } }).Count
+        }).Count -and @(RecordsOf 'no such id').Count -eq 0
+    }
+    Must ((@(ScanIds).Count -ge 8) -and (IndexAgrees)) 'the ledger index equals a full scan'
+    $null = ReadLedger
+    Must ((IndexAgrees) -and @($script:ledgerRecords).Count -eq $script:nextSeq - 1) 'the ledger index equals a full scan after ReadLedger'
+    $saved = $script:ledgerRecords, $script:ledgerById
+    try {
+        $script:ledgerRecords, $script:ledgerById = @(), [Collections.Generic.Dictionary[string, Collections.Generic.List[object]]]::new([StringComparer]::Ordinal)
+        foreach ($id in 'case-A', 'CASE-a', 'case-A') { $record = [pscustomobject]@{ id = $id }; $script:ledgerRecords += $record; IndexRecord $record }
+        Must (@(RecordsOf 'case-A').Count -eq 2 -and @(RecordsOf 'CASE-a').Count -eq 1 -and @(RecordsOf 'case-a').Count -eq 0) 'ids that differ only in case stay apart'
+        Refused { LedgerIds } 'Two effect ledger ids differ only in case.'
+    } finally { $script:ledgerRecords, $script:ledgerById = $saved }
     "PASS primitives in PowerShell $($PSVersionTable.PSVersion)"
 }
 function Primitive51([string]$Scratch) {
@@ -1360,9 +1490,18 @@ $null = Run 'Apply'
 # Owned value drift is repaired by reverting and owning again (registry only; damaged bytes are A6 above).
 SetFontValue (ValueName $fonts[0]) 'negative-control'
 MustReject { Run 'Test' } 'Registry drift:*'
+# The value was owned (last record commit) before this Apply, whose only records are this id's
+# undone, intent and commit; the full history also holds the A15-A21 Uninstall/Apply cycles.
+$mark, $valueId = (LastSeq), (ValueId (ValueName $fonts[0]))
 $fixed = Run 'Apply'
 if ($fixed.changedProperties -ne 1 -or $fixed.removed -ne 1 -or (FontValue (ValueName $fonts[0])) -cne (FontPath $fonts[0])) { throw 'Owned value drift was not repaired.' }
-if ((Phases (ValueId (ValueName $fonts[0]))) -cne 'intent,commit,undone,intent,commit') { throw 'The value repair is not recorded as undone then owned again.' }
+$history = @(Ledger | Where-Object { $_.id -ceq $valueId })
+$earlier = @($history | Where-Object { [long]$_.seq -le $mark })
+$repair = @($history | Where-Object { [long]$_.seq -gt $mark } | ForEach-Object { $_.phase }) -join ','
+$added = @(Ledger | Where-Object { [long]$_.seq -gt $mark }).Count
+if (-not $earlier.Count -or $earlier[-1].phase -cne 'commit' -or $repair -cne 'undone,intent,commit' -or $added -ne 3) {
+    throw "The value repair is not recorded as undone then owned again: before '$(@($earlier | ForEach-Object { $_.phase }) -join ',')', repair '$repair', $added new records."
+}
 $null = Run 'Test'
 
 # Valid JSON with altered bytes still fails the inventory before effects.
@@ -1398,14 +1537,18 @@ SetFontValue (ValueName $fonts[1]) $null
 # A temporary file no intent names is never touched (A13).
 $foreignTemp = (FontPath $fonts[0]) + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
 [IO.File]::WriteAllText($foreignTemp, 'proof: not named by any intent')
+$mark = LastSeq  # after the crafted records: fonts[1]'s value must gain exactly undone, intent, commit from this Apply
 $recovered = Run 'Apply'
+$fontValueNew = @(Ledger | Where-Object { $_.id -ceq (ValueId (ValueName $fonts[1])) -and [long]$_.seq -gt $mark } | ForEach-Object { $_.phase }) -join ','
 if ((Phases (ValueId 'Proof Void (TrueType)')) -cne 'intent,void' -or
     (Phases (FileId $confirmPath)) -cne 'intent,commit,undone' -or (Test-Path -LiteralPath $confirmPath) -or
     (Phases (FileId $tempTarget)) -cne 'intent,void' -or (Test-Path -LiteralPath $namedTemp) -or
     (Phases (ValueId 'Proof Confirm (TrueType)')) -cne 'intent,commit,undone' -or $null -ne (FontValue 'Proof Confirm (TrueType)') -or
-    (Phases (ValueId (ValueName $fonts[1]))) -cne 'intent,commit,undone,intent,commit' -or (FontValue (ValueName $fonts[1])) -cne (FontPath $fonts[1]) -or
+    $fontValueNew -cne 'undone,intent,commit' -or (FontValue (ValueName $fonts[1])) -cne (FontPath $fonts[1]) -or
     -not (Test-Path -LiteralPath $foreignTemp)) {
-    throw 'Interrupted attempts were not recovered exactly as recorded.'
+    throw ("Interrupted attempts were not recovered exactly as recorded: " +
+        ((@((ValueId 'Proof Void (TrueType)'), (FileId $confirmPath), (FileId $tempTarget), (ValueId 'Proof Confirm (TrueType)')) |
+            ForEach-Object { "$_ = $(Phases $_)" }) -join '; ') + "; $(ValueId (ValueName $fonts[1])) new since seq $mark = '$fontValueNew'")
 }
 $null = Run 'Test'
 # A second writer and a torn highest record stop every writer before any effect.

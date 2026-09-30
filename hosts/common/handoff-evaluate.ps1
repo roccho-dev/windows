@@ -168,6 +168,16 @@ function Test-PathSegment([string]$Segment) {
         $Segment -match '[. ]$' -or $Segment -match '^(CON|PRN|AUX|NUL|COM\d|LPT\d)(\..*)?$')
 }
 
+# True when $Target is a tree of locked package $Package: its leaf is <package, lowercase>-<version>
+# (a digit first, no '-', so chromium-extra-1 is not Chromium's), and, when $Programs is passed,
+# it lies directly in $Programs (an empty or $null $Programs is false). It calls nothing that
+# validates records, so Get-EffectRecordProblem and Get-PackageAssetPath can both use it.
+function Test-PackageTarget([string]$Target, $Package, [string]$Programs) {
+    $Package -is [string] -and $Package -cmatch '^[A-Za-z0-9][A-Za-z0-9.-]*\z' -and
+        [IO.Path]::GetFileName($Target) -cmatch ('^' + [regex]::Escape($Package.ToLowerInvariant()) + '-[0-9][A-Za-z0-9.]*\z') -and
+        (-not $PSBoundParameters.ContainsKey('Programs') -or ($Programs -and [IO.Path]::GetDirectoryName($Target) -eq $Programs.TrimEnd('\')))
+}
+
 # True for an absolute file path, or an HKCU key when $Kind is a registry kind.
 function Test-EffectPath([string]$Kind, $Target) {
     $registry = $Kind -cin @('registry-value', 'registry-key-created')
@@ -283,6 +293,11 @@ function Get-EffectRecordProblem($Record) {
     $name = Get-Field $Record 'name'
     if ($kind -eq 'registry-value' -and $name -isnot [string]) { return 'name is missing.' }
     if ($kind -ne 'registry-value' -and $null -ne $name) { return 'name belongs to registry-value only.' }
+    # R1 reads package from intents; only a tree intent of that package's own tree may carry it.
+    $package = Get-Field $Record 'package'
+    if ($null -ne $package -and ($phase -cne 'intent' -or $kind -cne 'tree-extracted' -or -not (Test-PackageTarget $target $package))) {
+        return 'package names no tree of that package.'
+    }
     $prior, $desired = (Get-Field $Record 'prior'), (Get-Field $Record 'desired')
     foreach ($problem in @((Get-EffectStateProblem $kind $prior 'prior'), (Get-EffectStateProblem $kind $desired 'desired'))) {
         if ($problem) { return $problem }
@@ -646,15 +661,16 @@ function Get-StagingCleanupSteps($Record, $Observed) {
 }
 
 # R1: true when the ledger ($Records) proves this code once installed package $Package: some
-# tree-extracted attempt whose intent carries package = $Package (exactly, case-sensitive) has a
-# commit, whether or not a later record closed it. A void-only attempt (nothing was ever
+# tree-extracted attempt whose intent carries package = $Package (exactly, case-sensitive), for a
+# tree of that package directly in $Programs (Test-PackageTarget; any version), has a commit,
+# whether or not a later record closed it. No $Programs proves nothing. A void-only attempt (nothing was ever
 # extracted), another package's attempt (even a name that starts the same), an intent without
 # the field prove nothing, and neither does an id whose records together are not a valid history
 # (Get-EffectAttempt: a malformed record, a repeated seq, a commit describing another effect, a
 # void after a commit), nor any ledger in which two records share a seq. Only then is protected
 # data (a browser profile) taken as ours; the first install happens only while it is absent.
-function Test-PackageHistory($Records, [string]$Package) {
-    if (-not $Package) { return $false }
+function Test-PackageHistory($Records, [string]$Package, [string]$Programs) {
+    if (-not $Package -or -not $Programs) { return $false }
     $all = @($Records | Where-Object { $null -ne $_ })
     $seqs = @($all | ForEach-Object { [string](Get-Field $_ 'seq') })
     if (@($seqs | Sort-Object -Unique).Count -ne $seqs.Count) { return $false }
@@ -667,7 +683,8 @@ function Test-PackageHistory($Records, [string]$Package) {
             switch -CaseSensitive (Get-Field $record 'phase') {
                 'intent' { $intent = $record }
                 'commit' {
-                    if ($null -ne $intent -and (Get-Field $intent 'kind') -ceq 'tree-extracted' -and (Get-Field $intent 'package') -ceq $Package) { return $true }
+                    if ($null -ne $intent -and (Get-Field $intent 'kind') -ceq 'tree-extracted' -and (Get-Field $intent 'package') -ceq $Package -and
+                        (Test-PackageTarget ([string](Get-Field $intent 'target')) $Package $Programs)) { return $true }
                 }
                 default { $intent = $null }  # void or undone closes the attempt
             }
@@ -684,12 +701,115 @@ function Test-PackageHistory($Records, [string]$Package) {
 function Get-PackageAssetPath($Record, [string]$Programs) {
     $package, $target, $temp = (Get-Field $Record 'package'), [string](Get-Field $Record 'target'), (Get-Field $Record 'temp')
     if ((Get-Field $Record 'kind') -cne 'tree-extracted' -or (Get-Field $Record 'phase') -cne 'intent' -or $temp -isnot [string] -or
-        $null -ne (Get-EffectRecordProblem $Record) -or $package -isnot [string] -or $package -cnotmatch '^[A-Za-z0-9][A-Za-z0-9.-]*\z' -or
-        -not $Programs -or [IO.Path]::GetDirectoryName($target) -ne $Programs.TrimEnd('\') -or
-        [IO.Path]::GetFileName($target) -cnotmatch ('^' + [regex]::Escape($package.ToLowerInvariant()) + '-[0-9][A-Za-z0-9.]*\z')) {
+        $null -ne (Get-EffectRecordProblem $Record) -or -not (Test-PackageTarget $target $package $Programs)) {
         return $null
     }
     return $temp + '.asset'
+}
+
+# The class of one locked package, from what was read before any effect:
+#   $TreeClass  Get-EffectClass of its owned tree id against the observed target (after
+#               recovery): absent, owned-*, preexisting-* (an unrecorded tree, A2) or indeterminate
+#   $Entries    how many HKCU/HKLM Uninstall entries may be this product (FindUninstallEntries),
+#               and $Problems their ExistingProblems (none when every entry is exactly the lock)
+#   $Protected  whether declared protected data exists; $History, Test-PackageHistory
+# The ledger decides ownership: an owned tree stays owned-match or owned-drift, removable by
+# Uninstall, whatever else appears. An external entry is never taken over and marks the package
+# external: beside an owned tree it is a conflict (two installs share one profile), reported as
+# drift after the other effects, with nothing new written. Without an owned tree, an entry makes
+# it preexisting-match or -drift; then an unrecorded tree decides (A2); then protected data
+# without history is foreign (R1); otherwise it is absent, the only class that installs.
+function Get-PackageClass([string]$TreeClass, [int]$Entries, [string[]]$Problems, [bool]$Protected, [bool]$History) {
+    $external = $Entries -gt 0
+    $class = if ($TreeClass -cin @('owned-match', 'owned-drift', 'indeterminate')) { $TreeClass }
+        elseif ($external) { $(if (@($Problems | Where-Object { $_ }).Count) { 'preexisting-drift' } else { 'preexisting-match' }) }
+        elseif ($TreeClass -cin @('preexisting-match', 'preexisting-drift')) { $TreeClass }
+        elseif ($TreeClass -ceq 'absent') { $(if ($Protected -and -not $History) { 'preexisting-drift' } else { 'absent' }) }
+        else { 'indeterminate' }
+    $conflict = $external -and $class -cin @('owned-match', 'owned-drift')
+    [ordered]@{ class = $class; external = $external; conflict = $conflict
+        install = ($class -ceq 'absent')
+        converged = ($class -cin @('owned-match', 'preexisting-match') -and -not $conflict) }
+}
+
+# The archive entry names of a `tar -tf` listing ($Lines), normalized for Get-ZipEntryProblem:
+# a name that is a directory above an inventory file ($Files, exact case) becomes '<name>/'
+# whether or not tar marked it with one trailing '/'; a marked name that is not such a directory
+# keeps its '/', so it is refused; empty lines (the listing's end) are dropped. Anything else
+# stays as listed and is judged by Get-ZipEntryProblem.
+function ConvertFrom-TarListing($Lines, $Files) {
+    $inventory = ConvertTo-FileMap $Files
+    $parents = @{}
+    if ($null -ne $inventory) {
+        foreach ($file in $inventory.Keys) { $parts = $file.Split('/'); for ($i = 1; $i -lt $parts.Count; $i++) { $parents[$parts[0..($i - 1)] -join '/'] = $true } }
+    }
+    foreach ($line in @($Lines)) {
+        $name = ([string]$line).TrimEnd("`r")
+        if ($name -eq '') { continue }
+        $marked = $name.EndsWith('/')
+        if ($marked) { $name = $name.Substring(0, $name.Length - 1) }
+        # Case-sensitive: Get-ZipEntryProblem refuses a parent spelled in another case.
+        if ($marked -or @($parents.Keys) -ccontains $name) { "$name/" } else { $name }
+    }
+}
+
+# One command line for a native Windows program (CommandLineToArgvW / MSVC argv rules), since
+# Windows PowerShell 5.1 has no ProcessStartInfo.ArgumentList: an argument that is empty or holds
+# white space or '"' is quoted, a '"' is escaped, and backslashes before a '"' or the closing
+# quote are doubled. A NUL cannot be passed and stops the run.
+function Join-NativeArguments([string[]]$Arguments) {
+    @(foreach ($value in @($Arguments)) {
+        $argument = [string]$value
+        if ($argument.Contains([string][char]0)) { throw 'A native argument holds a NUL.' }
+        if ($argument -ne '' -and $argument -notmatch '[\s"]') { $argument; continue }
+        '"' + ($argument -replace '(\\*)"', '$1$1\"' -replace '(\\+)\z', '$1$1') + '"'
+    }) -join ' '
+}
+
+# A byte count as win.ps1 reads it from JSON: a positive integer no larger than 2^53 - 1.
+function Test-ByteCount($Value) { ($Value -is [int] -or $Value -is [long]) -and $Value -gt 0 -and $Value -le 9007199254740991 }
+
+# Why one package cannot be installed at $Target with $Free bytes free on its volume, or $null:
+# the asset, the unpacked inventory and $Seed (0 until seeds exist) plus 64 MiB of ledger
+# headroom must fit, and every path the install creates must stay below the Windows PowerShell
+# 5.1 limits (a file path below 260 characters, a directory below 248), measured under the
+# staging directory (<target>.<guid32>.staging, the longest form) and for its asset file.
+function Get-PackageSpaceProblem($Package, [string]$Target, $Free, $Seed = 0) {
+    $size, $unpacked = (Get-Field $Package 'size'), (Get-Field $Package 'unpackedSize')
+    $files = ConvertTo-FileMap (Get-Field $Package 'files')
+    if (-not (Test-ByteCount $size) -or -not (Test-ByteCount $unpacked) -or -not ($Seed -is [int] -or $Seed -is [long]) -or $Seed -lt 0 -or
+        -not ($Free -is [int] -or $Free -is [long]) -or $null -eq $files -or $files.Count -eq 0 -or -not $Target) {
+        return 'The package size, inventory, target or free space is invalid.'
+    }
+    $need = [long]$size + [long]$unpacked + [long]$Seed + 64MB
+    if ([long]$Free -lt $need) { return "Needs $need bytes free on the volume of $Target; $Free are." }
+    $staging = $Target + '.' + ('0' * 32) + '.staging'
+    $directories = @{ $staging = $true }
+    $longest = "$staging.asset"
+    foreach ($name in $files.Keys) {
+        $path = $staging + '\' + $name.Replace('/', '\')
+        if ($path.Length -gt $longest.Length) { $longest = $path }
+        $parent = [IO.Path]::GetDirectoryName($path)
+        while ($parent.Length -gt $staging.Length) { $directories[$parent] = $true; $parent = [IO.Path]::GetDirectoryName($parent) }
+    }
+    if ($longest.Length -ge 260) { return "A path would be $($longest.Length) characters (limit 259): $longest" }
+    $deepest = @($directories.Keys | Sort-Object Length -Descending)[0]
+    if ($deepest.Length -ge 248) { return "A directory path would be $($deepest.Length) characters (limit 247): $deepest" }
+    return $null
+}
+
+# Why a downloaded asset is not exactly the lock, or $null: its length ($Length) and its
+# SHA-256 ($Sha256) and, when the lock names one, SHA-1 ($Sha1), computed from the bytes read
+# under a handle that denies writers; hashes compare as lowercase hex, so '0x…' or a trailing
+# newline never matches.
+function Get-AssetProblem($Package, $Length, [string]$Sha256, [string]$Sha1) {
+    $size, $sha256Lock, $sha1Lock = (Get-Field $Package 'size'), (Get-Field $Package 'sha256'), (Get-Field $Package 'sha1')
+    if (-not (Test-ByteCount $size) -or $sha256Lock -isnot [string] -or $sha256Lock -cnotmatch '^[0-9a-f]{64}\z' -or
+        ($null -ne $sha1Lock -and ($sha1Lock -isnot [string] -or $sha1Lock -cnotmatch '^[0-9a-f]{40}\z'))) { return 'The lock is invalid.' }
+    if (-not ($Length -is [int] -or $Length -is [long]) -or [long]$Length -ne [long]$size) { return "The asset is $Length bytes, not $size." }
+    if ($Sha256 -cnotmatch '^[0-9A-Fa-f]{64}\z' -or $Sha256.ToLowerInvariant() -cne $sha256Lock) { return 'The asset SHA-256 differs from the lock.' }
+    if ($null -ne $sha1Lock -and ($Sha1 -cnotmatch '^[0-9A-Fa-f]{40}\z' -or $Sha1.ToLowerInvariant() -cne $sha1Lock)) { return 'The asset SHA-1 differs from the lock.' }
+    return $null
 }
 
 # Why a machine-wide Noctty is present, or $null: any HKLM (either view) key for the
