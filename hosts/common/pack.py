@@ -375,7 +375,8 @@ def typography(value: object, entries: list[dict], packages: list[dict]) -> dict
         raise ValueError(f"typography role is not selected by common fonts: {value['desktop']!r}")
     face = families[value["desktop"]]
     units = len(face.encode("utf-16-le")) // 2
-    if not 1 <= units <= 31 or re.search(r"[\x00-\x1f\x7f\ud800-\udfff]", face):
+    # A str holds code points, so a character beyond the BMP is caught by ord, not by a surrogate range.
+    if not 1 <= units <= 31 or re.search(r"[\x00-\x1f\x7f\ud800-\udfff]", face) or any(ord(c) > 0xFFFF for c in face):
         raise ValueError(f"typography face does not fit a LOGFONTW: {face!r}")
     if [p["name"] for p in packages].count(value["interpreter"]) != 1:
         raise ValueError(f"typography interpreter is not one locked package: {value['interpreter']!r}")
