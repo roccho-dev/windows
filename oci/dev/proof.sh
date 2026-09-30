@@ -17,7 +17,10 @@ cleanup() {
   fi
   docker rm -f "$core" >/dev/null 2>&1 || true
   docker volume rm "$nix_volume" "$work_volume" >/dev/null 2>&1 || true
-  rm -rf "$evidence"
+  rm -f -- "$evidence/page" "$evidence/before"
+  # The Jev fixtures are throwaway Git repositories whose object files cannot be named in advance; they stay in this
+  # disposable temporary directory rather than being deleted recursively.
+  rmdir -- "$evidence" 2>/dev/null || echo "kept $evidence (Jev fixture repositories)" >&2
   exit "$code"
 }
 trap cleanup EXIT
@@ -183,9 +186,33 @@ NIX
   rm -f "$cipher"; absent=$(commit absent)
   launch_as red --envs-sha "$absent" --apps-sha "$apps_good" --port "$port"
   test -z "$(ls -A "$fx/tmp")"
+  # scratch_clear as built into the launcher: it removes exactly the scratch the launcher writes, and keeps and refuses
+  # anything else (here a loose object and a foreign pack name).
+  sed -n '/^scratch_clear() {$/,/^}$/p' "$launch" > "$fx/scratch-clear.sh"
+  grep -q '^scratch_clear() {$' "$fx/scratch-clear.sh"
+  scratch_case() {
+    local expect=$1 extra=$2 cu work repo p code=0
+    cu=$(dirname "$(readlink -f "$(command -v rmdir)")")
+    work=$(mktemp -d -p "$fx") repo=$work/envs.git p=pack-$(printf '%040d' 0)
+    mkdir -p "$repo/objects/pack" "$repo/objects/info" "$repo/refs/heads" "$repo/refs/tags"
+    touch "$work/cipher.yaml" "$repo/HEAD" "$repo/config" "$repo/FETCH_HEAD" "$repo/refs/heads/proposals" \
+      "$repo/objects/pack/$p.pack" "$repo/objects/pack/$p.idx" "$repo/objects/pack/$p.rev"
+    if [ -n "$extra" ]; then mkdir -p "$(dirname "$repo/$extra")"; echo foreign > "$repo/$extra"; fi
+    # shellcheck disable=SC1091
+    (source "$fx/scratch-clear.sh"; scratch_clear) || code=$?
+    if [ "$expect" = clean ]; then
+      [ "$code" -eq 0 ] && [ ! -e "$work" ] || { echo 'scratch_clear left or refused the launcher scratch' >&2; return 1; }
+    else
+      [ "$code" -ne 0 ] && [ "$(cat "$repo/$extra")" = foreign ] || { echo "scratch_clear removed or accepted $extra" >&2; return 1; }
+    fi
+  }
+  scratch_case clean ''
+  scratch_case kept objects/ab/cdef0123456789abcdef0123456789abcdef01
+  scratch_case kept objects/pack/pack-foreign.pack
   rm -f "$marker"
   echo 'PASS jev tools (fixtures): production profile has only the two bounded tools and exact constants; same source;'
   echo 'PASS jev launch: closed child environment, loopback, no core, absent HOME, no temp left after any launch, key never in argv or output, build before decrypt;'
+  echo 'PASS jev scratch: removed file by file before the child, never recursively; unexpected entries kept and refused;'
   echo 'PASS jev RED: arguments, stale/off/unknown envs commit, unbuildable apps, identity mode/missing/other, tamper, two recipients, extra field, absent'
 }
 jev_proof

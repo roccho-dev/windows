@@ -218,18 +218,22 @@ let
       install -d -m 755 /seed/var
       printf '%s\n' '${marker}' > /seed/var/own-nix
     fi
+    # An interrupted copy leaves its staging directory; it is never reused or deleted: refuse until inspected.
+    for t in /seed/.own-seed-tmp /seed/.own-seed.*; do
+      if [ -e "$t" ] || [ -L "$t" ]; then fail "$t is left from an interrupted seed; not deleting it"; fi
+    done
     install -d -m 1775 -o 0 -g 30000 /seed/store
-    rm -rf /seed/.own-seed-tmp
-    install -d -m 700 /seed/.own-seed-tmp
+    tmp=$(mktemp -d /seed/.own-seed.XXXXXXXX)
+    [ -z "$(ls -A "$tmp")" ] || fail "$tmp is not empty"
     copied=0
     while read -r p; do
       b=''${p#/nix/store/}
       if [ -e "/seed/store/$b" ] || [ -L "/seed/store/$b" ]; then continue; fi
-      cp -a "$p" "/seed/.own-seed-tmp/$b"
-      mv -T "/seed/.own-seed-tmp/$b" "/seed/store/$b"
+      cp -a "$p" "$tmp/$b"
+      mv -T "$tmp/$b" "/seed/store/$b"
       copied=$((copied + 1))
     done < ${closure}/store-paths
-    rmdir /seed/.own-seed-tmp
+    rmdir "$tmp"
     # Paths are logical /nix/store names; only the database lives under /seed here.
     nix-store --store 'local?state=/seed/var/nix' --load-db < ${closure}/registration
     ${profileLib}

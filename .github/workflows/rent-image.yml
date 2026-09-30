@@ -336,7 +336,10 @@ jobs:
           docker load < result
           docker load < result-1
           key_dir="$(mktemp -d)"
-          trap 'status=$?; [ "$status" -eq 0 ] || { docker logs rent-smoke 2>&1 | tail -n 40; docker logs rent-cand 2>&1 | tail -n 40; } || true; docker rm -f rent-smoke rent-refuse rent-cand >/dev/null 2>&1 || true; docker volume rm rent-smoke-repos rent-smoke-state rent-smoke-nix rent-smoke-home rent-smoke-old rent-smoke-import >/dev/null 2>&1 || true; rm -rf "$key_dir"' EXIT
+          # Every file this step writes under $key_dir; the exit trap removes exactly these, then the empty directory.
+          key_files=(answer cand cand-visible cf-help cf-version closure cmdlines gate gh host.pub import imported key key.pub
+            known_hosts logs modes mountinfo mountlib.sh procs refuse start-real start-stub visible)
+          trap 'status=$?; [ "$status" -eq 0 ] || { docker logs rent-smoke 2>&1 | tail -n 40; docker logs rent-cand 2>&1 | tail -n 40; } || true; docker rm -f rent-smoke rent-refuse rent-cand >/dev/null 2>&1 || true; docker volume rm rent-smoke-repos rent-smoke-state rent-smoke-nix rent-smoke-home rent-smoke-old rent-smoke-import >/dev/null 2>&1 || true; rm -f -- "${key_files[@]/#/$key_dir/}"; rmdir -- "$key_dir" || { echo "kept $key_dir: unexpected entries" >&2; exit 1; }' EXIT
           test "$(docker image inspect --format '{{json .Config.Volumes}}' "$image")" = null
           test "$(docker image inspect --format '{{json .Config.Volumes}}' "$real")" = null
           # The stub image differs from the published one only in the cloudflared store path rent-start runs.
@@ -362,7 +365,9 @@ jobs:
           # slot VOLUME MODE OWNER CONTENT-COMMAND: (re)place the token slot as envs would, through a one-shot container.
           slot() {
             docker run --rm -v "$1:/s" -e "TOK=$tok" "$image" /bin/bash -c "set -eu
-              rm -rf /s/cloudflared/token; install -d -m 700 -o 0 -g 0 /s/cloudflared; $4
+              t=/s/cloudflared/token
+              if [ -d \$t ] && [ ! -L \$t ]; then rmdir \$t; else rm -f \$t; fi
+              install -d -m 700 -o 0 -g 0 /s/cloudflared; $4
               if [ -e /s/cloudflared/token ] && [ ! -L /s/cloudflared/token ]; then chmod $2 /s/cloudflared/token; chown $3 /s/cloudflared/token; fi"
           }
           ssh-keygen -q -t ed25519 -N '' -f "$key_dir/key"
@@ -446,6 +451,17 @@ jobs:
           state_import :ro > "$key_dir/import"
           if grep -q synthetic "$key_dir/import"; then echo 'import printed file contents' >&2; exit 1; fi
           # An identical rerun (as after an interruption) is a no-op; a differing target is never overwritten.
+          state_import :ro > /dev/null
+          # A staging directory left by an interrupted import is refused before any write and never deleted.
+          import_listing() { docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c 'cd /s && find . -printf "%p %s %T@\n" | LC_ALL=C sort | sha256sum'; }
+          docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c \
+            'install -d -m 700 /s/dev/codex/.import-auth.json.interrupt && echo foreign > /s/dev/codex/.import-auth.json.interrupt/auth.json'
+          before=$(import_listing)
+          if state_import :ro > "$key_dir/import" 2>&1; then echo 'imported over an interrupted staging directory' >&2; exit 1; fi
+          grep -qF '/var/lib/rent/dev/codex/.import-auth.json.interrupt is left from an interrupted import; not deleting it' "$key_dir/import"
+          test "$(import_listing)" = "$before"
+          docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c \
+            'rm -- /s/dev/codex/.import-auth.json.interrupt/auth.json && rmdir -- /s/dev/codex/.import-auth.json.interrupt'
           state_import :ro > /dev/null
           docker run --rm -v rent-smoke-old:/o "$image" /bin/bash -c 'echo changed >> /o/.codex/auth.json'
           if state_import :ro > "$key_dir/import" 2>&1; then echo 'overwrote a differing target' >&2; exit 1; fi

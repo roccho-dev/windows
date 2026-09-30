@@ -126,21 +126,29 @@
             elif [ ! -L "$dst" ] && same "$src" "$dst"; then :
             else fail "$dst already exists and differs from its source"; fi
           fi
+          # A staging directory left by an interrupted import is never reused or deleted: refuse until it is inspected.
+          for t in "$dst.partial" "''${dst%/*}/.import-''${dst##*/}".*; do
+            if [ -e "$t" ] || [ -L "$t" ]; then fail "$t is left from an interrupted import; not deleting it"; fi
+          done
         done
         install -d -m 755 -o 0 -g 0 "$s"
         install -d -m 700 -o 1000 -g 1000 "$s/codex" "$s/claude" "$s/claude/projects" "$s/claude/$p"
-        # Each target appears only complete: copy to a .partial name, check it, then rename into place.
+        # Each target appears only complete: copy into a fresh private directory beside it, check it, rename it into
+        # place, then remove the now-empty directory.
         for e in "''${pairs[@]}"; do
           IFS='|' read -r src dst kind <<< "$e"
           if ! { [ -e "$dst" ] && same "$src" "$dst"; }; then
-            rm -rf "$dst.partial"
+            tmp=$(mktemp -d "''${dst%/*}/.import-''${dst##*/}.XXXXXXXX")
+            [ -z "$(ls -A "$tmp")" ] || fail "$tmp is not empty"
+            new=$tmp/''${dst##*/}
             case $kind in
-              f) install -m 600 -o 1000 -g 1000 "$src" "$dst.partial" ;;
-              d) cp -R --no-dereference --preserve=mode,timestamps "$src" "$dst.partial"
-                 chown -R -h 1000:1000 "$dst.partial" ;;
+              f) install -m 600 -o 1000 -g 1000 "$src" "$new" ;;
+              d) cp -R --no-dereference --preserve=mode,timestamps "$src" "$new"
+                 chown -R -h 1000:1000 "$new" ;;
             esac
-            same "$src" "$dst.partial" || fail "$dst.partial differs from its source"
-            mv -T "$dst.partial" "$dst"
+            same "$src" "$new" || fail "$new differs from its source"
+            mv -T "$new" "$dst"
+            rmdir "$tmp"
           fi
           echo "imported $dst ($(du -sb "$dst" | cut -f1) bytes)"
         done
@@ -298,18 +306,22 @@
               install -d -m 755 /seed/var
               printf '%s\n' '${rentNixMarker}' > /seed/var/rent-nix
             fi
+            # An interrupted copy leaves its staging directory; it is never reused or deleted: refuse until inspected.
+            for t in /seed/.rent-seed-tmp /seed/.rent-seed.*; do
+              if [ -e "$t" ] || [ -L "$t" ]; then fail "$t is left from an interrupted seed; not deleting it"; fi
+            done
             install -d -m 1775 -o 0 -g 30000 /seed/store
-            rm -rf /seed/.rent-seed-tmp
-            install -d -m 700 /seed/.rent-seed-tmp
+            tmp=$(mktemp -d /seed/.rent-seed.XXXXXXXX)
+            [ -z "$(ls -A "$tmp")" ] || fail "$tmp is not empty"
             copied=0
             while read -r p; do
               b=''${p#/nix/store/}
               if [ -e "/seed/store/$b" ] || [ -L "/seed/store/$b" ]; then continue; fi
-              cp -a "$p" "/seed/.rent-seed-tmp/$b"
-              mv -T "/seed/.rent-seed-tmp/$b" "/seed/store/$b"
+              cp -a "$p" "$tmp/$b"
+              mv -T "$tmp/$b" "/seed/store/$b"
               copied=$((copied + 1))
             done < ${closure}/store-paths
-            rmdir /seed/.rent-seed-tmp
+            rmdir "$tmp"
             # Paths are logical /nix/store names; only the database lives under /seed here.
             nix-store --store 'local?state=/seed/var/nix' --load-db < ${closure}/registration
             ${profileLib}

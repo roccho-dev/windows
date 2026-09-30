@@ -91,13 +91,30 @@
         [ ! -e /homeless-shelter ] || fail "/homeless-shelter exists; the child's HOME must not exist"
 
         # The ciphertext: at a commit on envs proposals, and exactly the one proposals carries now.
-        # The scratch directory holds only public data; only this mktemp directory is removed, on exit and before the child.
+        # The scratch directory holds only public data. Git is pinned to write only the files scratch_clear names (no
+        # template, packed objects, no automatic maintenance); they are removed one by one, then the empty
+        # directories, on exit and before the child. Anything else is kept and the launch is RED.
         work=$("$cu/mktemp" -d)
-        trap '"$cu/rm" -rf -- "$work"' EXIT
         repo=$work/envs.git
-        git_ init -q --bare "$repo"
-        git_ -C "$repo" fetch -q --no-tags "$envs_remote" "+refs/heads/proposals:refs/heads/proposals" \
-          || fail "cannot fetch envs proposals"
+        scratch_clear() {
+          [ -e "$work" ] || return 0
+          local f d
+          for f in "$repo"/objects/pack/*; do
+            [[ ''${f##*/} =~ ^pack-[0-9a-f]{40}([0-9a-f]{24})?\.(pack|idx|rev)$ ]] || continue
+            "$cu/rm" -f -- "$f"
+          done
+          "$cu/rm" -f -- "$work/cipher.yaml" "$repo/HEAD" "$repo/config" "$repo/FETCH_HEAD" "$repo/packed-refs" \
+            "$repo/refs/heads/proposals"
+          for d in "$repo/objects/pack" "$repo/objects/info" "$repo/objects" "$repo/refs/heads" "$repo/refs/tags" \
+            "$repo/refs" "$repo" "$work"; do
+            [ ! -e "$d" ] || "$cu/rmdir" -- "$d" 2>/dev/null || return 1
+          done
+        }
+        trap 'scratch_clear || echo "voice-ui-jev-dev: kept $work: unexpected scratch entries" >&2' EXIT
+        git_ init -q --bare --template= "$repo"
+        git_ -c fetch.unpackLimit=1 -c transfer.unpackLimit=1 -c gc.auto=0 -c maintenance.auto=false \
+          -c fetch.writeCommitGraph=false -C "$repo" fetch -q --no-tags "$envs_remote" \
+          "+refs/heads/proposals:refs/heads/proposals" || fail "cannot fetch envs proposals"
         git_ -C "$repo" cat-file -e "$envs_sha^{commit}" 2>/dev/null || fail "the envs commit is not on proposals"
         git_ -C "$repo" merge-base --is-ancestor "$envs_sha" proposals || fail "the envs commit is not on proposals"
         at=$(git_ -C "$repo" rev-parse -q --verify "$envs_sha:$cipher_path") || fail "no OCI ciphertext at that envs commit"
@@ -138,7 +155,8 @@
         key=$(SOPS_AGE_KEY_FILE=$identity ${pkgs.sops}/bin/sops --decrypt --input-type yaml --extract '["JEV_API_KEY"]' \
           "$cipher" 2>/dev/null) || fail "decryption failed"
         [ -n "$key" ] || fail "the decrypted key is empty"
-        "$cu/rm" -rf -- "$work"
+        scratch_clear || fail "kept $work: unexpected scratch entries"
+        trap - EXIT
 
         # One foreground child whose environment is built from nothing (env -i). The key reaches it only through a pipe
         # from a builtin, never argv or a file; with lastpipe the launcher itself becomes the child.
