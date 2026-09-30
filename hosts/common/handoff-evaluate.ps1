@@ -976,12 +976,19 @@ function Get-UninstallPlan($Records, $Observations) {
         $refused += [ordered]@{ id = $null; class = 'indeterminate'; reason = 'Two ids differ only in case.' }
         return [ordered]@{ ok = $false; steps = $steps; refused = $refused; kept = $kept; resolutions = $resolutions }
     }
+    # One pass groups the records by id (ordinal, in ledger order), and each id is validated once:
+    # Get-EffectClass is given that attempt instead of validating the same records again.
+    $groups = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($record in $all) {
+        $id = [string](Get-Field $record 'id')
+        if (-not $groups.ContainsKey($id)) { $groups[$id] = [Collections.Generic.List[object]]::new() }
+        $groups[$id].Add($record)
+    }
     $entries = @()
     foreach ($id in $ids) {
-        $records = @($all | Where-Object { [string](Get-Field $_ 'id') -ceq $id })
-        $attempt = Get-EffectAttempt $records
+        $attempt = Get-EffectAttempt @($groups[$id])
         $open = @(if (-not $attempt.closed) { $attempt.records })
-        $entries += [pscustomobject]@{ id = $id; class = (Get-EffectClass $records (Get-Field $Observations $id))
+        $entries += [pscustomobject]@{ id = $id; class = (Get-EffectClass $null (Get-Field $Observations $id) '' $null $attempt)
             record = $(if ($open.Count) { $open[0] } else { $null })
             start = $(if ($open.Count) { [long](Get-Field $open[0] 'seq') } else { 0 }); refusal = $null }
     }

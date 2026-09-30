@@ -257,6 +257,30 @@ $plan = Get-UninstallPlan $records @{ k = $exists; v = $data; s = $exists }
 Must ($plan.ok -and (Actions $plan) -ceq 'delete-empty-key,delete-registry-value,delete-empty-key') 'a created key is removed after what it holds'
 Must (-not (Get-UninstallPlan (@(Owned 1 v registry-value "$clsid\LocalServer32" $data '') + @(Owned 3 k registry-key-created $clsid $exists $null)) @{ k = $exists; v = $data }).ok) 'a value owned before its key is refused'
 Must (-not (Get-UninstallPlan (@(Owned 1 k registry-key-created $clsid $exists $null) + @(Owned 3 j registry-key-created $clsid.ToLowerInvariant() $exists $null)) @{ k = $exists; j = $exists }).ok) 'two claims on one key are refused'
+# P1b-lite: the plan groups the ledger by id in one pass and validates each id once (Get-EffectAttempt), with the
+# plan unchanged: interleaved attempts; a reverted and a voided id kept; a malformed id refused; ids that differ
+# only in case refuse the whole plan before any validation.
+function PlanRecord($Seq, $Id, $Phase, $Target, $Observed) {
+    $r = PureRecord $Seq $Phase file-created $Target $absent @{ exists = $true; sha256 = (Sha a) } $Observed $null; $r.id = $Id; $r
+}
+$planMade = @{ exists = $true; sha256 = (Sha a) }
+$planLedger = @((PlanRecord 1 f1 intent 'C:\u\a' $null), (PlanRecord 2 f2 intent 'C:\u\b' $null), (PlanRecord 3 f1 commit 'C:\u\a' $planMade),
+    (PlanRecord 4 f2 commit 'C:\u\b' $planMade), (PlanRecord 5 f3 intent 'C:\u\c' $null), (PlanRecord 6 f3 void 'C:\u\c' $absent))
+$planMalformed = @((PlanRecord 7 m intent 'C:\u\m' $null), (PlanRecord 8 m commit 'C:\u\m' $planMade), (PlanRecord 9 m void 'C:\u\m' $absent))
+$planSeen = @{ f1 = $planMade; f2 = $absent; f3 = $absent; m = $absent }
+$script:validateAttempt, $script:attemptsValidated = ${function:Get-EffectAttempt}, 0
+try {
+    ${function:Get-EffectAttempt} = { $script:attemptsValidated++; & $script:validateAttempt @args }
+    $planOk = Get-UninstallPlan $planLedger $planSeen; $okValidated = $script:attemptsValidated; $script:attemptsValidated = 0
+    $planBad = Get-UninstallPlan ($planLedger + $planMalformed) $planSeen; $badValidated = $script:attemptsValidated; $script:attemptsValidated = 0
+    $planCased = Get-UninstallPlan ($planLedger + @(PlanRecord 10 F1 intent 'C:\u\z' $null)) $planSeen; $casedValidated = $script:attemptsValidated
+} finally { ${function:Get-EffectAttempt} = $script:validateAttempt }
+Must ($okValidated -eq 3 -and $badValidated -eq 4 -and $casedValidated -eq 0) "P1b-lite: one validation per id ($okValidated, $badValidated, $casedValidated)"
+Must ($planOk.ok -and (Actions $planOk) -ceq 'delete-file' -and @($planOk.steps)[0].id -ceq 'f1' -and
+    (@($planOk.resolutions | ForEach-Object { "$($_.id):$($_.resolution)" }) -join ',') -ceq 'f2:undone' -and
+    (@($planOk.kept | ForEach-Object { $_.id } | Sort-Object) -join ',') -ceq 'f2,f3' -and
+    -not $planBad.ok -and @($planBad.steps).Count -eq 0 -and (@($planBad.refused | ForEach-Object { "$($_.id):$($_.class)" }) -join ',') -ceq 'm:indeterminate' -and
+    -not $planCased.ok -and @($planCased.refused)[0].reason -ceq 'Two ids differ only in case.') 'P1b-lite: the plan is unchanged'
 # The temporary path an intent names: only <target>.<guid32>.tmp (file) or .staging (tree).
 $guid = '0123456789abcdef' * 2
 foreach ($case in @(@('file-created', 'C:\u\f.ttf', "C:\u\f.ttf.$guid.tmp", $true), @('tree-extracted', 'C:\u\t', "C:\u\t.$guid.staging", $true),
@@ -1066,9 +1090,22 @@ function SetFontValue([string]$Name, $Data) {
 }
 function FileId([string]$Path) { 'file-created:' + $Path.ToUpperInvariant() }
 function ValueId([string]$Name) { 'registry-value:' + ('HKCU\' + $fontSubkey + '|' + $Name).ToUpperInvariant() }
+# Every record is read on every call; a parse is reused only for the same file name with exactly the same text
+# (the proof itself rewrites and tears records), and files gone from the ledger leave the cache. Records are read-only.
+$script:ledgerParsed = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 function Ledger {
-    if (-not (Test-Path -LiteralPath $ledgerDir)) { return @() }
-    @(Get-ChildItem -LiteralPath $ledgerDir -Filter '*.json' | Sort-Object Name | ForEach-Object { [IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json })
+    if (-not (Test-Path -LiteralPath $ledgerDir)) { $script:ledgerParsed.Clear(); return @() }
+    $present = @{}
+    $records = @(foreach ($file in @(Get-ChildItem -LiteralPath $ledgerDir -Filter '*.json' | Sort-Object Name)) {
+        $text = [IO.File]::ReadAllText($file.FullName)
+        $present[$file.Name] = $true
+        if (-not $script:ledgerParsed.ContainsKey($file.Name) -or $script:ledgerParsed[$file.Name].text -cne $text) {
+            $script:ledgerParsed[$file.Name] = [pscustomobject]@{ text = $text; record = ($text | ConvertFrom-Json) }
+        }
+        $script:ledgerParsed[$file.Name].record
+    })
+    foreach ($name in @($script:ledgerParsed.Keys | Where-Object { -not $present.ContainsKey($_) })) { $null = $script:ledgerParsed.Remove($name) }
+    $records
 }
 function Phases([string]$Id) { @(Ledger | Where-Object { $_.id -ceq $Id } | ForEach-Object { $_.phase }) -join ',' }
 # Apply now also converges Noctty, so font counts are taken over font records only.
@@ -1732,6 +1769,21 @@ $torn = Join-Path $ledgerDir ('{0:D8}.json' -f (1 + @(Ledger).Count))
 [IO.File]::WriteAllText($torn, '{"ledger":"effe')
 MustReject { Run 'Apply' } 'Torn or unreadable ledger record*'
 [IO.File]::Delete($torn)  # the documented manual step: only the highest record, only when it does not parse
+# The proof's Ledger cache (P4) reuses a parse only for identical text: a rewrite of the same length and with the old
+# timestamp is read again, and so is a same-length torn record (it no longer parses); the exact bytes then return.
+$first = Join-Path $ledgerDir '00000001.json'
+$firstBytes, $firstStamp = [IO.File]::ReadAllBytes($first), [IO.File]::GetLastWriteTimeUtc($first)
+$firstText, $firstUtc = [Text.Encoding]::UTF8.GetString($firstBytes), [string]@(Ledger)[0].utc
+$rewrite = [regex]::new('"utc":"2').Replace($firstText, '"utc":"3', 1)
+try {
+    [IO.File]::WriteAllText($first, $rewrite); [IO.File]::SetLastWriteTimeUtc($first, $firstStamp)
+    $rewrittenUtc = [string]@(Ledger)[0].utc
+    [IO.File]::WriteAllText($first, '{' + ('x' * ($firstText.Length - 1))); [IO.File]::SetLastWriteTimeUtc($first, $firstStamp)
+    $tornReread = $false
+    try { $null = Ledger } catch { $tornReread = $true }
+} finally { [IO.File]::WriteAllBytes($first, $firstBytes); [IO.File]::SetLastWriteTimeUtc($first, $firstStamp) }
+Must ($rewrite -cne $firstText -and $rewrite.Length -eq $firstText.Length -and $rewrittenUtc -cne $firstUtc -and $tornReread -and
+    [string]@(Ledger)[0].utc -ceq $firstUtc) 'P4: the proof ledger rereads a same-length rewrite or tear'
 
 # A14: a foreign value naming an owned file keeps it: Uninstall refuses as a whole, GC keeps it open.
 SetFontValue 'Proof Foreign (TrueType)' (FontPath $fonts[0])
