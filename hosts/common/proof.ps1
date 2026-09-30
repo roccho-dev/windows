@@ -292,17 +292,166 @@ function Snapshot {
         files = @($fonts | ForEach-Object { if (Test-Path -LiteralPath (FontPath $_)) { (Get-FileHash -LiteralPath (FontPath $_)).Hash } else { '-' } })
         values = @($fonts | ForEach-Object { [string](FontValue (ValueName $_)) }) } | ConvertTo-Json -Compress
 }
+# ---- G4/G3 measurement: printed evidence only; nothing here fails the proof ----
+# It runs before the font proof, so a later failure (e.g. a registered font Windows keeps
+# open) cannot suppress this evidence. The exact bundled Noctty registers itself for the
+# default terminal on this disposable runner, and native RegistryKey snapshots show what it
+# changed. Values under HKCU\Software\Classes and HKCU\Console are printed in full, with no
+# noise subtracted: they are the evidence for the Nix list. Elsewhere only key, value name
+# and change are printed, never data; Noctty mentions are checked on the raw delta and
+# reported by token.
+$g4 = [ordered]@{ status = 'not run' }
+$sep = [char]1  # separates key and value name in snapshot entries; <key> marks the key itself
+function Say([string]$Line) { Write-Host "G4 $Line" }
+function ValueText([Microsoft.Win32.RegistryKey]$Key, [string]$Name) {
+    $kind = [string]$Key.GetValueKind($Name)
+    $value = $Key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    $data = switch ($kind) {
+        'DWord' { [string][BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$value), 0) }
+        'QWord' { [string][BitConverter]::ToUInt64([BitConverter]::GetBytes([long]$value), 0) }
+        'MultiString' { @($value) -join [char]0 }
+        { $_ -in @('String', 'ExpandString') } { [string]$value }
+        default { if ($value -is [byte[]]) { [Convert]::ToHexString($value) } else { [string]$value } }
+    }
+    "${kind}:$data"
+}
+# key<SOH>name -> kind:data for every value, and key<SOH><key> for every key, beneath $Roots.
+function RegistrySnapshot([string]$Hive, [string]$View, [string[]]$Roots) {
+    $map = @{}
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($Hive, $View)
+    try {
+        $pending = [Collections.Generic.Stack[string]]::new()
+        foreach ($root in $Roots) { $pending.Push($root) }
+        while ($pending.Count) {
+            $path = $pending.Pop()
+            try { $key = if ($path) { $base.OpenSubKey($path) } else { $base } } catch { $map["$path$sep<unreadable>"] = 'unreadable'; continue }
+            if ($null -eq $key) { continue }
+            try {
+                $map["$path$sep<key>"] = 'key'
+                foreach ($name in $key.GetValueNames()) { $map["$path$sep$name"] = ValueText $key $name }
+                foreach ($sub in $key.GetSubKeyNames()) { $pending.Push($(if ($path) { "$path\$sub" } else { $sub })) }
+            } catch { $map["$path$sep<unreadable>"] = 'unreadable' } finally { if ($path) { $key.Close() } }
+        }
+    } finally { $base.Close() }
+    $map
+}
+function SnapshotDiff($Before, $After) {
+    foreach ($entry in @(@($Before.Keys) + @($After.Keys) | Sort-Object -Unique)) {
+        $old, $new = $Before[$entry], $After[$entry]
+        if ($old -ceq $new) { continue }
+        $key, $name = $entry.Split($sep, 2)
+        [pscustomobject]@{ entry = $entry; key = $key; name = $name; before = $old; after = $new
+            change = $(if ($null -eq $old) { 'added' } elseif ($null -eq $new) { 'removed' } else { 'changed' }) }
+    }
+}
+# Every file (size and hash) and every directory, including the directory itself, so a
+# created or removed empty directory shows too.
+function FileSnapshot([string]$Directory) {
+    $map = @{}
+    if (Test-Path -LiteralPath $Directory) {
+        $map[".$sep"] = 'directory'
+        foreach ($item in @(Get-ChildItem -LiteralPath $Directory -Recurse -Force)) {
+            $map[$item.FullName.Substring($Directory.Length + 1) + $sep] = $(if ($item.PSIsContainer) { 'directory' } else {
+                "$($item.Length) bytes, sha256 $((Get-FileHash -LiteralPath $item.FullName).Hash)" })
+        }
+    }
+    $map
+}
+# A vendor command with a deadline, so a window that stays open cannot hold the proof.
+function Vendor([string]$Exe, [string]$Argument) {
+    $info = [Diagnostics.ProcessStartInfo]::new($Exe, $Argument)
+    $info.UseShellExecute, $info.RedirectStandardOutput, $info.RedirectStandardError, $info.CreateNoWindow = $false, $true, $true, $true
+    $process = [Diagnostics.Process]::Start($info)
+    $out, $err = $process.StandardOutput.ReadToEndAsync(), $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit(60000)) { $process.Kill($true); return [pscustomobject]@{ exit = 'timeout after 60 s'; output = '' } }
+    $process.WaitForExit()
+    [pscustomobject]@{ exit = $process.ExitCode; output = @(($out.Result + "`n" + $err.Result) -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 20) -join ' | ' }
+}
+function Region([string]$Key) { $Key -match '^(Software\\Classes|Console)(\\|$)' }
+try {
+    $PSNativeCommandUseErrorActionPreference = $false
+    $noctty = '{33368C6F-D328-410C-B225-26DC9F12C728}'; $proxy = '{1D349824-21FB-46C7-ACF3-746EDC991D52}'
+    $iids = @('{59D55CCE-FC8A-48B4-ACE8-0A9286C6557F}', '{AA6B364F-4A50-4176-9002-0AE755E7B5EF}', '{6F23DA90-15C5-4203-9DB0-64E73F1B1B00}')
+    $g4Dir = Join-Path $env:RUNNER_TEMP ('noctty-g4-' + [guid]::NewGuid().ToString('N'))  # fresh, never deleted
+    $null = New-Item -ItemType Directory -Path $g4Dir
+    $ProgressPreference = 'SilentlyContinue'
+    Expand-Archive -LiteralPath (Join-Path $PSScriptRoot 'payload/noctty.zip') -DestinationPath $g4Dir
+    $install = Join-Path $g4Dir 'noctty'
+    $wrong = @($manifest.noctty.files.PSObject.Properties | Where-Object {
+        (Get-FileHash -LiteralPath (Join-Path $g4Dir $_.Name.Replace('/', '\'))).Hash -ne $_.Value })
+    Say "bundled Noctty $($manifest.noctty.version) extracted to $install; files differing from the manifest: $($wrong.Count)"
+    $userDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'noctty'
+    $hklmRoots = @("SOFTWARE\Classes\CLSID\$noctty", "SOFTWARE\Classes\CLSID\$proxy") + @($iids | ForEach-Object { "SOFTWARE\Classes\Interface\$_" }) +
+        @('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
+    function Machine { $m = @{}; foreach ($view in 'Registry64', 'Registry32') { $s = RegistrySnapshot 'LocalMachine' $view $hklmRoots; foreach ($k in $s.Keys) { $m["$view\$k"] = $s[$k] } }; $m }
+    $s0 = RegistrySnapshot 'CurrentUser' 'Default' @('')
+    Start-Sleep -Seconds 5  # bounded control interval: what changes on its own shows up between S0 and S1
+    $s1 = RegistrySnapshot 'CurrentUser' 'Default' @('')
+    $h1, $tree1, $user1 = (Machine), (FileSnapshot $install), (FileSnapshot $userDir)
+    $register = Vendor (Join-Path $install 'noctty.com') '+register-default-terminal'
+    $s2 = RegistrySnapshot 'CurrentUser' 'Default' @('')
+    $h2, $tree2, $user2 = (Machine), (FileSnapshot $install), (FileSnapshot $userDir)
+    Say "HKCU values and keys: S0 $($s0.Count), S1 $($s1.Count), S2 $($s2.Count); vendor +register-default-terminal exit $($register.exit): $($register.output)"
+
+    $noise = @(SnapshotDiff $s0 $s1)
+    $noiseEntries = @($noise | ForEach-Object { $_.entry })
+    Say "control S0->S1 changed entries: $($noise.Count); under Classes/Console (not subtracted there): $(@($noise | Where-Object { Region $_.key }).Count)"
+    $delta = @(SnapshotDiff $s1 $s2)
+    $vendorRegion = @($delta | Where-Object { Region $_.key })
+    foreach ($d in $vendorRegion) { Say "CLASSES/CONSOLE $($d.change) HKCU\$($d.key) [$($d.name)] $($d.before) -> $($d.after)" }
+    $other = @($delta | Where-Object { -not (Region $_.key) -and $noiseEntries -notcontains $_.entry })
+    Say "other HKCU changes after exact (key, name) noise filter: $($other.Count)"
+    foreach ($d in @($other | Select-Object -First 200)) { Say "OTHER $($d.change) HKCU\$($d.key) [$($d.name)]" }
+    $tokens = @($install, 'noctty', $noctty, $proxy) + $iids
+    $mentions = @(foreach ($d in @($delta | Where-Object { -not (Region $_.key) })) {
+        $hit = @($tokens | Where-Object { "$($d.key)$sep$($d.name)$sep$($d.after)$sep$($d.before)" -like "*$_*" })
+        if ($hit.Count) { Say "MENTION $($d.change) HKCU\$($d.key) [$($d.name)] token $($hit[0])"; $d }
+    })
+    $machine = @(SnapshotDiff $h1 $h2)
+    foreach ($d in $machine) { Say "HKLM $($d.change) $($d.key) [$($d.name)] $($d.before) -> $($d.after)" }
+    $treeDiff = @(SnapshotDiff $tree1 $tree2)
+    $userDiff = @(SnapshotDiff $user1 $user2)
+    foreach ($d in @($treeDiff + $userDiff)) { Say "FILE $($d.change) $($d.key) $($d.before) -> $($d.after)" }
+
+    # G3 on CI: a console entry point must not write into the install directory.
+    $version = Vendor (Join-Path $install 'noctty.com') '--version'
+    $tree3 = FileSnapshot $install
+    Say "noctty.com --version exit $($version.exit): $($version.output); install directory changes: $(@(SnapshotDiff $tree2 $tree3).Count)"
+
+    $unregister = Vendor (Join-Path $install 'noctty.com') '+unregister-default-terminal'
+    $s3 = RegistrySnapshot 'CurrentUser' 'Default' @('')
+    $remains = @(SnapshotDiff $s1 $s3 | Where-Object { Region $_.key })
+    Say "vendor +unregister-default-terminal exit $($unregister.exit): $($unregister.output)"
+    foreach ($d in $remains) { Say "REMAINS $($d.change) HKCU\$($d.key) [$($d.name)] $($d.before) -> $($d.after)" }
+    $g4 = [ordered]@{ status = 'measured'; registerExit = $register.exit; versionExit = $version.exit; unregisterExit = $unregister.exit
+        classesConsoleChanges = $vendorRegion.Count; otherHkcuChanges = $other.Count; mentions = $mentions.Count
+        hklmChanges = $machine.Count; installFileChanges = $treeDiff.Count + @(SnapshotDiff $tree2 $tree3).Count
+        userNocttyFileChanges = $userDiff.Count; remainingAfterUnregister = $remains.Count; controlNoise = $noise.Count }
+} catch {
+    $g4 = [ordered]@{ status = "measurement error: $($_.Exception.Message)" }
+    Say $g4.status
+}
+
 foreach ($font in $fonts) {
     if ((Test-Path -LiteralPath (FontPath $font)) -or $null -ne (FontValue (ValueName $font))) { throw 'Proof requires a fresh disposable font target.' }
 }
 if (Test-Path -LiteralPath $ledgerDir) { throw 'Proof requires no effect ledger yet.' }
 $n = $fonts.Count
+# A6 (owned): an Apply interrupted after committing fonts[0]'s file and before its value left
+# that owned file unregistered, and its bytes were then damaged. Only an unregistered file can
+# be damaged here: Windows keeps a registered per-user font file open without write sharing.
+$null = New-Item -ItemType Directory -Path $fontDir, $ledgerDir -Force
+CraftFile (FontPath $fonts[0]) $fonts[0].sha256.ToLowerInvariant() @('intent', 'commit')
+[IO.File]::WriteAllText((FontPath $fonts[0]), 'negative-control')
 MustReject { Run 'Test' } 'Installed bytes differ:*'
 
-# A1: one intent and one commit per owned file and value; a second Apply writes nothing.
+# A1: the first Apply reverts and owns fonts[0]'s damaged file again, then owns every other file
+# and every value from no record at all (one intent and one commit each); a second Apply writes nothing.
 $first = Run 'Apply'
-if ($first.copied -ne $n -or $first.changedProperties -ne $n -or $first.recordsWritten -ne 4 * $n -or @(Ledger).Count -ne 4 * $n) {
-    throw 'The first Apply did not own each font file and value exactly once.'
+if ($first.copied -ne $n -or $first.changedProperties -ne $n -or $first.removed -ne 1 -or $first.recordsWritten -ne 4 * $n + 1 -or
+    @(Ledger).Count -ne 4 * $n + 3 -or (Get-FileHash -LiteralPath (FontPath $fonts[0])).Hash -ne $fonts[0].sha256 -or
+    (Phases (FileId (FontPath $fonts[0]))) -cne 'intent,commit,undone,intent,commit') {
+    throw 'The first Apply did not repair the owned damaged file and own each other font file and value exactly once.'
 }
 $second = Run 'Apply'
 if ($second.copied -ne 0 -or $second.changedProperties -ne 0 -or $second.removed -ne 0 -or $second.recordsWritten -ne 0) { throw 'Second apply changed state.' }
@@ -318,16 +467,12 @@ foreach ($font in $fonts) {
     try { if ([string]$key.GetValueKind((ValueName $font)) -cne 'String') { throw 'A font value is not REG_SZ.' } } finally { $key.Close() }
 }
 
-# Owned drift is repaired by reverting and owning again: a changed value, then damaged bytes (A6, owned).
+# Owned value drift is repaired by reverting and owning again (registry only; damaged bytes are A6 above).
 SetFontValue (ValueName $fonts[0]) 'negative-control'
 MustReject { Run 'Test' } 'Registry drift:*'
 $fixed = Run 'Apply'
 if ($fixed.changedProperties -ne 1 -or $fixed.removed -ne 1 -or (FontValue (ValueName $fonts[0])) -cne (FontPath $fonts[0])) { throw 'Owned value drift was not repaired.' }
 if ((Phases (ValueId (ValueName $fonts[0]))) -cne 'intent,commit,undone,intent,commit') { throw 'The value repair is not recorded as undone then owned again.' }
-[IO.File]::WriteAllText((FontPath $fonts[0]), 'negative-control')
-MustReject { Run 'Test' } 'Installed bytes differ:*'
-$fixed = Run 'Apply'
-if ($fixed.copied -ne 1 -or (Get-FileHash -LiteralPath (FontPath $fonts[0])).Hash -ne $fonts[0].sha256) { throw 'Owned damaged bytes were not repaired.' }
 $null = Run 'Test'
 
 # Valid JSON with altered bytes still fails the inventory before effects.
@@ -536,4 +681,5 @@ $null = RunSsh 'RentSshTest'
     uninstallEmptiedOwnedFonts = $true;
     rentSsh = "cloudflared $($manifest.cloudflared.version) client, strict config, Include preserved and idempotent, drift repaired"
     winReportsHandoffUnproven = $true; handoffProbeRefusedOnRunner = $true; handoffEvaluatorCases = $handoffCases;
+    g4Measurement = $g4;
     scope = 'current-user owned fonts, registry and SSH-client convergence; not Restore/Uninstall of Noctty, the default terminal or packages, rendering, default-terminal handoff, real-host UX or a Cloudflare connection' } | ConvertTo-Json

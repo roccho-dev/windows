@@ -237,17 +237,27 @@ def inventoried(packages: object) -> list[dict]:
 
 
 def noctty_inventory(archive_path: Path) -> dict[str, str]:
+    """noctty/... path -> sha256 of every file, each a Windows path. A directory entry must
+    also be noctty or beneath it and hold a file: the inventory lists files only, so an
+    empty directory would be extracted but never owned or removed (the package M2 rule)."""
     files: dict[str, str] = {}
+    directories: list[str] = []
     with zipfile.ZipFile(archive_path) as upstream:
         for entry in upstream.infolist():
-            name = relative(entry.filename)
+            name = windows_path(entry.filename.rstrip("/") if entry.is_dir() else entry.filename)
             if entry.is_dir():
+                if name != "noctty" and not name.startswith("noctty/"):
+                    raise ValueError(f"Unexpected noctty directory: {name}")
+                directories.append(name)
                 continue
             if not name.startswith("noctty/") or name.casefold() in (n.casefold() for n in files):
                 raise ValueError(f"Unexpected or duplicate noctty path: {name}")
             if (entry.external_attr >> 16) & 0o170000 == 0o120000:
                 raise ValueError(f"Symlink in noctty archive: {name}")
             files[name] = hashlib.sha256(upstream.read(entry)).hexdigest()
+    empty = [d for d in directories if not any(f.startswith(d + "/") for f in files)]
+    if empty:
+        raise ValueError(f"Noctty archive has directories without files: {empty}")
     if not {"noctty/noctty.exe", "noctty/noctty.com",
             "noctty/noctty-terminal-handoff-proxy.dll"}.issubset(files):
         raise ValueError("Noctty archive lacks default-terminal components")

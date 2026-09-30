@@ -294,6 +294,25 @@ class CompilerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsafe"):
             pack.distribution(fonts, noctty, cloudflared, choices, scripts, "test", self.root / "out")
 
+    def test_noctty_archive_windows_paths_and_directories(self):
+        fonts = self.payload()
+        noctty, cloudflared, choices, scripts = self.inputs()
+        with zipfile.ZipFile(noctty, "a") as z:
+            z.writestr("noctty/", "")
+            z.writestr("noctty/share/", "")
+            z.writestr("noctty/share/readme.txt", "fixture")
+        pack.distribution(fonts, noctty, cloudflared, choices, scripts, "test", self.root / "ok")
+        for case, (name, pattern) in {"empty directory": ("noctty/empty/", "without files"),
+                                      "reserved name": ("noctty/NUL.txt", "Not a Windows path"),
+                                      "trailing dot": ("noctty/share/a.", "Not a Windows path"),
+                                      "directory outside": ("other/", "Unexpected noctty directory")}.items():
+            archive = self.root / f"noctty-{case.replace(' ', '-')}.zip"
+            archive.write_bytes(noctty.read_bytes())
+            with zipfile.ZipFile(archive, "a") as z:
+                z.writestr(name, "" if name.endswith("/") else "fixture")
+            with self.subTest(case=case), self.assertRaisesRegex(ValueError, pattern):
+                pack.distribution(fonts, archive, cloudflared, choices, scripts, "test", self.root / "out")
+
     def test_cloudflared_must_be_selected_and_executable(self):
         fonts = self.payload()
         noctty, cloudflared, choices, scripts = self.inputs()
