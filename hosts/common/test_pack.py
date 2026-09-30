@@ -172,6 +172,32 @@ class CompilerTests(unittest.TestCase):
         seed.update(changes)
         return seed
 
+    def test_app_path_lock_contract(self):
+        for app_path in ("fixture.exe", "Chromium.exe", "a-b_c.1.exe", "9.exe"):
+            with self.subTest(app_path=app_path):
+                self.assertEqual(pack.package_locks([self.lock(appPath=app_path)]), [self.lock(appPath=app_path)])
+        other = {"name": "Other", "directory": "Programs/other-1.0"}
+        self.assertEqual(len(pack.package_locks([self.lock(appPath="fixture.exe"), self.lock(appPath="other.exe", **other)])), 2)
+        for app_path in ("fixture", "fixture.EXE", "fixture.exe ", " fixture.exe", "fixture.exe\n", ".exe", "-fixture.exe",
+                         "a/fixture.exe", "a\\fixture.exe", "../fixture.exe", "fixture.exe.", "con.exe", "NUL.exe", "fix ture.exe",
+                         "fixture.exe/", "fixture.cmd", "", 1, None, ["fixture.exe"]):
+            with self.subTest(app_path=app_path), self.assertRaises(ValueError):
+                pack.package_locks([self.lock(appPath=app_path)])
+        # One App Paths name per lock, without case: two locks may not share it.
+        with self.assertRaisesRegex(ValueError, "appPath"):
+            pack.package_locks([self.lock(appPath="Fixture.exe"), self.lock(appPath="fixture.exe", **other)])
+
+    def test_app_path_reaches_the_manifest_but_not_the_inventory(self):
+        fonts = self.payload()
+        noctty, cloudflared, choices, scripts = self.inputs()
+        self.with_packages(choices, self.lock(appPath="fixture.exe", inventory=str(self.inventory())))
+        pack.distribution(fonts, noctty, cloudflared, choices, scripts, "test", self.root / "out")
+        with zipfile.ZipFile(self.root / "out" / "windows-dist.zip") as z:
+            package, = json.loads(z.read("manifest.json"))["packages"]
+        self.assertEqual(package["appPath"], "fixture.exe")
+        self.assertEqual(package["files"], {"bin/fixture.exe": "1" * 64})
+        self.assertEqual(package, self.lock(appPath="fixture.exe", files={"bin/fixture.exe": "1" * 64}, unpackedSize=10))
+
     def test_seed_lock_contract(self):
         self.assertEqual(pack.package_locks([self.lock(seed=self.seed())]), [self.lock(seed=self.seed())])
         bad = {

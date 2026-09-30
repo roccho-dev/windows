@@ -101,9 +101,16 @@ function AssertPackageShape($Package) {
     # A seed goes into the owned tree beside the executable, from a bundle file of its exact hash.
     $problem = Get-SeedProblem $Package $manifest.files
     if ($problem) { throw "Invalid package seed in manifest: ${name}: $problem" }
+    # An App Paths name (not written yet): one segment ending in lowercase .exe, as pack.py checks.
+    $appPath = Get-Field $Package 'appPath'
+    if ($null -ne $appPath -and ($appPath -isnot [string] -or $appPath -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]*\.exe\z' -or -not (Test-PathSegment $appPath))) {
+        throw "Invalid package appPath in manifest: $name"
+    }
 }
 
 foreach ($package in $manifest.packages) { AssertPackageShape $package }
+$appPaths = @($manifest.packages | ForEach-Object { Get-Field $_ 'appPath' } | Where-Object { $null -ne $_ })
+if (@($appPaths | Sort-Object -Unique).Count -ne $appPaths.Count) { throw 'Two packages share an App Paths name.' }  # ignoring case
 $packageNames = @($Packages | ForEach-Object { ([string]$_).Split(',') } | ForEach-Object { $_.Trim() })
 if ($PSBoundParameters.ContainsKey('Packages')) {
     if ($Mode -ne 'Apply') { throw '-Packages is only for -Mode Apply; Restore converges every locked package.' }

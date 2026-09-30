@@ -66,6 +66,9 @@ let
   #   seed        optional: Chromium's initial_preferences, beside the executable, which pack.py
   #               writes from these font roles (families from choices); a file of the owned tree
   #               that Chromium reads only when it creates a profile (README)
+  #   appPath     optional: the one HKCU App Paths name (<name>.exe, lowercase .exe) that launches the
+  #               owned executable by name (Win+R); never the executable's own name when another
+  #               product owns it (chrome.exe is Google Chrome's)
   packageLocks = [
     {
       # Hibbiki third-party build (the approved exception). sha256 is GitHub's
@@ -91,6 +94,7 @@ let
       # Without --user-data-dir this build uses the synced profile's location.
       protected = [ "Chromium/User Data" ];
       seed = { path = "Chrome-bin/initial_preferences"; fonts = { proportional = "ui"; fixed = "terminal"; }; };
+      appPath = "chromium.exe";
     }
     {
       # Official release; publisher SHA256 equals GitHub's asset digest.
@@ -116,11 +120,11 @@ let
   ];
   # The fixed-output fetch checks sha256; pack.py checks size, sha1 and the
   # archive listing, and inventories the tree 7-Zip extracts: each file's sha256
-  # and unpackedSize, the sum of their sizes (never written here by hand). The seed is
-  # not part of the archive, so the inventory's input omits it.
+  # and unpackedSize, the sum of their sizes (never written here by hand). The seed and
+  # appPath are not part of the archive, so the inventory's input omits them.
   inventory = lock: let
     archive = pkgs.fetchurl { inherit (lock) url sha256; };
-    upstream = builtins.removeAttrs lock [ "seed" ];
+    upstream = builtins.removeAttrs lock [ "seed" "appPath" ];
   in pkgs.runCommand "package-inventory-${lock.name}" { nativeBuildInputs = [ python pkgs._7zz ]; } ''
     7zz l -slt ${archive} > listing.txt
     python ${./pack.py} listing listing.txt

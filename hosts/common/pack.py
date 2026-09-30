@@ -96,6 +96,8 @@ SEED_NAME, SEED_NAMES = "initial_preferences", ("initial_preferences", "master_p
 # Preferences are; Zyyy is the default script, Jpan the one a Japanese page uses.
 SEED_GENERICS = {"standard": "proportional", "sansserif": "proportional", "fixed": "fixed"}
 SEED_SCRIPTS = ("Zyyy", "Jpan")
+# An App Paths name: one segment ending in lowercase .exe; win.ps1 AssertPackageShape holds the same rule.
+APP_PATH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.exe")
 TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*")
 # A version starts with a digit and holds no '-', so Programs/<name>-<version> splits one way
 # only (chromium-extra-1 is never Chromium's); win.ps1 Get-PackageAssetPath relies on it.
@@ -134,10 +136,10 @@ def package_locks(packages: object) -> list[dict]:
     a matching HKCU or HKLM Uninstall entry, never by this path (see nix.nix)."""
     if not isinstance(packages, list) or not packages:
         raise ValueError("Empty package selection")
-    names, owned = set(), []
+    names, owned, app_paths = set(), [], set()
     for package in packages:
-        if not isinstance(package, dict) or set(package) - {"sha1", "seed"} != PACKAGE_KEYS:
-            raise ValueError(f"Package lock keys differ from {sorted(PACKAGE_KEYS)} (+ optional sha1, seed)")
+        if not isinstance(package, dict) or set(package) - {"sha1", "seed", "appPath"} != PACKAGE_KEYS:
+            raise ValueError(f"Package lock keys differ from {sorted(PACKAGE_KEYS)} (+ optional sha1, seed, appPath)")
         name, version = text(package["name"], "name"), text(package["version"], "version")
         if not TOKEN.fullmatch(name) or not VERSION.fullmatch(version) or name.casefold() in names:
             raise ValueError(f"Invalid or duplicate package: {name!r} {version!r}")
@@ -167,6 +169,12 @@ def package_locks(packages: object) -> list[dict]:
             path = PurePosixPath(windows_path(text(seed["path"], f"{name} seed path")))
             if path.name != SEED_NAME or path.parent != PurePosixPath(executable).parent:
                 raise ValueError(f"Package {name} seed is not {SEED_NAME} beside {executable}")
+        if "appPath" in package:
+            app_path = package["appPath"]
+            if (not isinstance(app_path, str) or not APP_PATH.fullmatch(app_path) or windows_path(app_path) != app_path
+                    or app_path.casefold() in app_paths):
+                raise ValueError(f"Package {name} appPath is not one unique <name>.exe segment: {app_path!r}")
+            app_paths.add(app_path.casefold())
         existing = package["existing"]
         if not isinstance(existing, dict) or set(existing) != EXISTING_KEYS:
             raise ValueError(f"Package {name} existing-install keys differ from {sorted(EXISTING_KEYS)}")
