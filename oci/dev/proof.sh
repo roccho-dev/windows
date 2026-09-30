@@ -197,6 +197,14 @@ NIX
   grep -qx "key $(printf %s "$key" | sha256sum | cut -d' ' -f1)" "$marker"
   grep -qx 'argv clean' "$marker"
   test "$(grep -n 'voice-ui-jev-dev: built ' "$out" | cut -d: -f1)" -lt "$(grep -n 'voice-ui-jev-dev: decrypt ' "$out" | cut -d: -f1)"
+  # An explicit --host alone chooses the listen address, in any position; the hostile HOST above never does.
+  launch_as pass --host 0.0.0.0 "${args[@]}"
+  test "$(head -n 1 "$marker")" = "names HOME HOST JEV_API_KEY LANG PATH PORT "
+  grep -qx 'host 0.0.0.0' "$marker"
+  grep -qx 'argv clean' "$marker"
+  grep -qF "on 0.0.0.0:$port with" "$out"
+  launch_as pass "${args[@]}" --host 127.0.0.1
+  grep -qx 'host 127.0.0.1' "$marker"
 
   # Arguments: exactly three flags, exact SHAs, an unprivileged port.
   launch_as red --envs-sha "$good" --apps-sha "$apps_good"
@@ -204,6 +212,11 @@ NIX
   launch_as red --envs-sha "${good^^}" --apps-sha "$apps_good" --port "$port"
   launch_as red --envs-sha "$good" --apps-sha "$apps_good" --port 80
   launch_as red --envs-sha "$good" --apps-sha "$apps_good" --port 70000
+  # The host: only 127.0.0.1 or 0.0.0.0, once, with a value.
+  for h in localhost :: 192.0.2.1 '' 127.0.0.2; do launch_as red "${args[@]}" --host "$h"; done
+  launch_as red "${args[@]}" --host
+  launch_as red "${args[@]}" --host 0.0.0.0 --host 0.0.0.0
+  launch_as red --envs-sha "$good" --apps-sha "$apps_good" --host 0.0.0.0 --host 127.0.0.1
   # The envs commit: stale ancestor, off proposals, or unknown.
   launch_as red --envs-sha "$stale" --apps-sha "$apps_good" --port "$port"
   launch_as red --envs-sha "$off" --apps-sha "$apps_good" --port "$port"
@@ -289,10 +302,10 @@ NIX
   test ! -e "$fx"
   rm -f "$marker"
   echo 'PASS jev tools (fixtures): production profile has only the two bounded tools and exact constants; same source;'
-  echo 'PASS jev launch: closed child environment, loopback, no core, absent HOME, no temp left after any launch, key never in argv or output, build before decrypt;'
+  echo 'PASS jev launch: closed child environment, loopback unless --host 0.0.0.0 is explicit, no core, absent HOME, no temp left after any launch, key never in argv or output, build before decrypt;'
   echo 'PASS jev scratch: removed file by file before the child, never recursively; unexpected entries and types kept and refused;'
   echo 'PASS jev fixtures: Git-verified objects and known files removed, foreign entries kept and refused; no fixture or test identity left;'
-  echo 'PASS jev RED: arguments, stale/off/unknown envs commit, unbuildable apps, identity mode/missing/other, tamper, two recipients, extra field, absent'
+  echo 'PASS jev RED: arguments, host, stale/off/unknown envs commit, unbuildable apps, identity mode/missing/other, tamper, two recipients, extra field, absent'
 }
 jev_proof
 
