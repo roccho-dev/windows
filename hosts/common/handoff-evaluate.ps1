@@ -129,15 +129,18 @@ function Get-HandoffVerdict($Record, $Events, [string]$ExpectedTerminal) {
 #   seq       positive integer, unique across the ledger
 #   phase     'intent' | 'commit' | 'void' | 'undone'
 #   id        opaque effect key, stable for one target
-#   kind      file-created | file-replaced | prefix-inserted | registry-value | tree-extracted
+#   kind      file-created | file-replaced | prefix-inserted | registry-value |
+#             registry-key-created | tree-extracted
 #   target    absolute file or directory path (drive, backslashes, no . or ..),
-#             or an HKCU\ key for registry-value; never HKLM
+#             or an HKCU\ key for the registry kinds; never HKLM
 #   name      registry-value only: the value name ('' is the default value)
 #   prior     the state before the effect
 #   desired   the state the effect writes; never equal to prior, so an already
 #             matching target is preexisting-match and gets no intent
 #   observed  absent on an intent; the readback, equal to desired on a commit
 #             and to prior on a void or undone
+#   temp      intent only, optional: the temporary path it names before creating
+#             it (Get-IntentTempProblem)
 # A state is { exists = [bool] } plus, when exists is true:
 #   file kinds      sha256; prior of file-replaced and prefix-inserted also has
 #                   backup, an absolute path holding the prior bytes; desired of
@@ -147,8 +150,10 @@ function Get-HandoffVerdict($Record, $Events, [string]$ExpectedTerminal) {
 #                   observers convert the signed Int32/Int64 PowerShell reads
 #                   (e.g. -1 is 4294967295); a differing representation is drift.
 #   tree-extracted  files, a map of '/'-separated relative path -> sha256
+#   registry-key-created  nothing more: the key exists
 # Per kind, prior and desired must be:
-#   file-created, tree-extracted     prior absent, desired present
+#   file-created, tree-extracted,
+#   registry-key-created             prior absent, desired present
 #   file-replaced, prefix-inserted   prior present with backup, desired present
 #   registry-value                   prior either, desired present
 # A backup file is its own file-created effect with an earlier seq, so reverse
@@ -161,12 +166,13 @@ function Test-PathSegment([string]$Segment) {
         $Segment -match '[. ]$' -or $Segment -match '^(CON|PRN|AUX|NUL|COM\d|LPT\d)(\..*)?$')
 }
 
-# True for an absolute file path, or an HKCU key when $Kind is registry-value.
+# True for an absolute file path, or an HKCU key when $Kind is a registry kind.
 function Test-EffectPath([string]$Kind, $Target) {
-    $root = if ($Kind -eq 'registry-value') { '^HKCU\\' } else { '^[A-Za-z]:\\' }
+    $registry = $Kind -cin @('registry-value', 'registry-key-created')
+    $root = if ($registry) { '^HKCU\\' } else { '^[A-Za-z]:\\' }
     if ($Target -isnot [string] -or $Target -notmatch $root) { return $false }
     foreach ($segment in ($Target -replace $root, '').Split('\')) {
-        if ($Kind -eq 'registry-value') { if ($segment -in @('', '.', '..')) { return $false } }
+        if ($registry) { if ($segment -in @('', '.', '..')) { return $false } }
         elseif (-not (Test-PathSegment $segment)) { return $false }
     }
     return $true
@@ -207,6 +213,7 @@ function Get-EffectStateProblem([string]$Kind, $State, [string]$Role) {
         'tree-extracted' {
             if ($null -eq (ConvertTo-FileMap (Get-Field $State 'files'))) { return "$Role.files is not a safe path -> sha256 map." }
         }
+        'registry-key-created' { }
         default {
             $sha = Get-Field $State 'sha256'
             if ($sha -isnot [string] -or $sha -notmatch '^[0-9A-Fa-f]{64}$') { return "$Role.sha256 is not a SHA-256." }
@@ -236,6 +243,7 @@ function Test-EffectStateEqual([string]$Kind, $Expected, $Actual) {
             }
             return $true
         }
+        'registry-key-created' { return $true }
         default {
             $sha = [string](Get-Field $Expected 'sha256')
             return ($sha -ne '' -and $sha -eq [string](Get-Field $Actual 'sha256'))
@@ -253,7 +261,7 @@ function Get-EffectRecordProblem($Record) {
     $phase = Get-Field $Record 'phase'
     if ($phase -cnotin @('intent', 'commit', 'void', 'undone')) { return 'phase is not intent, commit, void or undone.' }
     $kind = Get-Field $Record 'kind'
-    if ($kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'tree-extracted')) {
+    if ($kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted')) {
         return 'kind is not an effect kind.'
     }
     $id = Get-Field $Record 'id'
@@ -269,7 +277,7 @@ function Get-EffectRecordProblem($Record) {
     }
     if (-not (Get-Field $desired 'exists')) { return 'desired must exist.' }
     if (Test-EffectStateEqual $kind $prior $desired) { return 'desired equals prior; there is no effect to own.' }
-    if ($kind -in @('file-created', 'tree-extracted') -and (Get-Field $prior 'exists')) { return 'prior must be absent.' }
+    if ($kind -in @('file-created', 'tree-extracted', 'registry-key-created') -and (Get-Field $prior 'exists')) { return 'prior must be absent.' }
     if ($kind -in @('file-replaced', 'prefix-inserted')) {
         $backup = Get-Field $prior 'backup'
         if (-not (Get-Field $prior 'exists')) { return 'prior must exist.' }
@@ -285,8 +293,9 @@ function Get-EffectRecordProblem($Record) {
     $observed = Get-Field $Record 'observed'
     if ($phase -ceq 'intent') {
         if ($null -ne $observed) { return 'an intent has no observed state.' }
-        return $null
+        return Get-IntentTempProblem $Record
     }
+    if ($null -ne (Get-Field $Record 'temp')) { return 'only an intent names a temporary path.' }
     $problem = Get-EffectStateProblem $kind $observed 'observed'
     if ($problem) { return $problem }
     $expected, $label = if ($phase -ceq 'commit') { $desired, 'desired' } else { $prior, 'prior' }
@@ -350,7 +359,7 @@ function Get-EffectAttempt($Records) {
 # preexisting-match or preexisting-drift against $Desired; indeterminate when the
 # kind or a state is malformed. $Resolution is passed through.
 function Get-UnownedClass([string]$Kind, $Desired, $Current, $Resolution) {
-    $problem = if ($Kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'tree-extracted')) {
+    $problem = if ($Kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted')) {
         'The selection kind is not an effect kind.'
     } else { Get-EffectStateProblem $Kind $Desired 'desired' }
     if (-not $problem) { $problem = Get-EffectStateProblem $Kind $Current 'current' }
@@ -431,6 +440,8 @@ function Get-UndoSteps($Record) {
             }
             $step
         }
+        # Removed only while it holds no value and no subkey; never recursively.
+        'registry-key-created' { [ordered]@{ action = 'delete-empty-key'; key = $target } }
         'tree-extracted' {
             $files = ConvertTo-FileMap (Get-Field $desired 'files')
             $paths = [string[]]@($files.Keys)
@@ -456,18 +467,102 @@ function Get-UndoSteps($Record) {
 # True when two records' targets cannot have separate owners: the same registry
 # value (key and name, ignoring case), or file-system targets where one equals or
 # contains the other per '\' segment, ignoring case (a file inside an extracted
-# tree, or a nested tree). Registry and file-system targets never overlap.
+# tree, or a nested tree). Registry and file-system targets never overlap. A
+# created key and a value in it or beneath it, or a created key beneath it, have
+# separate owners only when the key's intent came first (lower seq), so reverse
+# order removes what it holds before the key; two claims on one key overlap.
 function Test-TargetOverlap($First, $Other) {
     $firstKind, $otherKind = [string](Get-Field $First 'kind'), [string](Get-Field $Other 'kind')
     $a = ([string](Get-Field $First 'target')).ToUpperInvariant()
     $b = ([string](Get-Field $Other 'target')).ToUpperInvariant()
-    if (($firstKind -ceq 'registry-value') -ne ($otherKind -ceq 'registry-value')) { return $false }
-    if ($firstKind -ceq 'registry-value') {
+    $registry = @('registry-value', 'registry-key-created')
+    if (($firstKind -cin $registry) -ne ($otherKind -cin $registry)) { return $false }
+    if ($firstKind -ceq 'registry-value' -and $otherKind -ceq 'registry-value') {
         return ($a -ceq $b -and ([string](Get-Field $First 'name')).ToUpperInvariant() -ceq
             ([string](Get-Field $Other 'name')).ToUpperInvariant())
     }
-    return ($a -ceq $b -or $a.StartsWith($b + '\', [StringComparison]::Ordinal) -or
-        $b.StartsWith($a + '\', [StringComparison]::Ordinal))
+    if ($firstKind -notin $registry) {
+        return ($a -ceq $b -or $a.StartsWith($b + '\', [StringComparison]::Ordinal) -or
+            $b.StartsWith($a + '\', [StringComparison]::Ordinal))
+    }
+    foreach ($pair in @(@($First, $a, $Other, $b, $otherKind), @($Other, $b, $First, $a, $firstKind))) {
+        $key, $keyPath, $held, $heldPath, $heldKind = $pair
+        if ([string](Get-Field $key 'kind') -cne 'registry-key-created') { continue }
+        if ($heldPath -ceq $keyPath -and $heldKind -ceq 'registry-key-created') { return $true }
+        if ($heldPath -ceq $keyPath -or $heldPath.StartsWith($keyPath + '\', [StringComparison]::Ordinal)) {
+            return -not ([long](Get-Field $key 'seq') -lt [long](Get-Field $held 'seq'))
+        }
+    }
+    return $false
+}
+
+# Why the temporary path an intent names (field temp, named before it exists) is not
+# one only that intent could have made, or $null when it is absent or valid: exactly
+# <target>.<guid32>.tmp for a file-created file, or <target>.<guid32>.staging for a
+# tree-extracted extraction directory, beside its target. Other kinds name none.
+function Get-IntentTempProblem($Record) {
+    $temp, $target = (Get-Field $Record 'temp'), [string](Get-Field $Record 'target')
+    if ($null -eq $temp) { return $null }
+    $suffix = switch -CaseSensitive ([string](Get-Field $Record 'kind')) { 'file-created' { 'tmp' } 'tree-extracted' { 'staging' } }
+    if (-not $suffix) { return "A $(Get-Field $Record 'kind') intent names no temporary path." }
+    if ($temp -isnot [string] -or $temp -cnotmatch ('^' + [regex]::Escape($target) + '\.[0-9a-f]{32}\.' + $suffix + '$')) {
+        return "The temporary path is not $target.<guid32>.$suffix."
+    }
+    return $null
+}
+
+# Cleanup of the staging directory an interrupted tree-extracted intent named, from
+# $Observed: every entry now beneath it as { path = '/'-relative; directory = bool;
+# reparse = bool }. Only an open intent's own valid staging path with a valid inventory
+# qualifies, and only when no entry is a reparse point and every entry is a file of that
+# inventory (bytes ignored: a crash may have truncated it) or a directory holding one.
+# Steps, each path once: those files, then those directories deepest first, then the
+# staging directory; each directory removal is non-recursive. Otherwise ok is false.
+function Get-StagingCleanupSteps($Record, $Observed) {
+    $staging = Get-Field $Record 'temp'
+    $refuse = { param($Reason) [ordered]@{ ok = $false; reason = $Reason; steps = @() } }
+    if ((Get-Field $Record 'kind') -cne 'tree-extracted' -or (Get-Field $Record 'phase') -cne 'intent' -or
+        $staging -isnot [string] -or (Get-IntentTempProblem $Record)) {
+        return & $refuse 'No tree intent names this staging directory.'
+    }
+    $files = ConvertTo-FileMap (Get-Field (Get-Field $Record 'desired') 'files')
+    if ($null -eq $files -or $files.Count -eq 0) { return & $refuse 'The intent has no valid inventory.' }
+    $parents = @{}
+    foreach ($name in $files.Keys) {
+        $parts = $name.Split('/')
+        for ($i = 1; $i -lt $parts.Count; $i++) { $parents[$parts[0..($i - 1)] -join '/'] = $true }
+    }
+    $fileSteps, $directories, $unknown, $seen = @(), @(), @(), @{}
+    foreach ($entry in @($Observed)) {
+        $path = [string](Get-Field $entry 'path')
+        if ((Get-Field $entry 'reparse') -eq $true) { return & $refuse "A reparse point is in the staging directory: $path" }
+        if ($seen.ContainsKey($path)) { continue }
+        $seen[$path] = $true
+        if ((Get-Field $entry 'directory') -eq $true) {
+            if ($parents.ContainsKey($path)) { $directories += $path } else { $unknown += $path }
+        } elseif ($files.ContainsKey($path)) {
+            $fileSteps += [ordered]@{ action = 'delete-file'; path = $staging + '\' + $path.Replace('/', '\') }
+        } else { $unknown += $path }
+    }
+    if ($unknown.Count) { return & $refuse "Not in the inventory, so not removed: $($unknown -join ', ')" }
+    $names = [string[]]$directories
+    [Array]::Sort($names, [StringComparer]::OrdinalIgnoreCase)
+    [Array]::Reverse($names)  # descending puts every directory before its parent
+    $steps = $fileSteps + @($names | ForEach-Object { [ordered]@{ action = 'remove-empty-directory'; path = $staging + '\' + $_.Replace('/', '\') } }) +
+        @([ordered]@{ action = 'remove-empty-directory'; path = $staging })
+    [ordered]@{ ok = $true; reason = $null; steps = $steps }
+}
+
+# Why a machine-wide Noctty is present, or $null: any HKLM (either view) key for the
+# Noctty terminal or proxy CLSID in $ClsidKeys, or an HKLM Uninstall DisplayName in
+# $DisplayNames that names Noctty. Restore and Apply then stop before any effect.
+function Get-MachineNocttyReason($ClsidKeys, $DisplayNames) {
+    $classes = @('{33368C6F-D328-410C-B225-26DC9F12C728}', '{1D349824-21FB-46C7-ACF3-746EDC991D52}')
+    foreach ($key in @($ClsidKeys)) {
+        foreach ($clsid in $classes) { if ([string]$key -like "*\CLSID\$clsid") { return "HKLM registers Noctty: $key" } }
+    }
+    foreach ($name in @($DisplayNames)) { if ([string]$name -like '*noctty*') { return "HKLM Uninstall lists $name" } }
+    return $null
 }
 
 # The uninstall plan for all ledger records ($Records, any order) and
@@ -559,11 +654,14 @@ function Get-UninstallPlan($Records, $Observations) {
 # { console; terminal }, $null for an absent value. A record is well formed only
 # as win.ps1 writes it: written is exactly the Windows Terminal console and Noctty
 # terminal, and priorSelectsNoctty is true exactly when the prior terminal is Noctty.
-# action is 'report' when the original selection is unknown (priorSelectsNoctty);
-# 'none' when the current pair already equals the prior pair ($null matching
-# $null), so a repeated rollback succeeds without an effect; 'restore' (set the
-# prior pair, deleting a $null value) when the current pair still equals written;
-# otherwise 'refuse'.
+# action is 'report' when the original selection is unknown (priorSelectsNoctty).
+# Otherwise each current value is its prior ($null matching $null; a prior equal to
+# what was written counts as prior), what Restore wrote, or other: any other is
+# 'refuse'; both prior is 'none', so a repeated rollback succeeds without an effect;
+# else 'restore' with steps for only the values still as written, DelegationTerminal
+# first (a $null value deletes it). An interruption between the two writes, in either
+# direction, so resumes with the value left to restore. Every result has steps (empty
+# unless 'restore'), so strict callers can always read it.
 function Get-LegacyTerminalPlan($Record, $Current) {
     $windowsTerminalConsole = '{2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}'
     $nocttyTerminal = '{33368C6F-D328-410C-B225-26DC9F12C728}'
@@ -578,21 +676,26 @@ function Get-LegacyTerminalPlan($Record, $Current) {
         $wc -isnot [string] -or $wc -ne $windowsTerminalConsole -or $wt -isnot [string] -or $wt -ne $nocttyTerminal -or
         ($null -ne $pc -and $pc -isnot [string]) -or ($null -ne $pt -and $pt -isnot [string]) -or
         $selects -ne ($pt -eq $nocttyTerminal)) {
-        return [ordered]@{ action = 'refuse'; reason = 'Malformed default-terminal record.' }
+        return [ordered]@{ action = 'refuse'; reason = 'Malformed default-terminal record.'; steps = @() }
     }
     if ($selects) {
-        return [ordered]@{ action = 'report'; reason = 'Noctty was already selected when recorded; the original selection is unknown.' }
+        return [ordered]@{ action = 'report'; reason = 'Noctty was already selected when recorded; the original selection is unknown.'; steps = @() }
     }
     $cc, $ct = (Get-Field $Current 'console'), (Get-Field $Current 'terminal')
     if (($null -ne $cc -and $cc -isnot [string]) -or ($null -ne $ct -and $ct -isnot [string])) {
-        return [ordered]@{ action = 'refuse'; reason = 'The current selection is not readable as two values.' }
+        return [ordered]@{ action = 'refuse'; reason = 'The current selection is not readable as two values.'; steps = @() }
     }
-    if ($cc -eq $pc -and $ct -eq $pt) {
-        return [ordered]@{ action = 'none'; reason = 'Already restored: the current selection equals the recorded prior one.' }
+    $steps = @()
+    foreach ($value in @(@('DelegationTerminal', $ct, $pt, $wt), @('DelegationConsole', $cc, $pc, $wc))) {
+        $name, $now, $prior, $wrote = $value
+        if ($now -eq $prior) { continue }
+        if ($now -isnot [string] -or $now -ne $wrote) {
+            return [ordered]@{ action = 'refuse'; reason = "$name is neither its recorded prior value nor the one Restore wrote."; steps = @() }
+        }
+        $steps += [ordered]@{ name = $name; expect = $wrote; value = $prior }
     }
-    if ($cc -isnot [string] -or $ct -isnot [string] -or $cc -ne $wc -or $ct -ne $wt) {
-        return [ordered]@{ action = 'refuse'; reason = 'The current selection is not the one Restore wrote.' }
+    if (-not $steps.Count) {
+        return [ordered]@{ action = 'none'; reason = 'Already restored: the current selection equals the recorded prior one.'; steps = @() }
     }
-    [ordered]@{ action = 'restore'; key = $key; expectConsole = $wc; expectTerminal = $wt
-        console = $pc; terminal = $pt; reason = $null }
+    [ordered]@{ action = 'restore'; key = $key; steps = $steps; reason = $null }
 }

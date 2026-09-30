@@ -206,7 +206,8 @@ $pureKinds = @(
     @('prefix-inserted', 'C:\u\p', @{ exists = $true; sha256 = (Sha b); backup = 'C:\u\p.bak' }, @{ exists = $true; sha256 = (Sha c); line = 'Include x' }, $null),
     @('file-replaced', 'C:\u\r', @{ exists = $true; sha256 = (Sha b); backup = 'C:\u\r.bak' }, @{ exists = $true; sha256 = (Sha c) }, $null),
     @('registry-value', 'HKCU\Software\W', $absent, @{ exists = $true; type = 'String'; data = 'new' }, 'v'),
-    @('registry-value', 'HKCU\Software\W', @{ exists = $true; type = 'String'; data = 'old' }, @{ exists = $true; type = 'String'; data = 'new' }, 'v'))
+    @('registry-value', 'HKCU\Software\W', @{ exists = $true; type = 'String'; data = 'old' }, @{ exists = $true; type = 'String'; data = 'new' }, 'v'),
+    @('registry-key-created', 'HKCU\Software\Classes\CLSID\{W}', $absent, @{ exists = $true }, $null))
 foreach ($case in $pureKinds) {
     $kind, $target, $prior, $desired, $name = $case
     $committed = @((PureRecord 1 intent $kind $target $prior $desired $null $name), (PureRecord 2 commit $kind $target $prior $desired $desired $name))
@@ -227,6 +228,91 @@ $plan = Get-UninstallPlan @((PureRecord 1 intent file-created 'C:\u\f' $absent @
 if (-not $plan.ok -or @($plan.steps).Count -or ($plan.resolutions | ForEach-Object { $_.resolution }) -cne 'undone') {
     throw 'A reverted owned effect is not closed undone by the uninstall plan.'
 }
+
+# S-A1b pure rules (no executor uses them yet).
+function Must([bool]$Holds, [string]$Rule) { if (-not $Holds) { throw "Pure ledger rule failed: $Rule" } }
+function Owned($Seq, $Id, $Kind, $Target, $Desired, $Name) {
+    foreach ($phase in 'intent', 'commit') {
+        $r = PureRecord $Seq $phase $Kind $Target $absent $Desired $(if ($phase -ceq 'commit') { $Desired } else { $null }) $Name
+        $r.id = $Id; $Seq++; $r
+    }
+}
+function Actions($Plan) { @($Plan.steps | ForEach-Object { $_.action }) -join ',' }
+$clsid = 'HKCU\Software\Classes\CLSID\{W}'
+$exists, $data = @{ exists = $true }, @{ exists = $true; type = 'String'; data = 'x' }
+# A created key may hold values and created subkeys whose intents came later; they are removed first.
+$records = @(Owned 1 k registry-key-created $clsid $exists $null) + @(Owned 3 v registry-value "$clsid\LocalServer32" $data '') +
+    @(Owned 5 s registry-key-created "$clsid\InprocServer32" $exists $null)
+$plan = Get-UninstallPlan $records @{ k = $exists; v = $data; s = $exists }
+Must ($plan.ok -and (Actions $plan) -ceq 'delete-empty-key,delete-registry-value,delete-empty-key') 'a created key is removed after what it holds'
+Must (-not (Get-UninstallPlan (@(Owned 1 v registry-value "$clsid\LocalServer32" $data '') + @(Owned 3 k registry-key-created $clsid $exists $null)) @{ k = $exists; v = $data }).ok) 'a value owned before its key is refused'
+Must (-not (Get-UninstallPlan (@(Owned 1 k registry-key-created $clsid $exists $null) + @(Owned 3 j registry-key-created $clsid.ToLowerInvariant() $exists $null)) @{ k = $exists; j = $exists }).ok) 'two claims on one key are refused'
+# The temporary path an intent names: only <target>.<guid32>.tmp (file) or .staging (tree).
+$guid = '0123456789abcdef' * 2
+foreach ($case in @(@('file-created', 'C:\u\f.ttf', "C:\u\f.ttf.$guid.tmp", $true), @('tree-extracted', 'C:\u\t', "C:\u\t.$guid.staging", $true),
+        @('file-created', 'C:\u\f.ttf', "C:\u\f.ttf.$guid.staging", $false), @('tree-extracted', 'C:\u\t', "C:\u\t.$guid.tmp", $false),
+        @('tree-extracted', 'C:\u\t', "C:\v\t.$guid.staging", $false), @('tree-extracted', 'C:\u\t', "C:\u\t.$($guid.ToUpperInvariant()).staging", $false),
+        @('registry-key-created', $clsid, "$clsid.$guid.tmp", $false))) {
+    Must ($null -eq (Get-IntentTempProblem @{ kind = $case[0]; target = $case[1]; temp = $case[2] }) -eq $case[3]) "temp $($case[2]) for $($case[0])"
+}
+# Staging cleanup deletes only what the tree intent's inventory names, deepest directory first.
+$treeIntent = PureRecord 1 intent tree-extracted 'C:\u\t' $absent @{ exists = $true; files = @{ 'a.txt' = (Sha a); 'd/b.txt' = (Sha b) } } $null $null
+$treeIntent.temp = "C:\u\t.$guid.staging"
+$cleanup = Get-StagingCleanupSteps $treeIntent @(@{ path = 'a.txt'; directory = $false }, @{ path = 'd'; directory = $true }, @{ path = 'd/b.txt'; directory = $false })
+Must ($cleanup.ok -and (@($cleanup.steps | ForEach-Object { "$($_.action) $($_.path)" }) -join ';') -ceq
+    "delete-file C:\u\t.$guid.staging\a.txt;delete-file C:\u\t.$guid.staging\d\b.txt;remove-empty-directory C:\u\t.$guid.staging\d;remove-empty-directory C:\u\t.$guid.staging") 'staging cleanup order'
+Must ((Get-StagingCleanupSteps $treeIntent @(@{ path = 'a.txt'; directory = $false })).ok) 'a partial staging directory is cleaned'
+foreach ($observed in @(@(@{ path = 'x.txt'; directory = $false }), @(@{ path = 'e'; directory = $true }), @(@{ path = '../a.txt'; directory = $false }))) {
+    Must (-not (Get-StagingCleanupSteps $treeIntent $observed).ok) "staging entry $($observed[0].path) is not removed"
+}
+$committed = $treeIntent.Clone(); $committed.phase = 'commit'
+$foreign = $treeIntent.Clone(); $foreign.temp = "C:\u\other.$guid.staging"
+Must (-not (Get-StagingCleanupSteps $committed @()).ok -and -not (Get-StagingCleanupSteps $foreign @()).ok) 'only an intent-named staging directory is cleaned'
+foreach ($files in @('not a map', @{})) {
+    $bad = $treeIntent.Clone(); $bad.desired = @{ exists = $true; files = $files }
+    Must (-not (Get-StagingCleanupSteps $bad @(@{ path = 'a.txt'; directory = $false })).ok) 'a malformed or empty inventory cleans nothing'
+}
+$twice = Get-StagingCleanupSteps $treeIntent @(@{ path = 'a.txt'; directory = $false }, @{ path = 'A.TXT'; directory = $false })
+Must ($twice.ok -and @($twice.steps).Count -eq 2) 'an entry observed twice is removed once'
+Must (-not (Get-StagingCleanupSteps $treeIntent @(@{ path = 'd'; directory = $true; reparse = $true })).ok) 'a reparse point stops staging cleanup'
+# A record may name only the temporary path its intent could have made, and only on the intent.
+$fileIntent = PureRecord 1 intent file-created 'C:\u\f.ttf' $absent @{ exists = $true; sha256 = (Sha a) } $null $null
+$fileIntent.temp = "C:\u\f.ttf.$guid.tmp"
+Must ($null -eq (Get-EffectRecordProblem $fileIntent) -and $null -eq (Get-EffectRecordProblem $treeIntent)) 'valid intent temps'
+$fileIntent.Remove('temp')
+Must ($null -eq (Get-EffectRecordProblem $fileIntent)) 'an intent without a temp'
+$fileIntent.temp = 'C:\evil'
+Must ($null -ne (Get-EffectRecordProblem $fileIntent)) 'a foreign temp path is a malformed intent'
+$fileCommit = PureRecord 2 commit file-created 'C:\u\f.ttf' $absent @{ exists = $true; sha256 = (Sha a) } @{ exists = $true; sha256 = (Sha a) } $null
+$fileCommit.temp = "C:\u\f.ttf.$guid.tmp"
+$valueIntent = PureRecord 1 intent registry-value 'HKCU\Software\W' $absent @{ exists = $true; type = 'String'; data = 'x' } $null 'v'
+$valueIntent.temp = "HKCU\Software\W.$guid.tmp"
+Must ($null -ne (Get-EffectRecordProblem $fileCommit) -and $null -ne (Get-EffectRecordProblem $valueIntent)) 'a temp on a commit or a value intent'
+# Legacy %%Startup rollback resumes an interruption in either direction, Terminal first.
+function Legacy($PriorConsole, $PriorTerminal, $Selects) {
+    @{ schema = 1; key = 'HKCU\Console\%%Startup'; priorDelegationConsole = $PriorConsole; priorDelegationTerminal = $PriorTerminal
+        priorSelectsNoctty = $Selects; written = @{ DelegationConsole = $wtConsole; DelegationTerminal = $noctty } }
+}
+function LegacyPlan($Record, $Console, $Terminal) {
+    $p = Get-LegacyTerminalPlan $Record @{ console = $Console; terminal = $Terminal }
+    "$($p.action):$(@(if ($p.Contains('steps')) { $p.steps | ForEach-Object { $_.name } }) -join ',')"
+}
+$clean = Legacy $null $null $false
+Must ((LegacyPlan $clean $wtConsole $noctty) -ceq 'restore:DelegationTerminal,DelegationConsole') 'both written'
+Must ((LegacyPlan $clean $wtConsole $null) -ceq 'restore:DelegationConsole') 'console written, terminal already prior'
+Must ((LegacyPlan $clean $null $noctty) -ceq 'restore:DelegationTerminal') 'terminal written, console already prior'
+Must ((LegacyPlan $clean $null $null) -ceq 'none:') 'both prior'
+Must ((LegacyPlan $clean $wtConsole $terminal) -ceq 'refuse:') 'a value that is neither prior nor written'
+Must ((LegacyPlan (Legacy $wtConsole $null $false) $wtConsole $noctty) -ceq 'restore:DelegationTerminal') 'a prior equal to written counts as prior'
+Must ((LegacyPlan (Legacy $wtConsole $noctty $true) $wtConsole $noctty) -ceq 'report:') 'original unknown'
+foreach ($result in @((Get-LegacyTerminalPlan $clean @{ console = $null; terminal = $null }), (Get-LegacyTerminalPlan (Legacy $wtConsole $noctty $true) @{}),
+        (Get-LegacyTerminalPlan @{ schema = 1 } @{}), (Get-LegacyTerminalPlan $clean @{ console = 1; terminal = $null }))) {
+    Must (@($result.steps).Count -eq 0) "a $($result.action) plan still has (empty) steps"
+}
+# A machine-wide Noctty (either CLSID in either HKLM view, or an Uninstall name) is recognized.
+Must ($null -ne (Get-MachineNocttyReason @("Registry32\SOFTWARE\Classes\CLSID\$noctty") @()) -and
+    $null -ne (Get-MachineNocttyReason @() @('Noctty 1.3.131')) -and
+    $null -eq (Get-MachineNocttyReason @('Registry64\SOFTWARE\Classes\CLSID\{00000000-0000-0000-0000-000000000000}') @('Windows Terminal'))) 'machine-wide Noctty'
 
 # ---- Owned fonts through the effect ledger (native files and HKCU values) ----
 $fonts = @($manifest.fonts)
@@ -368,6 +454,31 @@ function Vendor([string]$Exe, [string]$Argument) {
     [pscustomobject]@{ exit = $process.ExitCode; output = @(($out.Result + "`n" + $err.Result) -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 20) -join ' | ' }
 }
 function Region([string]$Key) { $Key -match '^(Software\\Classes|Console)(\\|$)' }
+# The vendor registers only with HKCU\Console\%%Startup\DelegationConsole selecting
+# Windows Terminal's OpenConsole, which Restore writes just before registering. That
+# precondition is seeded before S0, so only the vendor's own changes are in the delta (a
+# vendor rewrite of it still shows as changed), and the original key and both values are
+# put back afterwards, the result read back and reported.
+$startupPath = 'Console\%%Startup'
+$startupSaved = $null  # the original state, once read; restoration runs only then
+function StartupState {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($startupPath)
+    if ($null -eq $key) { return [ordered]@{ keyExisted = $false; values = @{} } }
+    try {
+        $values = @{}
+        foreach ($name in 'DelegationConsole', 'DelegationTerminal') {
+            if ($key.GetValueNames() -contains $name) {
+                $values[$name] = [ordered]@{ kind = $key.GetValueKind($name)
+                    data = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
+            }
+        }
+        [ordered]@{ keyExisted = $true; values = $values }
+    } finally { $key.Close() }
+}
+function StartupText($State) {
+    "key $(if ($State.keyExisted) { 'present' } else { 'absent' })" + (@('DelegationConsole', 'DelegationTerminal' | ForEach-Object {
+        $v = $State.values[$_]; "; $_ $(if ($v) { "$($v.kind):$($v.data)" } else { 'absent' })" }) -join '')
+}
 try {
     $PSNativeCommandUseErrorActionPreference = $false
     $noctty = '{33368C6F-D328-410C-B225-26DC9F12C728}'; $proxy = '{1D349824-21FB-46C7-ACF3-746EDC991D52}'
@@ -384,6 +495,15 @@ try {
     $hklmRoots = @("SOFTWARE\Classes\CLSID\$noctty", "SOFTWARE\Classes\CLSID\$proxy") + @($iids | ForEach-Object { "SOFTWARE\Classes\Interface\$_" }) +
         @('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
     function Machine { $m = @{}; foreach ($view in 'Registry64', 'Registry32') { $s = RegistrySnapshot 'LocalMachine' $view $hklmRoots; foreach ($k in $s.Keys) { $m["$view\$k"] = $s[$k] } }; $m }
+    $startupSaved = StartupState
+    $seed = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($startupPath)
+    try { $seed.SetValue('DelegationConsole', $wtConsole, [Microsoft.Win32.RegistryValueKind]::String) } finally { $seed.Close() }
+    $wtVersion = try {
+        @(& $windowsPowerShell -NoProfile -NonInteractive -Command '(Get-AppxPackage -Name Microsoft.WindowsTerminal | Select-Object -First 1).Version' |
+            Where-Object { "$_" -match '^\d+(\.\d+){1,3}$' }) -join ''
+    } catch { "unreadable: $($_.Exception.Message)" }
+    if (-not $wtVersion) { $wtVersion = 'absent' }
+    Say "precondition before S0: $(StartupText $startupSaved) -> DelegationConsole String:$wtConsole; Windows Terminal package: $wtVersion"
     $s0 = RegistrySnapshot 'CurrentUser' 'Default' @('')
     Start-Sleep -Seconds 5  # bounded control interval: what changes on its own shows up between S0 and S1
     $s1 = RegistrySnapshot 'CurrentUser' 'Default' @('')
@@ -426,10 +546,35 @@ try {
     $g4 = [ordered]@{ status = 'measured'; registerExit = $register.exit; versionExit = $version.exit; unregisterExit = $unregister.exit
         classesConsoleChanges = $vendorRegion.Count; otherHkcuChanges = $other.Count; mentions = $mentions.Count
         hklmChanges = $machine.Count; installFileChanges = $treeDiff.Count + @(SnapshotDiff $tree2 $tree3).Count
-        userNocttyFileChanges = $userDiff.Count; remainingAfterUnregister = $remains.Count; controlNoise = $noise.Count }
+        userNocttyFileChanges = $userDiff.Count; remainingAfterUnregister = $remains.Count; controlNoise = $noise.Count
+        windowsTerminal = $wtVersion; seededDelegationConsole = $true; startupKeyCreated = -not $startupSaved.keyExisted }
 } catch {
     $g4 = [ordered]@{ status = "measurement error: $($_.Exception.Message)" }
     Say $g4.status
+} finally {
+    # Put back only the two values and, if the measurement created the key and it is empty
+    # again, the key itself (never recursively); then read it back and report exactly.
+    $restore = 'not seeded'
+    if ($null -ne $startupSaved) {
+        try {
+            $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($startupPath, $true)
+            $empty = $false
+            if ($null -ne $key) {
+                try {
+                    foreach ($name in 'DelegationConsole', 'DelegationTerminal') {
+                        $prior = $startupSaved.values[$name]
+                        if ($prior) { $key.SetValue($name, $prior.data, $prior.kind) } else { $key.DeleteValue($name, $false) }
+                    }
+                    $empty = $key.ValueCount -eq 0 -and $key.SubKeyCount -eq 0
+                } finally { $key.Close() }
+            }
+            if (-not $startupSaved.keyExisted -and $empty) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($startupPath, $false) }
+            $now = StartupText (StartupState)
+            $restore = if ($now -ceq (StartupText $startupSaved)) { 'verified' } else { "differs from before G4: now $now" }
+        } catch { $restore = "failed: $($_.Exception.Message)" }
+    }
+    $g4['startupRestore'] = $restore
+    Say "HKCU\$startupPath restore: $restore"
 }
 
 foreach ($font in $fonts) {
