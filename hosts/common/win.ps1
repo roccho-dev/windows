@@ -212,7 +212,9 @@ $nocttyConfigText = 'font-family = ' + $manifest.noctty.fontFamily + "`n"
 $terminalStartup = 'HKCU:\Console\%%Startup'
 $windowsTerminalConsole = '{2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}'
 $nocttyTerminal = '{33368C6F-D328-410C-B225-26DC9F12C728}'
-$nocttyProxy = '{1D349824-21FB-46C7-ACF3-746EDC991D52}'
+# The six HKCU COM values the handoff needs, from Nix, with {install} bound to this user's directory.
+$nocttyRegistration = Get-NocttyRegistration (Get-Field $manifest.noctty 'registration') $nocttyDirectory $manifest.noctty.files
+if ($nocttyRegistration.problem) { throw "Invalid Noctty registration in manifest: $($nocttyRegistration.problem)" }
 $terminalProvenance = Join-Path $localAppData 'windows-iac\provenance\default-terminal.json'
 $packageStates = @()
 
@@ -320,12 +322,6 @@ if ($Mode -eq 'RentSsh' -or $Mode -eq 'RentSshTest') {
     return
 }
 
-function RegistryDefault([string]$Path) {
-    $key = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
-    if ($null -eq $key) { return $null }
-    return $key.GetValue('')
-}
-
 function RestoreRegistryString([string]$Path, [string]$Name, [object]$Value) {
     if ($null -eq $Value) {
         Remove-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction SilentlyContinue
@@ -342,15 +338,16 @@ function TestNocttyRegistration {
     if ($null -eq $startup -or
         $startup.GetValue('DelegationConsole') -ne $windowsTerminalConsole -or
         $startup.GetValue('DelegationTerminal') -ne $nocttyTerminal) { return $false }
-    $classes = 'HKCU:\Software\Classes'
-    if ((RegistryDefault "$classes\CLSID\$nocttyTerminal\LocalServer32") -ne ('"' + $nocttyExe + '"') -or
-        (RegistryDefault "$classes\CLSID\$nocttyProxy\InprocServer32") -ne (Join-Path (Split-Path -Parent $nocttyExe) 'noctty-terminal-handoff-proxy.dll')) {
-        return $false
-    }
-    foreach ($iid in @('{59D55CCE-FC8A-48B4-ACE8-0A9286C6557F}',
-                       '{AA6B364F-4A50-4176-9002-0AE755E7B5EF}',
-                       '{6F23DA90-15C5-4203-9DB0-64E73F1B1B00}')) {
-        if ((RegistryDefault "$classes\Interface\$iid\ProxyStubClsid32") -ne $nocttyProxy) { return $false }
+    # Each manifest value as a REG_SZ; data compares ignoring case, as Windows paths and COM do.
+    foreach ($value in $nocttyRegistration.values) {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($value.key)
+        if ($null -eq $key) { return $false }
+        try {
+            if ($key.GetValueNames() -notcontains $value.name -or [string]$key.GetValueKind($value.name) -cne 'String' -or
+                $key.GetValue($value.name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) -ne $value.data) {
+                return $false
+            }
+        } finally { $key.Close() }
     }
     return $true
 }

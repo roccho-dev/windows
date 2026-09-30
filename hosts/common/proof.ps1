@@ -313,6 +313,37 @@ foreach ($result in @((Get-LegacyTerminalPlan $clean @{ console = $null; termina
 Must ($null -ne (Get-MachineNocttyReason @("Registry32\SOFTWARE\Classes\CLSID\$noctty") @()) -and
     $null -ne (Get-MachineNocttyReason @() @('Noctty 1.3.131')) -and
     $null -eq (Get-MachineNocttyReason @('Registry64\SOFTWARE\Classes\CLSID\{00000000-0000-0000-0000-000000000000}') @('Windows Terminal'))) 'machine-wide Noctty'
+# The built registration binds {install} and derives exactly the ten keys CI #58 created below the shared roots.
+$install = 'C:\u\Programs\noctty-1'
+$registration = Get-NocttyRegistration $manifest.noctty.registration $install $manifest.noctty.files
+$proxyClsid = '{1D349824-21FB-46C7-ACF3-746EDC991D52}'
+$tenKeys = @("Software\Classes\CLSID\$noctty", "Software\Classes\CLSID\$noctty\LocalServer32",
+    "Software\Classes\CLSID\$proxyClsid", "Software\Classes\CLSID\$proxyClsid\InprocServer32") +
+    @('{59D55CCE-FC8A-48B4-ACE8-0A9286C6557F}', '{6F23DA90-15C5-4203-9DB0-64E73F1B1B00}', '{AA6B364F-4A50-4176-9002-0AE755E7B5EF}' |
+        ForEach-Object { "Software\Classes\Interface\$_"; "Software\Classes\Interface\$_\ProxyStubClsid32" })
+Must ($null -eq $registration.problem -and @($registration.values).Count -eq 6 -and
+    (@($registration.keys | Sort-Object) -join ';') -ceq (@($tenKeys | Sort-Object) -join ';')) 'six values and the ten derived keys'
+$bound = @($registration.values | ForEach-Object { "$($_.key)|$($_.name)=$($_.data)" })
+Must ($bound -ccontains "Software\Classes\CLSID\$noctty\LocalServer32|=`"$install\noctty\noctty.exe`"" -and
+    $bound -ccontains "Software\Classes\CLSID\$proxyClsid\InprocServer32|=$install\noctty\noctty-terminal-handoff-proxy.dll" -and
+    $bound -ccontains "Software\Classes\CLSID\$proxyClsid\InprocServer32|ThreadingModel=Both") '{install} bound, ThreadingModel kept'
+# Malformed registrations are refused as a whole.
+$row = @{ key = "Software\Classes\CLSID\$noctty\LocalServer32"; name = ''; data = '"{install}\noctty\noctty.exe"' }
+$files = @{ 'noctty/noctty.exe' = (Sha a) }
+function Variant([hashtable]$Change) { $r = $row.Clone(); foreach ($k in $Change.Keys) { if ($null -eq $Change[$k]) { $r.Remove($k) } else { $r[$k] = $Change[$k] } }; $r }
+Must ($null -eq (Get-NocttyRegistration @($row) $install $files).problem) 'a valid row'
+foreach ($case in @(@('empty', @()), @('duplicate', @($row, (Variant @{ key = $row.key.ToUpperInvariant().Replace('SOFTWARE\CLASSES\CLSID', 'Software\Classes\CLSID') }))),
+        @('two spellings of one key', @($row, (Variant @{ key = "Software\Classes\CLSID\$noctty\localserver32\X"; data = 'x' }))),
+        @('shared root', @(Variant @{ key = 'Software\Classes\CLSID' })), @('other root', @(Variant @{ key = "Software\Classes\AppID\$noctty" })),
+        @('lowercase GUID', @(Variant @{ key = "Software\Classes\CLSID\$($noctty.ToLowerInvariant())" })),
+        @('extra field', @(Variant @{ type = 'String' })), @('missing field', @(Variant @{ name = $null })), @('not a string', @(Variant @{ data = 1 })),
+        @('install in key', @(Variant @{ key = "Software\Classes\CLSID\$noctty\{install}" })), @('install not first', @(Variant @{ data = 'x {install}\noctty\noctty.exe' })),
+        @('not an inventory file', @(Variant @{ data = '{install}\noctty\noctty.com' })), @('unbalanced quote', @(Variant @{ data = '{install}\noctty\noctty.exe"' })),
+        @('empty data', @(Variant @{ data = '' })))) {
+    $refused = Get-NocttyRegistration $case[1] $install $files
+    Must ($refused.problem -and -not @($refused.values).Count -and -not @($refused.keys).Count) "registration refuses: $($case[0])"
+}
+Must ([bool](Get-NocttyRegistration @($row) 'Programs\noctty-1' $files).problem) 'a relative install path is refused'
 
 # ---- Owned fonts through the effect ledger (native files and HKCU values) ----
 $fonts = @($manifest.fonts)

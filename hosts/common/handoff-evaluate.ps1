@@ -565,6 +565,51 @@ function Get-MachineNocttyReason($ClsidKeys, $DisplayNames) {
     return $null
 }
 
+# The Noctty default-terminal registration from manifest.noctty.registration: $Rows, each
+# exactly { key; name; data } strings, under the same rules as pack.py noctty_registration.
+# A key is a CLSID or Interface {GUID} key under Software\Classes or beneath it; {install}
+# opens data, optionally quoted, names a file of $Files (the Noctty inventory) and is bound
+# to $Install, the absolute versioned Noctty directory. values are the rows with data bound;
+# keys are every key from the {GUID} key down to each value's key, parents first, each once,
+# so the shared CLSID and Interface roots are never among them. A key spelled in two cases,
+# or a key and name repeated ignoring case, is a problem; with a problem both lists are empty.
+function Get-NocttyRegistration($Rows, [string]$Install, $Files) {
+    $refuse = { param($Reason) [ordered]@{ problem = $Reason; values = @(); keys = @() } }
+    $inventory = ConvertTo-FileMap $Files
+    if ($null -eq $inventory -or -not (Test-EffectPath 'file' $Install)) { return & $refuse 'The inventory or install path is invalid.' }
+    $root = '^Software\\Classes\\(CLSID|Interface)\\\{[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}\}(\\[^\\\x00-\x1f]+)*$'
+    $values, $keys, $seen, $spelled = @(), @(), @{}, @{}
+    foreach ($row in @($Rows)) {
+        $fields = if ($row -is [Collections.IDictionary]) { @($row.Keys) } elseif ($row -is [Management.Automation.PSCustomObject]) { @($row.PSObject.Properties.Name) } else { @() }
+        $key, $name, $data = (Get-Field $row 'key'), (Get-Field $row 'name'), (Get-Field $row 'data')
+        if ((@($fields | Sort-Object) -join ',') -cne 'data,key,name' -or $key -isnot [string] -or $name -isnot [string] -or $data -isnot [string]) {
+            return & $refuse 'A registration row is not exactly { key; name; data } strings.'
+        }
+        if ($key -cnotmatch $root -or $data -eq '' -or ($name + $data) -match '[\x00-\x1f]' -or ($key + $name).Contains('{install}')) {
+            return & $refuse "Invalid registration value: $key [$name]"
+        }
+        if ($data.Contains('{install}')) {
+            if ($data -cnotmatch '^("?)\{install\}\\([^"]+)\1$' -or -not $inventory.ContainsKey($Matches[2].Replace('\', '/'))) {
+                return & $refuse "Registration data does not name a Noctty file: $key [$name]"
+            }
+            $data = $data.Replace('{install}', $Install)
+        }
+        $id = ($key + '|' + $name).ToUpperInvariant()
+        if ($seen.ContainsKey($id)) { return & $refuse "Duplicate registration value: $key [$name]" }
+        $seen[$id] = $true
+        $values += [ordered]@{ key = $key; name = $name; data = $data }
+        $parts = $key.Split('\')
+        for ($i = 4; $i -le $parts.Count; $i++) {
+            $path = $parts[0..($i - 1)] -join '\'
+            $upper = $path.ToUpperInvariant()
+            if (-not $spelled.ContainsKey($upper)) { $spelled[$upper] = $path; $keys += $path }
+            elseif ($spelled[$upper] -cne $path) { return & $refuse "A registration key is spelled in two cases: $path" }
+        }
+    }
+    if (-not $values.Count) { return & $refuse 'The registration is empty.' }
+    [ordered]@{ problem = $null; values = $values; keys = $keys }
+}
+
 # The uninstall plan for all ledger records ($Records, any order) and
 # $Observations, a map id -> current state; a missing observation is indeterminate.
 # Ids are visited by the seq of their open attempt's intent, latest first. Only
