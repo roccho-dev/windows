@@ -1,14 +1,17 @@
 # Common selection → Windows recovery
 
-Issue #7 implementation slice. `nix.nix` owns selections and pins; generated
-DSC configuration is not a second editable Spec. No custom DSC resource,
-WinGet catalog, per-product installer, or new top-level directory is added.
+Issue #7 implementation slice. `nix.nix` is the only authority for selections,
+pins and package locks; `win.ps1` is a small native Windows activation adapter
+that realizes them. No DSC backend, WinGet catalog, per-product installer, or new
+top-level directory is used. (The DSC `Microsoft.Windows/Registry` resource is a
+proof-of-concept example that Microsoft says not to use in production, so the
+bundled DSC backend and its generated document were removed.)
 
 ```text
 flake.lock + common/nix.nix
   ├─ common-fonts          selected TTF bytes and licenses, reusable by Linux
-  └─ windows-dist.zip     fonts + pinned noctty + pinned DSC + generated configs
-       └─ win.ps1         verify → realize files → DSC convergence
+  └─ windows-dist.zip     fonts + pinned noctty + cloudflared + locked package metadata
+       └─ win.ps1         verify → classify → owned effects through the effect ledger
 ```
 
 ## Build and use
@@ -21,43 +24,41 @@ nix build .#common-fonts --no-write-lock-file
 # result/share/fonts
 ```
 
-On a clean Windows 11 x64 installation with Windows PowerShell 5.1 and WinGet,
-verify the ZIP against a checksum from a
-trusted successful CI/release, extract into a fresh directory, then run:
+On a Windows 11 x64 installation with Windows PowerShell 5.1, verify the ZIP
+against a checksum from a trusted successful CI/release, extract into a fresh
+directory, then run:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Validate     # read-only
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Restore      # fonts, Noctty, and two packages
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Restore      # fonts, Noctty, packages (see below)
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RestoreTest  # fail on drift
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Uninstall    # dry run: lists what it would revert
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Uninstall -Apply  # reverts owned fonts and Noctty, restores the selection
 ```
 
-`Restore` converges the selected fonts, the pinned noctty portable ZIP and its
-`font-family = PlemolJP Console NF` configuration, and the pinned WinGet package
-IDs/versions for Chromium and AutoHotkey. The
-selected Chromium WinGet manifest offers a current-user installer. The machine
-needs a network connection and a working WinGet source for those two packages;
-they are not redistributed in the ZIP. `Restore` runs the package DSC `test`
-first and skips `set` only when every package is installed at exactly its pinned
-version (`inDesiredState`, matching `actualState.version`, no differing
-properties); then no installer runs, so an open browser and its profile are left
-alone. The output reports `packagesSet` as `skipped`, `applied` or `notRun`, and
-`RestoreTest` fails on the same version drift. Windows Terminal is OS/Store-owned and is
-not installed or pinned: `Restore` and `RestoreTest` only assert version 1.24 or
-newer, because its OpenConsole is Noctty's console half. Noctty is included because its WinGet
-package is not published. The release ZIP can be downloaded again after a clean install; Nix
-is only needed to build it, not to apply it.
+`Restore` converges the selected fonts and the pinned noctty portable ZIP, its
+`font-family = PlemolJP Console NF` configuration and its default-terminal
+registration (all owned through the effect ledger below), and the locked packages
+(Chromium and AutoHotkey; see "Locked packages" below). Windows Terminal is OS/Store-owned and is not installed or
+pinned: `Restore` and `RestoreTest` only assert version 1.24 or newer, because its
+OpenConsole is Noctty's console half. The release ZIP can be downloaded again
+after a clean install; Nix is only needed to build it, not to apply it.
 
-After installing the dependencies, `Restore` selects the Windows Terminal 1.24+
-OpenConsole console delegate and calls Noctty's `+register-default-terminal` for
-the current user. `Restore` then checks the registration, one COM activation,
-and the delegate pair as read from inside the Windows Terminal package (below);
-any failure restores the previous delegate selection and fails `Restore`.
-`RestoreTest` checks registry state (delegate pair, COM class and proxy DLL
-mappings) and the same package-context pair, and fails if that pair differs or
+`Restore` registers Noctty natively; it never runs Noctty's own
+`+register-default-terminal` (only the CI measurement below does). It owns the
+six COM values and the keys it creates (see "Owned Noctty" below), then writes
+`HKCU\Console\%%Startup` `DelegationConsole` (the Windows Terminal 1.24+
+OpenConsole) and `DelegationTerminal` (Noctty), each only when it differs. It then
+checks the registration, one COM activation, and the delegate pair as read from
+inside the Windows Terminal package (below); if any of that fails after a write,
+only the values this run wrote go back to what this run found just before (not to
+the older prior in the record below, which is `Uninstall`'s), and only while they
+still hold what it wrote; then `Restore` fails.
+`RestoreTest` checks registry state (delegate pair and the six COM values) and
+the same package-context pair, and fails if that pair differs or
 cannot be read; it writes no registry value. It does not start the Noctty COM
 server or open a window, but it starts a Windows PowerShell reader under a
-headless `conhost.exe` inside the Windows Terminal package (below) and still
-runs the DSC and WinGet resource tests. Every mode reports `registrationState`
+headless `conhost.exe` inside the Windows Terminal package (below). Every mode reports `registrationState`
 (`registered` or `unregistered`) and `handoffProof = "unproven"`:
 registration and COM activation are not evidence that a new console opens in
 Noctty, and `inDesiredState` never includes handoff. Windows Terminal remains installed
@@ -82,17 +83,29 @@ The package-context reader needs Windows
 PowerShell 5.1 (Appx module for `Invoke-CommandInDesktopPackage`) and Windows
 Terminal; it does not use Windows Script Host, which on the development host
 had no `.js` script engine.
-`Apply` and `Test` are font-only CI proof modes and do not run this check.
+`Apply` (the CI proof mode) converges the same fonts, Noctty and selection as
+`Restore` without packages, the Windows Terminal version, COM activation and this
+check; `Test` checks fonts only.
 
-Before its first change to `HKCU\Console\%%Startup`, `Restore` writes the prior
-`DelegationConsole`/`DelegationTerminal` values once to
+**Run `Restore`, `Apply` and `Uninstall` as the same user.** The effect ledger
+lives in that user's `%LOCALAPPDATA%`; another account (for example an elevated
+token of a different administrator) reads a different or no ledger and would
+see nothing owned. `Uninstall` reports its `identity` (SID, profile, elevated)
+and `ledgerFound`, and claims an empty owned range only when the ledger was
+found. Inside an app's registry silo the ledger and the font values may be
+virtualized too; font `Uninstall` performs no silo check (`siloCheck =
+"notPerformed"`), so its claim covers only what that process sees.
+
+Before its first change to `HKCU\Console\%%Startup`, `Apply`/`Restore` writes the
+prior `DelegationConsole`/`DelegationTerminal` values once to
 `LocalApplicationData\windows-iac\provenance\default-terminal.json`. The record
-is never replaced; an unreadable record fails `Restore`, and
-`priorSelectsNoctty = true` marks a record taken when Noctty was already
-selected, whose true original is unknown. **Rollback from this record is not
-implemented yet**: no mode reads it, and Noctty's `+unregister-default-terminal`
-effect on COM/Interface keys is unverified. Until then, restore the recorded
-pair by hand and keep the record.
+is never replaced; an unreadable record stops `Apply`/`Restore` before any effect,
+and `priorSelectsNoctty = true` marks a record taken when Noctty was already
+selected, whose true original is unknown. `Uninstall -Apply` restores from it only
+values that still hold what was written,
+`DelegationTerminal` first, so a half-restored pair resumes; a value changed by
+anyone else, or an unknown original, is refused and never guessed. The record is
+kept afterwards.
 
 ### Default-terminal handoff proof (host only)
 
@@ -189,17 +202,192 @@ file stay below the line and are kept once as `config.before-windows-rent`; it
 refuses a byte-order mark, an Include elsewhere, or an existing backup. Access
 credentials are never written here.
 
-`Apply` and `Test` retain their font-only meaning for the CI proof. They own
-selected content-addressed TTF files beneath the current user's
-`LocalApplicationData\Microsoft\Windows\Fonts` and corresponding HKCU font
-registrations. `Restore` also writes the selected noctty configuration and
-default-terminal registration, but
-does not replace Windows-owned UI fonts or restore old registry settings,
-accounts, profiles, or personal app data. The user directory is a runtime Binding, not common Spec.
-Each invocation puts the bundled backend first on `PATH` and in
-`DSC_RESOURCE_PATH`, but discovery is not confined to the bundle: the
-`Microsoft.WinGet/Package` resource is not bundled and is resolved from the
-machine's App Installer/WinGet installation.
+## Owned fonts and the effect ledger
+
+`Apply` (the CI proof mode) and `Restore` own the selected content-addressed
+TTF files beneath the current user's `LocalApplicationData\Microsoft\Windows\Fonts`
+and their `HKCU\Software\Microsoft\Windows NT\CurrentVersion\Fonts` values
+`<full name> (TrueType)` (REG_SZ, the file's path), written natively. `Test` and
+`RestoreTest` read both back. The same ledger owns Noctty (below). Nothing here
+replaces Windows-owned UI fonts or restores old registry settings, accounts,
+profiles, or personal app data. The user directory is a runtime Binding, not
+common Spec.
+
+Every owned effect is recorded in `%LOCALAPPDATA%\windows-iac\ledger`, one file
+per record (`<seq>.json`, created new, written through and flushed) while
+`ledger\.lock` is held: an **intent** before the effect (a new font file names its
+temporary file there first), then a **commit** with the read-back state; reverting
+writes **undone**, and an interrupted intent that never took effect is closed
+**void**. Before anything else, each run recovers interrupted attempts from what
+it reads: an intent whose effect is present is committed, one whose target is
+still absent is voided (deleting only the temporary file that intent named), and
+a committed effect found reverted is closed undone. Anything else stops the run.
+Only what this code created is owned (the prior state is always absent), so:
+
+- A matching file or value that was already there is `preexisting` and never
+  written or removed; one that differs is reported as `Font drift` and left alone.
+- Owned drift (changed bytes or value) is repaired by reverting and owning again.
+- A value recorded for an older selection is reverted and owned again for the new
+  file; owned files no longer selected are collected afterwards (values first).
+  A file that any HKCU or HKLM Fonts value still names (by path, or by the same
+  bytes under another name) is kept and reported as `gcKeptReferenced`.
+- A file Windows has locked (a loaded font) is never deferred or forced: the run
+  fails and the file stays owned for the next run.
+
+### Owned Noctty
+
+`Apply`/`Restore` classify every Noctty effect before the first effect of the
+run, then (after fonts) create only what is absent, in this order:
+
+1. the tree `%LOCALAPPDATA%\Programs\noctty-<version>`, extracted from the bundled
+   ZIP only after every entry name is checked against the pinned inventory, into
+   a staging directory its intent names, compared exactly, then renamed;
+2. `%LOCALAPPDATA%\noctty\config.ghostty` (`font-family = …`);
+3. the `HKCU\Console\%%Startup` key, if missing;
+4. the COM keys derived from the six values in `nix.nix` (below
+   `Software\Classes\CLSID\{…}` and `…\Interface\{…}`, parents first; an existing
+   key is never owned, and the shared `CLSID`/`Interface` roots never are), then
+   the six REG_SZ values; then the selection above.
+
+Shared parents they need (`Programs`, `%LOCALAPPDATA%\noctty`, the two roots)
+are created as needed, listed in `sharedCreated`, and never removed. No Start-menu
+shortcut is created; an existing one is untouched. The run stops before any
+effect on: a machine-wide Noctty (either CLSID in HKLM, or an HKLM Uninstall
+entry naming it); a tree that differs from the inventory, owned or not (an extra,
+missing or changed file, a junction, an empty directory), which is never
+overwritten; or a COM registration that is neither entirely present and exact
+(then nothing is written for it) nor entirely absent or owned (**K-rule**: one
+foreign or differing value, or a mix, refuses), or, when the registration will be
+written, an existing COM key holding any value or subkey other than the declared
+ones (an existing empty key is fine, and never owned). An unrecorded tree or value that
+exactly matches is `preexisting-match`: left alone and never owned (A2), so an
+exact pre-ledger Noctty (as on the development host) is not written. A differing
+configuration is reported as `Noctty drift` and never written. Version drift (a
+registration naming another version's tree) is a differing value: it refuses.
+If a running Noctty ever writes into its own tree, that tree reads as drift and
+`RestoreTest` fails for that site; this is recorded, not hidden (unmeasured: G3).
+After a version change, the older version's owned tree stays until `Uninstall`,
+which removes it too; `Apply`/`Restore` do not collect it. In `Restore`, package
+installation (disabled until S-A2) comes after this plan, so no package changes
+before a Noctty refusal.
+
+The vendor registration also writes bookkeeping keys (`…\{Noctty}\noctty.default-terminal`
+with `Present = 0` markers) and two CLSID description strings. They are **not**
+written here, on the reading that COM never reads them; this stays conditional on
+the VM proof below.
+
+`Uninstall` without `-Apply` changes nothing and lists the plan. With `-Apply` it
+plans everything first; if anything is refused (owned drift other than a partly
+removed tree, an unhandled id, a file an unowned Fonts value names, a created key
+holding a value or subkey the plan does not remove (**A3**), an unowned COM
+server path naming an owned tree, or, while owned COM values would go, a
+selection record that cannot restore or would leave Noctty selected), nothing is
+removed. Otherwise it restores the selection (above), reads it again and stops if
+Noctty is still selected, then removes owned values, created keys (deepest first,
+only while empty), owned files, and last owned trees (file by file, then empty
+directories, never recursively), checking the COM guard again just before. A tree
+left partly removed (a crash, or a file locked by a running `noctty.exe`) is
+resumed by the next `Uninstall` (`resumed`). A key someone else writes into
+between the check and its removal would lose that value with it (a small window;
+A3 refuses it at plan time). It reports `ownedOpen` (0 when empty),
+`changedAfterClose` (closed targets that no longer read as their prior; reported,
+not a failure), `defaultTerminal` (the rollback action), `retained` (the ledger
+and provenance directories, which are state rather than effects) and
+`notInLedger` (an existing shortcut, the default-terminal record and RentSsh).
+`Apply` and `Uninstall` may run elevated on a disposable runner; `Restore` may not.
+
+### Locked packages
+
+`Restore` covers every lock in `nix.nix`; `Apply` covers only those named by
+`-Mode Apply -Packages AutoHotkey,Chromium` (exact lock names) and none otherwise.
+After recovery and before any effect, each package is classified: the effect
+ledger decides ownership of its tree `%LOCALAPPDATA%\Programs\<name>-<version>`
+(one `tree-extracted` effect whose intent names the package); an HKCU or HKLM
+(64- or 32-bit) Uninstall entry with its declared key, or DisplayName and
+Publisher, is never taken over (`preexisting-match` when DisplayVersion and the
+ProductVersion of that entry's own executable equal the lock, else
+`preexisting-drift`), and beside an owned tree it is a conflict, reported as drift;
+an unrecorded tree is `preexisting-match` only when it is exactly the pinned
+inventory; declared protected data (the Chromium `User Data` profile) is someone
+else's, `preexisting-drift`, unless the ledger shows this package was once
+installed and committed here (R1). Only `absent` installs. An indeterminate or
+owned-drift package, too little space (asset + `unpackedSize` + seed + 64 MiB) or a path
+at the Windows PowerShell 5.1 limits stops the run before any effect.
+
+An install writes its intent first, then downloads the locked URL with the inbox
+`curl.exe` (HTTPS only, redirects too, bounded time) to the one file the intent
+implies (`<staging>.asset`), checks size, SHA-256 and SHA-1 while holding it open
+against writers, checks the `tar -tf` listing against the pinned inventory, extracts
+with the inbox `tar.exe` into the staging directory, deletes the asset, requires the
+staging tree to be exactly the inventory, renames it into place and commits. An
+interrupted install is recovered: the asset and the inventory-named staging files
+are removed and the intent voided; anything else there stops recovery and is kept.
+Once the selected version is owned and exact, owned trees of its other versions are
+removed the Uninstall way (a tree in use, or one another effect refers to, is kept
+and reported). `Uninstall` refuses, before removing anything, while a package's
+executable is in use; it never removes protected data, a foreign App Paths name or an
+external install. A 7z asset (Chromium) installs like a ZIP, through inbox
+`tar.exe`.
+
+**Launch by name (App Paths).** A lock's `appPath` (Chromium: `chromium.exe`, never the
+executable's own name) is the only name owned: the key
+`HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths\<appPath>` and its default
+REG_SZ naming the owned executable, written after the tree and pointed at a new
+version before old trees go; the `App Paths` key itself is shared, never owned. It is
+written only for a package owned exactly (or just installed) without a conflict or a
+profile its seed would overwrite, and only while the key and its default value are each
+absent or owned: a key or value this distribution does not own is drift even with our
+exact data (never taken over; remove it by hand, then `Restore`), and so is the name in
+HKLM (64- or 32-bit view), which HKCU would shadow; an owned key that later meets one is
+only reported. While it names a tree, that tree is not collected or uninstalled unless
+the same plan removes the value. A name no lock declares any more is collected by a run
+that handles packages (`Restore`, or `Apply -Packages`): value, then key, only while the
+key holds nothing else, and never while a seed would overwrite a profile; `Uninstall`
+removes it likewise, refusing a key with foreign content (A3).
+Nothing else is registered: no `Path` value, shortcut, PATH, HKLM, file or URL
+association, or default-browser entry. **Limits now:** a package removed from the
+locks altogether leaves its ledger records unreadable, as for its tree; a read-only
+file in an extracted tree would make `Uninstall` fail (recorded, not hidden).
+
+**Chromium font seed.** `pack.py` generates
+`payload/chromium/initial_preferences` from the lock's `seed` roles: exactly the six
+preferences `webkit.webprefs.fonts.{standard,sansserif,fixed}.{Zyyy,Jpan}`, IBM Plex Sans
+JP proportional and PlemolJP Console NF fixed (every TTF of a role must carry that
+typographic family). The manifest records its `path` beside `chrome.exe` in the owned
+tree, `file`, `sha256` and `size`; the archive may hold no `initial_preferences` or
+`master_preferences` there, and the seed is outside `files` and `unpackedSize`. An
+install lists the archive against the inventory alone, then, after extraction, writes
+the seed into staging as a new, flushed file from the bundle (length and SHA-256
+checked again); the staged tree must be exactly the inventory and the seed, which
+recovery and `Uninstall` remove with the tree. An owned tree recorded for another
+inventory or seed of the same version is `owned-drift` (Uninstall, then install again).
+Chromium reads the seed only on a first run, for a `User Data` without its `First Run` sentinel, and then
+**overwrites that profile's existing `Preferences`**. So every mode reads, and never
+writes, `User Data\First Run` and `User Data\Default\Preferences` (no mode starts
+Chromium): while `Default\Preferences` exists without `First Run`, an install is
+refused (besides R1, which refuses any profile without this package's history), and
+an owned seeded tree never converges. Like R1, this writes nothing for Chromium and
+fails as package drift after the other effects (`RestoreTest` fails too), saying not
+to start that Chromium; only an owned-drift tree (C1) stops the run before any
+effect. `Uninstall` removes the tree with its seed, never the profile. Boundary: a profile present at `Restore` is not
+installed over; a partial `User Data` restored by hand after the install and started
+before the next `Restore`/`RestoreTest` is outside automated prevention. Only
+`Default` is checked; other profiles, and this build's own first-run behaviour, are
+unproven until the VM run. Sites that set fonts in CSS, serif, other scripts, and
+Chromium's and Windows' own UI are unaffected; a later user setting prevails, and sync
+may.
+
+**Torn record.** A power loss can tear only the highest-seq record, and every mode
+that reads the ledger then stops. Remove that one file by hand only if it is the
+highest `<seq>.json` **and** does not parse as JSON; then rerun, and recovery
+closes the attempt from the machine's state. A record that parses but is invalid
+is never removed: stop and investigate.
+**Stale lock.** A power loss can also leave `ledger\.lock`, and every writer then stops with "Another run holds the effect ledger lock"; delete that one file by hand only when no `win.ps1` (`powershell.exe`) process is running.
+
+**#14 (RentSsh).** The ledger owns only what it created (prior absent). A
+`prefix-inserted` or `file-replaced` effect cannot be moved to a new version by
+undo-then-rewrite, because the restored prior classifies as `preexisting-*`; #14
+must define an explicit transition record first.
 
 The ZIP checksum binds transported bytes. The embedded inventory detects
 post-extraction corruption, not publisher authenticity. The manifest records
@@ -207,26 +395,103 @@ the source commit; the Windows proof requires the expected exact commit.
 
 ## Failure and restoration
 
-A failed apply can leave partial state. Rerun the same artifact to converge,
-but corrupt registered/in-use font files may be locked by Windows and cause
-Apply to fail. This adapter does not stop OS services or reboot to unlock them.
-New font versions use new content-addressed filenames, avoiding in-place updates.
-
-Reapplying a prior artifact restores registrations for names it owns. This is
-**not transactional rollback or garbage collection**: removed family names and
-old content-addressed files are deliberately not deleted.
+A failed apply can leave partial state and an open ledger attempt; rerun the same
+artifact and recovery converges it. Corrupt registered/in-use font files may be
+locked by Windows and make the run fail; this adapter does not stop OS services
+or reboot to unlock them. New font versions use new content-addressed filenames,
+avoiding in-place updates.
 
 ## Proof boundaries
 
-`test_pack.py` covers compiler metadata, license retention, deterministic ZIPs,
-hash inventories, and empty/duplicate/unsafe-input rejection using synthetic
-fixtures. It is not native Windows evidence.
+`test_pack.py` covers compiler metadata, license retention, font families,
+deterministic ZIPs and seed bytes, hash inventories, and empty/duplicate/unsafe/
+colliding-input rejection using synthetic fixtures. It is not native Windows evidence.
 
 `proof.ps1` runs only on disposable GitHub-hosted Windows runners. It requires
-exact source identity, repairs damaged bytes seeded before registration,
-applies twice with zero changes on the second apply, independently reads actual
-registry values, rejects and repairs registry drift, and rejects package
-corruption. It also requires every `win.ps1` answer to report
+exact source identity; checks the pure ledger classification for every kind;
+applies twice with one intent and one commit per owned file and value and zero
+changes on the second apply; independently reads the files and values back from
+`manifest.fonts`; repairs owned value and byte drift and refuses unowned drift;
+rejects package corruption; replays interrupted attempts (void, commit, undone,
+temporary files an intent named, a temporary file none named, a second writer, a
+torn record); keeps files a foreign value names; moves an owned value to a new
+selection and collects the old file; and uninstalls (dry run unchanged, locked
+file kept owned, then empty, then a no-op), all with Noctty converged by the same
+`Apply` (A22). For Noctty (A15-A21) it checks the order of the owned effects and
+an independent readback of the tree, configuration, keys, six values and
+selection; a differing owned or unowned tree refused before any effect; a
+half-restored selection and a partly removed tree resumed by `Uninstall`; an
+interrupted extraction voided and its staging cleaned; A3, the K-rule (one value
+exact or foreign with the rest absent) and the COM guard (six exact unowned
+values naming an owned tree) refusing before any removal; a differing user
+configuration kept; and an exact unowned tree left alone. The create and undo
+primitives also run in a Windows PowerShell 5.1 child on synthetic targets. The
+G4 gate measures the vendor's own registration against the six values. A
+`Restore` rollback after a failed activation or package check is not exercised
+on CI (`Restore` refuses the elevated runner, whose Windows Terminal is 1.23).
+For packages (A23-A30, AutoHotkey and Chromium each downloaded once) it checks the
+`-Packages` contract and R1 before any effect, an external
+entry never taken over (alone or beside the owned tree), a clean AutoHotkey install
+owned exactly with no asset or staging left and a second Apply writing nothing,
+an owned older version collected, interrupted installs recovered (asset and
+staging removed; foreign staging content kept), and `Uninstall` refusing while the
+executable is in use, then removing the tree but not the profile. For the Chromium
+seed (A28 and the primitives) it checks the bundled bytes against the font roles, every
+malformed seed refused, the listing against the inventory alone, a staging tree exact
+only after the verified seed is written (a differing one writes nothing), recovery
+removing the seed, and, with the profile only read, O1 keeping Chromium from installing
+(package drift, nothing written) and C1 stopping a stand-in owned tree before any effect.
+A29 installs the locked Chromium for real through `win.ps1` (`Apply -Packages
+Chromium`) over the proof's stand-in profile, with `First Run` beside it and this
+package's history (so R1 and O1 allow it and the profile is never written): one intent
+naming the package and one commit, the tree exactly the inventory and the seed, no
+asset or staging left. Its first run is then observed and asserted, within a budget of
+about 120 s (each step starts only when its bounded share is left; the final bounded
+cleanup and readouts come on top), the baseline taken after the install and just
+before the first launch: the owned tree is started only with scratch
+`--user-data-dir` profiles on the runner. It requires `First Run` and the six seed
+preferences after a first GUI run; which of `Default` and `Profile
+1` a first run over Preferences without `First Run` overwrites; the fonts a headless PDF
+embeds; the tree unchanged; every `chrome.exe` as tree, descendant (traced by PID and
+creation time, its parent seen running at or after the child's creation), outside (only
+with a readable path elsewhere) or unknown, its windows closed one by one and 45 s to
+end, only tree and descendant processes ever killed, and H1 (all ended), H2 (the browser
+stays for an observed reason: background mode, or a window still left after closing)
+or H3 (outside) decided only on positive evidence, an unknown survivor being unproven,
+never a pass; Local State's `background_mode.enabled`; nothing new under the default
+`%LOCALAPPDATA%\Chromium` (moved aside, never deleted, never through a reparse point;
+anything not moved is a stop condition); fixed HKCU names before and after, read before
+any move, every added App Paths, Uninstall, StartMenuInternet, RegisteredApplications and
+`Software\Classes` name (those directly under it and OpenWithProgids) listed; any stop
+condition fails the proof (only an unreadable PDF and the names added outside App Paths
+and Uninstall are record only). A second Apply then writes nothing for Chromium, still
+owned exactly, and `Uninstall` removes the tree with its seed and keeps the profile and
+the scratch profiles. Within A29 (one download), A30 checks the same install owned
+`App Paths\chromium.exe` (one REG_SZ default naming the owned `chrome.exe`, written
+once), that a foreign value in the key stops `Uninstall` before any removal, and that
+`Uninstall` removes the value, then the key (the runner must have no
+`App Paths\chromium.exe` in HKCU or either HKLM view beforehand). It then reports
+`appPathsLaunch` in the proof's answer: `proven` when ShellExecute (Win+R's API), from an
+empty directory with `chromium` on no PATH, starts exactly the owned `chrome.exe` by the
+name `chromium`, and the same launch then fails with "file not found" after `Uninstall`;
+`unproven` only when `chromium`, `chromium.exe` and a same-name HKCU probe (a copy of
+`PING.EXE` registered under its own name, both spellings) all fail with "file not found"
+on this elevated runner, that is, none of the names tried here (`chromium`,
+`chromium.exe`, same-name probe in two spellings) resolved using this ShellExecute
+method; any other
+outcome fails the proof. The primitives prove, on a throwaway name in the runner's real
+HKCU, a foreign key (even with our exact data) as drift that is never written, HKLM
+conflicts (stubbed), re-pointing, the tree reference and retired names; the main
+`Apply`/`RestoreTest` path meeting a foreign key (nothing written, package drift at the
+end) is not exercised end to end, only its decision. The
+runner is an elevated Windows Server: a clean, unelevated Windows 11 user's `Restore`,
+first run on the default `User Data` and Win+R itself are proven only by the VM run.
+**Required before #7 is complete and before this build is used on a real host, whatever
+`appPathsLaunch` says (VM run, S7):** on a clean
+Windows 11 VM, as an unelevated user in an Explorer-launched session, Win+R `chromium`
+after `Restore` starts the owned `chrome.exe` (positive), and the same Win+R after
+`Uninstall` finds nothing (negative).
+It also requires every `win.ps1` answer to report
 `handoffProof = "unproven"` and `handoff-proof.ps1` to refuse the runner, so CI
 never claims a real default-terminal handoff. Negative controls must fail for
 their expected reason.
@@ -243,8 +508,19 @@ proven target-owned smoke tests and publication still need composition into the
 final single `ci.yml` with the open OCI stack. Do not discard existing proof to
 claim one workflow prematurely. Existing OCI definitions and #8 are unchanged.
 
-`%LOCALAPPDATA%\windows-iac\provenance\default-terminal.json` is new per-user
-state written by `Restore`; no current uninstall or rollback path removes it.
+`%LOCALAPPDATA%\windows-iac\provenance\default-terminal.json` is per-user state;
+rollback reads it and nothing removes it. A clean Chromium install and its App Paths
+registration are enabled and proven on the CI runner (A29, A30; the launch by name as
+`appPathsLaunch` reports), but the VM run, including the Win+R positive and negative
+above, is still open, so `Restore`/`Uninstall` as a whole is not complete.
+
+**Required on a VM before the native registration is accepted (unproven here):**
+from an unelevated, Explorer-launched shell with Windows Terminal 1.24 or newer,
+`Restore` (COM activation and the package-context pair), the handoff proof above
+(a new console opens in this Noctty), and one GUI start and close of Noctty
+showing no write inside its tree (G3). These also gate leaving out the vendor's
+bookkeeping keys and descriptions; if handoff fails without them, they become
+owned values.
 
 Application/UI selection beyond noctty, Japanese/Nerd/Emoji rendering,
 font reload/relogin, Linux profile activation, and real-host
