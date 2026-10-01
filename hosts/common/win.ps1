@@ -138,7 +138,8 @@ if ($null -ne $uiTypography -and (-not (Test-UiFontFace (Get-Field $uiTypography
     throw 'Invalid typography in manifest.'
 }
 if ($Typography -and $null -eq $uiTypography) { throw 'This distribution selects no UI font face.' }
-# Store apps Restore installs when absent (pack.py checks the same shape); never owned, updated or removed.
+# Store apps Restore installs when absent; introduced identities are ledgered with removal held.
+# Existing packages and all user data remain unowned.
 $apps = @(Get-Field $manifest 'apps' | Where-Object { $null -ne $_ })
 foreach ($app in $apps) {
     if ((Get-Field $app 'source') -cne 'msstore' -or [string](Get-Field $app 'id') -cnotmatch '^[0-9A-Z]{12}\z' -or
@@ -158,6 +159,9 @@ foreach ($app in $apps) {
     }
 }
 if (@($apps | Where-Object { $null -ne (Get-Field $_ 'appearance') }).Count -gt 1) { throw 'Two apps preconfigure the one Codex config.' }
+$wingetBootstrap = Get-Field $manifest 'wingetBootstrap'
+$problem = Get-BootstrapProblem $wingetBootstrap
+if ($problem -or ($apps.Count -and $null -eq $wingetBootstrap)) { throw "Invalid WinGet recovery metadata: $problem" }
 $packageDirectories = @($manifest.packages | ForEach-Object { $_.directory })
 if (@($packageDirectories | Sort-Object -Unique).Count -ne $packageDirectories.Count) { throw 'Duplicate package directory.' }
 $protectedPaths = @($manifest.packages | ForEach-Object { @($_.protected) })
@@ -661,6 +665,7 @@ function IsPackageTree([string]$Target) {
 # Anything else is outside this version and stops the run.
 function Observe($Effect) {
     $kind, $target = [string](Get-Field $Effect 'kind'), [string](Get-Field $Effect 'target')
+    if ($kind -ceq 'appx-package' -and (Test-EffectPath $kind $target)) { return ObserveAppx (Get-Field $Effect 'desired') }
     if ($kind -ceq 'ui-font-face' -and (Test-EffectPath $kind $target)) { return ObserveUiFont $target.Substring('winmetrics:'.Length) }
     if ($kind -ceq 'pref-value' -and (IsChromiumPrefs $target)) { return ObservePref $target ([string](Get-Field $Effect 'name')) }
     if ($kind -ceq 'app-theme-fonts' -and (Test-EffectPath $kind $target)) { return ObserveAppFonts $target.Substring('codex-config:desktop.'.Length) }
@@ -1326,10 +1331,213 @@ function AppStates {
 function ConvergeApps {
     foreach ($state in @(AppStates | Where-Object { $_.action -ceq 'install' })) {
         $winget = Join-Path $localAppData 'Microsoft\WindowsApps\winget.exe'
-        if (-not (Test-Path -LiteralPath $winget)) { $script:appDrift += "$($state.app.name): WinGet (App Installer) is missing; not installed"; continue }
-        $null = Invoke-Native $winget @('install', '--id', $state.app.id, '--source', 'msstore', '--exact', '--silent', '--disable-interactivity',
-            '--accept-package-agreements', '--accept-source-agreements') 1800
+        EnsureWinGet $winget
+        $effect = AppxEffect $state.app.package $state.app.publisherId $null
+        IntroduceAppx $effect {
+            $null = Invoke-Native $winget @('install', '--id', $state.app.id, '--source', 'msstore', '--exact', '--silent', '--disable-interactivity',
+                '--accept-package-agreements', '--accept-source-agreements') 1800
+        }
+    }
+}
+
+# Current-user native inventory. Version/full name are provenance; provider updates
+# do not revoke ownership of an introduced package family.
+function AppxRows([string]$Name) {
+    @(Get-AppxPackage -Name $Name -ErrorAction Stop | ForEach-Object {
+        [ordered]@{ name = [string]$_.Name; publisherId = [string]$_.PublisherId; publisher = [string]$_.Publisher
+            version = [string]$_.Version; fullName = [string]$_.PackageFullName
+            architecture = ([string]$_.Architecture).ToLowerInvariant(); framework = [bool]$_.IsFramework }
+    })
+}
+
+function ObserveAppx($Identity) {
+    $name, $publisher = [string](Get-Field $Identity 'name'), [string](Get-Field $Identity 'publisherId')
+    $found = @(AppxRows $name)
+    if (-not $found.Count) { return [ordered]@{ exists = $false } }
+    if (@($found | Where-Object { $_.name -cne $name -or $_.publisherId -cne $publisher }).Count) { throw "Appx identity conflict: $name" }
+    [ordered]@{ exists = $true; name = $name; publisherId = $publisher; packages = $found }
+}
+
+function AppxEffect([string]$Name, [string]$PublisherId, $Provenance) {
+    $target = "appx:${Name}_$PublisherId"
+    $desired = [ordered]@{ exists = $true; name = $Name; publisherId = $PublisherId }
+    if ($null -ne $Provenance) { $desired.provenance = $Provenance }
+    [ordered]@{ kind = 'appx-package'; id = 'appx-package:' + $target; target = $target
+        prior = [ordered]@{ exists = $false }; desired = $desired }
+}
+
+# Intent precedes the native call. A native failure can follow successful package
+# effects: recovery reobserves and commits rather than losing their provenance.
+function IntroduceAppx($Effect, [scriptblock]$Deploy) {
+    if ((ObserveAppx $Effect.desired).exists) { throw "Refusing to introduce $($Effect.target): it already exists." }
+    WriteRecord 'intent' $Effect $null
+    Recovering $Effect {
+        & $Deploy
+        $observed = ObserveAppx $Effect.desired
+        if (-not $observed.exists) { throw "Native deployment did not introduce $($Effect.target)." }
+        WriteRecord 'commit' $Effect $observed
         $script:changed++
+    }
+}
+
+# Read only one named entry. XML has no DTD or external resolver.
+function AppxXml($Zip, [string]$Entry) {
+    $entries = @($Zip.Entries | Where-Object { $_.FullName -ceq $Entry })
+    if ($entries.Count -ne 1) { throw "Archive must contain exactly one $Entry." }
+    $stream = $entries[0].Open()
+    $settings = [Xml.XmlReaderSettings]::new(); $settings.DtdProcessing = 'Prohibit'; $settings.XmlResolver = $null
+    $reader = [Xml.XmlReader]::Create($stream, $settings)
+    try { $document = [Xml.XmlDocument]::new(); $document.XmlResolver = $null; $document.Load($reader); return $document }
+    finally { $reader.Dispose(); $stream.Dispose() }
+}
+
+# Check identity and every dependency minimum from the actual inner manifests.
+function AssertAppxManifest($Xml, $Expected, [string]$Publisher, [bool]$Framework, $Dependencies) {
+    $identity = $Xml.SelectSingleNode('/*[local-name()="Package"]/*[local-name()="Identity"]')
+    $frameworkNode = $Xml.SelectSingleNode('/*[local-name()="Package"]/*[local-name()="Properties"]/*[local-name()="Framework"]')
+    $isFramework = $null -ne $frameworkNode -and $frameworkNode.InnerText -ceq 'true'
+    if ($null -eq $identity -or $identity.GetAttribute('Name') -cne $Expected.name -or
+        $identity.GetAttribute('Publisher') -cne $Publisher -or $identity.GetAttribute('Version') -cne $Expected.version -or
+        $identity.GetAttribute('ProcessorArchitecture') -cne 'x64' -or $isFramework -ne $Framework) {
+        throw "Package manifest differs from locked $($Expected.name) x64 identity/version/framework."
+    }
+    $actual = @($Xml.SelectNodes('/*[local-name()="Package"]/*[local-name()="Dependencies"]/*[local-name()="PackageDependency"]'))
+    if ($actual.Count -ne @($Dependencies).Count) { throw 'Package dependency count differs from the lock.' }
+    foreach ($dependency in @($Dependencies)) {
+        $match = @($actual | Where-Object { $_.GetAttribute('Name') -ceq $dependency.name -and
+            $_.GetAttribute('Publisher') -ceq $Publisher -and $_.GetAttribute('MinVersion') -ceq $dependency.version })
+        if ($match.Count -ne 1) { throw "Package dependency manifest differs: $($dependency.name)" }
+    }
+}
+
+function AssertMicrosoftSignature([string]$Path, [string]$Publisher) {
+    $signature = Get-AuthenticodeSignature -LiteralPath $Path
+    if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate -or $signature.SignerCertificate.Subject -cne $Publisher) {
+        throw 'Bootstrap package does not have a valid locked Microsoft signature.'
+    }
+}
+
+# Copy only explicitly named locked members, CreateNew, never extract a ZIP tree.
+function CopyAppxEntry($Zip, [string]$Entry, [string]$Path) {
+    $entries = @($Zip.Entries | Where-Object { $_.FullName -ceq $Entry })
+    if ($entries.Count -ne 1) { throw "Archive must contain exactly one $Entry." }
+    $input = $entries[0].Open()
+    try { $output = [IO.File]::Open($Path, 'CreateNew', 'Write', 'None'); try { $input.CopyTo($output); $output.Flush($true) } finally { $output.Dispose() } }
+    finally { $input.Dispose() }
+}
+
+function FetchBootstrap($Lock, [string]$Path) {
+    $null = Invoke-Native (Join-Path $env:SystemRoot 'System32\curl.exe') @('-q', '--fail', '--silent', '--show-error', '--location',
+        '--proto', '=https', '--proto-redir', '=https', '--max-time', '600', '--output', $Path, $Lock.url) 660
+    $stream = [IO.File]::Open($Path, 'Open', 'Read', 'Read')
+    try {
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        try { $sha = -join ($hasher.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') }) } finally { $hasher.Dispose() }
+        $problem = Get-AssetProblem $Lock $stream.Length $sha ''
+        if ($problem) { throw "Bootstrap asset differs from lock: $problem" }
+        $stream.Position = 0
+        return $stream  # held against writers through validation and native deployment
+    } catch { $stream.Dispose(); throw }
+}
+
+function BootstrapExpected($Package, [bool]$AppInstaller) {
+    [ordered]@{ name = $Package.name; publisherId = $wingetBootstrap.publisherId
+        version = $(if ($AppInstaller) { $Package.appVersion } else { $Package.version }) }
+}
+
+function BootstrapAction($Expected, [string]$AliasPath, [switch]$AppInstaller) {
+    Get-BootstrapAction @(AppxRows $Expected.name) $Expected (Test-Path -LiteralPath $AliasPath -PathType Leaf) -AppInstaller:$AppInstaller
+}
+
+# Recheck before each call; do not pass a lower/foreign framework to native update resolution.
+function DeployBootstrap($Expected, [string]$Path, $Provenance, [string]$AliasPath, [switch]$AppInstaller) {
+    $action = BootstrapAction $Expected $AliasPath -AppInstaller:$AppInstaller
+    if ($action -ceq 'present') { return }
+    if ($action -cne 'install') { throw "Existing $($Expected.name) is protected; bootstrap refused." }
+    IntroduceAppx (AppxEffect $Expected.name $Expected.publisherId $Provenance) {
+        if ($AppInstaller) { $null = Add-AppxPackage -Path $Path -StubPackageOption InstallFull -ErrorAction Stop }
+        else { $null = Add-AppxPackage -Path $Path -ErrorAction Stop }
+    }
+}
+
+# Native processor inventory distinguishes ARM64 hosts running an emulated x64
+# process. Process environment variables alone cannot establish host architecture.
+function AssertBootstrapHost {
+    $processors = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)
+    if (-not [Environment]::Is64BitOperatingSystem -or -not $processors.Count -or
+        @($processors | Where-Object { $_.Architecture -ne 9 }).Count) { throw 'Absent-AppInstaller recovery supports native x64 Windows only.' }
+}
+
+# Lazy: ConvergeApps calls this only for absent apps. Present apps have no WinGet
+# prerequisite. A disabled alias on registered App Installer is reported untouched.
+# Provisioned-only is not assumed present. Bootstrap is x64 only, never elevated.
+function EnsureWinGet([string]$AliasPath) {
+    $bundle = $wingetBootstrap.bundle
+    $expected = BootstrapExpected $bundle $true
+    $action = BootstrapAction $expected $AliasPath -AppInstaller
+    if ($action -ceq 'present') { return }
+    if ($action -cne 'install') { throw 'Existing App Installer or disabled WinGet alias is protected; restore it explicitly before installing a Store app.' }
+    AssertBootstrapHost
+    if (-not (Get-Command Add-AppxPackage -ErrorAction Stop).Parameters.ContainsKey('StubPackageOption')) { throw 'Native full-package deployment is unavailable; bootstrap refused.' }
+    $dependencies = @($wingetBootstrap.dependencies.packages)
+    foreach ($package in $dependencies) {
+        if ((BootstrapAction (BootstrapExpected $package $false) $AliasPath) -ceq 'refuse') { throw "Existing $($package.name) is below the required version or foreign; untouched." }
+    }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $scratch = Join-Path ([IO.Path]::GetTempPath()) ('windows-iac-winget-' + [guid]::NewGuid().ToString('N'))
+    if (Test-Path -LiteralPath $scratch) { throw 'Bootstrap scratch path already exists.' }
+    $null = [IO.Directory]::CreateDirectory($scratch)
+    $paths, $handles, $archives = @(), @(), @()
+    try {
+        $bundlePath, $dependenciesPath = (Join-Path $scratch 'installer.msixbundle'), (Join-Path $scratch 'dependencies.zip')
+        $paths += $bundlePath, $dependenciesPath
+        $bundleStream = FetchBootstrap $bundle $bundlePath; $handles += $bundleStream
+        $dependenciesStream = FetchBootstrap $wingetBootstrap.dependencies $dependenciesPath; $handles += $dependenciesStream
+        AssertMicrosoftSignature $bundlePath $wingetBootstrap.publisher
+        $bundleZip = [IO.Compression.ZipArchive]::new($bundleStream, 'Read', $true); $archives += $bundleZip
+        $dependencyZip = [IO.Compression.ZipArchive]::new($dependenciesStream, 'Read', $true); $archives += $dependencyZip
+        $bundleXml = AppxXml $bundleZip 'AppxMetadata/AppxBundleManifest.xml'
+        $identity = $bundleXml.SelectSingleNode('/*[local-name()="Bundle"]/*[local-name()="Identity"]')
+        $application = @($bundleXml.SelectNodes('/*[local-name()="Bundle"]/*[local-name()="Packages"]/*[local-name()="Package"]') |
+            Where-Object { $_.GetAttribute('Type') -ceq 'application' -and $_.GetAttribute('Architecture') -ceq 'x64' -and $_.GetAttribute('IsStub') -cne 'true' })
+        if ($null -eq $identity -or $identity.GetAttribute('Name') -cne $bundle.name -or
+            $identity.GetAttribute('Publisher') -cne $wingetBootstrap.publisher -or $identity.GetAttribute('Version') -cne $bundle.version -or
+            $application.Count -ne 1 -or $application[0].GetAttribute('FileName') -cne $bundle.entry -or
+            $application[0].GetAttribute('Version') -cne $bundle.appVersion) { throw 'App Installer bundle identity/version/x64 entry differs from lock.' }
+        $innerPath = Join-Path $scratch 'app.msix'; $paths += $innerPath
+        CopyAppxEntry $bundleZip $bundle.entry $innerPath
+        $innerStream = [IO.File]::Open($innerPath, 'Open', 'Read', 'Read'); $handles += $innerStream
+        $innerZip = [IO.Compression.ZipArchive]::new($innerStream, 'Read', $true); $archives += $innerZip
+        AssertAppxManifest (AppxXml $innerZip 'AppxManifest.xml') $expected $wingetBootstrap.publisher $false $dependencies
+        $deployments = @()
+        foreach ($package in $dependencies) {
+            $path = Join-Path $scratch ([IO.Path]::GetFileName($package.entry)); $paths += $path
+            CopyAppxEntry $dependencyZip $package.entry $path
+            $stream = [IO.File]::Open($path, 'Open', 'Read', 'Read'); $handles += $stream
+            $zip = [IO.Compression.ZipArchive]::new($stream, 'Read', $true); $archives += $zip
+            $wanted = BootstrapExpected $package $false
+            AssertAppxManifest (AppxXml $zip 'AppxManifest.xml') $wanted $wingetBootstrap.publisher $true @()
+            AssertMicrosoftSignature $path $wingetBootstrap.publisher
+            $deployments += [ordered]@{ expected = $wanted; path = $path }
+        }
+        # All archive checks precede the first deployment intent, no force/shutdown flags.
+        foreach ($deployment in $deployments) { DeployBootstrap $deployment.expected $deployment.path $wingetBootstrap.dependencies $AliasPath }
+        foreach ($package in $dependencies) {
+            if ((BootstrapAction (BootstrapExpected $package $false) $AliasPath) -cne 'present') { throw 'App Installer dependency presence changed; bundle deployment refused.' }
+        }
+        DeployBootstrap $expected $bundlePath $bundle $AliasPath -AppInstaller
+        if ((BootstrapAction $expected $AliasPath -AppInstaller) -cne 'present') { throw 'Native deployment did not provide the WinGet alias; provenance retained.' }
+    } finally {
+        foreach ($archive in $archives) { $archive.Dispose() }
+        foreach ($handle in $handles) { $handle.Dispose() }
+        # Bounded files only, non-recursive. Foreign entries stop cleanup, not adopted.
+        foreach ($path in $paths) {
+            $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            if ($null -eq $item) { continue }
+            if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Bootstrap scratch contains a foreign entry; retained.' }
+            [IO.File]::Delete($path)
+        }
+        [IO.Directory]::Delete($scratch, $false)
     }
 }
 
@@ -2385,7 +2593,7 @@ function Uninstall {
     }
     $answer = [ordered]@{ mode = $Mode; apply = [bool]$Apply; source = $manifest.source; identity = $script:runIdentity
         ledgerFound = $found; siloCheck = 'notPerformed'
-        scope = 'owned fonts, desktop UI font faces, the ChatGPT app''s theme fonts, the six Chromium font preferences written into existing profiles, Noctty, package trees and their App Paths names visible to this process, and the default-terminal selection this distribution wrote; protected package data (a browser profile), Store apps and RentSsh are not in the ledger'
+        scope = 'owned fonts, UI and app theme fonts, six Chromium preferences, Noctty, package trees, App Paths and terminal selection; introduced locked Appx and declared Store packages are ledgered with removal held; user data, preexisting apps, other Store dependencies and RentSsh are unowned'
         planned = @($steps | ForEach-Object { StepText $_ })
         resolutions = @($plan.resolutions | ForEach-Object { "$($_.id): $($_.resolution)" }); resumed = @($plan.resumed)
         defaultTerminal = $legacy.action

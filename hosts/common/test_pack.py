@@ -1,5 +1,6 @@
 """Compiler tests; native Windows convergence is deliberately a separate proof."""
 import json
+import io
 from pathlib import Path
 import tempfile
 import unittest
@@ -318,6 +319,7 @@ class CompilerTests(unittest.TestCase):
         choices.write_text(json.dumps({"noctty": {"version": "1.0", "fontFamily": "Test Font",
                                                   "registration": REGISTRATION},
                                        "cloudflared": {"version": "2.0"},
+                                       "wingetBootstrap": self.bootstrap(),
                                        "packages": [self.lock(inventory=str(self.inventory()))]}))
         scripts = self.root / "scripts"
         scripts.mkdir(exist_ok=True)
@@ -328,6 +330,72 @@ class CompilerTests(unittest.TestCase):
 
     APP = {"name": "ChatGPT", "source": "msstore", "id": "9PLM9XGG6VKS", "package": "OpenAI.Codex",
            "publisherId": "2p2nqsd0c76g0"}
+
+    def bootstrap(self):
+        return {"architecture": "x64", "publisherId": "8wekyb3d8bbwe",
+                "publisher": "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
+                "bundle": {"url": "https://github.com/microsoft/winget-cli/releases/download/v1.2.3/installer.msixbundle",
+                           "size": 10, "sha256": "1" * 64, "name": "Microsoft.DesktopAppInstaller",
+                           "version": "2026.917.151.0", "entry": "AppInstaller_x64.msix", "appVersion": "1.29.380.0"},
+                "dependencies": {"url": "https://github.com/microsoft/winget-cli/releases/download/v1.2.3/dependencies.zip",
+                                 "size": 10, "sha256": "2" * 64, "packages": [
+                                     {"name": "Microsoft.VCLibs.140.00", "version": "14.0.33519.0",
+                                      "entry": "x64/Microsoft.VCLibs.140.00_14.0.33519.0_x64.appx"}]}}
+
+    def test_bootstrap_archive_identity_not_filename_only(self):
+        lock = self.bootstrap()
+        publisher = lock["publisher"]
+        package = lock["dependencies"]["packages"][0]
+
+        def archive(entries):
+            output = io.BytesIO()
+            with zipfile.ZipFile(output, "w") as z:
+                for name, contents in entries.items():
+                    z.writestr(name, contents)
+            return output.getvalue()
+
+        def manifest(name, version, framework=False, dependencies="", arch="x64"):
+            return f'<Package><Identity Name="{name}" Version="{version}" Publisher="{publisher}" ProcessorArchitecture="{arch}"/>' \
+                   f'<Properties><Framework>{str(framework).lower()}</Framework></Properties><Dependencies>{dependencies}</Dependencies></Package>'
+
+        dependency = f'<PackageDependency Name="{package["name"]}" MinVersion="{package["version"]}" Publisher="{publisher}"/>'
+        bundle_xml = f'<Bundle><Identity Name="Microsoft.DesktopAppInstaller" Publisher="{publisher}" Version="2026.917.151.0"/>' \
+                     '<Packages><Package Type="application" Architecture="x64" Version="1.29.380.0" FileName="AppInstaller_x64.msix"/>' \
+                     '<Package Type="application" Architecture="x64" Version="1.29.379.0" FileName="stub.msix" IsStub="true"/></Packages></Bundle>'
+        deps = self.root / "dependencies.zip"
+        deps.write_bytes(archive({package["entry"]: archive({"AppxManifest.xml": manifest(package["name"], package["version"], True)})}))
+        lock["dependencies"].update(size=deps.stat().st_size, sha256=pack.digest(deps))
+        bundle = self.root / "installer.msixbundle"
+        for arch in ("x64", "x86"):
+            bundle.write_bytes(archive({"AppxMetadata/AppxBundleManifest.xml": bundle_xml, "AppInstaller_x64.msix":
+                                       archive({"AppxManifest.xml": manifest("Microsoft.DesktopAppInstaller", "1.29.380.0", dependencies=dependency, arch=arch)})}))
+            lock["bundle"].update(size=bundle.stat().st_size, sha256=pack.digest(bundle))
+            if arch == "x64":
+                pack.verify_bootstrap(lock, bundle, deps)
+            else:
+                with self.assertRaisesRegex(ValueError, "inner identity"):
+                    pack.verify_bootstrap(lock, bundle, deps)
+        lock["bundle"]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "differs"):
+            pack.verify_bootstrap(lock, bundle, deps)
+
+    def test_bootstrap_shape_and_metadata_only(self):
+        good = self.bootstrap()
+        self.assertEqual(pack.winget_bootstrap(good), good)
+        for field, change in (("architecture", "arm64"), ("publisherId", "aaaaaaaaaaaaa"), ("publisher", "Other")):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                pack.winget_bootstrap({**good, field: change})
+        for part, field, change in (("bundle", "appVersion", "1.2"), ("bundle", "version", "latest"),
+                                    ("bundle", "entry", "AppInstaller_arm64.msix"), ("dependencies", "url", "https://example.com/a.zip")):
+            with self.subTest(part=part, field=field), self.assertRaises(ValueError):
+                pack.winget_bootstrap({**good, part: {**good[part], field: change}})
+        fonts = self.payload()
+        noctty, cloudflared, choices, scripts = self.inputs()
+        pack.distribution(fonts, noctty, cloudflared, choices, scripts, "test", self.root / "out")
+        with zipfile.ZipFile(self.root / "out/windows-dist.zip") as z:
+            selected = json.loads(z.read("manifest.json"))
+            self.assertEqual(selected["wingetBootstrap"], good)
+            self.assertFalse(any(n.endswith((".msixbundle", ".appx", "dependencies.zip")) for n in z.namelist()))
 
     def test_typography_and_apps_reach_the_manifest(self):
         fonts = self.payload()

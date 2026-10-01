@@ -150,7 +150,7 @@ function Get-HandoffVerdict($Record, $Events, [string]$ExpectedTerminal) {
 #   phase     'intent' | 'commit' | 'void' | 'undone'
 #   id        opaque effect key, stable for one target
 #   kind      file-created | file-replaced | prefix-inserted | registry-value |
-#             registry-key-created | tree-extracted | ui-font-face | app-theme-fonts | pref-value
+#             registry-key-created | tree-extracted | ui-font-face | app-theme-fonts | pref-value | appx-package
 #   target    absolute file or directory path (drive, backslashes, no . or ..),
 #             or an HKCU\ key for the registry kinds; never HKLM; for ui-font-face
 #             winmetrics:<slot>, one of Get-UiFontSlots
@@ -184,6 +184,9 @@ function Get-HandoffVerdict($Record, $Events, [string]$ExpectedTerminal) {
 #                   present leaf only, compared as canonical JSON; desired holds ui, code
 #                   and content and no *Face, and theme, the whole theme written, when the
 #                   attempt creates it (then prior.fonts is empty)
+#   appx-package    name and publisherId of a current-user package family; version/fullName
+#                   are observation/provenance only, not lifecycle equality (Store updates).
+#                   Target is appx:<name>_<publisherId>. Removal remains held.
 # Per kind, prior and desired must be:
 #   file-created, tree-extracted,
 #   registry-key-created, pref-value prior absent, desired present
@@ -583,6 +586,7 @@ function Get-CssFamilies([string]$Value) { @($Value.Split(',') | ForEach-Object 
 # True for an absolute file path, an HKCU key when $Kind is a registry kind, winmetrics:<slot> for ui-font-face, or
 # codex-config:desktop.<theme> for app-theme-fonts.
 function Test-EffectPath([string]$Kind, $Target) {
+    if ($Kind -ceq 'appx-package') { return ($Target -is [string] -and $Target -cmatch '^appx:[A-Za-z0-9][A-Za-z0-9.-]*_[a-z0-9]{13}\z') }
     if ($Kind -ceq 'ui-font-face') { return ($Target -is [string] -and (Get-UiFontSlots | ForEach-Object { "winmetrics:$_" }) -ccontains $Target) }
     if ($Kind -ceq 'app-theme-fonts') { return ($Target -is [string] -and (Get-AppThemeKeys | ForEach-Object { "codex-config:desktop.$_" }) -ccontains $Target) }
     $registry = $Kind -cin @('registry-value', 'registry-key-created')
@@ -640,6 +644,10 @@ function Get-EffectStateProblem([string]$Kind, $State, [string]$Role) {
             if (@(Get-Field $State 'other' | Where-Object { $null -ne $_ -and $_ -isnot [string] }).Count) { return "$Role.other is not a list of paths." }
         }
         'registry-key-created' { }
+        'appx-package' {
+            if ([string](Get-Field $State 'name') -cnotmatch '^[A-Za-z0-9][A-Za-z0-9.-]*\z' -or
+                [string](Get-Field $State 'publisherId') -cnotmatch '^[a-z0-9]{13}\z') { return "$Role is not a package identity." }
+        }
         'ui-font-face' { if (-not (Test-UiFontFace (Get-Field $State 'face'))) { return "$Role.face is not a face name." } }
         'pref-value' { if ((Get-Field $State 'value') -isnot [string]) { return "$Role.value is not a string." } }
         'app-theme-fonts' {
@@ -680,6 +688,8 @@ function Test-EffectStateEqual([string]$Kind, $Expected, $Actual) {
                 (@(Get-Field $Actual 'other' | Where-Object { $null -ne $_ } | Sort-Object) -join '|')
         }
         'registry-key-created' { return $true }
+        'appx-package' { return ([string](Get-Field $Expected 'name') -ceq [string](Get-Field $Actual 'name') -and
+            [string](Get-Field $Expected 'publisherId') -ceq [string](Get-Field $Actual 'publisherId')) }
         'ui-font-face' { return ([string](Get-Field $Expected 'face') -ceq [string](Get-Field $Actual 'face')) }
         'pref-value' { return ([string](Get-Field $Expected 'value') -ceq [string](Get-Field $Actual 'value')) }
         'app-theme-fonts' {
@@ -703,7 +713,7 @@ function Get-EffectRecordProblem($Record) {
     $phase = $fields.phase
     if ($phase -isnot [string] -or $phase -cnotin @('intent', 'commit', 'void', 'undone')) { return 'phase is not intent, commit, void or undone.' }
     $kind = $fields.kind
-    if ($kind -isnot [string] -or $kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted', 'ui-font-face', 'app-theme-fonts', 'pref-value')) {
+    if ($kind -isnot [string] -or $kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted', 'ui-font-face', 'app-theme-fonts', 'pref-value', 'appx-package')) {
         return 'kind is not an effect kind.'
     }
     $id = $fields.id
@@ -725,7 +735,10 @@ function Get-EffectRecordProblem($Record) {
     }
     if (-not (Get-Field $desired 'exists')) { return 'desired must exist.' }
     if (Test-EffectStateEqual $kind $prior $desired) { return 'desired equals prior; there is no effect to own.' }
-    if ($kind -in @('file-created', 'tree-extracted', 'registry-key-created', 'pref-value') -and (Get-Field $prior 'exists')) { return 'prior must be absent.' }
+    if ($kind -in @('file-created', 'tree-extracted', 'registry-key-created', 'pref-value', 'appx-package') -and (Get-Field $prior 'exists')) { return 'prior must be absent.' }
+    if ($kind -ceq 'appx-package' -and $target -cne ('appx:' + (Get-Field $desired 'name') + '_' + (Get-Field $desired 'publisherId'))) {
+        return 'target differs from the package identity.'
+    }
     if ($kind -ceq 'pref-value' -and @(Get-Field $desired 'created' | Where-Object { $_ -isnot [string] -or -not $name.StartsWith($_ + '.', [StringComparison]::Ordinal) }).Count) {
         return 'desired.created is not a list of parents of name.'
     }
@@ -826,7 +839,7 @@ function Get-EffectAttempt($Records) {
 # holds some face and holds no content of its own, so another face is absent (free to
 # take, recording that face as prior), never preexisting-drift; so do an app theme's fonts.
 function Get-UnownedClass([string]$Kind, $Desired, $Current, $Resolution) {
-    $problem = if ($Kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted', 'ui-font-face', 'app-theme-fonts', 'pref-value')) {
+    $problem = if ($Kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted', 'ui-font-face', 'app-theme-fonts', 'pref-value', 'appx-package')) {
         'The selection kind is not an effect kind.'
     } else { Get-EffectStateProblem $Kind $Desired 'desired' }
     if (-not $problem) { $problem = Get-EffectStateProblem $Kind $Current 'current' }
@@ -1012,6 +1025,7 @@ function Test-TargetOverlap($First, $Other) {
     $firstKind, $otherKind = [string](Get-Field $First 'kind'), [string](Get-Field $Other 'kind')
     $a = ([string](Get-Field $First 'target')).ToUpperInvariant()
     $b = ([string](Get-Field $Other 'target')).ToUpperInvariant()
+    if ($firstKind -ceq 'appx-package' -or $otherKind -ceq 'appx-package') { return ($firstKind -ceq $otherKind -and $a -ceq $b) }
     $registry = @('registry-value', 'registry-key-created')
     if (($firstKind -cin $registry) -ne ($otherKind -cin $registry)) { return $false }
     # Leaves of one Preferences file have separate owners; a leaf and its file do not.
@@ -1467,6 +1481,8 @@ function Get-UninstallPlan($Records, $Observations) {
         }
         if ($entry.refusal) {
             $refused += [ordered]@{ id = $entry.id; class = 'indeterminate'; reason = $entry.refusal }
+        } elseif ($class.class -ceq 'owned-match' -and (Get-Field $entry.record 'kind') -ceq 'appx-package') {
+            $refused += [ordered]@{ id = $entry.id; class = 'owned-match'; reason = 'Introduced Appx package retained; removal requires disposable install/licensing/removal proof.' }
         } elseif ($class.class -ceq 'owned-match' -or $null -ne $resume) {
             if ($null -ne $resume) { $resumed += $entry.id } else { $resume = @(Get-UndoSteps $entry.record) }
             foreach ($step in $resume) { $step['id'] = $entry.id; $step['kind'] = [string](Get-Field $entry.record 'kind'); $steps += $step }
@@ -1556,11 +1572,59 @@ function Get-LegacyTerminalPlan($Record, $Current) {
 # $Found, the packages of the current user named $App.package (each { name; publisherId; version }):
 # 'install' when there is none; 'present' when there is exactly one, of that publisher (any version:
 # a Store app updates itself, so the version is reported, not pinned); 'refuse' otherwise. An app is
-# never reinstalled, updated, closed or removed, and its data is never owned.
+# never reinstalled, updated or closed; newly introduced packages have held removal, data is never owned.
 function Get-AppAction($Found, $App) {
     $package, $publisher = [string](Get-Field $App 'package'), [string](Get-Field $App 'publisherId')
     $named = @($Found | Where-Object { $null -ne $_ -and [string](Get-Field $_ 'name') -ceq $package })
     if ($named.Count -eq 0) { return 'install' }
     if ($named.Count -eq 1 -and [string](Get-Field $named[0] 'publisherId') -ceq $publisher) { return 'present' }
     return 'refuse'
+}
+
+# Bootstrap uses exactly present/install/refuse. An existing App Installer with its alias
+# disabled is protected. Frameworks may satisfy a locked minimum with a newer native version;
+# foreign lower versions are refused instead of silently upgraded by dependency resolution.
+function Get-BootstrapAction($Found, $Expected, [bool]$AliasPresent, [switch]$AppInstaller) {
+    $named = @($Found | Where-Object { [string](Get-Field $_ 'name') -ceq [string](Get-Field $Expected 'name') })
+    if (-not $named.Count) { return 'install' }
+    $adequate = $false
+    foreach ($package in $named) {
+        $architecture = [string](Get-Field $package 'architecture')
+        if ([string](Get-Field $package 'publisherId') -cne [string](Get-Field $Expected 'publisherId') -or
+            ($AppInstaller -and $architecture -cne 'x64') -or (-not $AppInstaller -and $architecture -cnotin @('x64', 'x86')) -or
+            (-not $AppInstaller -and (Get-Field $package 'framework') -ne $true)) { return 'refuse' }
+        try { $version = [version](Get-Field $package 'version') } catch { return 'refuse' }
+        if ($architecture -ceq 'x64' -and $version -ge [version](Get-Field $Expected 'version')) { $adequate = $true }
+    }
+    if ($adequate -and (-not $AppInstaller -or $AliasPresent)) { return 'present' }
+    return 'refuse'
+}
+
+# Same release-lock shape as pack.py; actual archive manifests/signatures are checked by win.ps1.
+function Get-BootstrapProblem($Value) {
+    if ($null -eq $Value) { return $null }
+    if ((Get-Field $Value 'architecture') -cne 'x64' -or (Get-Field $Value 'publisherId') -cne '8wekyb3d8bbwe' -or
+        (Get-Field $Value 'publisher') -cne 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US') {
+        return 'Bootstrap must select official Microsoft x64 packages.'
+    }
+    foreach ($key in 'bundle', 'dependencies') {
+        $asset = Get-Field $Value $key
+        $suffix = if ($key -ceq 'bundle') { 'msixbundle' } else { 'zip' }
+        if ([string](Get-Field $asset 'url') -cnotmatch ('^https://github\.com/microsoft/winget-cli/releases/download/v[0-9.]+/[A-Za-z0-9_.-]+\.' + $suffix + '\z') -or
+            -not (Test-ByteCount (Get-Field $asset 'size')) -or [string](Get-Field $asset 'sha256') -cnotmatch '^[0-9a-f]{64}\z') { return "Invalid bootstrap $key lock." }
+    }
+    $bundle = Get-Field $Value 'bundle'
+    if ((Get-Field $bundle 'name') -cne 'Microsoft.DesktopAppInstaller' -or (Get-Field $bundle 'entry') -cne 'AppInstaller_x64.msix') { return 'Invalid App Installer identity/entry.' }
+    $versions = @((Get-Field $bundle 'version'), (Get-Field $bundle 'appVersion'))
+    $seen = @{}
+    $packages = @(Get-Field (Get-Field $Value 'dependencies') 'packages')
+    if (-not $packages.Count) { return 'Bootstrap dependencies are empty.' }
+    foreach ($package in $packages) {
+        $name, $version, $entry = (Get-Field $package 'name'), (Get-Field $package 'version'), (Get-Field $package 'entry')
+        if ([string]$name -cnotmatch '^[A-Za-z0-9][A-Za-z0-9.-]*\z' -or $seen.ContainsKey([string]$name) -or $entry -cne "x64/${name}_${version}_x64.appx") { return 'Invalid or duplicate bootstrap dependency.' }
+        $seen[$name] = $true
+        $versions += $version
+    }
+    if (@($versions | Where-Object { $_ -isnot [string] -or $_ -cnotmatch '^[0-9]+(\.[0-9]+){3}\z' }).Count) { return 'Bootstrap versions need four numeric parts.' }
+    return $null
 }

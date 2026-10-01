@@ -463,6 +463,47 @@ msstore --exact --silent`). With exactly one of that publisher it does nothing. 
 else fails and is never replaced. `Restore` and `RestoreTest` then require it to be
 present and report its version.
 
+**Absent App Installer recovery.** Only an absent declared app enters this step.
+An already installed app needs no WinGet alias and triggers no bootstrap or drift.
+When App Installer is absent for this user, `Restore` fetches the official stable
+WinGet v1.29.380 bundle and dependency ZIP locked in `nix.nix`. They are not bundled
+(315 MB combined). The build checks their actual size/hash and nested manifests;
+Windows repeats byte checks and checks valid Microsoft signatures before any
+Appx intent/deployment. Bundle version **2026.917.151.0** differs from its x64 app
+**1.29.380.0**. The three locked x64 frameworks are VCLibs.140.00 **14.0.33519.0**,
+VCLibs.140.00.UWPDesktop **14.0.33728.0**, and WindowsAppRuntime.1.8 **8000.616.304.0**.
+
+- Native x64 host inventory is required; ARM64 (including x64 emulation) is refused.
+- Existing same/newer matching x64 packages stay untouched. Matching x86 frameworks
+  alongside an adequate x64 version also stay untouched (even a lower x86 version).
+  All rows must have the expected publisher/framework identity and valid versions.
+  An inadequate x64 version, foreign identity, non-framework, unsupported architecture,
+  or x86-only family is refused, not upgraded or taken over. This family boundary
+  refuses adding x64 to an existing x86-only family rather than falsely owning it as
+  newly introduced. App Installer remains x64-only.
+- A registered App Installer with a disabled/missing alias is reported untouched;
+  there is no guessed package-exe bypass, forced alias setting or re-registration.
+  Registering a provisioned package is not mistaken for fully absent recovery.
+- Each absent framework then the bundle uses native per-user `Add-AppxPackage`,
+  without force/unsigned/shutdown/update/downgrade or speculative licensing options.
+  The bundle contains an older stub too; validation selects its full x64 application,
+  and the bundle call uses documented
+  [`-StubPackageOption InstallFull`](https://learn.microsoft.com/en-us/powershell/module/appx/add-appxpackage#-stubpackageoption),
+  with native parameter support checked before effects.
+  Before the bundle call, all native dependency minimums must still be satisfied.
+- Every introduced locked framework/App Installer and the introduced declared app
+  has an `appx-package` intent before the call and a readback commit. Failures are
+  reobserved: native nonzero after success still retains the introduced identity.
+  Current state compares name and publisher id; version/full name and asset locks
+  are provenance, so a normal Store update stays recognized. Absence closes undone.
+- Existing apps/packages and all user data remain unowned. Store-managed internal
+  dependencies outside the locked bootstrap selection are not adopted by the ledger.
+- `Uninstall` retains introduced packages and reports refusal until disposable
+  install/licensing/removal proof exists; held removal is not cleanup success.
+- Temporary downloads and selected members are removed non-recursively on ordinary
+  exit. A power loss may leave that run's unique temporary directory; it is not a
+  persistent package effect or automatically adopted by a later run.
+
 **ChatGPT app fonts.** The app's `appearance` in `nix.nix` names font roles for the
 app's own settings: UI and content use IBM Plex Sans JP, and code uses PlemolJP Console
 NF, each written as a quoted CSS family, in both the light and dark themes.
@@ -503,10 +544,10 @@ NF, each written as a quoted CSS family, in both the light and dark themes.
     settings are never owned.
   - `Uninstall` needs the app present while the ledger owns its fonts.
 
-This uses neither Microsoft DSC nor a pinned package. The Store serves and updates its
-current version, so installing needs the network and a restore gets that day's
-version. An app is not a ledger effect: it is never reinstalled, updated, closed or
-removed, and its data and settings, including in-app fonts, are not owned or written.
+The app itself is not version-pinned: the Store serves and updates its current
+version, so installation needs the network and gets that day's version. Its new
+package identity has held removal as above; its theme font settings have their own
+conditional undo, independently of package ownership. Other data/settings stay unowned.
 
 ### Chromium fonts in existing profiles (the one exception to protected data)
 
@@ -690,8 +731,13 @@ result, and the live fonts must not change.
   run takes the slot back, writing exactly undone, intent and commit, and changing only that face.
 - **Uninstall:** after a later height change, it restores each face only, keeps that
   height and is byte-exact elsewhere.
-`Restore`'s Store app step (WinGet) is not run on CI;
-only its decision (`Get-AppAction`) is. The runner has no ChatGPT app, so the app fonts
+`Restore`'s live Store deployment is not run on CI. The existing proof also checks
+bootstrap action ordering, fixed-lock shape, actual fetched-byte verification,
+inner-manifest/signature rejection before effects, and real write-ahead ledger
+recovery with a synthetic package observer/deployer in PowerShell 7 and 5.1.
+Nonzero after implicit success, absent-now recovery, held removal and a present-app
+no-op with no alias are covered. These are not native fresh Store/licensing tests.
+The runner has no ChatGPT app, so the app fonts
 are proven on CI only as pure rules: complete default themes, font-only themes refused,
 the edits for an existing and an absent theme, records, classes, the undo of a created
 and a recoloured theme, and the comparison of the rest of the config. `Apply
@@ -748,14 +794,35 @@ owned values.
 Noctty sample of ASCII, kana, kanji and the Nerd Font glyph U+F121 was accepted by the
 user as rendering without visible missing-glyph boxes. That host's Noctty was already
 configured with PlemolJP. This is an accepted visual sample on one existing machine.
-It is not a clean-install, `Restore` or VM result. No UI font face or Store app was
-applied on that host. The clean VM run (S7) is deferred by the user, so a full clean
-restore is not claimed.
+It does not complete formal title-associated handoff or the partial H/F browser
+proof; browser × Noctty stability remains deferred under PR #24.
 
-Application/UI selection beyond noctty and the six Win32 UI font slots, Japanese/Nerd/Emoji rendering,
-font reload/relogin, Linux profile activation, and real-host
-Spec + Binding → Runtime → Proof/restoration remain unproven. Installing a font
-does not prove an application uses it. Native `nix.exe` is not a prerequisite.
+The existing host's typography was applied from **e38c6ac**, under the explicit
+CI101 scope approval: its font/app checks passed but the whole Windows job failed
+later in the A32 fixture JSON reader's case-only-key handling. Six classic Win32
+faces persisted as IBM Plex Sans JP (live Segoe UI, **pendingLogon**), and both app
+themes' six font settings persisted (UI/content IBM, code PlemolJP). The app itself
+was preserved, not reinstalled. Chromium fonts were applied separately from
+**5412df0**, after **all CI102 jobs succeeded**, to Default/Profile 2/Profile 3's
+six absent font leaves; other preferences and Noctty/OS settings were preserved.
+PR #30 merged that source as **9af03edd**. These applications need no repeat.
+
+Persistence is not live appearance. Normal sign-in and app/browser visual checks
+wait until **all agents stop**. Raw WindowMetrics font layout is undocumented and
+limited to the tested Windows builds; modern OS UI, app-owned fonts, browser chrome
+and website CSS are not promised to become globally uniform. Clean VM recovery,
+Store install/licensing/removal and formal handoff proof remain user-deferred or
+unproven; current installed-host/no-op and CI success cannot substitute for them.
+The immediate next slice defines legitimate absent-host WSL/WSLC platform recovery.
+No CLI replacement was performed: the upstream MSI stops WSLService and can close
+apps, so the user's noninterruption condition is not satisfied during ongoing work.
+
+The accepted Noctty sample covers its displayed ASCII/Japanese/Nerd glyphs, not
+every glyph or Emoji. OS/app/browser settings are persisted as described, while
+live appearance after normal sign-in/restart, fresh clean restore and conditional
+removal remain open. Linux profile activation and OCI/image/data gates belong to
+their separate scopes. Installing a font alone does not prove an application uses
+it. Native `nix.exe` is not a prerequisite.
 
 Hosted CI success does not authorize dependency merges, issue closure, or real-PC
 changes. Keep #7 open until its remaining acceptance is demonstrated.
