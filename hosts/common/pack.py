@@ -577,6 +577,16 @@ def verify_platform(lock: object, asset: Path) -> None:
             raise ValueError("WSL installer is not an MSI compound document")
 
 
+def noctty_launch(value: object) -> dict:
+    """Bounded existing-session shell selection; no startup/create fallback."""
+    if (not isinstance(value, dict) or set(value) != {"session", "container", "shell", "windowSaveState"}
+            or any(not isinstance(value.get(k), str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]+", value[k])
+                   for k in ("session", "container"))
+            or value.get("shell") != "/bin/sh" or value.get("windowSaveState") != "never"):
+        raise ValueError("Invalid Noctty existing-session shell selection")
+    return dict(value)
+
+
 def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
                  scripts: Path, source: str, out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
@@ -589,6 +599,7 @@ def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
         raise ValueError("Noctty font is not selected by common fonts")
     noctty_files = noctty_inventory(noctty)
     registration = noctty_registration(selected["noctty"].get("registration"), noctty_files)
+    launch = noctty_launch(selected["noctty"].get("launch"))
     packages = inventoried(selected.get("packages"))
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -622,6 +633,7 @@ def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
         write_json(root / "manifest.json", {"schemaVersion": 3, "source": source, "fonts": entries,
                    "noctty": {"version": selected["noctty"]["version"],
                               "fontFamily": selected["noctty"]["fontFamily"],
+                              "launch": launch,
                               "files": noctty_files, "registration": registration},
                    "cloudflared": {"version": selected["cloudflared"]["version"], "file": "payload/cloudflared.exe",
                                    "sha256": files["payload/cloudflared.exe"]},

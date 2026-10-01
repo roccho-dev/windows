@@ -179,6 +179,10 @@ let
     noctty = {
       version = nocttyVersion;
       fontFamily = "PlemolJP Console NF";
+      # Ordinary windows/tabs enter this existing normal-user OCI. Handoff
+      # adopts the caller's PTY instead. No session/container is started here.
+      launch = { session = "wslc-cli-resta"; container = "windows-own";
+        shell = "/bin/sh"; windowSaveState = "never"; };
       # The HKCU String values the default-terminal handoff needs, as the vendor registration
       # wrote them on CI #58 (G4) without its own bookkeeping and descriptions; {install} is
       # %LOCALAPPDATA%\Programs\noctty-<version>. win.ps1 derives the keys to create below the

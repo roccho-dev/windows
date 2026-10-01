@@ -19,7 +19,9 @@ param(
     # other effect), while Chromium is closed. Restore never edits an existing profile (a new one gets the seed).
     [switch]$ChromiumFonts,
     # Apply only: write the fonts of the app already present (its preconfiguration), alone: no install, no OS font, no other effect.
-    [switch]$AppFonts
+    [switch]$AppFonts,
+    # Apply only: converge/recover the Noctty configuration alone; no terminal selection, fonts or runtime launch.
+    [Alias('NocttyConfig')][switch]$NocttyConfigOnly
 )
 
 # The native Windows activation adapter. Product selection belongs to the built distribution (Nix).
@@ -131,6 +133,7 @@ if ($PSBoundParameters.ContainsKey('Packages')) {
 if ($Typography -and ($Mode -ne 'Apply' -or $PSBoundParameters.ContainsKey('Packages'))) { throw '-Typography is only for -Mode Apply, without -Packages.' }
 if ($ChromiumFonts -and ($Mode -ne 'Apply' -or $Typography -or $AppFonts -or $PSBoundParameters.ContainsKey('Packages'))) { throw '-ChromiumFonts is only for -Mode Apply, without -Packages, -Typography or -AppFonts.' }
 if ($AppFonts -and ($Mode -ne 'Apply' -or $Typography -or $PSBoundParameters.ContainsKey('Packages'))) { throw '-AppFonts is only for -Mode Apply, without -Packages or -Typography.' }
+if ($NocttyConfigOnly -and ($Mode -ne 'Apply' -or $Typography -or $ChromiumFonts -or $AppFonts -or $PSBoundParameters.ContainsKey('Packages'))) { throw '-NocttyConfig is only for -Mode Apply, without other scopes.' }
 # The desktop UI font face (a selected family, pack.py) set through ui-font.ahk by the locked interpreter package.
 $uiTypography = Get-Field $manifest 'typography'
 if ($null -ne $uiTypography -and (-not (Test-UiFontFace (Get-Field $uiTypography 'face')) -or (Get-Field $uiTypography 'script') -cne 'ui-font.ahk' -or
@@ -238,7 +241,18 @@ $nocttyDirectory = Join-Path $localAppData ('Programs\noctty-' + $manifest.noctt
 $nocttyConfig = Join-Path $localAppData 'noctty\config.ghostty'
 # Never created, written or removed; Uninstall only reports whether one exists.
 $nocttyShortcut = Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs\noctty.lnk'
-$nocttyConfigText = 'font-family = ' + $manifest.noctty.fontFamily + "`n"
+# Native ProgramFiles is independent of process bitness. This readonly path
+# lookup is not a platform inventory or an installation prerequisite.
+function PlatformDirectory {
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $key = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion', $false)
+        try { $directory = [string]$key.GetValue('ProgramFilesDir') } finally { $key.Dispose() }
+    } finally { $base.Dispose() }
+    if (-not [IO.Path]::IsPathRooted($directory)) { throw 'Native ProgramFiles directory unavailable.' }
+    return Join-Path $directory 'WSL'
+}
+$nocttyConfigText = Get-NocttyConfigText $manifest.noctty (Join-Path (PlatformDirectory) 'wslc.exe')
 $terminalStartup = 'HKCU:\Console\%%Startup'
 $startupSubkey = 'Console\%%Startup'
 $registryViews = @(@('HKCU', 'CurrentUser', 'Default'), @('HKLM', 'LocalMachine', 'Registry64'), @('HKLM32', 'LocalMachine', 'Registry32'))
@@ -1585,15 +1599,6 @@ function PlatformRegistryReach {
     }
     return $false
 }
-function PlatformDirectory {
-    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
-    try {
-        $key = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion', $false)
-        try { $directory = [string]$key.GetValue('ProgramFilesDir') } finally { $key.Dispose() }
-    } finally { $base.Dispose() }
-    if (-not [IO.Path]::IsPathRooted($directory)) { throw 'Native ProgramFiles directory unavailable.' }
-    return Join-Path $directory 'WSL'
-}
 function PlatformInventory {
     $msi = @(PlatformMsiRows)
     $appx = @(Get-AppxPackage -AllUsers -Name $wslPlatform.appxName -ErrorAction Stop | ForEach-Object {
@@ -2426,24 +2431,36 @@ function PlanNoctty([switch]$Restore) {
 # values. A configuration that differs from the selection is reported and never written. Shared
 # parents (Programs, %LOCALAPPDATA%\noctty, the CLSID and Interface roots) are created as needed
 # and listed, never owned.
+function ConvergeNocttyConfig($Effect, $State) {
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($nocttyConfigText)
+    switch ($State.class) {
+        'absent' { SharedDirectory (Split-Path -Parent $Effect.target); CreateOwnedFile $Effect $bytes }
+        'owned-match' {
+            if (-not (Test-EffectStateEqual 'file-created' $State.recorded $Effect.desired)) {
+                UndoOwned $State.open (Observe $Effect) -Replacing
+                CreateOwnedFile $Effect $bytes
+            }
+        }
+        'preexisting-match' { }
+        default { throw "Noctty drift: configuration is $($State.class); never overwritten." }
+    }
+}
+
+function ApplyNocttyConfigOnly {
+    $effect = (NocttyEffects).config
+    RecoverId $effect.id
+    ConvergeNocttyConfig $effect (Classify $effect)
+    if (-not (Test-EffectStateEqual 'file-created' $effect.desired (Observe $effect))) { throw 'Noctty configuration did not converge.' }
+    return $effect
+}
+
 function ApplyNoctty($Plan) {
     $effects, $classes = $Plan.effects, $Plan.classes
     if ($classes[$effects.tree.id].class -ceq 'absent') {
         SharedDirectory (Split-Path -Parent $effects.tree.target)
         CreateOwnedTree $effects.tree (BundlePath 'payload/noctty.zip')
     }
-    $config, $bytes = $classes[$effects.config.id], [Text.UTF8Encoding]::new($false).GetBytes($nocttyConfigText)
-    switch ($config.class) {
-        'absent' { SharedDirectory (Split-Path -Parent $nocttyConfig); CreateOwnedFile $effects.config $bytes }
-        'owned-match' {
-            if (-not (Test-EffectStateEqual 'file-created' $config.recorded $effects.config.desired)) {
-                UndoOwned $config.open (Observe $effects.config) -Replacing
-                CreateOwnedFile $effects.config $bytes
-            }
-        }
-        'preexisting-match' { }
-        default { $script:nocttyDrift += "$nocttyConfig differs from the selection ($($config.class)); not written" }
-    }
+    ConvergeNocttyConfig $effects.config $classes[$effects.config.id]
     if ($classes[$effects.startup.id].class -ceq 'absent') { CreateOwnedKey $effects.startup }
     if ($Plan.com -ceq 'converge') {
         SharedKey 'Software\Classes\CLSID'
@@ -2958,6 +2975,13 @@ try {
         if ($problem) { throw "$Mode refused, nothing written: $problem. Run from a normal user context (a shell or task outside any packaged app)." }
         LockLedger
         $null = ReadLedger
+        if ($NocttyConfigOnly) {
+            $effect = ApplyNocttyConfigOnly
+            [ordered]@{ mode = $Mode; source = $manifest.source; scope = 'Noctty configuration only'; target = $effect.target
+                changedProperties = $script:changed; recordsWritten = $script:recordsWritten; inDesiredState = $true
+                runtimeProof = 'unproven'; session = $manifest.noctty.launch.session; container = $manifest.noctty.launch.container } | ConvertTo-Json -Depth 8 -Compress
+            return
+        }
         RecoverLedger
         if ($AppFonts) {
             # The selected fonts must already be exact (read-only here); then the present app's fonts alone.

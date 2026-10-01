@@ -44,6 +44,13 @@ function Win51([string[]]$Arguments) {
     }
 }
 function Run([string]$Mode) { Win51 @('-Mode', $Mode) }
+function SelectedNocttyConfigText($Noctty) {
+    # Same production native-path observer and pure renderer; no runtime launch.
+    $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'win.ps1'), [ref]$null, [ref]$null)
+    $definition = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'PlatformDirectory' }, $false)
+    . ([scriptblock]::Create($definition.Extent.Text))
+    return Get-NocttyConfigText $Noctty (Join-Path (PlatformDirectory) 'wslc.exe')
+}
 # A wrapped child message may gain or lose a space at a line break, so a pattern
 # that fails exactly is compared once more with all whitespace removed.
 function MustReject([scriptblock]$Action, [string]$Pattern) {
@@ -324,6 +331,14 @@ Must ((Get-AppAction @() $app) -ceq 'install' -and (Get-AppAction @(@{ name = 'O
 # The bootstrap action has no registration branch. Validate every native candidate
 # before accepting a sufficient version (a later foreign record cannot be hidden by order).
 $bootstrap = $manifest.wingetBootstrap
+$manualText = Get-NocttyConfigText $manifest.noctty 'C:\Program Files\WSL\wslc.exe'
+Must ($manualText -ceq ('font-family = ' + $manifest.noctty.fontFamily + "`n" +
+    'command = direct:"C:\Program Files\WSL\wslc.exe" --session wslc-cli-resta exec --interactive --tty windows-own /bin/sh -i' + "`nwindow-save-state = never`n")) 'Noctty direct existing OCI shell and fresh manual window, quoted native path'
+foreach ($change in @(@{ session = '' }, @{ session = "name`ncommand = cmd" }, @{ container = 'other name' }, @{ shell = '/bin/sh -c cmd' }, @{ windowSaveState = 'always' }, @{ fallback = 'create' })) {
+    $case = @{ session = 'wslc-cli-resta'; container = 'windows-own'; shell = '/bin/sh'; windowSaveState = 'never' }
+    foreach ($key in $change.Keys) { $case[$key] = $change[$key] }
+    Must ($null -ne (Get-NocttyLaunchProblem $case)) 'Noctty selectors refuse injection or startup fallback'
+}
 Must ($null -eq (Get-BootstrapProblem $bootstrap) -and $bootstrap.bundle.version -cne $bootstrap.bundle.appVersion) 'distinct locked bundle and app versions'
 $expectedAppInstaller = @{ name = $bootstrap.bundle.name; publisherId = $bootstrap.publisherId; version = $bootstrap.bundle.appVersion }
 $goodAppInstaller = @{ name = $bootstrap.bundle.name; publisherId = $bootstrap.publisherId; architecture = 'x64'; version = $bootstrap.bundle.appVersion }
@@ -821,7 +836,8 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
         'SelectNoctty', 'StartupPair', 'RecordPriorTerminal', 'TestNocttyRegistration', 'TestNocttyActivation', 'AssertActualSelection', 'RestoreLegacy',
         'StepText', 'IsPackageTree', 'RemovePackageAsset', 'IndexRecord', 'ReadLedger', 'LedgerIds', 'NewLedgerIndex', 'AttemptOf',
         'PackageEffect', 'SeedHazard', 'WriteSeed', 'AppPathEffects', 'IsAppPathEffect', 'MachineAppPath', 'EffectClass', 'AppPathState',
-        'ConvergeAppPath', 'CollectAppPathGarbage', 'ConvergeEffect', 'Classify', 'UndoOwned', 'SharedKey', 'ObserveKeyContent'
+        'ConvergeAppPath', 'CollectAppPathGarbage', 'ConvergeEffect', 'Classify', 'UndoOwned', 'SharedKey', 'ObserveKeyContent',
+        'ConvergeNocttyConfig','ApplyNocttyConfigOnly','PlatformDirectory','SharedDirectory'
     $names += 'AppxEffect', 'ObserveAppx', 'IntroduceAppx', 'ConvergeApps', 'FetchBootstrap', 'AssertAppxManifest', 'AssertMicrosoftSignature'
     $names += 'PlatformEffect','ObservePlatformEffect','IntroducePlatform','IsPlatformEffect'
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'win.ps1'), [ref]$null, [ref]$null)
@@ -846,7 +862,7 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
     $fontDirectory, $fontSubkey = (Join-Path $Scratch 'fonts'), 'Software\Microsoft\Windows NT\CurrentVersion\Fonts'
     $fontKey = 'HKCU\' + $fontSubkey
     $nocttyDirectory = Join-Path $Scratch ('Programs\noctty-' + $manifest.noctty.version)
-    $nocttyConfig, $nocttyConfigText = (Join-Path $Scratch 'noctty\config.ghostty'), ('font-family = ' + $manifest.noctty.fontFamily + "`n")
+    $nocttyConfig, $nocttyConfigText = (Join-Path $Scratch 'noctty\config.ghostty'), (Get-NocttyConfigText $manifest.noctty (Join-Path (PlatformDirectory) 'wslc.exe'))
     $clsid = '{' + [guid]::NewGuid().ToString().ToUpperInvariant() + '}'
     $nocttyRegistration = Get-NocttyRegistration @(@{ key = "Software\Classes\CLSID\$clsid\LocalServer32"; name = ''; data = 'proof' }) $nocttyDirectory $manifest.noctty.files
     $script:ledgerRecords, $script:nextSeq, $script:recordsWritten, $script:copied, $script:changed, $script:removed = @(), 1, 0, 0, 0, 0
@@ -1245,8 +1261,44 @@ public static string[] Split(string cmd) {
         }
         $startup.Close()
     }
-    CreateOwnedFile $selected.config ([Text.UTF8Encoding]::new($false).GetBytes($nocttyConfigText))
-    Must ((Phases $selected.config) -ceq 'intent,commit') 'the config is created from bytes'
+    # Production config-only path migrates an owned old font-only config without
+    # entering any other observer/effect. User drift remains intact.
+    $desiredConfigText = $nocttyConfigText
+    $nocttyConfigText = 'font-family = ' + $manifest.noctty.fontFamily + "`n"
+    $oldConfig = (NocttyEffects).config
+    CreateOwnedFile $oldConfig ([Text.UTF8Encoding]::new($false).GetBytes($nocttyConfigText))
+    $nocttyConfigText = $desiredConfigText
+    $guardNames = 'RecoverLedger','ConvergeFonts','AssertFonts','ConvergeUiFont','ConvergeAppFonts','ConvergeChromiumFonts',
+        'ApplyNoctty','SelectNoctty','PlanNoctty','StartupPair','ObserveValue','ObserveKey','ObserveTree','ConvergeApps','PlatformInventory','Invoke-Native'
+    $savedFunctions = @{}
+    foreach ($name in $guardNames) {
+        $oldFunction = Get-Item ('Function:' + $name) -ErrorAction SilentlyContinue
+        $savedFunctions[$name] = if ($null -ne $oldFunction) { $oldFunction.ScriptBlock } else { $null }
+        Set-Item ('Function:' + $name) { throw 'Config-only entered an unrelated observer/effect.' }
+    }
+    try {
+        $null = ApplyNocttyConfigOnly
+        $mark = $script:recordsWritten
+        $null = ApplyNocttyConfigOnly
+        Must ($script:recordsWritten -eq $mark -and [IO.File]::ReadAllText($nocttyConfig) -ceq $desiredConfigText) 'config-only owned migration and repeated no-op'
+        [IO.File]::WriteAllText($nocttyConfig, "font-family = user`n")
+        Refused { ApplyNocttyConfigOnly } '*Noctty drift:*'
+        Must ($script:recordsWritten -eq $mark -and [IO.File]::ReadAllText($nocttyConfig) -ceq "font-family = user`n") 'config-only user drift refuses without writes'
+        [IO.File]::WriteAllText($nocttyConfig, $desiredConfigText)
+        $ownedConfigPath = $nocttyConfig
+        try {
+            $nocttyConfig = Join-Path $Scratch 'unowned-config.ghostty'
+            [IO.File]::WriteAllText($nocttyConfig, "font-family = user`n")
+            Refused { ApplyNocttyConfigOnly } '*Noctty drift:*'
+            Must ($script:recordsWritten -eq $mark -and [IO.File]::ReadAllText($nocttyConfig) -ceq "font-family = user`n") 'unowned config remains intact with no ownership adoption'
+        } finally { $nocttyConfig = $ownedConfigPath }
+    } finally {
+        foreach ($name in $guardNames) {
+            if ($null -ne $savedFunctions[$name]) { Set-Item ('Function:' + $name) $savedFunctions[$name] }
+            else { Remove-Item ('Function:' + $name) }
+        }
+    }
+    Must ((Phases $selected.config) -ceq 'intent,commit,undone,intent,commit') 'old owned attempt closes before the new write-ahead intent/commit'
     if ($Real) {
         CreateOwnedTree $selected.tree $zip
         Must ((Phases $selected.tree) -ceq 'intent,commit' -and (Test-EffectStateEqual tree-extracted $selected.tree.desired (Observe $selected.tree)) -and
@@ -1502,7 +1554,7 @@ foreach ($definition in $winAst.FindAll({ param($n) $n -is [Management.Automatio
 $effectRoot = Join-Path $env:RUNNER_TEMP ('noctty-effects-' + [guid]::NewGuid().ToString('N'))
 $localAppData = $effectRoot
 $nocttyDirectory, $nocttyConfig = "$effectRoot\Programs\noctty-$($manifest.noctty.version)", "$effectRoot\noctty\config.ghostty"
-$nocttyConfigText = 'font-family = ' + $manifest.noctty.fontFamily + "`n"
+$nocttyConfigText = SelectedNocttyConfigText $manifest.noctty
 $nocttyRegistration = Get-NocttyRegistration $manifest.noctty.registration $nocttyDirectory $manifest.noctty.files
 $selected = NocttyEffects
 $all = @($selected.tree, $selected.config, $selected.startup) + $selected.keys + $selected.values
@@ -1710,6 +1762,37 @@ function Vendor([string]$Exe, [string]$Argument) {
     $process.WaitForExit()
     [pscustomobject]@{ exit = $process.ExitCode; output = @(($out.Result + "`n" + $err.Result) -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 20) -join ' | ' }
 }
+function VendorConfig([string]$Exe, [string]$ConfigFile) {
+    # v1.3.131 validate_config ends a positional Zig stdout writer even when empty.
+    # Its resize on a Windows pipe returns FileTooBig. Native Start-Process on
+    # Windows supplies actual regular-file handles; keep the real parser/exit gate.
+    if ($env:OS -cne 'Windows_NT' -or -not (Get-Command Start-Process).Parameters.ContainsKey('Environment')) {
+        throw 'Config syntax proof requires Windows Start-Process with child Environment support.'
+    }
+    $stdoutPath = $ConfigFile + '.stdout'
+    $stderrPath = $ConfigFile + '.stderr'
+    if (Test-Path -LiteralPath $stdoutPath) { throw 'Config stdout capture already exists.' }
+    if (Test-Path -LiteralPath $stderrPath) { throw 'Config stderr capture already exists.' }
+    $process = $null
+    try {
+        $process = Start-Process -FilePath $Exe -ArgumentList (Join-NativeArguments @('+validate-config', ('--config-file=' + $ConfigFile))) `
+            -NoNewWindow -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -Environment @{ GHOSTTY_LOG = 'stderr' }
+        if (-not $process.WaitForExit(60000)) {
+            $process.Kill($true); $process.WaitForExit()
+            return [pscustomobject]@{ exit = 'timeout after 60 s'; output = '' }
+        }
+        $process.WaitForExit()
+        $stdout = [IO.File]::ReadAllText($stdoutPath)
+        $stderr = [IO.File]::ReadAllText($stderrPath)
+        $lines = @(($stdout + "`n" + $stderr) -split "`r?`n" | Where-Object { $_.Trim() })
+        $sample = @($lines | Select-Object -First 20)
+        if ($lines.Count -gt 20) { $sample += @($lines | Select-Object -Last 5) }
+        [pscustomobject]@{ exit = $process.ExitCode; diagnostics = $stdout; output = $sample -join ' | ' }
+    } finally {
+        if ($null -ne $process) { $process.Dispose() }
+        [IO.File]::Delete($stdoutPath); [IO.File]::Delete($stderrPath)
+    }
+}
 function Region([string]$Key) { $Key -match '^(Software\\Classes|Console)(\\|$)' }
 # The vendor registers only with HKCU\Console\%%Startup\DelegationConsole selecting
 # Windows Terminal's OpenConsole, which Restore writes just before registering. That
@@ -1718,6 +1801,7 @@ function Region([string]$Key) { $Key -match '^(Software\\Classes|Console)(\\|$)'
 # put back afterwards, the result read back and reported.
 $startupPath = 'Console\%%Startup'
 $startupSaved = $null  # the original state, once read; restoration runs only then
+$vendorRegistrationAttempted = $false
 function StartupState {
     $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($startupPath)
     if ($null -eq $key) { return [ordered]@{ keyExisted = $false; values = @{} } }
@@ -1765,6 +1849,7 @@ try {
     Start-Sleep -Seconds 5  # bounded control interval: what changes on its own shows up between S0 and S1
     $s1 = RegistrySnapshot 'CurrentUser' 'Default' @('')
     $h1, $tree1, $user1 = (Machine), (FileSnapshot $install), (FileSnapshot $userDir)
+    $vendorRegistrationAttempted = $true
     $register = Vendor (Join-Path $install 'noctty.com') '+register-default-terminal'
     $s2 = RegistrySnapshot 'CurrentUser' 'Default' @('')
     $h2, $tree2, $user2 = (Machine), (FileSnapshot $install), (FileSnapshot $userDir)
@@ -1792,6 +1877,25 @@ try {
 
     # G3 on CI: a console entry point must not write into the install directory.
     $version = Vendor (Join-Path $install 'noctty.com') '--version'
+    $syntaxConfig = Join-Path $env:RUNNER_TEMP ('noctty-syntax-' + [guid]::NewGuid().ToString('N') + '.ghostty')
+    $fontOnlyConfig = $syntaxConfig + '.font-only'
+    $invalidConfig = $syntaxConfig + '.invalid'
+    try {
+        [IO.File]::WriteAllText($syntaxConfig, (SelectedNocttyConfigText $manifest.noctty), [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($fontOnlyConfig, ('font-family = ' + $manifest.noctty.fontFamily + "`n"), [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($invalidConfig, ([IO.File]::ReadAllText($syntaxConfig) + "noctty-iac-invalid-field = true`n"), [Text.UTF8Encoding]::new($false))
+        foreach ($candidate in @($fontOnlyConfig, $syntaxConfig, $invalidConfig)) {
+            Say "config syntax input $candidate; bytes $((Get-Item -LiteralPath $candidate).Length); sha256 $((Get-FileHash -LiteralPath $candidate).Hash)"
+        }
+        $fontOnly = VendorConfig (Join-Path $install 'noctty.com') $fontOnlyConfig
+        $syntax = VendorConfig (Join-Path $install 'noctty.com') $syntaxConfig
+        $invalid = VendorConfig (Join-Path $install 'noctty.com') $invalidConfig
+        Say "font-only config control exit $($fontOnly.exit): $($fontOnly.output)"
+        Say "desired config syntax exit $($syntax.exit): $($syntax.output)"
+        Say "invalid-field config control exit $($invalid.exit): $($invalid.output)"
+        Must ($invalid.exit -ceq 1 -and $invalid.diagnostics -match 'noctty-iac-invalid-field') 'Noctty config negative control must reject the actual invalid field.'
+        Must ($syntax.exit -ceq 0) "Noctty vendor config syntax (not runtime): $($syntax.output)"
+    } finally { [IO.File]::Delete($syntaxConfig); [IO.File]::Delete($fontOnlyConfig); [IO.File]::Delete($invalidConfig) }
     $tree3 = FileSnapshot $install
     Say "noctty.com --version exit $($version.exit): $($version.output); install directory changes: $(@(SnapshotDiff $tree2 $tree3).Count)"
 
@@ -1827,21 +1931,34 @@ try {
     foreach ($line in $gate) { Say "GATE $line" }
     Say "gate: $(@($wanted.Keys).Count) declared entries, $(@($measured.Keys).Count) measured after exclusions, $($gate.Count) problems"
 
-    $unregister = Vendor (Join-Path $install 'noctty.com') '+unregister-default-terminal'
-    $s3 = RegistrySnapshot 'CurrentUser' 'Default' @('')
-    $remains = @(SnapshotDiff $s1 $s3 | Where-Object { Region $_.key })
-    Say "vendor +unregister-default-terminal exit $($unregister.exit): $($unregister.output)"
-    foreach ($d in $remains) { Say "REMAINS $($d.change) HKCU\$($d.key) [$($d.name)] $($d.before) -> $($d.after)" }
-    $g4 = [ordered]@{ status = 'measured'; registerExit = $register.exit; versionExit = $version.exit; unregisterExit = $unregister.exit
+    $g4 = [ordered]@{ status = 'measured'; registerExit = $register.exit; versionExit = $version.exit
         classesConsoleChanges = $vendorRegion.Count; otherHkcuChanges = $other.Count; mentions = $mentions.Count
         hklmChanges = $machine.Count; installFileChanges = $treeDiff.Count + @(SnapshotDiff $tree2 $tree3).Count
-        userNocttyFileChanges = $userDiff.Count; remainingAfterUnregister = $remains.Count; controlNoise = $noise.Count
+        userNocttyFileChanges = $userDiff.Count; controlNoise = $noise.Count
         windowsTerminal = $wtVersion; seededDelegationConsole = $true; startupKeyCreated = -not $startupSaved.keyExisted
         gate = $(if ($gate.Count) { $gate -join '; ' } else { 'pass' }) }
 } catch {
     $g4 = [ordered]@{ status = "measurement error: $($_.Exception.Message)" }
     Say $g4.status
 } finally {
+    # Even a failed syntax/measurement gate must release the vendor's test registration.
+    # Keep its original failure; cleanup is evidence, not a replacement PASS.
+    if ($vendorRegistrationAttempted) {
+        try {
+            $unregister = Vendor (Join-Path $install 'noctty.com') '+unregister-default-terminal'
+            $s3 = RegistrySnapshot 'CurrentUser' 'Default' @('')
+            $remains = @(SnapshotDiff $s1 $s3 | Where-Object { Region $_.key })
+            Say "vendor +unregister-default-terminal exit $($unregister.exit): $($unregister.output)"
+            foreach ($d in $remains) { Say "REMAINS $($d.change) HKCU\$($d.key) [$($d.name)] $($d.before) -> $($d.after)" }
+            $g4['unregisterExit'] = $unregister.exit
+            $g4['remainingAfterUnregister'] = $remains.Count
+            if ($unregister.exit -ne 0) { throw "vendor unregister exit $($unregister.exit)" }
+        } catch {
+            $g4['unregisterFailure'] = $_.Exception.Message
+            if ($g4.status -ceq 'measured') { $g4.status = "measurement cleanup error: $($_.Exception.Message)" }
+            Say "vendor registration cleanup failed: $($_.Exception.Message)"
+        }
+    }
     # Put back only the two values and, if the measurement created the key and it is empty
     # again, the key itself (never recursively); then read it back and report exactly.
     $restore = 'not seeded'
@@ -2014,7 +2131,7 @@ Must ((Phases $treeId) -ceq 'intent,commit' -and (Phases $configId) -ceq 'intent
     -not @($valueIds | Where-Object { (Phases $_) -cne 'intent,commit' }).Count -and
     -not @($keyIds | Where-Object { (Phases $_) -cnotin @('', 'intent,commit') }).Count -and
     -not @(1..($order.Count - 1) | Where-Object { $order[$_] -le $order[$_ - 1] }).Count) 'A15: owned Noctty effects, in order'
-Must ((TreeExact) -and [IO.File]::ReadAllText($realConfig) -ceq ('font-family = ' + $manifest.noctty.fontFamily + "`n") -and
+Must ((TreeExact) -and [IO.File]::ReadAllText($realConfig) -ceq (SelectedNocttyConfigText $manifest.noctty) -and
     -not @($bound.values | Where-Object { (ComValue $_) -cne "String:$($_.data)" }).Count -and -not @($bound.keys | Where-Object { -not (KeyExists $_) }).Count -and
     (Selection) -ceq "$wtConsole|$noctty" -and (Test-Path -LiteralPath (Join-Path $realLocal 'windows-iac\provenance\default-terminal.json')) -and
     (Test-Path -LiteralPath $shortcut) -eq $shortcutBefore -and $first.registrationState -ceq 'registered') 'A15: independent readback'

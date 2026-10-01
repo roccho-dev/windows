@@ -36,6 +36,14 @@ REGISTRATION = [
 
 
 class CompilerTests(unittest.TestCase):
+    def test_noctty_existing_session_selection(self):
+        launch = {"session": "wslc-cli-resta", "container": "windows-own", "shell": "/bin/sh", "windowSaveState": "never"}
+        self.assertEqual(pack.noctty_launch(launch), launch)
+        for change in ({"session": ""}, {"session": "name\ncommand = cmd"}, {"container": "other name"},
+                       {"shell": "/bin/sh -c cmd"}, {"windowSaveState": "always"}, {"fallback": "create"}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                pack.noctty_launch(dict(launch, **change))
+
     def test_platform_bytes_and_supported_scope(self):
         self.assertEqual(pack.wsl_platform(WSL_LOCK), WSL_LOCK)
         self.assertIsNone(pack.wsl_platform(None))
@@ -345,7 +353,9 @@ class CompilerTests(unittest.TestCase):
         cloudflared.write_bytes(b"MZ fixture: not the real client")
         choices = self.root / "choices.json"
         choices.write_text(json.dumps({"noctty": {"version": "1.0", "fontFamily": "Test Font",
-                                                  "registration": REGISTRATION},
+                                                  "registration": REGISTRATION,
+                                                  "launch": {"session": "wslc-cli-resta", "container": "windows-own",
+                                                             "shell": "/bin/sh", "windowSaveState": "never"}},
                                        "cloudflared": {"version": "2.0"},
                                        "wingetBootstrap": self.bootstrap(),
                                        "packages": [self.lock(inventory=str(self.inventory()))]}))
@@ -545,6 +555,8 @@ class CompilerTests(unittest.TestCase):
             self.assertEqual(manifest["source"], "a" * 40)
             self.assertEqual(manifest["noctty"]["version"], "1.0")
             self.assertEqual(manifest["noctty"]["registration"], REGISTRATION)
+            self.assertEqual(manifest["noctty"]["launch"], {"session": "wslc-cli-resta", "container": "windows-own",
+                                                        "shell": "/bin/sh", "windowSaveState": "never"})
             self.assertEqual(manifest["cloudflared"], {"version": "2.0", "file": "payload/cloudflared.exe",
                                                        "sha256": pack.digest(cloudflared)})
             self.assertEqual(z.read("payload/cloudflared.exe"), cloudflared.read_bytes())
