@@ -106,7 +106,8 @@ is refused before the ledger lock or any effect. This bounded direct-MSI method
 supports native **x64 Windows build 26100 or newer**; it does not promise the older
 build/servicing combinations accepted by other WSL installation routes.
 
-`nix.nix` pins Microsoft's **2.9.13.0 prerelease** x64 MSI, hash, size, native
+`nix.nix` pins Microsoft's [**3.0.1.0 stable release**](https://github.com/microsoft/WSL/releases/tag/3.0.1)
+x64 MSI, hash, size, native
 ProductCode/UpgradeCode/PackageCode, machine identity and signer. CI verifies the
 locked bytes; the asset is not bundled in the distribution. Before the first native
 change, recovery fetches and verifies size/hash, Microsoft signature and the actual
@@ -127,6 +128,12 @@ completed native failure in the same invocation is separately reobserved. Verifi
 download source is retained on unfinished timeout, its path recorded in the native
 intent; that retention is not a cleanup success. This follows the native
 [installer client/service distinction](https://devblogs.microsoft.com/setup/the-windows-installer-service/).
+
+The stable pin replaces PR #32's 2.9.13.0 prerelease pin for **absent-platform
+recovery only**. It does not update an existing compatible platform. A requested
+one-time vendor update on this host is a separate maintenance operation; source/CI
+verification is not evidence that 3.0.1 has been installed or run here. Data-format
+compatibility does not make the installer's service/client stop noninterrupting.
 
 The preflight covers installed MSI in **all user contexts** with readonly native
 [ProductsEx](https://learn.microsoft.com/en-us/windows/win32/msi/installer-productsex),

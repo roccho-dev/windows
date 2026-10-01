@@ -14,10 +14,10 @@ import pack
 WSL_LOCK = {
     "architecture": "x64", "minimumBuild": 26100, "minimumVersion": "2.9.3.0", "feature": "VirtualMachinePlatform",
     "appxName": "MicrosoftCorporationII.WindowsSubsystemForLinux", "publisherId": "8wekyb3d8bbwe",
-    "url": "https://github.com/microsoft/WSL/releases/download/2.9.13/wsl.2.9.13.0.x64.msi",
-    "size": 367693824, "sha256": "a00b0010f802ac461aaf44374b6ecbeae4b620453a77565f31eade5737e8af55",
-    "release": "prerelease", "version": "2.9.13.0", "productCode": "{861425A4-7173-4B0D-8EC1-7A94FD333418}",
-    "upgradeCode": "{6D5B792B-1EDC-4DE9-8EAD-201B820F8E82}", "packageCode": "{10B09957-0F00-4852-B522-8E6EDB50249B}",
+    "url": "https://github.com/microsoft/WSL/releases/download/3.0.1/wsl.3.0.1.0.x64.msi",
+    "size": 367669248, "sha256": "28b1a0d013640a2ac95898ea705fa186e5b4ff767a1c1b49257161bc106599c6",
+    "release": "stable", "version": "3.0.1.0", "productCode": "{14CEDBC6-042F-4AB4-B177-BAFE1C16BC7A}",
+    "upgradeCode": "{6D5B792B-1EDC-4DE9-8EAD-201B820F8E82}", "packageCode": "{8C6DA5D3-6340-4B41-A662-6580A3A559CD}",
     "productName": "Windows Subsystem for Linux", "manufacturer": "Microsoft Corporation", "template": "x64;1033",
     "publisher": "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
 }

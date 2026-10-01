@@ -1378,8 +1378,8 @@ public static string[] Split(string cmd) {
     Refused { IntroducePlatform $nativePlatform { $script:platformInventory.installReach = $true; CompletedNativeFailure 'native MSI partial failure' } } 'native MSI partial failure'
     Must ((Phases $nativePlatform) -ceq 'intent,void,intent' -and
         (Get-EffectClass @(RecordsOf $nativePlatform.id) (ObservePlatformEffect $nativePlatform)).class -ceq 'indeterminate') 'MSI partial service/PF reach leaves open native provenance'
-    $script:platformInventory.msi = @(@{ identityVerified = $true; context = 4; version = '2.9.13.0'; productCode = $wslPlatform.productCode })
-    $script:platformInventory.provisioned = @(@{ publisherId = $wslPlatform.publisherId; version = '2.9.13.0' })
+    $script:platformInventory.msi = @(@{ identityVerified = $true; context = 4; version = $wslPlatform.version; productCode = $wslPlatform.productCode })
+    $script:platformInventory.provisioned = @(@{ publisherId = $wslPlatform.publisherId; version = $wslPlatform.version })
     $script:completedPlatformId = $null
     Refused { RecoverId $nativePlatform.id } '*same-boot native platform outcome is unknown*'
     $script:platformBoot = 'after-reboot'
@@ -1399,7 +1399,7 @@ public static string[] Split(string cmd) {
     Must ((Phases $nativePlatform) -ceq 'intent,void,intent,commit,undone,intent,void') 'after explicit later boot genuinely absent timed-out operation voids through production observer'
     $script:platformBoot = 'synthetic-boot'
     $result = IntroducePlatform $nativePlatform {
-        $script:platformInventory.msi = @(@{ identityVerified = $true; context = 4; version = '2.9.13.0'; productCode = $wslPlatform.productCode })
+        $script:platformInventory.msi = @(@{ identityVerified = $true; context = 4; version = $wslPlatform.version; productCode = $wslPlatform.productCode })
         $script:platformInventory.provisioned = @()  # supported modern native MSI may ignore glue failure
         $script:platformInventory.installReach = $true
         @{ exitCode = 3010 }
