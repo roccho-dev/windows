@@ -571,7 +571,7 @@ def verify_platform(lock: object, asset: Path) -> None:
     selected = wsl_platform(lock)
     if selected is None:
         raise ValueError("Missing WSL platform lock")
-    verify_asset(selected, asset)
+    verify_asset({"name": selected["productName"], **selected}, asset)
     with asset.open("rb") as stream:
         if stream.read(8) != bytes.fromhex("d0cf11e0a1b11ae1"):
             raise ValueError("WSL installer is not an MSI compound document")
