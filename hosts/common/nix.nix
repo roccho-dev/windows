@@ -44,6 +44,33 @@ let
     url = "https://github.com/cloudflare/cloudflared/releases/download/${cloudflaredVersion}/cloudflared-windows-amd64.exe";
     sha256 = "5253e66f1f493c4e13539749f1aa86fd0c61e3072900fec29a44ba046a6d97e2";
   };
+  # Official stable WinGet recovery, fetched only when a missing Store app needs it.
+  # Bundle and inner app versions differ. These assets are not distribution payloads.
+  microsoftPublisher = "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US";
+  wingetBootstrap = {
+    architecture = "x64";
+    publisher = microsoftPublisher;
+    publisherId = "8wekyb3d8bbwe";
+    bundle = {
+      url = "https://github.com/microsoft/winget-cli/releases/download/v1.29.380/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle";
+      size = 217276577;
+      sha256 = "65dea9c01ce08ee7b763366b27c0e651f97db857c11ca9b9c301826c10092f2e";
+      name = "Microsoft.DesktopAppInstaller";
+      version = "2026.917.151.0";
+      entry = "AppInstaller_x64.msix";
+      appVersion = "1.29.380.0";
+    };
+    dependencies = {
+      url = "https://github.com/microsoft/winget-cli/releases/download/v1.29.380/DesktopAppInstaller_Dependencies.zip";
+      size = 97760717;
+      sha256 = "ba875afe9d190f61218985ac0292a99d1db710bf93e13c68944ca9d89f0d82d1";
+      packages = map (p: p // { entry = "x64/${p.name}_${p.version}_x64.appx"; }) [
+        { name = "Microsoft.VCLibs.140.00"; version = "14.0.33519.0"; }
+        { name = "Microsoft.VCLibs.140.00.UWPDesktop"; version = "14.0.33728.0"; }
+        { name = "Microsoft.WindowsAppRuntime.1.8"; version = "8000.616.304.0"; }
+      ];
+    };
+  };
   # Release-asset locks. The bytes are never bundled; the build fetches them only
   # to verify the lock and pin the extracted file inventory; Restore must fetch
   # and verify them again before any effect. Paths are relative to
@@ -150,14 +177,16 @@ let
       ];
     };
     cloudflared.version = cloudflaredVersion;
+    inherit wingetBootstrap;
     packages = map (lock: lock // { inventory = "${inventory lock}"; }) packageLocks;
     # The desktop UI font face: the family of this role, set face-only in the six Win32 UI font slots
-    # (SystemParametersInfoW) by ui-font.ahk, run by this locked package's interpreter (no compiler).
+    # in HKCU WindowMetrics; ui-font.ahk reads the live faces only (no setter or compiler).
     typography = { desktop = "ui"; interpreter = "AutoHotkey"; };
     # Microsoft Store apps Restore installs when absent, by the official WinGet from the msstore source.
     # Not pinned: the Store serves and updates its current version, and installing needs the network.
-    # An app present (this package name and publisher id) is never reinstalled, closed or removed, and
-    # its data is never owned. The ChatGPT desktop app's package family is OpenAI.Codex_2p2nqsd0c76g0.
+    # An app present is never reinstalled or owned. A newly introduced package is ledgered;
+    # removal is held pending disposable proof. Its data is never owned.
+    # The ChatGPT desktop app's package family is OpenAI.Codex_2p2nqsd0c76g0.
     # appearance: the app's own font settings (its light and dark themes in the user's Codex config), written
     # through the app's bundled config service. fonts name roles of `choices`, written as quoted CSS families.
     # defaults are the app's own complete themes (initial.js `jq` of 26.928.1915.0, with accentSource), written
@@ -182,6 +211,9 @@ let
     python ${./pack.py} fonts ${policy} "$out"
   '';
   dist = pkgs.runCommand "windows-dist" { nativeBuildInputs = [ python ]; } ''
+    python ${./pack.py} bootstrap ${pkgs.writeText "winget-bootstrap.json" (builtins.toJSON wingetBootstrap)} \
+      ${pkgs.fetchurl { inherit (wingetBootstrap.bundle) url sha256; }} \
+      ${pkgs.fetchurl { inherit (wingetBootstrap.dependencies) url sha256; }}
     python ${./pack.py} dist ${fonts} ${noctty} ${cloudflared} ${windowsChoices} ${./.} ${pkgs.lib.escapeShellArg source} "$out"
   '';
 in {

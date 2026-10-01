@@ -321,6 +321,39 @@ Must ((Get-AppAction @() $app) -ceq 'install' -and (Get-AppAction @(@{ name = 'O
     (Get-AppAction @(@{ name = 'OpenAI.Codex'; publisherId = 'aaaaaaaaaaaaa' }) $app) -ceq 'refuse' -and
     (Get-AppAction @(@{ name = 'OpenAI.Codex'; publisherId = '2P2NQSD0C76G0' }) $app) -ceq 'refuse' -and
     (Get-AppAction @(@{ name = 'OpenAI.Codex'; publisherId = '2p2nqsd0c76g0' }, @{ name = 'OpenAI.Codex'; publisherId = '2p2nqsd0c76g0' }) $app) -ceq 'refuse') 'Get-AppAction'
+# The bootstrap action has no registration branch. Validate every native candidate
+# before accepting a sufficient version (a later foreign record cannot be hidden by order).
+$bootstrap = $manifest.wingetBootstrap
+Must ($null -eq (Get-BootstrapProblem $bootstrap) -and $bootstrap.bundle.version -cne $bootstrap.bundle.appVersion) 'distinct locked bundle and app versions'
+$expectedAppInstaller = @{ name = $bootstrap.bundle.name; publisherId = $bootstrap.publisherId; version = $bootstrap.bundle.appVersion }
+$goodAppInstaller = @{ name = $bootstrap.bundle.name; publisherId = $bootstrap.publisherId; architecture = 'x64'; version = $bootstrap.bundle.appVersion }
+$foreignAppInstaller = @{ name = $bootstrap.bundle.name; publisherId = 'aaaaaaaaaaaaa'; architecture = 'x64'; version = $bootstrap.bundle.appVersion }
+Must ((Get-BootstrapAction @() $expectedAppInstaller $false -AppInstaller) -ceq 'install' -and
+    (Get-BootstrapAction @($goodAppInstaller) $expectedAppInstaller $true -AppInstaller) -ceq 'present' -and
+    (Get-BootstrapAction @($goodAppInstaller) $expectedAppInstaller $false -AppInstaller) -ceq 'refuse' -and
+    (Get-BootstrapAction @($goodAppInstaller, $foreignAppInstaller) $expectedAppInstaller $true -AppInstaller) -ceq 'refuse' -and
+    (Get-BootstrapAction @($foreignAppInstaller, $goodAppInstaller) $expectedAppInstaller $true -AppInstaller) -ceq 'refuse') 'lazy bootstrap actions and order-independent identity protection'
+$expectedFramework = @{ name = 'Microsoft.VCLibs.140.00'; publisherId = $bootstrap.publisherId; version = '14.0.33519.0' }
+foreach ($version in '14.0.33519.0', '14.0.33520.0') {
+    $row = @{ name = $expectedFramework.name; publisherId = $bootstrap.publisherId; architecture = 'x64'; framework = $true; version = $version }
+    Must ((Get-BootstrapAction @($row) $expectedFramework $false) -ceq 'present') 'same/newer matching framework is preserved'
+}
+foreach ($row in @(@{ name = $expectedFramework.name; publisherId = $bootstrap.publisherId; architecture = 'x64'; framework = $true; version = '14.0.33518.0' },
+        @{ name = $expectedFramework.name; publisherId = $bootstrap.publisherId; architecture = 'x86'; framework = $true; version = '14.0.33519.0' },
+        @{ name = $expectedFramework.name; publisherId = $bootstrap.publisherId; architecture = 'x64'; framework = $false; version = '14.0.33519.0' })) {
+    Must ((Get-BootstrapAction @($row) $expectedFramework $true) -ceq 'refuse') 'foreign lower/non-x64/non-framework stays protected'
+}
+$appxWant = @{ exists = $true; name = 'OpenAI.Codex'; publisherId = '2p2nqsd0c76g0' }
+$appxTarget = 'appx:OpenAI.Codex_2p2nqsd0c76g0'
+$appxIntent = PureRecord 1 intent appx-package $appxTarget $absent $appxWant $null $null
+$appxCommit = PureRecord 2 commit appx-package $appxTarget $absent $appxWant ($appxWant + @{ version = '26.928.1915.0' }) $null
+Must ($null -eq (Get-EffectRecordProblem $appxIntent) -and
+    (Get-EffectClass @() $absent 'appx-package' $appxWant).class -ceq 'absent' -and
+    (Get-EffectClass @() $appxWant 'appx-package' $appxWant).class -ceq 'preexisting-match' -and
+    (Get-EffectClass @($appxIntent, $appxCommit) ($appxWant + @{ version = '27.0.0.0' })).class -ceq 'owned-match' -and
+    (Get-EffectClass @($appxIntent, $appxCommit) $absent).resolution -ceq 'undone' -and
+    -not (Get-UninstallPlan @($appxIntent, $appxCommit) @{ $appxIntent.id = $appxWant }).ok -and
+    (Get-EffectRecordProblem (PureRecord 1 intent appx-package 'appx:Other.App_2p2nqsd0c76g0' $absent $appxWant $null $null)) -ceq 'target differs from the package identity.') 'Appx identity lifecycle and held removal'
 # ChatGPT app theme fonts (app-theme-fonts): the manifest's defaults make complete themes and fonts alone do not; an
 # existing theme gets its three font leaves and loses only the Faces it has; the undo removes a created theme only
 # while nobody changed it, and otherwise restores each leaf, keeping a recoloured theme valid; everything else of the
@@ -723,6 +756,7 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
         'StepText', 'IsPackageTree', 'RemovePackageAsset', 'IndexRecord', 'ReadLedger', 'LedgerIds', 'NewLedgerIndex', 'AttemptOf',
         'PackageEffect', 'SeedHazard', 'WriteSeed', 'AppPathEffects', 'IsAppPathEffect', 'MachineAppPath', 'EffectClass', 'AppPathState',
         'ConvergeAppPath', 'CollectAppPathGarbage', 'ConvergeEffect', 'Classify', 'UndoOwned', 'SharedKey', 'ObserveKeyContent'
+    $names += 'AppxEffect', 'ObserveAppx', 'IntroduceAppx', 'ConvergeApps', 'FetchBootstrap', 'AssertAppxManifest', 'AssertMicrosoftSignature'
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'win.ps1'), [ref]$null, [ref]$null)
     foreach ($definition in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cin $names }, $false)) {
         . ([scriptblock]::Create($definition.Extent.Text))
@@ -1233,6 +1267,54 @@ public static string[] Split(string cmd) {
     Must ($null -eq (Get-Fields $ordinalFields @('key')).key -and (Get-Fields $ordinalFields @('Key')).Key -eq 1 -and $oneElement -is [array] -and $oneElement.Count -eq 1 -and
         (Get-EffectRecordProblem @{ ledger = 'effects'; schema = 1; seq = @(1); phase = 'intent'; kind = 'file-created'; id = 'x'; target = 'C:\u\f'
             prior = @{ exists = $false }; desired = @{ exists = $true; sha256 = ('a' * 64) } }) -ceq 'seq is not a positive integer.') 'Get-Fields keeps arrays and source key comparison'
+    # B1: actual write-ahead/recovery machinery, synthetic Appx observer/deployer only.
+    # It does not install/close/uninstall a Store app or claim fresh licensing proof.
+    $script:bootstrapRows = @{}
+    function AppxRows([string]$Name) { @($script:bootstrapRows[$Name] | Where-Object { $null -ne $_ }) }
+    $introduced = AppxEffect 'OpenAI.Codex' '2p2nqsd0c76g0' $null
+    $before = $script:nextSeq
+    Refused { IntroduceAppx $introduced { throw 'native denied' } } 'native denied'
+    Must ((Phases $introduced) -ceq 'intent,void') 'failed app introduction without effect voids its intent'
+    Refused { IntroduceAppx $introduced {
+        $script:bootstrapRows['OpenAI.Codex'] = @(@{ name = 'OpenAI.Codex'; publisherId = '2p2nqsd0c76g0'; version = '26.928.1915.0'; fullName = 'observed' })
+        throw 'native nonzero after implicit success'
+    } } 'native nonzero after implicit success'
+    Must ((Phases $introduced) -ceq 'intent,void,intent,commit' -and
+        @(RecordsOf $introduced.id)[-1].observed.packages[0].version -ceq '26.928.1915.0') 'implicit app success is committed with observed provenance'
+    $script:bootstrapRows['OpenAI.Codex'][0].version = '27.0.0.0'
+    RecoverId $introduced.id
+    Must ((Phases $introduced) -ceq 'intent,void,intent,commit') 'Store version update leaves identity ownership'
+    $held = Get-UninstallPlan @(RecordsOf $introduced.id) @{ $introduced.id = (Observe $introduced) }
+    Must (-not $held.ok -and -not $held.steps.Count -and $held.refused[0].reason -like '*retained*') 'introduced package removal held, no cleanup PASS'
+    $mark = $script:nextSeq
+    Refused { IntroduceAppx $introduced { throw 'must not run' } } '*already exists*'
+    Must ($mark -eq $script:nextSeq) 'preexisting package never receives a new intent'
+    $script:bootstrapRows['OpenAI.Codex'] = @()
+    RecoverId $introduced.id
+    Must ((Phases $introduced) -ceq 'intent,void,intent,commit,undone') 'introduced package found absent closes undone'
+    function AppStates { @([pscustomobject]@{ action = 'present'; app = @{ package = 'OpenAI.Codex'; publisherId = '2p2nqsd0c76g0' } }) }
+    function EnsureWinGet([string]$Path) { throw 'present app must not bootstrap or need an alias' }
+    ConvergeApps
+    Must ($mark + 1 -eq $script:nextSeq) 'present app has no bootstrap/alias prerequisite or effects'
+    # Actual fetched-byte verifier with a synthetic native transfer, no download/deployment.
+    function Invoke-Native([string]$Exe, [string[]]$Arguments, [int]$Seconds) {
+        $at = [Array]::IndexOf($Arguments, '--output'); [IO.File]::WriteAllText($Arguments[$at + 1], 'abc', [Text.UTF8Encoding]::new($false))
+    }
+    $download = Join-Path $Scratch 'bootstrap-asset'
+    $assetLock = @{ size = 3; sha256 = (Sha 'abc'); url = 'https://invalid.example/fixture' }
+    $handle = FetchBootstrap $assetLock $download
+    try { Must ($handle.Length -eq 3) 'bootstrap fetched hash and size verified' } finally { $handle.Dispose() }
+    $assetLock.sha256 = '0' * 64
+    Refused { FetchBootstrap $assetLock $download } '*asset differs from lock*'
+    Refused { AssertMicrosoftSignature $download $manifest.wingetBootstrap.publisher } '*valid locked Microsoft signature*'
+    Must ($mark + 1 -eq $script:nextSeq) 'bad bytes/signature fail without an Appx intent'
+    $publisher = $manifest.wingetBootstrap.publisher
+    $expected = @{ name = 'Microsoft.DesktopAppInstaller'; version = '1.29.380.0' }
+    $xml = [xml]("<Package><Identity Name='$($expected.name)' Version='$($expected.version)' Publisher='$publisher' ProcessorArchitecture='x64'/><Properties/><Dependencies/></Package>")
+    AssertAppxManifest $xml $expected $publisher $false @()
+    $xml.Package.Identity.SetAttribute('ProcessorArchitecture', 'x86')
+    Refused { AssertAppxManifest $xml $expected $publisher $false @() } '*manifest differs*'
+    Must ($mark + 1 -eq $script:nextSeq) 'wrong actual inner architecture fails before effects'
     "PASS primitives in PowerShell $($PSVersionTable.PSVersion)"
 }
 function Primitive51([string]$Scratch) {

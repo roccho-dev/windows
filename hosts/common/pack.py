@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 from pathlib import Path, PurePosixPath
 import re
 import shutil
 import tempfile
 import zipfile
+import xml.etree.ElementTree as ET
 
 from fontTools.ttLib import TTFont
 
@@ -442,6 +444,87 @@ def store_apps(value: object, entries: list[dict]) -> list[dict]:
     return [{**app, "appearance": appearance(app["appearance"], entries)} if "appearance" in app else app for app in value]
 
 
+def winget_bootstrap(value: object) -> dict | None:
+    """Pinned official x64 recovery metadata only; no fetched bootstrap bytes enter the bundle."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"architecture", "publisher", "publisherId", "bundle", "dependencies"}:
+        raise ValueError("Invalid WinGet bootstrap shape")
+    if value["architecture"] != "x64" or value["publisherId"] != "8wekyb3d8bbwe" or value["publisher"] != \
+            "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US":
+        raise ValueError("WinGet bootstrap must select official Microsoft x64 packages")
+    for key, suffix, extra in (("bundle", ".msixbundle", {"name", "version", "entry", "appVersion"}),
+                               ("dependencies", ".zip", {"packages"})):
+        asset = value[key]
+        if not isinstance(asset, dict) or set(asset) != {"url", "size", "sha256"} | extra or not is_size(asset["size"]):
+            raise ValueError(f"Invalid bootstrap {key} lock")
+        hex_digest(asset["sha256"], 64, key)
+        if not isinstance(asset["url"], str) or not re.fullmatch(
+                r"https://github\.com/microsoft/winget-cli/releases/download/v[0-9.]+/[A-Za-z0-9_.-]+" + re.escape(suffix), asset["url"]):
+            raise ValueError(f"Bootstrap {key} is not an official fixed release asset")
+    bundle = value["bundle"]
+    if bundle["name"] != "Microsoft.DesktopAppInstaller" or bundle["entry"] != "AppInstaller_x64.msix":
+        raise ValueError("Bootstrap bundle must contain the x64 App Installer")
+    packages = value["dependencies"]["packages"]
+    if not isinstance(packages, list) or not packages:
+        raise ValueError("Bootstrap dependencies are empty")
+    names = set()
+    for package in packages:
+        if not isinstance(package, dict) or set(package) != {"name", "version", "entry"} or \
+                not TOKEN.fullmatch(text(package["name"], "dependency name")) or package["name"] in names:
+            raise ValueError("Invalid or duplicate bootstrap dependency")
+        names.add(package["name"])
+        if package["entry"] != f"x64/{package['name']}_{package['version']}_x64.appx":
+            raise ValueError("Dependency entry does not match its locked identity")
+    for version in [bundle["version"], bundle["appVersion"]] + [p["version"] for p in packages]:
+        if not isinstance(version, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){3}", version):
+            raise ValueError("Bootstrap version must have four numeric parts")
+    return value
+
+
+def verify_bootstrap(value: dict, bundle_path: Path, dependency_path: Path) -> None:
+    """Build gate on actual locked archives, including nested manifests, never an extraction.
+    Native signature/deployment checks remain Windows responsibilities."""
+    winget_bootstrap(value)
+    bundle, packages = value["bundle"], value["dependencies"]["packages"]
+    for lock, path in ((bundle, bundle_path), (value["dependencies"], dependency_path)):
+        verify_asset({"name": "WinGet bootstrap", **lock}, path)
+
+    def xml(archive, entry):
+        if archive.namelist().count(entry) != 1:
+            raise ValueError(f"Bootstrap must contain exactly one {entry}")
+        return ET.fromstring(archive.read(entry))
+
+    def manifest(archive, expected, framework, dependencies):
+        root = xml(archive, "AppxManifest.xml")
+        identity = root.find("{*}Identity")
+        wanted = {"Name": expected["name"], "Publisher": value["publisher"],
+                  "Version": expected["version"], "ProcessorArchitecture": "x64"}
+        actual_framework = root.find("{*}Properties/{*}Framework")
+        if identity is None or identity.attrib != wanted or \
+                (actual_framework is not None and actual_framework.text == "true") != framework:
+            raise ValueError("Bootstrap inner identity/framework differs from lock")
+        actual = [d.attrib for d in root.findall("{*}Dependencies/{*}PackageDependency")]
+        wanted_deps = [{"Name": p["name"], "Publisher": value["publisher"], "MinVersion": p["version"]} for p in dependencies]
+        if sorted(actual, key=lambda d: d.get("Name", "")) != sorted(wanted_deps, key=lambda d: d["Name"]):
+            raise ValueError("Bootstrap inner dependency minima differ from lock")
+
+    with zipfile.ZipFile(bundle_path) as archive:
+        root = xml(archive, "AppxMetadata/AppxBundleManifest.xml")
+        identity = root.find("{*}Identity")
+        if identity is None or identity.attrib != {"Name": bundle["name"], "Publisher": value["publisher"], "Version": bundle["version"]}:
+            raise ValueError("Bootstrap bundle identity differs from lock")
+        application = [p for p in root.findall("{*}Packages/{*}Package") if p.get("Type") == "application" and p.get("Architecture") == "x64" and p.get("IsStub") != "true"]
+        if len(application) != 1 or application[0].get("FileName") != bundle["entry"] or application[0].get("Version") != bundle["appVersion"]:
+            raise ValueError("Bootstrap bundle x64 entry differs from lock")
+        with zipfile.ZipFile(io.BytesIO(archive.read(bundle["entry"]))) as inner:
+            manifest(inner, {"name": bundle["name"], "version": bundle["appVersion"]}, False, packages)
+    with zipfile.ZipFile(dependency_path) as archive:
+        for package in packages:
+            with zipfile.ZipFile(io.BytesIO(archive.read(package["entry"]))) as inner:
+                manifest(inner, package, True, [])
+
+
 def seed_preferences(seed: dict, entries: list[dict]) -> bytes:
     """The seed's bytes: exactly the six font preferences, each role's family from fonts.json,
     as compact sorted UTF-8 JSON with one trailing newline, so equal inputs give equal bytes."""
@@ -476,6 +559,9 @@ def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
             raise ValueError("Empty font payload")
         ui = typography(selected.get("typography"), entries, packages)
         apps = store_apps(selected.get("apps"), entries)
+        bootstrap = winget_bootstrap(selected.get("wingetBootstrap"))
+        if apps and bootstrap is None:
+            raise ValueError("Declared Store apps require absent-AppInstaller recovery metadata")
         for name in ("win.ps1", "proof.ps1", "handoff-proof.ps1", "handoff-evaluate.ps1",
                      "package-view.ps1", "ui-font.ahk", "README.md"):
             shutil.copyfile(scripts / name, root / name)
@@ -499,7 +585,7 @@ def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
                               "files": noctty_files, "registration": registration},
                    "cloudflared": {"version": selected["cloudflared"]["version"], "file": "payload/cloudflared.exe",
                                    "sha256": files["payload/cloudflared.exe"]},
-                   "packages": packages, "typography": ui, "apps": apps, "files": files})
+                   "packages": packages, "typography": ui, "apps": apps, "wingetBootstrap": bootstrap, "files": files})
         output = out / "windows-dist.zip"
         archive(root, output)
         (out / "windows-dist.zip.sha256").write_text(digest(output) + "  windows-dist.zip\n", encoding="ascii")
@@ -521,6 +607,9 @@ if __name__ == "__main__":
     inventory_parser = sub.add_parser("inventory")
     for argument in ("lock", "archive", "listing", "tree", "out"):
         inventory_parser.add_argument(argument, type=Path)
+    bootstrap_parser = sub.add_parser("bootstrap")
+    for argument in ("lock", "bundle", "dependencies"):
+        bootstrap_parser.add_argument(argument, type=Path)
     args = parser.parse_args()
     if args.command == "fonts":
         prepare_fonts(json.loads(args.policy.read_text()), args.out)
@@ -528,6 +617,8 @@ if __name__ == "__main__":
         listed_paths(args.listing.read_text(encoding="utf-8"))
     elif args.command == "inventory":
         package_inventory(args.lock, args.archive, args.listing, args.tree, args.out)
+    elif args.command == "bootstrap":
+        verify_bootstrap(json.loads(args.lock.read_text(encoding="utf-8")), args.bundle, args.dependencies)
     else:
         distribution(args.fonts, args.noctty, args.cloudflared, args.choices,
                      args.scripts, args.source, args.out)
