@@ -32,6 +32,7 @@ directory, then run:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Validate     # read-only
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Restore      # fonts, UI font faces, Noctty, packages, Store apps (see below)
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Apply -Typography  # fonts, UI font faces, a present app's fonts
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Apply -ChromiumFonts  # the seed's six fonts into existing Chromium profiles; Chromium closed
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RestoreTest  # fail on drift
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Uninstall    # dry run: lists what it would revert
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Uninstall -Apply  # reverts owned fonts and Noctty, restores the selection
@@ -465,6 +466,49 @@ current version, so installing needs the network and a restore gets that day's
 version. An app is not a ledger effect: it is never reinstalled, updated, closed or
 removed, and its data and settings, including in-app fonts, are not owned or written.
 
+### Chromium fonts in existing profiles (the one exception to protected data)
+
+A new profile gets the fonts from the seed. An existing profile (`Chromium/User Data`,
+declared `protected`) is never written by `Restore`, with one exception, on request only:
+`-Mode Apply -ChromiumFonts`.
+- **What it writes:** into each normal profile `Local State` lists in
+  `profile.info_cache` (`Default`, `Profile N`; never Guest or System Profile), only the
+  bundled seed's own six values. They are `webkit.webprefs.fonts.{standard,sansserif,fixed}.{Zyyy,Jpan}`;
+  there is no second copy of the font data.
+- **What it never touches:** accounts, sign-in, sync, extensions, tab groups, other
+  preferences, `Secure Preferences` and security settings.
+- **Not synced:** Chromium 154 registers these preferences without a sync flag
+  (`RegisterFontFamilyPrefs` in
+  [prefs_tab_helper.cc](https://chromium.googlesource.com/chromium/src/+/refs/tags/154.0.8037.58/chrome/browser/ui/prefs/prefs_tab_helper.cc)),
+  so no account or sync value overrides them.
+- **How it edits:**
+  - The file is read strictly: no BOM, valid UTF-8, at most 16 MB and 100 levels.
+  - A bounded scan (`Get-JsonScan`) finds the members. A key repeated in one object,
+    also through an escape, is refused.
+  - Each absent leaf, with any parent it needs, is inserted right after an existing
+    object's `{`. Every other byte stays, numbers included: they are never parsed into
+    values and written back.
+  - The result must scan cleanly. Read by the .NET Framework's JSON reader (an
+    installed assembly, loaded, never compiled), it must equal the original but for
+    the six leaves.
+- **Ownership:** each written leaf is a `pref-value` ledger effect (prior absent),
+  recording the parents it created.
+  - A leaf already holding the seed's value is left unowned.
+  - A different value is the user's choice: kept and reported, never written.
+  - An owned leaf changed afterwards is owned-drift: reported, never written.
+  - `Uninstall` removes an owned leaf only while it still holds the value written, and
+    a created parent only once it is empty. A file Chromium has since rewritten in its
+    own form is handled the same way.
+- **Only while Chromium is closed:**
+  - no `User Data\lockfile` (it is never removed here; a stale one is a real gate);
+  - no `chrome.exe` running from this install or an owned tree, and none whose path
+    cannot be read;
+  - no preference MAC on `webkit` (`protection.macs` or `PreferenceMACs`).
+- **The write:** one intent per leaf, then the profile's new text goes to a temporary
+  file beside it. With Chromium still closed and the file unchanged since it was read
+  (SHA-256), one `File.Replace` swaps it in, and each leaf is committed after
+  reading back.
+- **Limits:** nothing starts, stops or kills Chromium. The fonts show at its next start.
 **Torn record.** A power loss can tear only the highest-seq record, and every mode
 that reads the ledger then stops. Remove that one file by hand only if it is the
 highest `<seq>.json` **and** does not parse as JSON; then rerun, and recovery
@@ -599,7 +643,19 @@ outside CI, under Windows PowerShell 5.1, against the bundled service of package
 passed: converge, a second run writing nothing, a stale version refused, user drift
 not written, and the `Uninstall` plan restoring the prior Face object and keeping a
 recoloured theme. A fresh home without `config.toml` got both default themes.
-It also requires every `win.ps1` answer to report
+A32 runs `Apply -ChromiumFonts` on the proof's stand-in `User Data` only: its restored
+`Default` and a synthetic `Profile 2` with int64 bounds, extreme doubles, exponents, a
+20-digit integer, case-only keys and escapes.
+- **Refusals, each writing nothing:** a lockfile (it stays), a `chrome.exe` running from
+  this install, an escaped duplicate key, and the flag combined with `-Typography`.
+- **Write:** all six leaves land; a leaf already holding the seed's value is not owned;
+  numbers, keys and escapes keep their exact bytes.
+- **Re-runs:** a second run writes nothing, and an owned leaf changed later is drift.
+- **Uninstall:** after a compact rewrite, it leaves both profiles as they were.
+
+A file changed between read and replace (hash race) is not staged on CI; it was exercised outside CI, under Windows
+PowerShell 5.1, on a synthetic `User Data`. A `chrome.exe` whose path cannot be read is refused by code, but that
+case is not exercised anywhere.It also requires every `win.ps1` answer to report
 `handoffProof = "unproven"` and `handoff-proof.ps1` to refuse the runner, so CI
 never claims a real default-terminal handoff. Negative controls must fail for
 their expected reason.

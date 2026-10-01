@@ -288,7 +288,7 @@ Must ($null -eq (Get-EffectRecordProblem (UiRecord 1 intent 'spi:menu' $segoe $p
     (Get-EffectRecordProblem (UiRecord 1 intent 'spi:menu' $segoe @{ exists = $true; face = 'SEGOE UI' } $null)) -eq $null -and
     (Get-EffectRecordProblem (UiRecord 1 intent 'spi:menu' $segoe $segoe $null)) -like 'desired equals prior*' -and
     (Get-EffectRecordProblem (UiRecord 2 commit 'spi:menu' $segoe $plex $segoe)) -ceq 'observed differs from desired.' -and
-    (Get-EffectRecordProblem ((UiRecord 1 intent 'spi:menu' $segoe $plex $null) + @{ name = 'MenuFont' })) -ceq 'name belongs to registry-value only.') 'ui-font-face records'
+    (Get-EffectRecordProblem ((UiRecord 1 intent 'spi:menu' $segoe $plex $null) + @{ name = 'MenuFont' })) -ceq 'name belongs to registry-value and pref-value only.') 'ui-font-face records'
 Must ((Get-UnownedClass ui-font-face $plex $segoe $null).class -ceq 'absent' -and (Get-UnownedClass ui-font-face $plex $plex $null).class -ceq 'preexisting-match' -and
     (Get-UnownedClass ui-font-face $plex @{ exists = $true; face = 'ibm plex sans jp' } $null).class -ceq 'absent' -and
     (Get-EffectClass @((UiRecord 1 intent 'spi:menu' $segoe $plex $null), (UiRecord 2 commit 'spi:menu' $segoe $plex $plex)) @{ exists = $true; face = 'Meiryo UI' } '' $null).class -ceq 'owned-drift' -and
@@ -384,6 +384,31 @@ Must ((ConvertTo-CanonicalJson (0.1 + 0.2)) -cne (ConvertTo-CanonicalJson 0.3) -
     (ConvertTo-CanonicalJson (SerdeNumber '60')) -ceq '60' -and (ConvertTo-CanonicalJson (SerdeNumber '60.0')) -ceq '60.0' -and
     (ConvertTo-CanonicalJson (SerdeNumber '9223372036854775807')) -ceq '9223372036854775807' -and (ConvertTo-CanonicalJson (SerdeNumber '18446744073709551615')) -ceq '18446744073709551615' -and
     (ConvertTo-CanonicalJson (SerdeNumber '0.30000000000000004')) -ceq (ConvertTo-CanonicalJson (0.1 + 0.2)) -and (ConvertTo-CanonicalJson ([decimal]::Parse('60.0', [Globalization.CultureInfo]::InvariantCulture))) -ceq '60.0') 'canonical numbers keep kind and exact value'
+# Chromium font preferences: the scan refuses what is not one plain JSON object or repeats a key (also through an escape);
+# the edit inserts only the six leaves and its undo restores the exact bytes; pref-value records and overlaps.
+$scanRefused = @('{"c":1,"\u0063":2}', '{"a":1,}', '{"a":[1,]}', '[1]', '{} {}', '{"a":01}', "{`"a`":`"x`ty`"}", '' | Where-Object { try { $null = Get-JsonScan $_; $false } catch { $true } })
+$prefsText = '{ "n": [9223372036854775807, 1.7976931348623157e+308, 5e-324, 1e+05, 12345678901234567890], "C": 1, "c": 2, "a\"b": "caf\u00e9",' +
+    ' "webkit": { "webprefs": { "fonts": { "standard": { "Zyyy": "x" } } } } }'
+$prefsValues = [ordered]@{}
+foreach ($leaf in Get-ChromiumFontLeaves) { if ($leaf -cne 'webkit.webprefs.fonts.standard.Zyyy') { $prefsValues[$leaf] = 'IBM Plex Sans JP' } }
+$prefsEdit = Get-PrefsFontEdit $prefsText (Get-JsonScan $prefsText) $prefsValues
+$prefsBack = $prefsEdit.text
+foreach ($leaf in $prefsValues.Keys) { $prefsBack = Get-PrefsFontUndo $prefsBack $leaf $prefsEdit.created[$leaf] }
+$prefsAt = Resolve-JsonPath (Get-JsonScan $prefsEdit.text) 'webkit.webprefs.fonts.fixed.Jpan'
+Must ($scanRefused.Count -eq 8 -and $prefsBack -ceq $prefsText -and $prefsEdit.text.StartsWith($prefsText.Substring(0, $prefsText.IndexOf('"webkit"'))) -and
+    (ConvertFrom-JsonString $prefsEdit.text.Substring($prefsAt.member.valueStart, $prefsAt.member.valueEnd - $prefsAt.member.valueStart)) -ceq 'IBM Plex Sans JP' -and
+    (@($prefsEdit.created['webkit.webprefs.fonts.fixed.Jpan']) -join '|') -ceq 'webkit.webprefs.fonts.fixed' -and @($prefsEdit.created['webkit.webprefs.fonts.standard.Jpan']).Count -eq 0 -and
+    (ConvertTo-JsonString "a`"b\c`n") -ceq '"a\"b\\c\u000a"') 'Chromium preferences: strict scan, six-leaf edit, exact undo'
+$prefRecord = @{ ledger = 'effects'; schema = 1; seq = 1; phase = 'intent'; id = 'p'; kind = 'pref-value'; target = 'C:\u\User Data\Default\Preferences'; name = 'webkit.webprefs.fonts.fixed.Jpan'
+    prior = $absent; desired = @{ exists = $true; value = 'PlemolJP Console NF'; created = @('webkit.webprefs.fonts.fixed') } }
+function PrefVariant([hashtable]$Change) { $r = $prefRecord.Clone(); foreach ($k in $Change.Keys) { $r[$k] = $Change[$k] }; $r }
+$otherLeaf = PrefVariant @{ name = 'webkit.webprefs.fonts.fixed.Zyyy' }
+Must ($null -eq (Get-EffectRecordProblem $prefRecord) -and
+    (Get-EffectRecordProblem (PrefVariant @{ name = 'webkit.webprefs.default_font_size' })) -ceq 'name is not a Chromium font leaf.' -and
+    (Get-EffectRecordProblem (PrefVariant @{ prior = @{ exists = $true; value = 'x' } })) -ceq 'prior must be absent.' -and
+    (Get-EffectRecordProblem (PrefVariant @{ desired = @{ exists = $true; value = 'x'; created = @('webkit.other') } })) -ceq 'desired.created is not a list of parents of name.' -and
+    -not (Test-TargetOverlap $prefRecord $otherLeaf) -and (Test-TargetOverlap $prefRecord $prefRecord) -and
+    (Get-UnownedClass pref-value $prefRecord.desired @{ exists = $true; value = 'Meiryo' } $null).class -ceq 'preexisting-drift')'pref-value records: six leaves only, prior absent, parents of the leaf; leaves of one file have separate owners'
 Must ((@(Get-CssFamilies '"IBM Plex Sans JP", ''Segoe UI'' , monospace') -join '|') -ceq 'IBM Plex Sans JP|Segoe UI|monospace') 'CSS families of an app font'
 # P1b-lite: the plan groups the ledger by id in one pass and validates each id once (Get-EffectAttempt), with the
 # plan unchanged: interleaved attempts; a reverted and a voided id kept; a malformed id refused; ids that differ
@@ -2688,6 +2713,82 @@ if ($appPathsLaunch -ceq 'proven') {
     if ($null -ne $a30Gone.process) { $null = SettleChromium 5 $a30Gone.process }
     Must (A30NotFound $a30Gone) "A30: after Uninstall ShellExecute no longer finds chromium ($(A30Text $a30Gone))"
 }
+# ---- A32: the six Chromium font preferences written into existing profiles (Apply -ChromiumFonts) and removed again ----
+# On the proof's stand-in User Data only: its Default (the restored text) and a synthetic Profile 2 with every numeric,
+# key and escape edge; Local State lists both (and a System Profile, never written). Fonts are converged first (Apply);
+# -ChromiumFonts only asserts them.
+$null = Run 'Apply'
+$localState, $profile2 = (Join-Path $chromiumProfile 'Local State'), (Join-Path $chromiumProfile 'Profile 2')
+if ((Test-Path -LiteralPath $localState) -or (Test-Path -LiteralPath $profile2)) { throw 'A32 requires no Local State or Profile 2 in the stand-in User Data yet.' }
+[IO.File]::WriteAllText($localState, '{"profile":{"info_cache":{"Default":{"name":"a"},"Profile 2":{"name":"b"},"System Profile":{}}}}')
+$null = New-Item -ItemType Directory -Path $profile2
+$seedFonts = [IO.File]::ReadAllText((Join-Path $PSScriptRoot $chromium.seed.file)) | ConvertFrom-Json
+function SeedFont([string]$Leaf) { $v = $seedFonts; foreach ($k in $Leaf.Split('.')) { $v = $v.$k }; [string]$v }
+$leaves = @(Get-ChromiumFontLeaves)
+$p2Prefs, $defaultPrefs = (Join-Path $profile2 'Preferences'), $preferences
+$p2Original = @"
+{
+  "big": [9223372036854775807, -9223372036854775808, 1.7976931348623157e+308, 5e-324, 1e+05, 1.5e-05, 12345678901234567890],
+  "C": 1, "c": 2, "a\"b": "café caf$([char]0x00e9)",
+  "webkit": { "webprefs": { "default_font_size": 16, "fonts": { "standard": { "Zyyy": "$(SeedFont 'webkit.webprefs.fonts.standard.Zyyy')" } } } }
+}
+"@
+[IO.File]::WriteAllText($p2Prefs, $p2Original, [Text.UTF8Encoding]::new($false))
+function PrefId([string]$Prefs, [string]$Leaf) { 'pref-value:' + ($Prefs + '|' + $Leaf).ToUpperInvariant() }
+function PrefIds { foreach ($prefs in $defaultPrefs, $p2Prefs) { foreach ($leaf in $leaves) { PrefId $prefs $leaf } } }
+function ChromiumFonts { Win51 @('-Mode', 'Apply', '-ChromiumFonts') }
+function Untouched { [IO.File]::ReadAllText($defaultPrefs) -ceq $restored -and [IO.File]::ReadAllText($p2Prefs) -ceq $p2Original -and (NewRecords $mark @(PrefIds)) -eq 0 }
+$mark = LastSeq
+MustReject { Win51 @('-Mode', 'Apply', '-ChromiumFonts', '-Typography') } '-ChromiumFonts is only for -Mode Apply*'
+# Closed means closed: a lockfile (never removed here), or a chrome.exe running from this install, stops every profile.
+[IO.File]::WriteAllText((Join-Path $chromiumProfile 'lockfile'), '')
+MustReject { ChromiumFonts } '*Chromium font drift:*lockfile exists*'
+Must ((Untouched) -and (Test-Path -LiteralPath (Join-Path $chromiumProfile 'lockfile'))) 'A32: a lockfile stops the write and stays'
+[IO.File]::Delete((Join-Path $chromiumProfile 'lockfile'))
+$fakeTree = Join-Path $programsDir 'chromium-proof'
+$null = New-Item -ItemType Directory -Path $fakeTree
+[IO.File]::Copy((Join-Path $env:SystemRoot 'System32\PING.EXE'), (Join-Path $fakeTree 'chrome.exe'), $false)
+$fake = Start-Process -FilePath (Join-Path $fakeTree 'chrome.exe') -ArgumentList '-n', '120', '127.0.0.1' -WindowStyle Hidden -PassThru
+try { MustReject { ChromiumFonts } '*Chromium is running*' } finally { $fake.Kill(); $fake.WaitForExit() }
+[IO.File]::Delete((Join-Path $fakeTree 'chrome.exe')); [IO.Directory]::Delete($fakeTree, $false)
+Must (Untouched) 'A32: a chrome.exe of this install stops the write'
+# A key repeated through an escape makes a profile unreadable for edits: nothing is written anywhere (Default comes first).
+[IO.File]::WriteAllText($defaultPrefs, '{"c":1,"c":2}')
+MustReject { ChromiumFonts } '*repeats a key*'
+[IO.File]::WriteAllText($defaultPrefs, $restored)
+Must (Untouched) 'A32: an escaped duplicate key is refused'
+# The write: Default gets all six; Profile 2 the five it lacks (its standard.Zyyy already holds the seed value:
+# preexisting-match, never owned); every other byte of both stays.
+$applied = ChromiumFonts
+$p2Now = [IO.File]::ReadAllText($p2Prefs)
+$p2Parsed, $defaultParsed = ($p2Now | ConvertFrom-Json), ([IO.File]::ReadAllText($defaultPrefs) | ConvertFrom-Json)
+function FontOf($Doc, [string]$Leaf) { $v = $Doc; foreach ($k in $Leaf.Split('.')) { if ($null -eq $v -or $null -eq $v.PSObject.Properties[$k]) { return $null }; $v = $v.$k }; [string]$v }
+Must ((@($applied.chromiumFonts | ForEach-Object { "$($_.profile)=$($_.written)" }) -join ',') -ceq 'Default=6,Profile 2=5' -and
+    -not @($leaves | Where-Object { (FontOf $defaultParsed $_) -cne (SeedFont $_) -or (FontOf $p2Parsed $_) -cne (SeedFont $_) }).Count -and
+    $defaultParsed.proof -ceq 'a profile restored by hand' -and (Phases (PrefId $p2Prefs 'webkit.webprefs.fonts.standard.Zyyy')) -ceq '' -and
+    -not @($leaves | Where-Object { $_ -cne 'webkit.webprefs.fonts.standard.Zyyy' -and (Phases (PrefId $p2Prefs $_)) -cne 'intent,commit' }).Count) 'A32: the six leaves are the seed''s in both profiles; a matching one is not owned'
+Must ($p2Now.Contains('[9223372036854775807, -9223372036854775808, 1.7976931348623157e+308, 5e-324, 1e+05, 1.5e-05, 12345678901234567890]') -and
+    $p2Now.Contains('"C": 1, "c": 2, "a\"b": "café caf') -and $p2Now.Contains('"default_font_size": 16') -and
+    -not (Test-Path -LiteralPath (Join-Path $profile2 'Preferences.*.tmp'))) 'A32: numbers, case-only keys and escapes keep their exact bytes; no temporary file left'
+$mark = LastSeq
+$again = ChromiumFonts
+Must ((NewRecords $mark @(PrefIds)) -eq 0 -and (@($again.chromiumFonts | ForEach-Object { $_.written }) -join ',') -ceq '0,0') 'A32: a second run writes nothing'
+# A font changed after this wrote it is owned-drift: reported, never written.
+$owned = [IO.File]::ReadAllText($defaultPrefs)
+$fixedJpan = '"Jpan":"' + (SeedFont 'webkit.webprefs.fonts.fixed.Jpan') + '"'
+[IO.File]::WriteAllText($defaultPrefs, $owned.Remove($owned.LastIndexOf($fixedJpan), $fixedJpan.Length).Insert($owned.LastIndexOf($fixedJpan), '"Jpan":"Consolas"'))
+MustReject { ChromiumFonts } '*Default webkit.webprefs.fonts.fixed.Jpan: changed after this wrote it*'
+Must ((NewRecords $mark @(PrefIds)) -eq 0) 'A32: a changed owned font is drift and not written'
+[IO.File]::WriteAllText($defaultPrefs, $owned)
+# Chromium rewrites Preferences in its own form; Uninstall then removes exactly the owned leaves and the parents they made.
+function Compact([string]$Text) { (@([regex]::Matches($Text, '"(?:[^"\\]|\\.)*"|[^\s"]+') | ForEach-Object { $_.Value }) -join '') }
+[IO.File]::WriteAllText($p2Prefs, (Compact $p2Now))
+$gone = RunUninstall -Apply
+Must ($gone.ownedOpen -eq 0 -and [IO.File]::ReadAllText($defaultPrefs) -ceq $restored -and [IO.File]::ReadAllText($p2Prefs) -ceq (Compact $p2Original) -and
+    -not @(PrefIds | Where-Object { (Phases $_) -cnotin @('', 'intent,commit,undone') }).Count) 'A32: Uninstall leaves both profiles as they were (Profile 2 in Chromium''s form), every owned leaf undone'
+AssertEmpty
+[IO.File]::Delete($p2Prefs); [IO.Directory]::Delete($profile2, $false); [IO.File]::Delete($localState)
+
 [IO.File]::Delete($sentinel)
 [IO.File]::Delete($preferences)
 [IO.Directory]::Delete((Split-Path -Parent $preferences), $false)
