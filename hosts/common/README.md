@@ -30,7 +30,10 @@ directory, then run:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Validate     # read-only
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Restore      # fonts, Noctty, packages (see below)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Restore      # fonts, UI font faces, Noctty, packages, Store apps (see below)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Apply -Typography  # fonts, UI font faces, a present app's fonts
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Apply -AppFonts  # the present app's fonts only
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Apply -ChromiumFonts  # the seed's six fonts into existing Chromium profiles; Chromium closed
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RestoreTest  # fail on drift
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Uninstall    # dry run: lists what it would revert
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Uninstall -Apply  # reverts owned fonts and Noctty, restores the selection
@@ -377,6 +380,187 @@ unproven until the VM run. Sites that set fonts in CSS, serif, other scripts, an
 Chromium's and Windows' own UI are unaffected; a later user setting prevails, and sync
 may.
 
+### Desktop UI font faces
+
+`typography` in `nix.nix` names a font role (`ui`, IBM Plex Sans JP). `Restore`, and
+`Apply -Typography` (fonts, these faces and a present app's fonts alone, for a machine
+where `Restore` stops elsewhere, such as a machine-wide Noctty), stage that family in the
+six classic Win32 UI font slots: caption, small caption, menu, status, message, and icon
+title.
+- **What it writes:** only `lfFaceName` in each slot's persisted
+  `HKCU\Control Panel\Desktop\WindowMetrics` value (a 92-byte REG_BINARY LOGFONTW),
+  through the .NET registry API. Every other byte of each font (height, weight,
+  quality, ...) and every other WindowMetrics value (`CaptionWidth` and the rest) stay.
+- **No SPI:** `SystemParametersInfo` SET is not used. On CI it recomputed and persisted
+  the window geometry along with the face (CI 94), which is not a font-only change.
+- **Checks around each write:**
+  - before: the value must be REG_BINARY, 92 bytes, with a terminated valid face; it must
+    hold the expected face, and its other bytes must be those read for the intent;
+  - after: the face, every other byte and every other WindowMetrics value must read back
+    as required. A failure is reported, never covered by writing anything else.
+- **When it takes effect:** Windows reads these values at sign-in, so the faces apply
+  after the user's next normal sign-in. Running applications are not notified.
+  - Each slot is reported as `pendingLogon` (persisted, not yet in use), `active` (in
+    use; read through `ui-font.ahk get`), `liveUnknown` (no interpreter to read with)
+    or `drift`.
+  - `ui-font.ahk` is now read-only and advisory. It runs on the locked AutoHotkey, never
+    sets anything, and is needed for no write.
+- **Unproven:** this layout is not a documented API contract. It is tested on Windows 11
+  build 26200 (the host, read only) and the CI runner's Windows Server; it is proven only
+  once a real user's sign-in shows the faces `active`. If something calls the SPI SET
+  calls before that sign-in (changing text size, theme or scaling), Windows may write its
+  in-memory fonts back; that shows as drift.
+- **Context guard (every mode that writes):** `Apply` (with any flag), `Restore` and
+  `Uninstall -Apply` refuse before their first write, the ledger lock included, unless they
+  run in a normal user context. A context with package identity, or one beneath a packaged
+  app, is refused.
+  - **Why:** the ChatGPT app (OpenAI.Codex) declares file-system and registry write
+    virtualization. From inside it, `%LOCALAPPDATA%` (this ledger, Chromium's profile) and
+    HKCU writes go to the package's private copy (`...\Packages\OpenAI.Codex_...\LocalCache`).
+    They read back correctly there and miss the user's real state.
+  - **How it decides:** a shell started inside such an app reads "no package" itself, so
+    its ancestors are checked too. Only `APPMODEL_ERROR_NO_PACKAGE` counts as no
+    identity; any other answer refuses.
+  - **What it doesn't cover:** `Validate`, `Test`, `RestoreTest` and a dry-run `Uninstall`
+    are not affected. A shell started from Windows Terminal (itself a packaged app) is
+    refused too, which is the safe side.
+  - **Not proof:** neither check proves the view is the user's own, so run from a normal
+    user shell or task. The write-time checks in the face, Chromium and undo paths stay
+    as a second line.
+
+**Ledger:** each slot is a `ui-font-face` ledger effect: target `winmetrics:<slot>`, state
+`face`, prior the face found.
+- Another face in a slot nothing owns is `absent`, taken with that face recorded as prior.
+- Per slot: intent, the write, a commit read back. Recovery commits a slot that holds the
+  face and voids one that does not.
+- A face changed after this wrote it is owned-drift: `Apply` reports it and writes nothing,
+  and `Uninstall` refuses it (set it back by hand).
+- **Exactly the prior value again:** a committed effect whose target holds exactly its
+  recorded prior again counts as undone (the generic recovery rule, which also closes an
+  undo that stopped before its record). It is unowned again, and the next explicit run
+  writes the selection once more: `Restore`, or `Apply` with the matching flag. This holds
+  for a UI font slot back on its prior face, an app theme whose font leaves are back to
+  their prior values, and a Chromium font leaf that was deleted (Chromium deletes it when
+  set back to its default). Any other change to an owned value is drift: kept, reported,
+  never written. Nothing re-applies in the background; there is no scheduled task.
+- `Uninstall` writes each prior face back the same way, over whatever the other bytes are
+  then, so a size the user changed later is kept: only the face is owned.
+- Unselected owned fonts are collected only after the faces move, and a font whose family
+  a slot, an owned app font or an owned Chromium font still names is kept.
+
+This covers classic Win32 UI text only. Modern shell and XAML text, and applications' own
+fonts, are not changed: no uniform OS-wide font is claimed.
+
+`-Mode Apply -AppFonts` writes only the fonts of the app already present: no Store
+install, no OS font, Noctty or package. With no app, it does nothing.
+### Store apps
+
+`apps` in `nix.nix` lists Microsoft Store apps by Store id, package name and publisher
+id. For now it holds only the ChatGPT desktop app: `9PLM9XGG6VKS`, package family
+`OpenAI.Codex_2p2nqsd0c76g0`. `Restore` reads this user's packages (`Get-AppxPackage`).
+With none of that name it runs the official WinGet (`winget install --id <id> --source
+msstore --exact --silent`). With exactly one of that publisher it does nothing. Anything
+else fails and is never replaced. `Restore` and `RestoreTest` then require it to be
+present and report its version.
+
+**ChatGPT app fonts.** The app's `appearance` in `nix.nix` names font roles for the
+app's own settings: UI and content use IBM Plex Sans JP, and code uses PlemolJP Console
+NF, each written as a quoted CSS family, in both the light and dark themes.
+- **When it runs:** `Restore` sets them after installing the app and before its first
+  start. `Apply -Typography` sets them only when the app is already present.
+- **How it writes:** only through the app's own config service, the `codex.exe
+  app-server` bundled in the installed package. It calls `initialize`, `config/read`
+  with layers, then one `config/batchWrite` guarded by the user layer's
+  `expectedVersion`, then reads back. No model, thread or account request is made.
+  There is no file edit, internal IPC, `app.asar`, global-state or database write.
+- **What it changes:**
+  - An existing theme gets only its `ui`, `code` and `content` font leaves, and loses
+    any `uiFace`/`codeFace`/`contentFace` (a Face overrides the family). Its colors, the
+    mode and all other settings stay.
+  - An absent theme is created whole from the app's own defaults (`jq` of
+    26.928.1915.0, with `accentSource = "chatgpt"`). A theme with fonts alone is one the
+    app drops.
+- **Errors:** a refusal by the service is reported by method and JSON-RPC error code only; its message, which may quote a config line, and the service's stderr are never printed.
+- **Refusals:** a theme another config layer sets, one the app would reject, and a
+  read-only or repeated user layer are refused. A stale version is refused by the
+  service, and nothing is written.
+- **Ledger:** each theme is an `app-theme-fonts` effect with the prior font leaves
+  (Face objects included) recorded.
+  - `Uninstall` puts them back only while they are still the ones written. A theme it
+    created and nobody changed is removed whole; a recoloured one keeps its colors and
+    loses only the fonts, and stays valid.
+  - Fonts changed afterwards (the running app writes the whole theme when the user
+    changes appearance) are owned-drift: reported and never written. `Uninstall`
+    refuses them.
+  - Everything else in the user config is compared before and after each write
+    (values only, never printed), and a difference fails the run.
+- **Limits:**
+  - A running app shows the change after its next restart. Nothing here starts,
+    stops or restarts it; that restart and a visual check are the final gate.
+  - Starting the service does its normal runtime bookkeeping under the Codex home (and
+    its usual network requests), so the write is not the only file activity.
+  - Only this user's Codex config is written. The app's data, accounts and other
+    settings are never owned.
+  - `Uninstall` needs the app present while the ledger owns its fonts.
+
+This uses neither Microsoft DSC nor a pinned package. The Store serves and updates its
+current version, so installing needs the network and a restore gets that day's
+version. An app is not a ledger effect: it is never reinstalled, updated, closed or
+removed, and its data and settings, including in-app fonts, are not owned or written.
+
+### Chromium fonts in existing profiles (the one exception to protected data)
+
+A new profile gets the fonts from the seed. An existing profile (`Chromium/User Data`,
+declared `protected`) is never written by `Restore`, with one exception, on request only:
+`-Mode Apply -ChromiumFonts`.
+- **What it writes:** into each normal profile `Local State` lists in
+  `profile.info_cache` (`Default`, `Profile N`; never Guest or System Profile), only the
+  bundled seed's own six values. They are `webkit.webprefs.fonts.{standard,sansserif,fixed}.{Zyyy,Jpan}`;
+  there is no second copy of the font data.
+- **What it never touches:** accounts, sign-in, sync, extensions, tab groups, other
+  preferences, `Secure Preferences` and security settings.
+- **Not synced:** Chromium 154 registers these preferences without a sync flag
+  (`RegisterFontFamilyPrefs` in
+  [prefs_tab_helper.cc](https://chromium.googlesource.com/chromium/src/+/refs/tags/154.0.8037.58/chrome/browser/ui/prefs/prefs_tab_helper.cc)),
+  so no account or sync value overrides them.
+- **How it edits:**
+  - The file is read strictly: no BOM, valid UTF-8, at most 16 MB and 100 levels.
+  - A bounded scan (`Get-JsonScan`) finds the members. A key repeated in one object,
+    also through an escape, is refused.
+  - Each absent leaf, with any parent it needs, is inserted right after an existing
+    object's `{`. Every other byte stays, numbers included: they are never parsed into
+    values and written back.
+  - The result must scan cleanly. Read by the .NET Framework's JSON reader (an
+    installed assembly, loaded, never compiled), it must equal the original but for
+    the six leaves.
+- **Ownership:** each written leaf is a `pref-value` ledger effect (prior absent),
+  recording the parents it created.
+  - A leaf already holding the seed's value is left unowned.
+  - A different value is the user's choice: kept and reported, never written.
+  - An owned leaf changed afterwards is owned-drift: reported, never written.
+  - `Uninstall` removes an owned leaf only while it still holds the value written, and
+    a created parent only once it is empty. A file Chromium has since rewritten in its
+    own form is handled the same way.
+- **Only while Chromium is closed:**
+  - no `User Data\lockfile` (it is never removed here; a stale one is a real gate);
+  - no `chrome.exe` running from this install or an owned tree, and none whose path
+    cannot be read;
+  - no preference MAC on `webkit`: in the profile's `protection.macs`, or in
+    `HKCU\Software\Chromium\PreferenceMACs\<profile>`. Only that brand key is checked
+    (this build's); a build that keeps its MACs under another key is not covered.
+  - a `chrome.exe` whose path cannot be read refuses the write, because it could be this
+    install. This is code only, not exercised anywhere: neither CI nor the smoke can
+    start such a process.
+- **Only from a normal user context:** the same guard as the UI font faces runs before
+  any intent, before every Preferences write (`Apply` and `Uninstall`'s undo alike) and
+  when `Uninstall` plans. It refuses package identity, an unknown answer, or a packaged
+  app among the ancestors. A write from a packaged app's view could read back correctly
+  and still miss the user's real profile. The guard is not proof of the user's real view.
+- **The write:** one intent per leaf, then the profile's new text goes to a temporary
+  file beside it. With Chromium still closed and the file unchanged since it was read
+  (SHA-256), one `File.Replace` swaps it in, and each leaf is committed after
+  reading back.
+- **Limits:** nothing starts, stops or kills Chromium. The fonts show at its next start.
 **Torn record.** A power loss can tear only the highest-seq record, and every mode
 that reads the ledger then stops. Remove that one file by hand only if it is the
 highest `<seq>.json` **and** does not parse as JSON; then rerun, and recovery
@@ -384,7 +568,8 @@ closes the attempt from the machine's state. A record that parses but is invalid
 is never removed: stop and investigate.
 **Stale lock.** A power loss can also leave `ledger\.lock`, and every writer then stops with "Another run holds the effect ledger lock"; delete that one file by hand only when no `win.ps1` (`powershell.exe`) process is running.
 
-**#14 (RentSsh).** The ledger owns only what it created (prior absent). A
+**#14 (RentSsh).** The ledger owns only what it created (prior absent), except a UI
+font face, whose slot always holds one (above). A
 `prefix-inserted` or `file-replaced` effect cannot be moved to a new version by
 undo-then-rewrite, because the restored prior classifies as `preexisting-*`; #14
 must define an explicit transition record first.
@@ -491,7 +676,44 @@ first run on the default `User Data` and Win+R itself are proven only by the VM 
 Windows 11 VM, as an unelevated user in an Explorer-launched session, Win+R `chromium`
 after `Restore` starts the owned `chrome.exe` (positive), and the same Win+R after
 `Uninstall` finds nothing (negative).
-It also requires every `win.ps1` answer to report
+A31 (UI font faces, while AutoHotkey is owned) checks the face-only registry writes on
+the runner. CI cannot sign in, so the faces staying `pendingLogon` is the expected
+result, and the live fonts must not change.
+- **Refusals, each writing nothing:** a font value of the wrong length or type, the
+  flags misused, and `-AppFonts` without the app (which must touch nothing).
+- **Crash recovery:** a run that wrote three of six slots is recovered: three committed,
+  three voided and written anew.
+- **What changes:** only the six faces; every other byte and WindowMetrics value
+  (`CaptionWidth` included) and the live fonts stay.
+- **Re-runs:** a second run writes nothing. A third face (Arial) is drift: not written, and
+  `Uninstall` refuses it. The exact prior face again counts as undone: the next explicit
+  run takes the slot back, writing exactly undone, intent and commit, and changing only that face.
+- **Uninstall:** after a later height change, it restores each face only, keeps that
+  height and is byte-exact elsewhere.
+`Restore`'s Store app step (WinGet) is not run on CI;
+only its decision (`Get-AppAction`) is. The runner has no ChatGPT app, so the app fonts
+are proven on CI only as pure rules: complete default themes, font-only themes refused,
+the edits for an existing and an absent theme, records, classes, the undo of a created
+and a recoloured theme, and the comparison of the rest of the config. `Apply
+-Typography` there reports `appFonts = "appAbsent"`. The adapter itself was run
+outside CI, under Windows PowerShell 5.1, against the bundled service of package
+26.928.1915.0, on synthetic isolated Codex homes only (not the host's config). It
+passed: converge, a second run writing nothing, a stale version refused, user drift
+not written, and the `Uninstall` plan restoring the prior Face object and keeping a
+recoloured theme. A fresh home without `config.toml` got both default themes.
+A32 runs `Apply -ChromiumFonts` on the proof's stand-in `User Data` only: its restored
+`Default` and a synthetic `Profile 2` with int64 bounds, extreme doubles, exponents, a
+20-digit integer, case-only keys and escapes.
+- **Refusals, each writing nothing:** a lockfile (it stays), a `chrome.exe` running from
+  this install, an escaped duplicate key, and the flag combined with `-Typography`.
+- **Write:** all six leaves land; a leaf already holding the seed's value is not owned;
+  numbers, keys and escapes keep their exact bytes.
+- **Re-runs:** a second run writes nothing, and an owned leaf changed later is drift.
+- **Uninstall:** after a compact rewrite, it leaves both profiles as they were.
+
+A file changed between read and replace (hash race) is not staged on CI; it was exercised outside CI, under Windows
+PowerShell 5.1, on a synthetic `User Data`. A `chrome.exe` whose path cannot be read is refused by code, but that
+case is not exercised anywhere.It also requires every `win.ps1` answer to report
 `handoffProof = "unproven"` and `handoff-proof.ps1` to refuse the runner, so CI
 never claims a real default-terminal handoff. Negative controls must fail for
 their expected reason.
@@ -522,7 +744,15 @@ showing no write inside its tree (G3). These also gate leaving out the vendor's
 bookkeeping keys and descriptions; if handoff fails without them, they become
 owned values.
 
-Application/UI selection beyond noctty, Japanese/Nerd/Emoji rendering,
+**Recorded host observations (2026-10-01, no clean VM).** On the maintainer's host, a
+Noctty sample of ASCII, kana, kanji and the Nerd Font glyph U+F121 was accepted by the
+user as rendering without visible missing-glyph boxes. That host's Noctty was already
+configured with PlemolJP. This is an accepted visual sample on one existing machine.
+It is not a clean-install, `Restore` or VM result. No UI font face or Store app was
+applied on that host. The clean VM run (S7) is deferred by the user, so a full clean
+restore is not claimed.
+
+Application/UI selection beyond noctty and the six Win32 UI font slots, Japanese/Nerd/Emoji rendering,
 font reload/relogin, Linux profile activation, and real-host
 Spec + Binding → Runtime → Proof/restoration remain unproven. Installing a font
 does not prove an application uses it. Native `nix.exe` is not a prerequisite.

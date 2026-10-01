@@ -57,6 +57,22 @@ function MustReject([scriptblock]$Action, [string]$Pattern) {
 }
 $validated = Run 'Validate'
 if ($validated.source -ne $ExpectedSource -or $ExpectedSource -notmatch '^[0-9a-f]{40}$') { throw 'Source mismatch.' }
+# An app appearance is optional: the same bundle validates with apps that have none, and with no apps at all. A copy of the
+# listed files gets each variant's manifest.json (outside the inventory), run as the real one is (5.1, -File).
+foreach ($variant in 'without appearance', 'without apps') {
+    $copy = Join-Path $env:RUNNER_TEMP ('optional-apps-' + [guid]::NewGuid().ToString('N'))
+    $variantManifest = Get-Content (Join-Path $PSScriptRoot 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    foreach ($name in $variantManifest.files.PSObject.Properties.Name) {
+        $target = Join-Path $copy $name
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination $target
+    }
+    $variantManifest.apps = if ($variant -ceq 'without apps') { @() } else { @($variantManifest.apps | ForEach-Object { $_.PSObject.Properties.Remove('appearance'); $_ }) }
+    [IO.File]::WriteAllText((Join-Path $copy 'manifest.json'), ($variantManifest | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+    $variantLines = @(& $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $copy 'win.ps1') -Mode Validate 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw "win.ps1 -Mode Validate fails $variant`: $($variantLines -join ' ')" }
+    Write-Host "Validate $variant`: exit 0"
+}
 # The run identity is a record, not text (a [string] script parameter of the same name once flattened it).
 if ($validated.identity.sid -notmatch '^S-1-' -or $validated.identity.elevated -isnot [bool]) { throw 'win.ps1 reported no run identity record.' }
 # No win.ps1 mode may claim a real default-terminal handoff, and the host-only
@@ -217,7 +233,8 @@ $pureKinds = @(
     @('file-replaced', 'C:\u\r', @{ exists = $true; sha256 = (Sha b); backup = 'C:\u\r.bak' }, @{ exists = $true; sha256 = (Sha c) }, $null),
     @('registry-value', 'HKCU\Software\W', $absent, @{ exists = $true; type = 'String'; data = 'new' }, 'v'),
     @('registry-value', 'HKCU\Software\W', @{ exists = $true; type = 'String'; data = 'old' }, @{ exists = $true; type = 'String'; data = 'new' }, 'v'),
-    @('registry-key-created', 'HKCU\Software\Classes\CLSID\{W}', $absent, @{ exists = $true }, $null))
+    @('registry-key-created', 'HKCU\Software\Classes\CLSID\{W}', $absent, @{ exists = $true }, $null),
+    @('ui-font-face', 'winmetrics:menu', @{ exists = $true; face = 'Segoe UI' }, @{ exists = $true; face = 'IBM Plex Sans JP' }, $null))
 foreach ($case in $pureKinds) {
     $kind, $target, $prior, $desired, $name = $case
     $committed = @((PureRecord 1 intent $kind $target $prior $desired $null $name), (PureRecord 2 commit $kind $target $prior $desired $desired $name))
@@ -257,6 +274,158 @@ $plan = Get-UninstallPlan $records @{ k = $exists; v = $data; s = $exists }
 Must ($plan.ok -and (Actions $plan) -ceq 'delete-empty-key,delete-registry-value,delete-empty-key') 'a created key is removed after what it holds'
 Must (-not (Get-UninstallPlan (@(Owned 1 v registry-value "$clsid\LocalServer32" $data '') + @(Owned 3 k registry-key-created $clsid $exists $null)) @{ k = $exists; v = $data }).ok) 'a value owned before its key is refused'
 Must (-not (Get-UninstallPlan (@(Owned 1 k registry-key-created $clsid $exists $null) + @(Owned 3 j registry-key-created $clsid.ToLowerInvariant() $exists $null)) @{ k = $exists; j = $exists }).ok) 'two claims on one key are refused'
+# UI font faces: a slot always holds a face, so prior exists; face is the whole state, compared exactly; another
+# face unowned is absent (taken, recording it as prior); the undo writes the prior face back only over the one written.
+$segoe, $plex = @{ exists = $true; face = 'Segoe UI' }, @{ exists = $true; face = 'IBM Plex Sans JP' }
+function UiRecord($Seq, $Phase, $Target, $Prior, $Desired, $Observed) { $r = PureRecord $Seq $Phase ui-font-face $Target $Prior $Desired $Observed $null; $r.id = "ui:$Target"; $r }
+Must ($null -eq (Get-EffectRecordProblem (UiRecord 1 intent 'winmetrics:menu' $segoe $plex $null)) -and
+    $null -eq (Get-EffectRecordProblem (UiRecord 2 commit 'winmetrics:icon' $segoe $plex $plex)) -and
+    (Get-EffectRecordProblem (UiRecord 1 intent 'winmetrics:menu' $absent $plex $null)) -ceq 'prior must exist.' -and
+    (Get-EffectRecordProblem (UiRecord 1 intent 'winmetrics:Menu' $segoe $plex $null)) -like 'target*' -and
+    (Get-EffectRecordProblem (UiRecord 1 intent 'HKCU\Control Panel\Desktop\WindowMetrics' $segoe $plex $null)) -like 'target*' -and
+    (Get-EffectRecordProblem (UiRecord 1 intent 'winmetrics:menu' $segoe @{ exists = $true; face = 'x' * 32 } $null)) -like 'desired.face*' -and
+    (Get-EffectRecordProblem (UiRecord 1 intent 'winmetrics:menu' $segoe @{ exists = $true; face = "a`tb" } $null)) -like 'desired.face*' -and
+    (Get-EffectRecordProblem (UiRecord 1 intent 'winmetrics:menu' $segoe @{ exists = $true; face = 'SEGOE UI' } $null)) -eq $null -and
+    (Get-EffectRecordProblem (UiRecord 1 intent 'winmetrics:menu' $segoe $segoe $null)) -like 'desired equals prior*' -and
+    (Get-EffectRecordProblem (UiRecord 2 commit 'winmetrics:menu' $segoe $plex $segoe)) -ceq 'observed differs from desired.' -and
+    (Get-EffectRecordProblem ((UiRecord 1 intent 'winmetrics:menu' $segoe $plex $null) + @{ name = 'MenuFont' })) -ceq 'name belongs to registry-value and pref-value only.') 'ui-font-face records'
+Must ((Get-UnownedClass ui-font-face $plex $segoe $null).class -ceq 'absent' -and (Get-UnownedClass ui-font-face $plex $plex $null).class -ceq 'preexisting-match' -and
+    (Get-UnownedClass ui-font-face $plex @{ exists = $true; face = 'ibm plex sans jp' } $null).class -ceq 'absent' -and
+    (Get-EffectClass @((UiRecord 1 intent 'winmetrics:menu' $segoe $plex $null), (UiRecord 2 commit 'winmetrics:menu' $segoe $plex $plex)) @{ exists = $true; face = 'Meiryo UI' } '' $null).class -ceq 'owned-drift' -and
+    (Get-EffectClass @((UiRecord 1 intent 'winmetrics:menu' $segoe $plex $null)) $plex '' $null).resolution -ceq 'confirm') 'ui-font-face classes'
+$uiPlan = Get-UninstallPlan @((UiRecord 1 intent 'winmetrics:menu' $segoe $plex $null), (UiRecord 2 commit 'winmetrics:menu' $segoe $plex $plex),
+    (UiRecord 3 intent 'winmetrics:icon' $segoe $plex $null), (UiRecord 4 commit 'winmetrics:icon' $segoe $plex $plex)) @{ 'ui:winmetrics:menu' = $plex; 'ui:winmetrics:icon' = $plex }
+Must ($uiPlan.ok -and (Actions $uiPlan) -ceq 'set-ui-font-face,set-ui-font-face' -and
+    (@($uiPlan.steps | ForEach-Object { "$($_.slot):$($_.expectFace)>$($_.face)" }) -join '|') -ceq 'icon:IBM Plex Sans JP>Segoe UI|menu:IBM Plex Sans JP>Segoe UI' -and
+    -not (Get-UninstallPlan @((UiRecord 1 intent 'winmetrics:menu' $segoe $plex $null), (UiRecord 2 commit 'winmetrics:menu' $segoe $plex $plex)) @{ 'ui:winmetrics:menu' = @{ exists = $true; face = 'Meiryo UI' } }).ok) 'ui-font-face undo writes the prior face over the written one only; a changed face is refused'
+# The persisted LOGFONTW: only lfFaceName (bytes 28-91) changes; anything not a 92-byte font with a terminated valid
+# face is refused.
+$logFont = [byte[]]::new(92)
+[BitConverter]::GetBytes([int]-12).CopyTo($logFont, 0); $logFont[16] = 0x90; $logFont[26] = 5
+[Text.Encoding]::Unicode.GetBytes('Segoe UI').CopyTo($logFont, 28)
+$logFont[60] = 0x41  # a stale byte after the terminator, as Windows can leave
+$withPlex = Get-LogFontWithFace $logFont 'IBM Plex Sans JP'
+$unterminated = [byte[]]$logFont.Clone(); for ($i = 28; $i -lt 92; $i += 2) { $unterminated[$i] = 0x41 }
+$taller = [byte[]]$withPlex.Clone(); $taller[0] = 0xF0
+$refusedFaces = @(@(@{ b = [byte[]]::new(91); f = 'x' }, @{ b = $unterminated; f = 'x' }, @{ b = $logFont; f = ('x' * 32) }, @{ b = $logFont; f = "a`tb" }) |
+    Where-Object { try { $null = Get-LogFontWithFace $_.b $_.f; $false } catch { $true } })
+Must ((Get-LogFontFace $logFont) -ceq 'Segoe UI' -and (Get-LogFontFace $withPlex) -ceq 'IBM Plex Sans JP' -and (Test-LogFontFaceOnly $logFont $withPlex) -and
+    [BitConverter]::ToString($withPlex, 0, 28) -ceq [BitConverter]::ToString($logFont, 0, 28) -and $withPlex[28 + 2 * 'IBM Plex Sans JP'.Length] -eq 0 -and $withPlex[60] -eq 0 -and
+    $null -eq (Get-LogFontFace $unterminated) -and $null -eq (Get-LogFontFace ([byte[]]::new(91))) -and $null -eq (Get-LogFontFace 'not bytes') -and
+    -not (Test-LogFontFaceOnly $logFont $taller) -and $refusedFaces.Count -eq 4 -and (Get-LogFontFace (Get-LogFontWithFace $taller 'Segoe UI')) -ceq 'Segoe UI' -and
+    (Get-LogFontWithFace $taller 'Segoe UI')[0] -eq 0xF0) 'LOGFONTW face-only edits: header bytes kept, face region rewritten, invalid input refused, a later height kept by the undo'
+# Store apps: installed only when no package of that name exists; present only as exactly one of that publisher.
+$app = @{ name = 'ChatGPT'; package = 'OpenAI.Codex'; publisherId = '2p2nqsd0c76g0' }
+Must ((Get-AppAction @() $app) -ceq 'install' -and (Get-AppAction @(@{ name = 'Other.App'; publisherId = '2p2nqsd0c76g0' }) $app) -ceq 'install' -and
+    (Get-AppAction @(@{ name = 'OpenAI.Codex'; publisherId = '2p2nqsd0c76g0'; version = '1.0' }) $app) -ceq 'present' -and
+    (Get-AppAction @(@{ name = 'OpenAI.Codex'; publisherId = 'aaaaaaaaaaaaa' }) $app) -ceq 'refuse' -and
+    (Get-AppAction @(@{ name = 'OpenAI.Codex'; publisherId = '2P2NQSD0C76G0' }) $app) -ceq 'refuse' -and
+    (Get-AppAction @(@{ name = 'OpenAI.Codex'; publisherId = '2p2nqsd0c76g0' }, @{ name = 'OpenAI.Codex'; publisherId = '2p2nqsd0c76g0' }) $app) -ceq 'refuse') 'Get-AppAction'
+# ChatGPT app theme fonts (app-theme-fonts): the manifest's defaults make complete themes and fonts alone do not; an
+# existing theme gets its three font leaves and loses only the Faces it has; the undo removes a created theme only
+# while nobody changed it, and otherwise restores each leaf, keeping a recoloured theme valid; everything else of the
+# user config is compared, the font leaves aside.
+$appearanceApp = @($manifest.apps) | Where-Object { $null -ne $_.PSObject.Properties['appearance'] } | Select-Object -First 1
+if ($null -eq $appearanceApp) { throw 'The proof needs the ChatGPT app''s appearance in the manifest.' }
+$appearance = $appearanceApp.appearance
+$plexCss, $monoCss = '"IBM Plex Sans JP"', '"PlemolJP Console NF"'
+$appFonts = [ordered]@{ ui = $plexCss; code = $monoCss; content = $plexCss }
+Must ($appearance.fonts.ui -ceq $plexCss -and $appearance.fonts.content -ceq $plexCss -and $appearance.fonts.code -ceq $monoCss -and
+    $null -eq (Get-AppThemeProblem (New-AppTheme $appearance.defaults.light $appFonts)) -and $null -eq (Get-AppThemeProblem (New-AppTheme $appearance.defaults.dark $appFonts)) -and
+    (Get-AppThemeProblem @{ fonts = $appFonts }) -like 'accent*' -and
+    (Get-AppThemeProblem (New-AppTheme $appearance.defaults.dark @{ ui = 1; code = $null; content = $null })) -like 'fonts.ui*') 'app themes: complete defaults, font-only refused'
+$face = @{ family = 'Segoe UI'; fullName = 'Segoe UI'; postscriptName = 'SegoeUI' }
+$dark = '{"accent":"#3a83f7","accentSource":"chatgpt","contrast":60,"ink":"#ffffff","opaqueWindows":false,"surface":"#181818","semanticColors":{"diffAdded":"#40c977","diffRemoved":"#fa423e","skill":"#ad7bf9"},"fonts":{"content":"\"Segoe UI\"","contentFace":{"family":"Segoe UI","fullName":"Segoe UI","postscriptName":"SegoeUI"}}}' | ConvertFrom-Json
+$darkEdits = Get-AppFontEdits 'appearanceDarkChromeTheme' $dark $appFonts $appearance.defaults.dark
+$darkAfter = Get-AppThemeAfter 'appearanceDarkChromeTheme' $dark $darkEdits
+Must ((@($darkEdits | ForEach-Object { "$($_.keyPath)=$(ConvertTo-CanonicalJson $_.value)" }) -join '|') -ceq
+        'desktop.appearanceDarkChromeTheme.fonts.ui="\"IBM Plex Sans JP\""|desktop.appearanceDarkChromeTheme.fonts.code="\"PlemolJP Console NF\""|desktop.appearanceDarkChromeTheme.fonts.content="\"IBM Plex Sans JP\""|desktop.appearanceDarkChromeTheme.fonts.contentFace=null' -and
+    @($darkEdits | Where-Object { $_.mergeStrategy -cne 'replace' }).Count -eq 0 -and $null -eq (Get-AppThemeProblem $darkAfter) -and
+    (ConvertTo-CanonicalJson (Get-AppFontsState $darkAfter.fonts)) -ceq (ConvertTo-CanonicalJson $appFonts) -and $darkAfter.accent -ceq '#3a83f7' -and $darkAfter.contrast -eq 60) 'app fonts of an existing theme: font leaves only, its Face removed, colors kept'
+$lightEdits = Get-AppFontEdits 'appearanceLightChromeTheme' $null $appFonts $appearance.defaults.light
+Must ($lightEdits.Count -eq 1 -and $lightEdits[0].keyPath -ceq 'desktop.appearanceLightChromeTheme' -and $null -eq (Get-AppThemeProblem $lightEdits[0].value) -and
+    $lightEdits[0].value.accentSource -ceq 'chatgpt' -and $lightEdits[0].value.surface -ceq '#ffffff') 'app fonts of an absent theme: the whole default theme'
+# Records, classes and the undo of a leaf change and of a created theme.
+$priorDark = [ordered]@{ exists = $true; fonts = (Get-AppFontsState $dark.fonts) }
+$wantFonts = [ordered]@{ exists = $true; fonts = $appFonts }
+$created = New-AppTheme $appearance.defaults.light $appFonts
+$wantCreated = [ordered]@{ exists = $true; fonts = $appFonts; theme = $created }
+$empty = [ordered]@{ exists = $true; fonts = [ordered]@{} }
+function AppRecord($Seq, $Phase, $Target, $Prior, $Desired, $Observed) { $r = PureRecord $Seq $Phase app-theme-fonts $Target $Prior $Desired $Observed $null; $r.id = "app:$Target"; $r }
+$darkTarget, $lightTarget = 'codex-config:desktop.appearanceDarkChromeTheme', 'codex-config:desktop.appearanceLightChromeTheme'
+Must ($null -eq (Get-EffectRecordProblem (AppRecord 1 intent $darkTarget $priorDark $wantFonts $null)) -and
+    $null -eq (Get-EffectRecordProblem (AppRecord 2 commit $lightTarget $empty $wantCreated $wantFonts)) -and
+    (Get-EffectRecordProblem (AppRecord 1 intent $lightTarget $priorDark $wantCreated $null)) -ceq 'a created theme needs an empty prior.' -and
+    (Get-EffectRecordProblem (AppRecord 1 intent $lightTarget $empty ([ordered]@{ exists = $true; fonts = $appFonts; theme = @{ fonts = $appFonts } }) $null)) -like 'desired.theme: accent*' -and
+    (Get-EffectRecordProblem (AppRecord 1 intent $darkTarget $priorDark ([ordered]@{ exists = $true; fonts = [ordered]@{ ui = $plexCss; code = $monoCss; content = $plexCss; uiFace = $face } }) $null)) -ceq 'desired.fonts is not ui, code and content.' -and
+    (Get-EffectRecordProblem (AppRecord 1 intent 'codex-config:desktop.appearanceTheme' $priorDark $wantFonts $null)) -like 'target*' -and
+    (Get-EffectRecordProblem (AppRecord 1 intent $darkTarget $absent $wantFonts $null)) -ceq 'prior must exist.' -and
+    (Get-EffectRecordProblem (AppRecord 1 intent $darkTarget $wantFonts $wantFonts $null)) -like 'desired equals prior*') 'app-theme-fonts records'
+$darkNow = [ordered]@{ exists = $true; fonts = (Get-AppFontsState $darkAfter.fonts) }
+$userFonts = [ordered]@{ exists = $true; fonts = [ordered]@{ ui = '"Meiryo UI"'; code = $monoCss; content = $plexCss } }
+Must ((Get-UnownedClass app-theme-fonts $wantFonts $priorDark $null).class -ceq 'absent' -and (Get-UnownedClass app-theme-fonts $wantFonts $darkNow $null).class -ceq 'preexisting-match' -and
+    (Get-EffectClass @((AppRecord 1 intent $darkTarget $priorDark $wantFonts $null), (AppRecord 2 commit $darkTarget $priorDark $wantFonts $darkNow)) $userFonts '' $null).class -ceq 'owned-drift' -and
+    (Get-EffectClass @((AppRecord 1 intent $darkTarget $priorDark $wantFonts $null)) $priorDark '' $null).resolution -ceq 'void') 'app-theme-fonts classes'
+$darkUndo = @(Get-UndoSteps (AppRecord 1 intent $darkTarget $priorDark $wantFonts $null))[0]
+$darkUndoEdits = Get-AppFontUndoEdits $darkUndo $darkAfter
+$darkBack = Get-AppThemeAfter 'appearanceDarkChromeTheme' $darkAfter $darkUndoEdits
+Must ($darkUndo.action -ceq 'set-app-theme-fonts' -and $darkUndo.theme -ceq 'appearanceDarkChromeTheme' -and
+    (ConvertTo-CanonicalJson $darkBack) -ceq (ConvertTo-CanonicalJson $dark)) 'app fonts undo: the prior leaves and Face object back, nothing else'
+$lightUndo = @(Get-UndoSteps (AppRecord 1 intent $lightTarget $empty $wantCreated $null))[0]
+$recoloured = ($created | ConvertTo-Json -Depth 5 | ConvertFrom-Json)
+$recoloured.accent = '#ff0000'
+$recolouredBack = Get-AppThemeAfter 'appearanceLightChromeTheme' $recoloured (Get-AppFontUndoEdits $lightUndo $recoloured)
+$unchangedUndo = Get-AppFontUndoEdits $lightUndo ($created | ConvertTo-Json -Depth 5 | ConvertFrom-Json)  # one array: the edits of one batch
+$unchangedUndo = @($unchangedUndo | ForEach-Object { "$($_.keyPath)=$(ConvertTo-CanonicalJson $_.value)" }) -join '|'
+Must ($unchangedUndo -ceq 'desktop.appearanceLightChromeTheme=null' -and
+    $recolouredBack.accent -ceq '#ff0000' -and $null -eq (Get-AppThemeProblem $recolouredBack) -and @((Get-AppFontsState $recolouredBack.fonts).Keys).Count -eq 0) 'app fonts undo: a created theme goes whole only unchanged; recoloured, it keeps its colors, stays valid and loses the fonts'
+# The rest of the user config: font leaves and a created theme aside, any other change shows; key order does not.
+$config = '{"model":"m","desktop":{"appearanceTheme":"dark","codeFontSize":17,"appearanceDarkChromeTheme":{"accent":"#3a83f7","fonts":{"content":"x","other":"keep"}}},"z":{"b":1,"a":[1,"two"]}}' | ConvertFrom-Json
+$keys = @(Get-AppThemeKeys)
+$restBefore = Get-AppConfigRest $config $keys @()
+$fontOnly = ($config | ConvertTo-Json -Depth 8 | ConvertFrom-Json); $fontOnly.desktop.appearanceDarkChromeTheme.fonts.content = 'y'
+$fontOnly.desktop | Add-Member -NotePropertyName appearanceLightChromeTheme -NotePropertyValue ([pscustomobject]@{ accent = '#339cff' })
+$reordered = '{"z":{"a":[1,"two"],"b":1},"desktop":{"codeFontSize":17,"appearanceTheme":"dark","appearanceDarkChromeTheme":{"fonts":{"other":"keep","content":"x"},"accent":"#3a83f7"}},"model":"m"}' | ConvertFrom-Json
+$otherLeaf = ($config | ConvertTo-Json -Depth 8 | ConvertFrom-Json); $otherLeaf.desktop.appearanceDarkChromeTheme.fonts.other = 'changed'
+$mode = ($config | ConvertTo-Json -Depth 8 | ConvertFrom-Json); $mode.desktop.appearanceTheme = 'light'
+$caseKeys = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal); $caseKeys['b'] = 1; $caseKeys['A'] = 2; $caseKeys['a'] = 3  # TOML keys keep case
+Must ((Get-AppConfigRest $fontOnly $keys @('appearanceLightChromeTheme')) -ceq $restBefore -and (Get-AppConfigRest $reordered $keys @()) -ceq $restBefore -and
+    (Get-AppConfigRest $fontOnly $keys @()) -cne $restBefore -and (Get-AppConfigRest $otherLeaf $keys @()) -cne $restBefore -and (Get-AppConfigRest $mode $keys @()) -cne $restBefore -and
+    (ConvertTo-CanonicalJson $caseKeys) -ceq '{"A":2,"a":3,"b":1}') 'app config rest: only the font leaves and a created theme are set aside'
+# Numbers compare by kind and exact value: floats round-trip ('R', not G15), 60 is not 60.0, int64 max stays exact; the
+# layers' serde numbers keep integer or float and their range.
+function SerdeNumber([string]$Text) { ConvertFrom-LayerNumbers ('{"$serde_json::private::Number":"' + $Text + '"}' | ConvertFrom-Json) }
+Must ((ConvertTo-CanonicalJson (0.1 + 0.2)) -cne (ConvertTo-CanonicalJson 0.3) -and (ConvertTo-CanonicalJson 60) -ceq '60' -and (ConvertTo-CanonicalJson 60.0) -ceq '60.0' -and
+    (ConvertTo-CanonicalJson ([long]::MaxValue)) -ceq '9223372036854775807' -and (ConvertTo-CanonicalJson ([double][long]::MaxValue)) -cne '9223372036854775807' -and
+    (ConvertTo-CanonicalJson (SerdeNumber '60')) -ceq '60' -and (ConvertTo-CanonicalJson (SerdeNumber '60.0')) -ceq '60.0' -and
+    (ConvertTo-CanonicalJson (SerdeNumber '9223372036854775807')) -ceq '9223372036854775807' -and (ConvertTo-CanonicalJson (SerdeNumber '18446744073709551615')) -ceq '18446744073709551615' -and
+    (ConvertTo-CanonicalJson (SerdeNumber '0.30000000000000004')) -ceq (ConvertTo-CanonicalJson (0.1 + 0.2)) -and (ConvertTo-CanonicalJson ([decimal]::Parse('60.0', [Globalization.CultureInfo]::InvariantCulture))) -ceq '60.0') 'canonical numbers keep kind and exact value'
+# Chromium font preferences: the scan refuses what is not one plain JSON object or repeats a key (also through an escape);
+# the edit inserts only the six leaves and its undo restores the exact bytes; pref-value records and overlaps.
+$scanRefused = @('{"c":1,"\u0063":2}', '{"a":1,}', '{"a":[1,]}', '[1]', '{} {}', '{"a":01}', "{`"a`":`"x`ty`"}", '' | Where-Object { try { $null = Get-JsonScan $_; $false } catch { $true } })
+$prefsText = '{ "n": [9223372036854775807, 1.7976931348623157e+308, 5e-324, 1e+05, 12345678901234567890], "C": 1, "c": 2, "a\"b": "caf\u00e9",' +
+    ' "webkit": { "webprefs": { "fonts": { "standard": { "Zyyy": "x" } } } } }'
+$prefsValues = [ordered]@{}
+foreach ($leaf in Get-ChromiumFontLeaves) { if ($leaf -cne 'webkit.webprefs.fonts.standard.Zyyy') { $prefsValues[$leaf] = 'IBM Plex Sans JP' } }
+$prefsEdit = Get-PrefsFontEdit $prefsText (Get-JsonScan $prefsText) $prefsValues
+$prefsBack = $prefsEdit.text
+foreach ($leaf in $prefsValues.Keys) { $prefsBack = Get-PrefsFontUndo $prefsBack $leaf $prefsEdit.created[$leaf] }
+$prefsAt = Resolve-JsonPath (Get-JsonScan $prefsEdit.text) 'webkit.webprefs.fonts.fixed.Jpan'
+Must ($scanRefused.Count -eq 8 -and $prefsBack -ceq $prefsText -and $prefsEdit.text.StartsWith($prefsText.Substring(0, $prefsText.IndexOf('"webkit"'))) -and
+    (ConvertFrom-JsonString $prefsEdit.text.Substring($prefsAt.member.valueStart, $prefsAt.member.valueEnd - $prefsAt.member.valueStart)) -ceq 'IBM Plex Sans JP' -and
+    (@($prefsEdit.created['webkit.webprefs.fonts.fixed.Jpan']) -join '|') -ceq 'webkit.webprefs.fonts.fixed' -and @($prefsEdit.created['webkit.webprefs.fonts.standard.Jpan']).Count -eq 0 -and
+    (ConvertTo-JsonString "a`"b\c`n") -ceq '"a\"b\\c\u000a"') 'Chromium preferences: strict scan, six-leaf edit, exact undo'
+$prefRecord = @{ ledger = 'effects'; schema = 1; seq = 1; phase = 'intent'; id = 'p'; kind = 'pref-value'; target = 'C:\u\User Data\Default\Preferences'; name = 'webkit.webprefs.fonts.fixed.Jpan'
+    prior = $absent; desired = @{ exists = $true; value = 'PlemolJP Console NF'; created = @('webkit.webprefs.fonts.fixed') } }
+function PrefVariant([hashtable]$Change) { $r = $prefRecord.Clone(); foreach ($k in $Change.Keys) { $r[$k] = $Change[$k] }; $r }
+$otherLeaf = PrefVariant @{ name = 'webkit.webprefs.fonts.fixed.Zyyy' }
+Must ($null -eq (Get-EffectRecordProblem $prefRecord) -and
+    (Get-EffectRecordProblem (PrefVariant @{ name = 'webkit.webprefs.default_font_size' })) -ceq 'name is not a Chromium font leaf.' -and
+    (Get-EffectRecordProblem (PrefVariant @{ prior = @{ exists = $true; value = 'x' } })) -ceq 'prior must be absent.' -and
+    (Get-EffectRecordProblem (PrefVariant @{ desired = @{ exists = $true; value = 'x'; created = @('webkit.other') } })) -ceq 'desired.created is not a list of parents of name.' -and
+    -not (Test-TargetOverlap $prefRecord $otherLeaf) -and (Test-TargetOverlap $prefRecord $prefRecord) -and
+    (Get-UnownedClass pref-value $prefRecord.desired @{ exists = $true; value = 'Meiryo' } $null).class -ceq 'preexisting-drift')'pref-value records: six leaves only, prior absent, parents of the leaf; leaves of one file have separate owners'
+Must ((@(Get-CssFamilies '"IBM Plex Sans JP", ''Segoe UI'' , monospace') -join '|') -ceq 'IBM Plex Sans JP|Segoe UI|monospace') 'CSS families of an app font'
 # P1b-lite: the plan groups the ledger by id in one pass and validates each id once (Get-EffectAttempt), with the
 # plan unchanged: interleaved attempts; a reverted and a voided id kept; a malformed id refused; ids that differ
 # only in case refuse the whole plan before any validation.
@@ -1479,6 +1648,42 @@ foreach ($font in $fonts) {
     if ((Test-Path -LiteralPath (FontPath $font)) -or $null -ne (FontValue (ValueName $font))) { throw 'Proof requires a fresh disposable font target.' }
 }
 if (Test-Path -LiteralPath $ledgerDir) { throw 'Proof requires no effect ledger yet.' }
+# M-L1: from beneath a packaged app (here a copy of cmd.exe under a WindowsApps path starts win.ps1), every mode that
+# writes refuses before its first write: no ledger directory appears. Read-only modes are unaffected.
+$packagedLauncher = Join-Path $env:RUNNER_TEMP ('WindowsApps\guard-' + [guid]::NewGuid().ToString('N') + '\cmd.exe')
+$null = New-Item -ItemType Directory -Path (Split-Path -Parent $packagedLauncher)
+[IO.File]::Copy((Join-Path $env:SystemRoot 'System32\cmd.exe'), $packagedLauncher, $false)
+function Packaged([string[]]$Arguments) {
+    $ErrorActionPreference = 'Continue'
+    $PSNativeCommandUseErrorActionPreference = $false
+    # cmd.exe passes this PowerShell 7's PSModulePath on to the 5.1 child, which then cannot load its own modules
+    # (Get-FileHash not recognized, CI 99); a direct 5.1 launch is spared that. Without the variable 5.1 builds its
+    # default. Only this variable, only around this launch.
+    $modulePath, $out, $code = $env:PSModulePath, @(), 'not started'
+    try {
+        [Environment]::SetEnvironmentVariable('PSModulePath', $null, 'Process')
+        $out = @(& $packagedLauncher /d /c $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'win.ps1') @Arguments 2>&1 | ForEach-Object { [string]$_ })
+        $code = $LASTEXITCODE
+    } finally { [Environment]::SetEnvironmentVariable('PSModulePath', $modulePath, 'Process') }
+    # As Win51 reads it: 5.1 wraps an error at the console width, also inside a path, so the lines are rejoined without
+    # a separator up to the "At <script>:<line> char:<n>" line.
+    $message, $at = '', $false
+    foreach ($line in $out) { if ($line -match '^At .+ char:\d+\s*$') { $at = $true }; if (-not $at) { $message += $line } }
+    [pscustomobject]@{ code = $code; text = $message; ledger = (Test-Path -LiteralPath $ledgerDir) }
+}
+# On a failure the exit code, the ledger's presence and the start of the synthetic run's message (no profile data) are logged.
+function PackagedText($Run) { $text = [string]$Run.text -replace '\s+', ' '; "exit $($Run.code), ledger $($Run.ledger): $($text.Substring(0, [Math]::Min(600, $text.Length)))" }
+foreach ($arguments in @(@('-Mode', 'Apply'), @('-Mode', 'Apply', '-AppFonts'), @('-Mode', 'Uninstall', '-Apply'))) {
+    $run = Packaged $arguments
+    $refused = $run.code -ne 0 -and -not $run.ledger -and ($run.text -replace '\s', '') -like '*refused,nothingwritten:itrunsbeneaththepackagedapp*\WindowsApps\*'
+    if (-not $refused) { Write-Host "M-L1 $($arguments -join ' '): $(PackagedText $run)" }
+    Must $refused "M-L1: $($arguments -join ' ') beneath a packaged app is refused for that reason before any ledger write"
+}
+foreach ($arguments in @(@('-Mode', 'Validate'), @('-Mode', 'Uninstall'))) {
+    $run = Packaged $arguments
+    if ($run.code -ne 0 -or $run.ledger) { Write-Host "M-L1 $($arguments -join ' '): $(PackagedText $run)" }
+    Must ($run.code -eq 0 -and -not $run.ledger) "M-L1: $($arguments -join ' ') (read-only) still runs beneath a packaged app"
+}
 $n = $fonts.Count
 $shortcut = Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs\noctty.lnk'
 $shortcutBefore = Test-Path -LiteralPath $shortcut
@@ -1891,6 +2096,118 @@ Craft @{ phase = 'intent'; id = $oldId; kind = 'tree-extracted'; target = $oldTr
 Craft @{ phase = 'commit'; id = $oldId; kind = 'tree-extracted'; target = $oldTree; prior = $absent; desired = $oldDesired; observed = $oldDesired }
 $null = ApplyPackages 'AutoHotkey'
 Must ((Phases $oldId) -ceq 'intent,commit,undone' -and -not (Test-Path -LiteralPath $oldTree) -and (AhkExact)) 'A26: an owned older version is collected'
+# A31: the desktop UI font faces (ui-font-face): only lfFaceName of the six persisted WindowMetrics fonts, through the
+# registry, in effect at the next sign-in (which CI cannot do). The runner's WindowMetrics are the baseline.
+$uiFace = $manifest.typography.face
+$uiSlots = @('caption', 'smCaption', 'menu', 'status', 'message', 'icon')
+$uiValues = @{ caption = 'CaptionFont'; smCaption = 'SmCaptionFont'; menu = 'MenuFont'; status = 'StatusFont'; message = 'MessageFont'; icon = 'IconFont' }
+$ahkExe, $uiScript = (Join-Path $ahkTree $ahk.executable.Replace('/', '\')), (Join-Path $PSScriptRoot 'ui-font.ahk')
+function UiId([string]$Slot) { "ui-font-face:WINMETRICS:$($Slot.ToUpperInvariant())" }
+function Metrics {  # every HKCU WindowMetrics value, name -> kind:data (binary as hex)
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Control Panel\Desktop\WindowMetrics')
+    try {
+        $all = [ordered]@{}
+        foreach ($name in @($key.GetValueNames() | Sort-Object)) {
+            $value = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $all[$name] = "$($key.GetValueKind($name)):" + $(if ($value -is [byte[]]) { [Convert]::ToHexString($value) } else { [string]$value })
+        }
+        $all
+    } finally { $key.Close() }
+}
+function MetricsText($Metrics) { @($Metrics.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ';' }
+function SlotHex($Metrics, [string]$Slot) { ([string]$Metrics[$uiValues[$Slot]]).Substring('Binary:'.Length) }
+function HexFace([string]$Hex) { Get-LogFontFace ([Convert]::FromHexString($Hex)) }
+function HexRest([string]$Hex) { $Hex.Substring(0, 56) }  # the 28 bytes before lfFaceName, which ends the struct
+function UiRun([string[]]$Arguments) { Bounded $ahkExe (@('/ErrorStdOut', $uiScript) + $Arguments) 60 }
+function SetSlotValue([string]$Slot, $Value, [Microsoft.Win32.RegistryValueKind]$Kind = 'Binary') {  # proof fixtures only
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Control Panel\Desktop\WindowMetrics', $true)
+    try { $key.SetValue($uiValues[$Slot], $Value, $Kind) } finally { $key.Close() }
+}
+function SetSlotFace([string]$Slot, [string]$Face) { SetSlotValue $Slot (Get-LogFontWithFace ([Convert]::FromHexString((SlotHex (Metrics) $Slot))) $Face) }
+# Everything but the named slots' faces equals $Before (CaptionWidth and every other value included); those faces are $Face.
+function UiOnlyFaces($Before, [string[]]$Slots, [string]$Face) {
+    $now = Metrics
+    foreach ($slot in $uiSlots) {
+        $was, $is = (SlotHex $Before $slot), (SlotHex $now $slot)
+        if ((HexRest $is) -cne (HexRest $was) -or (HexFace $is) -cne $(if ($Slots -ccontains $slot) { $Face } else { HexFace $was })) { return $false }
+    }
+    foreach ($name in @($Before.Keys) + @($now.Keys)) { if (@($uiValues.Values) -notcontains $name -and $Before[$name] -cne $now[$name]) { return $false } }
+    return $true
+}
+function OthersSame($A, $B, [string]$Except) { -not @(@($A.Keys) + @($B.Keys) | Where-Object { $_ -cne $Except -and $A[$_] -cne $B[$_] }).Count }
+function UiNoRecords { (NewRecords $mark @($uiSlots | ForEach-Object { UiId $_ })) -eq 0 }
+$uiBefore = Metrics
+$uiGet = UiRun @('get')
+$uiLive = if ($uiGet.exit -eq 0) { $uiGet.stdout | ConvertFrom-Json } else { $null }
+function LiveKept {  # the live fonts (SPI GET) exactly as before: nothing here changes a running session
+    $now = UiRun @('get')
+    $now.exit -eq 0 -and -not @($uiSlots | Where-Object { (($now.stdout | ConvertFrom-Json).slots.$_.live) -cne $uiLive.slots.$_.live }).Count
+}
+Write-Host "A31 baseline: $(@($uiSlots | ForEach-Object { "$_='$(HexFace (SlotHex $uiBefore $_))'" }) -join ', '); get exit $($uiGet.exit) $(Tail $uiGet.stderr)"
+Must ($null -ne $uiLive -and -not @($uiSlots | Where-Object { $uiLive.slots.$_.persisted -cne (SlotHex $uiBefore $_) }).Count) 'A31: ui-font.ahk get reads the live fonts and the persisted values'
+$uiBase = @{}
+foreach ($slot in $uiSlots) { $uiBase[$slot] = HexFace (SlotHex $uiBefore $slot) }
+if (@($uiBase.Values) -ccontains $uiFace) { throw "Proof requires no UI font slot naming $uiFace on this runner yet." }
+MustReject { Win51 @('-Mode', 'Validate', '-Typography') } '-Typography is only for -Mode Apply*'
+MustReject { Win51 @('-Mode', 'Apply', '-Typography', '-Packages', 'AutoHotkey') } '-Typography is only for -Mode Apply*'
+MustReject { Win51 @('-Mode', 'Apply', '-AppFonts', '-Typography') } '-AppFonts is only for -Mode Apply*'
+# -AppFonts alone touches only a present app's fonts: here (no app) nothing at all.
+$mark = LastSeq
+$appOnly = Win51 @('-Mode', 'Apply', '-AppFonts')
+Must ((LastSeq) -eq $mark -and $appOnly.appFonts -ceq 'appAbsent' -and $appOnly.nocttyPlan -ceq 'notEvaluated' -and $appOnly.uiFont -ceq 'notEvaluated' -and (MetricsText (Metrics)) -ceq (MetricsText $uiBefore)) 'A31: -AppFonts leaves OS fonts, Noctty and packages alone'
+# A value that is not a 92-byte REG_BINARY LOGFONTW stops the run before any face is written.
+$captionBytes = [Convert]::FromHexString((SlotHex $uiBefore 'caption'))
+foreach ($wrong in @(@{ value = [byte[]]$captionBytes[0..90]; kind = 'Binary' }, @{ value = (SlotHex $uiBefore 'caption'); kind = 'String' })) {
+    SetSlotValue 'caption' $wrong.value $wrong.kind
+    $mark = LastSeq
+    MustReject { Win51 @('-Mode', 'Apply', '-Typography') } '*CaptionFont is not a 92-byte REG_BINARY LOGFONTW*'
+    $refusedMetrics = Metrics
+    SetSlotValue 'caption' $captionBytes
+    Must ((UiNoRecords) -and (OthersSame $refusedMetrics $uiBefore 'CaptionFont') -and $refusedMetrics['CaptionFont'] -clike "$($wrong.kind):*") "A31: a $($wrong.kind) value of the wrong shape is refused, nothing written"
+}
+Must ((MetricsText (Metrics)) -ceq (MetricsText $uiBefore)) 'A31: the shape fixtures are gone'
+# A crash after three slots were written: six intents, three faces already in place. Recovery commits those three and
+# voids the others, which are then written anew; only the six faces change, the live fonts not at all (pendingLogon).
+$mark = LastSeq
+foreach ($slot in $uiSlots) {
+    Craft @{ phase = 'intent'; id = (UiId $slot); kind = 'ui-font-face'; target = "winmetrics:$slot"
+        prior = @{ exists = $true; face = $uiBase[$slot] }; desired = @{ exists = $true; face = $uiFace } }
+}
+$written = @('caption', 'smCaption', 'menu')
+foreach ($slot in $written) { SetSlotFace $slot $uiFace }
+$typographyRun = Win51 @('-Mode', 'Apply', '-Typography')
+Must ($typographyRun.nocttyPlan -ceq 'notEvaluated' -and
+    -not @($uiSlots | Where-Object { (Phases (UiId $_)) -cne $(if ($written -ccontains $_) { 'intent,commit' } else { 'intent,void,intent,commit' }) }).Count -and
+    (UiOnlyFaces $uiBefore $uiSlots $uiFace) -and (LiveKept)) 'A31: Apply -Typography recovers the interrupted run and writes the rest; only the six faces changed (CaptionWidth and all other values kept), the live fonts untouched'
+Must ($typographyRun.uiFont.face -ceq $uiFace -and (@($typographyRun.uiFont.slots | ForEach-Object { "$($_.slot)=$($_.state)" }) -join ',') -ceq
+    (@($uiSlots | ForEach-Object { "$_=pendingLogon" }) -join ',')) 'A31: every slot reports pendingLogon (persisted, not yet in use)'
+$mark = LastSeq
+$null = Win51 @('-Mode', 'Apply', '-Typography')
+Must (UiNoRecords) 'A31: a second Apply -Typography writes nothing'
+# A face changed after this wrote it to a third face (neither the prior nor the selected one) is owned-drift: Apply reports
+# it and writes nothing, Uninstall refuses.
+$thirdFace = 'Arial'
+if ($thirdFace -ceq $uiBase.menu -or $thirdFace -ceq $uiFace) { throw "Proof requires the runner's menu face not to be $thirdFace." }
+SetSlotFace 'menu' $thirdFace
+$mark = LastSeq
+MustReject { Win51 @('-Mode', 'Apply', '-Typography') } "*UI font drift*winmetrics:menu is '$thirdFace'*"
+$driftText = MetricsText (Metrics)
+MustReject { RunUninstall -Apply } '*Uninstall refused*owned target differs*'
+Must ((UiNoRecords) -and (MetricsText (Metrics)) -ceq $driftText) 'A31: a third face is drift, not written; Uninstall refuses it'
+# Exactly the prior face again is the generic recovery boundary: a committed attempt whose target equals its prior is
+# closed undone (as after an undo that stopped before its record), so the slot is unowned again and an explicit
+# Apply -Typography takes it once more: undone, intent, commit; only the menu face changes.
+SetSlotFace 'menu' $uiBase.menu
+$beforePrior = Metrics
+$mark = LastSeq
+$null = Win51 @('-Mode', 'Apply', '-Typography')
+$menuPhases = (Phases (UiId 'menu')).Split(',')
+Must ((NewRecords $mark @($uiSlots | ForEach-Object { UiId $_ })) -eq 3 -and ($menuPhases[-3..-1] -join ',') -ceq 'undone,intent,commit' -and
+    (UiOnlyFaces $beforePrior @('menu') $uiFace)) 'A31: the exact prior face again counts as undone; the explicit Apply takes the slot again (3 records), changing only that face'
+# A size the user changes later is not this effect's: the undo (A27) puts back the face and keeps the new height.
+$tallCaption = [Convert]::FromHexString((SlotHex (Metrics) 'caption'))
+[BitConverter]::GetBytes([int]-40).CopyTo($tallCaption, 0)
+SetSlotValue 'caption' $tallCaption
 # A25: interrupted package attempts: recovery removes the derived asset and a partial staging and voids the
 # intent; a file the inventory does not name keeps the staging directory and the intent open until it is gone.
 function CrashIntent([string]$Leaf, [string]$Foreign) {
@@ -1957,6 +2274,13 @@ $gone = RunUninstall -Apply
 Must ($gone.ownedOpen -eq 0 -and -not (Test-Path -LiteralPath $ahkTree) -and -not (Test-Path -LiteralPath $chromiumTree) -and
     (Test-Path -LiteralPath "$chromiumProfile\proof.txt") -and [IO.File]::ReadAllText($preferences) -ceq $restored) 'A27: Uninstall removes the package trees, never the profile'
 AssertEmpty
+# A31 after Uninstall: each face is back, every other byte and value as it was, the later caption height kept.
+$uiAfter = Metrics
+$expectCaption = [byte[]](Get-LogFontWithFace $tallCaption $uiBase.caption)
+Must ((SlotHex $uiAfter 'caption') -ceq [Convert]::ToHexString($expectCaption) -and (OthersSame $uiAfter $uiBefore 'CaptionFont') -and
+    -not @($uiSlots | Where-Object { (Phases (UiId $_)) -cnotlike '*,undone' }).Count) 'A31: Uninstall restores each face only, byte-exact elsewhere, keeping the later caption height'
+SetSlotValue 'caption' $captionBytes
+Must ((MetricsText (Metrics)) -ceq (MetricsText $uiBefore)) 'A31: the runner''s WindowMetrics are its own again'
 
 # ---- A29 (b3b): the locked Chromium, installed for real (downloaded once), owned, first run, and removed ----
 # Here A27 has removed the stand-in 154 tree and every owned effect; the proof's stand-in profile keeps its restored
@@ -2455,6 +2779,83 @@ if ($appPathsLaunch -ceq 'proven') {
     if ($null -ne $a30Gone.process) { $null = SettleChromium 5 $a30Gone.process }
     Must (A30NotFound $a30Gone) "A30: after Uninstall ShellExecute no longer finds chromium ($(A30Text $a30Gone))"
 }
+# ---- A32: the six Chromium font preferences written into existing profiles (Apply -ChromiumFonts) and removed again ----
+# On the proof's stand-in User Data only: its Default (the restored text) and a synthetic Profile 2 with every numeric,
+# key and escape edge; Local State lists both (and a System Profile, never written). Fonts are converged first (Apply);
+# -ChromiumFonts only asserts them.
+$null = Run 'Apply'
+$localState, $profile2 = (Join-Path $chromiumProfile 'Local State'), (Join-Path $chromiumProfile 'Profile 2')
+if ((Test-Path -LiteralPath $localState) -or (Test-Path -LiteralPath $profile2)) { throw 'A32 requires no Local State or Profile 2 in the stand-in User Data yet.' }
+[IO.File]::WriteAllText($localState, '{"profile":{"info_cache":{"Default":{"name":"a"},"Profile 2":{"name":"b"},"System Profile":{}}}}')
+$null = New-Item -ItemType Directory -Path $profile2
+$seedFonts = [IO.File]::ReadAllText((Join-Path $PSScriptRoot $chromium.seed.file)) | ConvertFrom-Json
+function SeedFont([string]$Leaf) { $v = $seedFonts; foreach ($k in $Leaf.Split('.')) { $v = $v.$k }; [string]$v }
+$leaves = @(Get-ChromiumFontLeaves)
+$p2Prefs, $defaultPrefs = (Join-Path $profile2 'Preferences'), $preferences
+$p2Original = @"
+{
+  "big": [9223372036854775807, -9223372036854775808, 1.7976931348623157e+308, 5e-324, 1e+05, 1.5e-05, 12345678901234567890],
+  "C": 1, "c": 2, "a\"b": "café caf$([char]0x00e9)",
+  "webkit": { "webprefs": { "default_font_size": 16, "fonts": { "standard": { "Zyyy": "$(SeedFont 'webkit.webprefs.fonts.standard.Zyyy')" } } } }
+}
+"@
+[IO.File]::WriteAllText($p2Prefs, $p2Original, [Text.UTF8Encoding]::new($false))
+function PrefId([string]$Prefs, [string]$Leaf) { 'pref-value:' + ($Prefs + '|' + $Leaf).ToUpperInvariant() }
+function PrefIds { foreach ($prefs in $defaultPrefs, $p2Prefs) { foreach ($leaf in $leaves) { PrefId $prefs $leaf } } }
+function ChromiumFonts { Win51 @('-Mode', 'Apply', '-ChromiumFonts') }
+function Untouched { [IO.File]::ReadAllText($defaultPrefs) -ceq $restored -and [IO.File]::ReadAllText($p2Prefs) -ceq $p2Original -and (NewRecords $mark @(PrefIds)) -eq 0 }
+$mark = LastSeq
+MustReject { Win51 @('-Mode', 'Apply', '-ChromiumFonts', '-Typography') } '-ChromiumFonts is only for -Mode Apply*'
+# Closed means closed: a lockfile (never removed here), or a chrome.exe running from this install, stops every profile.
+[IO.File]::WriteAllText((Join-Path $chromiumProfile 'lockfile'), '')
+MustReject { ChromiumFonts } '*Chromium font drift:*lockfile exists*'
+Must ((Untouched) -and (Test-Path -LiteralPath (Join-Path $chromiumProfile 'lockfile'))) 'A32: a lockfile stops the write and stays'
+[IO.File]::Delete((Join-Path $chromiumProfile 'lockfile'))
+$fakeTree = Join-Path $programsDir 'chromium-proof'
+$null = New-Item -ItemType Directory -Path $fakeTree
+[IO.File]::Copy((Join-Path $env:SystemRoot 'System32\PING.EXE'), (Join-Path $fakeTree 'chrome.exe'), $false)
+$fake = Start-Process -FilePath (Join-Path $fakeTree 'chrome.exe') -ArgumentList '-n', '120', '127.0.0.1' -WindowStyle Hidden -PassThru
+try { MustReject { ChromiumFonts } '*Chromium is running*' } finally { $fake.Kill(); $fake.WaitForExit() }
+[IO.File]::Delete((Join-Path $fakeTree 'chrome.exe')); [IO.Directory]::Delete($fakeTree, $false)
+Must (Untouched) 'A32: a chrome.exe of this install stops the write'
+# A key repeated through an escape makes a profile unreadable for edits: nothing is written anywhere (Default comes first).
+[IO.File]::WriteAllText($defaultPrefs, '{"c":1,"c":2}')
+MustReject { ChromiumFonts } '*repeats a key*'
+[IO.File]::WriteAllText($defaultPrefs, $restored)
+Must (Untouched) 'A32: an escaped duplicate key is refused'
+# The write: Default gets all six; Profile 2 the five it lacks (its standard.Zyyy already holds the seed value:
+# preexisting-match, never owned); every other byte of both stays.
+$applied = ChromiumFonts
+$p2Now = [IO.File]::ReadAllText($p2Prefs)
+# -AsHashtable: Profile 2 keeps keys that differ only in case (C, c), which objects cannot hold; lookups are exact.
+$p2Parsed, $defaultParsed = ($p2Now | ConvertFrom-Json -AsHashtable), ([IO.File]::ReadAllText($defaultPrefs) | ConvertFrom-Json -AsHashtable)
+function FontOf($Doc, [string]$Leaf) { $v = $Doc; foreach ($k in $Leaf.Split('.')) { if ($v -isnot [Collections.IDictionary] -or -not $v.Contains($k)) { return $null }; $v = $v[$k] }; [string]$v }
+Must ((@($applied.chromiumFonts | ForEach-Object { "$($_.profile)=$($_.written)" }) -join ',') -ceq 'Default=6,Profile 2=5' -and
+    -not @($leaves | Where-Object { (FontOf $defaultParsed $_) -cne (SeedFont $_) -or (FontOf $p2Parsed $_) -cne (SeedFont $_) }).Count -and
+    $defaultParsed['proof'] -ceq 'a profile restored by hand' -and $p2Parsed['C'] -eq 1 -and $p2Parsed['c'] -eq 2 -and (Phases (PrefId $p2Prefs 'webkit.webprefs.fonts.standard.Zyyy')) -ceq '' -and
+    -not @($leaves | Where-Object { $_ -cne 'webkit.webprefs.fonts.standard.Zyyy' -and (Phases (PrefId $p2Prefs $_)) -cne 'intent,commit' }).Count) 'A32: the six leaves are the seed''s in both profiles; a matching one is not owned'
+Must ($p2Now.Contains('[9223372036854775807, -9223372036854775808, 1.7976931348623157e+308, 5e-324, 1e+05, 1.5e-05, 12345678901234567890]') -and
+    $p2Now.Contains('"C": 1, "c": 2, "a\"b": "café caf') -and $p2Now.Contains('"default_font_size": 16') -and
+    -not (Test-Path -LiteralPath (Join-Path $profile2 'Preferences.*.tmp'))) 'A32: numbers, case-only keys and escapes keep their exact bytes; no temporary file left'
+$mark = LastSeq
+$again = ChromiumFonts
+Must ((NewRecords $mark @(PrefIds)) -eq 0 -and (@($again.chromiumFonts | ForEach-Object { $_.written }) -join ',') -ceq '0,0') 'A32: a second run writes nothing'
+# A font changed after this wrote it is owned-drift: reported, never written.
+$owned = [IO.File]::ReadAllText($defaultPrefs)
+$fixedJpan = '"Jpan":"' + (SeedFont 'webkit.webprefs.fonts.fixed.Jpan') + '"'
+[IO.File]::WriteAllText($defaultPrefs, $owned.Remove($owned.LastIndexOf($fixedJpan), $fixedJpan.Length).Insert($owned.LastIndexOf($fixedJpan), '"Jpan":"Consolas"'))
+MustReject { ChromiumFonts } '*Default webkit.webprefs.fonts.fixed.Jpan: changed after this wrote it*'
+Must ((NewRecords $mark @(PrefIds)) -eq 0) 'A32: a changed owned font is drift and not written'
+[IO.File]::WriteAllText($defaultPrefs, $owned)
+# Chromium rewrites Preferences in its own form; Uninstall then removes exactly the owned leaves and the parents they made.
+function Compact([string]$Text) { (@([regex]::Matches($Text, '"(?:[^"\\]|\\.)*"|[^\s"]+') | ForEach-Object { $_.Value }) -join '') }
+[IO.File]::WriteAllText($p2Prefs, (Compact $p2Now))
+$gone = RunUninstall -Apply
+Must ($gone.ownedOpen -eq 0 -and [IO.File]::ReadAllText($defaultPrefs) -ceq $restored -and [IO.File]::ReadAllText($p2Prefs) -ceq (Compact $p2Original) -and
+    -not @(PrefIds | Where-Object { (Phases $_) -cnotin @('', 'intent,commit,undone') }).Count) 'A32: Uninstall leaves both profiles as they were (Profile 2 in Chromium''s form), every owned leaf undone'
+AssertEmpty
+[IO.File]::Delete($p2Prefs); [IO.Directory]::Delete($profile2, $false); [IO.File]::Delete($localState)
+
 [IO.File]::Delete($sentinel)
 [IO.File]::Delete($preferences)
 [IO.Directory]::Delete((Split-Path -Parent $preferences), $false)

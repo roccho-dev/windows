@@ -362,6 +362,86 @@ def archive(root: Path, destination: Path) -> None:
             result.writestr(info, path.read_bytes(), compresslevel=9)
 
 
+def typography(value: object, entries: list[dict], packages: list[dict]) -> dict | None:
+    """The desktop UI font face win.ps1 sets through ui-font.ahk: {desktop: <role>, interpreter:
+    <package name>} becomes {face: <that role's family>, interpreter, script}. The face fits a
+    LOGFONTW lfFaceName (1 to 31 UTF-16 units, no control or surrogate), as Test-UiFontFace checks."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"desktop", "interpreter"}:
+        raise ValueError("typography is not {desktop, interpreter}")
+    families = {e["role"]: e["family"] for e in entries}
+    if value["desktop"] not in families:
+        raise ValueError(f"typography role is not selected by common fonts: {value['desktop']!r}")
+    face = families[value["desktop"]]
+    units = len(face.encode("utf-16-le")) // 2
+    # A str holds code points, so a character beyond the BMP is caught by ord, not by a surrogate range.
+    if not 1 <= units <= 31 or re.search(r"[\x00-\x1f\x7f\ud800-\udfff]", face) or any(ord(c) > 0xFFFF for c in face):
+        raise ValueError(f"typography face does not fit a LOGFONTW: {face!r}")
+    if [p["name"] for p in packages].count(value["interpreter"]) != 1:
+        raise ValueError(f"typography interpreter is not one locked package: {value['interpreter']!r}")
+    return {"face": face, "interpreter": value["interpreter"], "script": "ui-font.ahk"}
+
+
+APP_KEYS = {"name", "source", "id", "package", "publisherId"}
+APP_FONTS = ("ui", "code", "content")
+THEME_KEYS = {"accent", "accentSource", "contrast", "ink", "opaqueWindows", "surface", "semanticColors"}
+THEME_COLORS = ("accent", "ink", "surface")
+SEMANTIC_COLORS = {"diffAdded", "diffRemoved", "skill"}
+HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
+
+
+def appearance(value: object, entries: list[dict]) -> dict:
+    """An app's font preconfiguration: {fonts: {ui, code, content: <role>}, defaults: {light, dark}}
+    becomes {fonts: {ui, code, content: '"<family>"'}, defaults}. Each default is a complete theme
+    as the app's schema requires one (win.ps1 Get-AppThemeProblem holds the same rule), fonts aside."""
+    if not isinstance(value, dict) or set(value) != {"fonts", "defaults"}:
+        raise ValueError("appearance is not {fonts, defaults}")
+    families = {e["role"]: e["family"] for e in entries}
+    fonts = value["fonts"]
+    if not isinstance(fonts, dict) or set(fonts) != set(APP_FONTS) or any(fonts[k] not in families for k in APP_FONTS):
+        raise ValueError(f"appearance fonts are not ui, code and content of selected roles: {fonts!r}")
+    if any(re.search(r'["\\\x00-\x1f]', families[fonts[k]]) for k in APP_FONTS):
+        raise ValueError("an appearance font family cannot be one quoted CSS family")
+    css = {k: f'"{families[fonts[k]]}"' for k in APP_FONTS}
+    defaults = value["defaults"]
+    if not isinstance(defaults, dict) or set(defaults) != {"light", "dark"}:
+        raise ValueError("appearance defaults are not light and dark")
+    for name, theme in defaults.items():
+        semantic = theme.get("semanticColors") if isinstance(theme, dict) else None
+        if not isinstance(theme, dict) or set(theme) != THEME_KEYS or \
+                not all(isinstance(theme[k], str) and HEX_COLOR.fullmatch(theme[k]) for k in THEME_COLORS) or \
+                theme["accentSource"] not in ("chatgpt", "custom") or \
+                type(theme["contrast"]) is not int or not 0 <= theme["contrast"] <= 100 or \
+                type(theme["opaqueWindows"]) is not bool or not isinstance(semantic, dict) or set(semantic) != SEMANTIC_COLORS or \
+                not all(isinstance(c, str) and HEX_COLOR.fullmatch(c) for c in semantic.values()):
+            raise ValueError(f"appearance default {name} is not a complete app theme")
+    return {"fonts": css, "defaults": defaults}
+
+
+def store_apps(value: object, entries: list[dict]) -> list[dict]:
+    """Microsoft Store apps Restore installs when absent (official WinGet, msstore source, exact id)
+    and otherwise only reads: the package family name's name and publisher id identify it. At most
+    one app may carry an appearance: it writes the one Codex user config."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("apps is not a list")
+    for app in value:
+        if not isinstance(app, dict) or set(app) - {"appearance"} != APP_KEYS or app["source"] != "msstore" or \
+                not all(isinstance(app[k], str) for k in APP_KEYS) or \
+                not re.fullmatch(r"[0-9A-Z]{12}", app["id"]) or \
+                not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 .-]*", app["name"]) or \
+                not TOKEN.fullmatch(app["package"]) or not re.fullmatch(r"[a-z0-9]{13}", app["publisherId"]):
+            raise ValueError(f"App is not {sorted(APP_KEYS)} of a msstore id and package identity: {app!r}")
+    for key in ("name", "id", "package"):
+        if len({app[key].casefold() for app in value}) != len(value):
+            raise ValueError(f"Two apps share a {key}")
+    if sum("appearance" in app for app in value) > 1:
+        raise ValueError("Two apps preconfigure the one Codex config")
+    return [{**app, "appearance": appearance(app["appearance"], entries)} if "appearance" in app else app for app in value]
+
+
 def seed_preferences(seed: dict, entries: list[dict]) -> bytes:
     """The seed's bytes: exactly the six font preferences, each role's family from fonts.json,
     as compact sorted UTF-8 JSON with one trailing newline, so equal inputs give equal bytes."""
@@ -394,8 +474,10 @@ def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
         entries = json.loads((fonts / "fonts.json").read_text(encoding="utf-8"))
         if not entries:
             raise ValueError("Empty font payload")
+        ui = typography(selected.get("typography"), entries, packages)
+        apps = store_apps(selected.get("apps"), entries)
         for name in ("win.ps1", "proof.ps1", "handoff-proof.ps1", "handoff-evaluate.ps1",
-                     "package-view.ps1", "README.md"):
+                     "package-view.ps1", "ui-font.ahk", "README.md"):
             shutil.copyfile(scripts / name, root / name)
         (root / "payload").mkdir()
         shutil.copyfile(noctty, root / "payload/noctty.zip")
@@ -417,7 +499,7 @@ def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
                               "files": noctty_files, "registration": registration},
                    "cloudflared": {"version": selected["cloudflared"]["version"], "file": "payload/cloudflared.exe",
                                    "sha256": files["payload/cloudflared.exe"]},
-                   "packages": packages, "files": files})
+                   "packages": packages, "typography": ui, "apps": apps, "files": files})
         output = out / "windows-dist.zip"
         archive(root, output)
         (out / "windows-dist.zip.sha256").write_text(digest(output) + "  windows-dist.zip\n", encoding="ascii")

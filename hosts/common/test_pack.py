@@ -322,9 +322,119 @@ class CompilerTests(unittest.TestCase):
         scripts = self.root / "scripts"
         scripts.mkdir(exist_ok=True)
         for name in ("win.ps1", "proof.ps1", "handoff-proof.ps1", "handoff-evaluate.ps1",
-                     "package-view.ps1", "README.md"):
+                     "package-view.ps1", "ui-font.ahk", "README.md"):
             (scripts / name).write_text("fixture")
         return noctty, cloudflared, choices, scripts
+
+    APP = {"name": "ChatGPT", "source": "msstore", "id": "9PLM9XGG6VKS", "package": "OpenAI.Codex",
+           "publisherId": "2p2nqsd0c76g0"}
+
+    def test_typography_and_apps_reach_the_manifest(self):
+        fonts = self.payload()
+        noctty, cloudflared, choices, scripts = self.inputs()
+        selected = json.loads(choices.read_text())
+        selected["typography"] = {"desktop": "fixture", "interpreter": "Fixture"}
+        selected["apps"] = [{**self.APP, "appearance": self.appearance()}]
+        choices.write_text(json.dumps(selected))
+        pack.distribution(fonts, noctty, cloudflared, choices, scripts, "test", self.root / "out")
+        with zipfile.ZipFile(self.root / "out" / "windows-dist.zip") as z:
+            manifest = json.loads(z.read("manifest.json"))
+            self.assertIn("ui-font.ahk", manifest["files"])
+        self.assertEqual(manifest["typography"], {"face": "Test Font", "interpreter": "Fixture", "script": "ui-font.ahk"})
+        self.assertEqual(manifest["apps"], [{**self.APP, "appearance": {"fonts": {k: '"Test Font"' for k in ("ui", "code", "content")},
+                                                                          "defaults": self.appearance()["defaults"]}}])
+        # Without either, the manifest says so and win.ps1 converges neither.
+        pack.distribution(fonts, noctty, cloudflared, *self.inputs()[2:], "test", self.root / "none")
+        with zipfile.ZipFile(self.root / "none" / "windows-dist.zip") as z:
+            manifest = json.loads(z.read("manifest.json"))
+        self.assertIsNone(manifest["typography"])
+        self.assertEqual(manifest["apps"], [])
+
+    def test_typography_contract(self):
+        entries = [{"role": "ui", "family": "IBM Plex Sans JP"}]
+        packages = [{"name": "AutoHotkey"}]
+        self.assertEqual(pack.typography({"desktop": "ui", "interpreter": "AutoHotkey"}, entries, packages),
+                         {"face": "IBM Plex Sans JP", "interpreter": "AutoHotkey", "script": "ui-font.ahk"})
+        self.assertEqual(pack.typography({"desktop": "ui", "interpreter": "AutoHotkey"},
+                                         [{"role": "ui", "family": "x" * 31}], packages)["face"], "x" * 31)
+        bad = {
+            "not a dict": ("ui", entries),
+            "extra key": ({"desktop": "ui", "interpreter": "AutoHotkey", "face": "x"}, entries),
+            "unknown role": ({"desktop": "terminal", "interpreter": "AutoHotkey"}, entries),
+            "unknown interpreter": ({"desktop": "ui", "interpreter": "Python"}, entries),
+            "face too long": ({"desktop": "ui", "interpreter": "AutoHotkey"}, [{"role": "ui", "family": "x" * 32}]),
+            "face beyond the BMP": ({"desktop": "ui", "interpreter": "AutoHotkey"}, [{"role": "ui", "family": "x\U0001F600"}]),
+            "face with a control": ({"desktop": "ui", "interpreter": "AutoHotkey"}, [{"role": "ui", "family": "a\tb"}]),
+        }
+        for case, (value, fonts) in bad.items():
+            with self.subTest(case=case), self.assertRaisesRegex(ValueError, "typography"):
+                pack.typography(value, fonts, packages)
+
+    # The app's own complete themes (26.928.1915.0 `jq`, with accentSource), as nix.nix declares them.
+    THEMES = {"light": {"accent": "#339cff", "accentSource": "chatgpt", "contrast": 45, "ink": "#1a1c1f", "opaqueWindows": False,
+                        "surface": "#ffffff", "semanticColors": {"diffAdded": "#00a240", "diffRemoved": "#ba2623", "skill": "#924ff7"}},
+              "dark": {"accent": "#339cff", "accentSource": "chatgpt", "contrast": 60, "ink": "#ffffff", "opaqueWindows": False,
+                       "surface": "#181818", "semanticColors": {"diffAdded": "#40c977", "diffRemoved": "#fa423e", "skill": "#ad7bf9"}}}
+
+    def appearance(self, **changes):
+        value = {"fonts": {"ui": "fixture", "content": "fixture", "code": "fixture"}, "defaults": json.loads(json.dumps(self.THEMES))}
+        value.update(changes)
+        return value
+
+    def test_appearance_contract(self):
+        entries = [{"role": "ui", "family": "IBM Plex Sans JP"}, {"role": "terminal", "family": "PlemolJP Console NF"}]
+        good = self.appearance(fonts={"ui": "ui", "content": "ui", "code": "terminal"})
+        self.assertEqual(pack.appearance(good, entries)["fonts"],
+                         {"ui": '"IBM Plex Sans JP"', "content": '"IBM Plex Sans JP"', "code": '"PlemolJP Console NF"'})
+        self.assertEqual(pack.appearance(good, entries)["defaults"], self.THEMES)
+
+        def theme(name, **changes):
+            themes = json.loads(json.dumps(self.THEMES))
+            themes[name].update(changes)
+            return themes
+        bad = {
+            "unknown role": self.appearance(fonts={"ui": "ui", "content": "ui", "code": "serif"}),
+            "missing content": self.appearance(fonts={"ui": "ui", "code": "terminal"}),
+            "no dark default": self.appearance(defaults={"light": self.THEMES["light"]}),
+            # A theme with fonts alone is one the app drops: every color is required.
+            "font-only theme": self.appearance(defaults={**self.THEMES, "light": {}}),
+            "missing surface": self.appearance(defaults={**self.THEMES, "dark": {k: v for k, v in self.THEMES["dark"].items() if k != "surface"}}),
+            "short hex": self.appearance(defaults=theme("light", accent="#39f")),
+            "contrast above 100": self.appearance(defaults=theme("dark", contrast=101)),
+            "bool contrast": self.appearance(defaults=theme("dark", contrast=True)),
+            "string opaqueWindows": self.appearance(defaults=theme("dark", opaqueWindows="false")),
+            "other accentSource": self.appearance(defaults=theme("dark", accentSource="system")),
+            "fonts in a default": self.appearance(defaults=theme("dark", fonts={"ui": None})),
+            "a semantic color missing": self.appearance(defaults=theme("light", semanticColors={"diffAdded": "#00a240", "skill": "#924ff7"})),
+        }
+        for case, value in bad.items():
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                pack.appearance(value, entries)
+        with self.assertRaises(ValueError):
+            pack.appearance(good, [{"role": "ui", "family": 'A "quoted" family'}, {"role": "terminal", "family": "x"}])
+        with self.assertRaisesRegex(ValueError, "one Codex config"):
+            pack.store_apps([{**self.APP, "appearance": good},
+                             {**self.APP, "name": "Other", "id": "9ABCDEFGHIJK", "package": "Other.App", "appearance": good}], entries)
+    def test_store_app_contract(self):
+        self.assertEqual(pack.store_apps([self.APP], []), [self.APP])
+        self.assertEqual(pack.store_apps(None, []), [])
+        bad = {
+            "not a list": self.APP,
+            "extra key": [{**self.APP, "version": "1.0"}],
+            "missing key": [{k: v for k, v in self.APP.items() if k != "publisherId"}],
+            "winget source": [{**self.APP, "source": "winget"}],
+            "lowercase id": [{**self.APP, "id": "9plm9xgg6vks"}],
+            "short id": [{**self.APP, "id": "9PLM9XGG6VK"}],
+            "package with an underscore": [{**self.APP, "package": "OpenAI.Codex_2p2nqsd0c76g0"}],
+            "publisher id length": [{**self.APP, "publisherId": "2p2nqsd0c76g"}],
+            "publisher id case": [{**self.APP, "publisherId": "2P2NQSD0C76G0"}],
+            "int name": [{**self.APP, "name": 1}],
+            "duplicate id": [self.APP, {**self.APP, "name": "Other", "package": "Other.App"}],
+            "duplicate package": [self.APP, {**self.APP, "name": "Other", "id": "9ABCDEFGHIJK", "package": "openai.codex"}],
+        }
+        for case, value in bad.items():
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                pack.store_apps(value, [])
 
     def test_distribution_is_deterministic_and_complete(self):
         fonts = self.payload()
