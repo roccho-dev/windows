@@ -17,7 +17,9 @@ param(
     [switch]$Typography,
     # Apply only: write the bundled seed's six font preferences into each existing normal Chromium profile, alone (no
     # other effect), while Chromium is closed. Restore never edits an existing profile (a new one gets the seed).
-    [switch]$ChromiumFonts
+    [switch]$ChromiumFonts,
+    # Apply only: write the fonts of the app already present (its preconfiguration), alone: no install, no OS font, no other effect.
+    [switch]$AppFonts
 )
 
 # The native Windows activation adapter. Product selection belongs to the built distribution (Nix).
@@ -127,7 +129,8 @@ if ($PSBoundParameters.ContainsKey('Packages')) {
     }
 }
 if ($Typography -and ($Mode -ne 'Apply' -or $PSBoundParameters.ContainsKey('Packages'))) { throw '-Typography is only for -Mode Apply, without -Packages.' }
-if ($ChromiumFonts -and ($Mode -ne 'Apply' -or $Typography -or $PSBoundParameters.ContainsKey('Packages'))) { throw '-ChromiumFonts is only for -Mode Apply, without -Packages or -Typography.' }
+if ($ChromiumFonts -and ($Mode -ne 'Apply' -or $Typography -or $AppFonts -or $PSBoundParameters.ContainsKey('Packages'))) { throw '-ChromiumFonts is only for -Mode Apply, without -Packages, -Typography or -AppFonts.' }
+if ($AppFonts -and ($Mode -ne 'Apply' -or $Typography -or $PSBoundParameters.ContainsKey('Packages'))) { throw '-AppFonts is only for -Mode Apply, without -Packages or -Typography.' }
 # The desktop UI font face (a selected family, pack.py) set through ui-font.ahk by the locked interpreter package.
 $uiTypography = Get-Field $manifest 'typography'
 if ($null -ne $uiTypography -and (-not (Test-UiFontFace (Get-Field $uiTypography 'face')) -or (Get-Field $uiTypography 'script') -cne 'ui-font.ahk' -or
@@ -658,7 +661,7 @@ function IsPackageTree([string]$Target) {
 # Anything else is outside this version and stops the run.
 function Observe($Effect) {
     $kind, $target = [string](Get-Field $Effect 'kind'), [string](Get-Field $Effect 'target')
-    if ($kind -ceq 'ui-font-face' -and (Test-EffectPath $kind $target)) { return ObserveUiFont $target.Substring(4) }
+    if ($kind -ceq 'ui-font-face' -and (Test-EffectPath $kind $target)) { return ObserveUiFont $target.Substring('winmetrics:'.Length) }
     if ($kind -ceq 'pref-value' -and (IsChromiumPrefs $target)) { return ObservePref $target ([string](Get-Field $Effect 'name')) }
     if ($kind -ceq 'app-theme-fonts' -and (Test-EffectPath $kind $target)) { return ObserveAppFonts $target.Substring('codex-config:desktop.'.Length) }
     if ($kind -ceq 'file-created' -and [IO.Path]::GetDirectoryName($target) -eq $fontDirectory -and
@@ -1003,7 +1006,7 @@ function UndoOwnedSteps($Steps) {
                 switch -CaseSensitive ($one.action) {
                     'set-ui-font-face' {
                         if ((ObserveUiFont $one.slot).face -cne $one.expectFace) { throw "Refusing to revert UI font $($one.slot): it changed since it was read." }
-                        UiFontSet $one.face @{ $one.slot = $one.expectFace }
+                        WriteUiFontFace $one.slot $one.expectFace $one.face $null  # face only, over the bytes there now
                     }
                     'set-app-theme-fonts' { UndoAppFonts $one $null }
                     'delete-pref-value' { UndoPrefValue $one }
@@ -1039,7 +1042,7 @@ function IsFontEffect($Record) {
 # a missing key throws, so each shape is checked, not assumed.
 function StepText($Step) {
     $on = if ($Step.Contains('expectValue')) { "$($Step.path) $($Step.name)" } elseif ($Step.Contains('path')) { $Step.path } elseif ($Step.Contains('expectFonts')) { "codex-config:desktop.$($Step.theme)" }
-        elseif ($Step.Contains('slot')) { "spi:$($Step.slot) '$($Step.expectFace)' -> '$($Step.face)'" }
+        elseif ($Step.Contains('slot')) { "winmetrics:$($Step.slot) '$($Step.expectFace)' -> '$($Step.face)'" }
         elseif ($Step.Contains('name')) { "$($Step.key)\$($Step.name)" } else { $Step.key }
     "$($Step.action) $on"
 }
@@ -1125,22 +1128,86 @@ function AssertFonts {
 }
 
 # ---- Desktop UI font faces (ui-font-face effects) -------------------------------
-# Six slots, face only, set by ui-font.ahk (SystemParametersInfoW) with the locked interpreter, which
-# checks each slot's expected face first and restores everything else it could have moved. Observation
-# reads what SPI persists, HKCU WindowMetrics, so recovery and Uninstall read a slot without the
-# interpreter. A face the user changed after this wrote it is owned-drift: reported, never written.
+# Six slots, face only, written into their persisted HKCU WindowMetrics values (REG_BINARY LOGFONTW, 92 bytes) through
+# the registry, which Windows reads at the next sign-in. No SystemParametersInfo SET is called: it recomputes and persists
+# the window geometry (CaptionWidth and more) too. Every other byte of each font, and every other WindowMetrics value,
+# stays. Observation, recovery and Uninstall read the same values. A face the user changed after this wrote it is
+# owned-drift: reported, never written. The raw value layout is not a documented API contract: proven on the builds
+# README names, and in effect only after the user's next sign-in (ui-font.ahk's read-only get tells pendingLogon from active).
 $script:uiFontDrift, $script:uiInterpreter = @(), $null
 $windowMetricsSubkey = 'Control Panel\Desktop\WindowMetrics'
 $uiFontValues = @{ caption = 'CaptionFont'; smCaption = 'SmCaptionFont'; menu = 'MenuFont'; status = 'StatusFont'; message = 'MessageFont'; icon = 'IconFont' }
 
-function ObserveUiFont([string]$Slot) {
+# A slot's persisted bytes, strictly: REG_BINARY, 92 bytes, a terminated valid face; anything else stops the run.
+function UiFontBytes([string]$Slot) {
     $name = $uiFontValues[$Slot]
     $value = ObserveValue $name $windowMetricsSubkey
-    $bytes = if ($value.exists -and $value.type -ceq 'Binary') { [byte[]]$value.data } else { $null }
-    if ($null -eq $bytes -or $bytes.Length -ne 92) { throw "HKCU\$windowMetricsSubkey\$name is not a LOGFONTW." }
-    $face = [Text.Encoding]::Unicode.GetString($bytes, 28, 64)
-    $end = $face.IndexOf([char]0)
-    [ordered]@{ exists = $true; face = $(if ($end -ge 0) { $face.Substring(0, $end) } else { $face }) }
+    $bytes = $null  # assigned in the branch: an if-expression would unroll the array into single bytes
+    if ($value.exists -and $value.type -ceq 'Binary') { $bytes = [byte[]]$value.data }
+    if ($null -eq (Get-LogFontFace $bytes)) { throw "HKCU\$windowMetricsSubkey\$name is not a 92-byte REG_BINARY LOGFONTW with a valid face." }
+    , $bytes
+}
+function ObserveUiFont([string]$Slot) { [ordered]@{ exists = $true; face = (Get-LogFontFace (UiFontBytes $Slot)) } }
+
+# Every WindowMetrics value as name -> kind:data (binary as hex), ordinal; for "nothing else changed".
+function WindowMetricsSnapshot {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($windowMetricsSubkey)
+    $all = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    if ($null -eq $key) { return , $all }
+    try {
+        foreach ($name in $key.GetValueNames()) {
+            $data = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $all[$name] = "$($key.GetValueKind($name)):" + $(if ($data -is [byte[]]) { [BitConverter]::ToString($data) } else { [string]($data -join "`n") })
+        }
+    } finally { $key.Close() }
+    , $all
+}
+
+# Why this process may not write the user's HKCU fonts, or $null. It must not run with package identity, nor beneath a
+# packaged app (an executable under WindowsApps): a shell started inside such an app reads "no package" itself while its
+# registry view can still be the app's. Only APPMODEL_ERROR_NO_PACKAGE (0x80073D54) counts as no identity; any other
+# answer refuses. Neither check proves the view is the user's own: run from a normal user shell or task.
+function PackageContextProblem {
+    try {
+        $current = [Windows.ApplicationModel.Package, Windows.ApplicationModel, ContentType = WindowsRuntime]::Current
+        return "this process has package identity $($current.Id.FullName)"
+    } catch {
+        $failure, $none = $_.Exception, $false
+        while ($null -ne $failure) {
+            if ($failure.HResult -eq -2147009196) { $none = $true }  # 0x80073D54, APPMODEL_ERROR_NO_PACKAGE
+            $failure = $failure.InnerException
+        }
+        if (-not $none) { return 'whether this process has package identity is unknown' }
+    }
+    $processes = @{}
+    foreach ($process in @(Get-CimInstance Win32_Process)) { $processes[[int]$process.ProcessId] = $process }
+    $id, $seen = $PID, @{}
+    while ($processes.ContainsKey($id) -and -not $seen.ContainsKey($id)) {
+        $seen[$id] = $true
+        $path = [string]$processes[$id].ExecutablePath
+        if ($path -match '\\WindowsApps\\') { return "it runs beneath the packaged app $path" }
+        $id = [int]$processes[$id].ParentProcessId
+    }
+    $null
+}
+
+# One slot's face, in place: read again now, only while it holds $Expect and (when given) the non-face bytes $Seen of
+# the intent's reading; only lfFaceName is written; afterwards the face is $Face, the other bytes are those just read,
+# and no other WindowMetrics value changed. A failure is reported as it is: nothing is restored over another writer.
+function WriteUiFontFace([string]$Slot, [string]$Expect, [string]$Face, $Seen) {
+    $name = $uiFontValues[$Slot]
+    $others = WindowMetricsSnapshot
+    $now = UiFontBytes $Slot
+    if ((Get-LogFontFace $now) -cne $Expect) { throw "Refusing to write HKCU\$windowMetricsSubkey\${name}: its face is not '$Expect'." }
+    if ($null -ne $Seen -and -not (Test-LogFontFaceOnly $Seen $now)) { throw "Refusing to write HKCU\$windowMetricsSubkey\${name}: it changed beyond its face since it was read." }
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($windowMetricsSubkey, $true)
+    try { $key.SetValue($name, (Get-LogFontWithFace $now $Face), [Microsoft.Win32.RegistryValueKind]::Binary) } finally { $key.Close() }
+    $script:changed++
+    $after, $othersAfter = (UiFontBytes $Slot), (WindowMetricsSnapshot)
+    if ((Get-LogFontFace $after) -cne $Face -or -not (Test-LogFontFaceOnly $now $after)) { throw "HKCU\$windowMetricsSubkey\$name does not read back '$Face' with its other bytes." }
+    $changedNames = @(@($others.Keys) + @($othersAfter.Keys) | Sort-Object -Unique | Where-Object { $_ -cne $name -and
+        (-not $others.ContainsKey($_) -or -not $othersAfter.ContainsKey($_) -or $others[$_] -cne $othersAfter[$_]) })
+    if ($changedNames.Count) { throw "WindowMetrics $($changedNames -join ', ') changed while $name was written; check them." }
 }
 
 # The faces the readable slots name now; font collection keeps their families.
@@ -1153,21 +1220,19 @@ function NamesFace([string]$Name, $Faces) {
 # The selected slot effects; prior is the face found when the intent is written.
 function UiFontEffects {
     foreach ($slot in Get-UiFontSlots) {
-        [ordered]@{ id = "ui-font-face:SPI:$($slot.ToUpperInvariant())"; kind = 'ui-font-face'; target = "spi:$slot"
+        [ordered]@{ id = "ui-font-face:WINMETRICS:$($slot.ToUpperInvariant())"; kind = 'ui-font-face'; target = "winmetrics:$slot"
             prior = $null; desired = [ordered]@{ exists = $true; face = $uiTypography.face } }
     }
 }
 
-# The interpreter package's executable with its locked SHA-256: the owned tree, or an existing install
-# classed preexisting-match. Nothing is installed here (Restore installs packages first).
+# The interpreter package's executable with its locked SHA-256 (the owned tree, or an exact existing install), for the
+# advisory live reading only; $null when there is none.
 function UiFontInterpreter {
     if ($null -ne $script:uiInterpreter) { return $script:uiInterpreter }
     $package = $manifest.packages | Where-Object { $_.name -ceq (Get-Field $uiTypography 'interpreter') } | Select-Object -First 1
-    if ($null -eq $package) { throw 'This distribution selects no UI font interpreter.' }
+    if ($null -eq $package) { return $null }
     $state = ClassifyPackage $package
-    if ($state.class -cnotin @('owned-match', 'preexisting-match')) {
-        throw "The UI font interpreter $($package.name) $($package.version) is $($state.class)$(if ($state.reason) { ": $($state.reason)" }); Restore installs it."
-    }
+    if ($state.class -cnotin @('owned-match', 'preexisting-match')) { return $null }
     $want = (ConvertTo-FileMap $package.files)[$package.executable]
     $candidates = @(Join-Path $state.effect.target $package.executable.Replace('/', '\')) + @(FindUninstallEntries $package.existing |
         Where-Object { $_.installLocation -is [string] -and $_.installLocation.Trim() } |
@@ -1178,21 +1243,25 @@ function UiFontInterpreter {
             return $exe
         }
     }
-    throw "No $($package.name) executable with the locked SHA-256 was found."
+    $null
 }
 
-# One ui-font.ahk set: $Face into each slot of $Expect (slot -> the face it must hold now).
-function UiFontSet([string]$Face, [hashtable]$Expect) {
-    $arguments = @('/ErrorStdOut', (BundlePath 'ui-font.ahk'), 'set', $Face) + @($Expect.Keys | Sort-Object | ForEach-Object { "$_=$($Expect[$_])" })
-    $null = Invoke-Native (UiFontInterpreter) $arguments 60
-    $script:changed++
+# Advisory: the faces this session uses (ui-font.ahk get), slot -> face; $null when they cannot be read.
+function UiLiveFaces {
+    $exe = UiFontInterpreter
+    if ($null -eq $exe) { return $null }
+    try { $slots = (Invoke-Native $exe @('/ErrorStdOut', (BundlePath 'ui-font.ahk'), 'get') 60 | ConvertFrom-Json).slots } catch { return $null }
+    $live = @{}
+    foreach ($slot in Get-UiFontSlots) { $live[$slot] = [string]$slots.$slot.face }
+    $live
 }
 
-# Apply -Typography and Restore, once the selected fonts are exact: every slot is classified first; an owned
-# face of an earlier selection goes back to its prior; then one intent per slot to write, one set of them all
-# (each slot's expected face is its prior), and a commit per slot read back. A failure recovers each slot at
-# once when it can: one that took the face commits, one that did not is voided.
+# Apply -Typography and Restore, once the selected fonts are exact: the context is checked, every slot is classified;
+# an owned face of an earlier selection goes back to its prior; then per slot an intent, the face-only write and a
+# commit read back. A failure recovers that slot at once when it can (written: commit; not: void).
 function ConvergeUiFont {
+    $problem = PackageContextProblem
+    if ($problem) { throw "UI font faces are not written: $problem." }
     $states = @(UiFontEffects | ForEach-Object { [pscustomobject]@{ effect = $_; state = (Classify $_) } })
     foreach ($s in $states) {
         if ($s.state.class -cnotin @('absent', 'owned-match', 'owned-drift', 'preexisting-match')) { throw "UI font $($s.effect.target) is $($s.state.class): $($s.state.reason)" }
@@ -1207,32 +1276,38 @@ function ConvergeUiFont {
         if (-not $plan.ok) { throw "UI font faces of an earlier selection cannot be reverted: $(@($plan.refused | ForEach-Object { "$($_.id): $($_.reason)" }) -join '; ')" }
         UndoOwnedSteps @(OrderedSteps $plan)
     }
-    $write = @(@($states | Where-Object { $_.state.class -ceq 'absent' }) + $changed | ForEach-Object { $_.effect })
-    if (-not $write.Count) { return }
-    $expect = @{}
-    foreach ($effect in $write) {
-        $effect.prior = Observe $effect
-        $expect[$effect.target.Substring(4)] = $effect.prior.face
+    foreach ($effect in @(@($states | Where-Object { $_.state.class -ceq 'absent' }) + $changed | ForEach-Object { $_.effect })) {
+        $slot = $effect.target.Substring('winmetrics:'.Length)
+        $seen = UiFontBytes $slot
+        $effect.prior = [ordered]@{ exists = $true; face = (Get-LogFontFace $seen) }
+        WriteRecord 'intent' $effect $null $null
+        try { WriteUiFontFace $slot $effect.prior.face $effect.desired.face $seen } catch {
+            $failure = $_
+            try { RecoverId $effect.id } catch { Write-Warning "Recovery of $($effect.id) deferred: $($_.Exception.Message)" }
+            throw $failure
+        }
+        WriteRecord 'commit' $effect (Observe $effect)
     }
-    foreach ($effect in $write) { WriteRecord 'intent' $effect $null $null }
-    try {
-        UiFontSet $uiTypography.face $expect
-        $wrong = @($write | Where-Object { (Observe $_).face -cne $uiTypography.face } | ForEach-Object { $_.target })
-        if ($wrong.Count) { throw "HKCU WindowMetrics does not read back '$($uiTypography.face)' for $($wrong -join ', ') (a registry silo?)." }
-    } catch {
-        $failure = $_
-        foreach ($effect in $write) { try { RecoverId $effect.id } catch { Write-Warning "Recovery of $($effect.id) deferred: $($_.Exception.Message)" } }
-        throw $failure
-    }
-    foreach ($effect in $write) { WriteRecord 'commit' $effect (Observe $effect) }
 }
 
-# Read-only: every slot names the selected face, owned or not.
+# Read-only: every slot's persisted face is the selected one, owned or not. Whether this session already uses it is
+# reported, not asserted (UiFontReport).
 function AssertUiFont {
     $wrong = @(UiFontEffects | ForEach-Object { $face = (Observe $_).face; if ($face -cne $uiTypography.face) { "$($_.target) is '$face'" } })
     if ($wrong.Count) { throw "UI font drift (selected '$($uiTypography.face)'): $($wrong -join '; ')" }
 }
 
+# Per slot: the persisted face, the live one (advisory) and the state: active (in use), pendingLogon (persisted, used
+# after the next sign-in), liveUnknown (no reading) or drift.
+function UiFontReport {
+    $live = UiLiveFaces
+    [ordered]@{ face = $uiTypography.face; slots = @(foreach ($slot in Get-UiFontSlots) {
+        $persisted = (ObserveUiFont $slot).face
+        $now = if ($null -ne $live) { $live[$slot] } else { $null }
+        [ordered]@{ slot = $slot; persisted = $persisted; live = $now
+            state = $(if ($persisted -cne $uiTypography.face) { 'drift' } elseif ($null -eq $now) { 'liveUnknown' } elseif ($now -ceq $uiTypography.face) { 'active' } else { 'pendingLogon' }) }
+    }) }
+}
 # ---- Store apps: installed when absent, never owned ------------------------------
 # Presence is this user's package of that name and publisher (Get-AppAction), any version: the Store updates
 # an app itself, so a restore gets the version the Store serves that day (online only), reported, not pinned.
@@ -2267,9 +2342,10 @@ function Uninstall {
             $problem = ChromiumClosedProblem $dir
             if ($problem) { $refused += "Chromium font preferences in ${dir}: $problem" }
         }
-        # A UI font face goes back through the interpreter, before any tree (OrderedSteps), so it must be there now.
+        # A UI font face is written back only where this process may write the user's HKCU fonts.
         if (@($steps | Where-Object { $_.action -ceq 'set-ui-font-face' }).Count) {
-            try { $null = UiFontInterpreter } catch { $refused += "UI font faces: $($_.Exception.Message)" }
+            $problem = PackageContextProblem
+            if ($problem) { $refused += "UI font faces: $problem" }
         }
         # A package tree whose executable runs (an exclusive read/write open fails) is not touched, so a
         # running browser never loses half its files; a partly removed tree still resumes (D1).
@@ -2327,7 +2403,7 @@ try {
     # UI font faces: Restore, and Apply -Typography; checked by RestoreTest too.
     $uiFont = $null -ne $uiTypography -and ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest' -or $Typography)
     # The app's fonts likewise, for an app already present: -Typography never installs it, Restore does first.
-    $appFonts, $appFontsResult = ($null -ne $appearanceApp -and ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest' -or $Typography)), 'notEvaluated'
+    $appFontScope, $appFontsResult = ($null -ne $appearanceApp -and ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest' -or $Typography -or $AppFonts)), 'notEvaluated'
     if ($Mode -eq 'Apply' -or $Mode -eq 'Restore') {
         # Owned fonts and Noctty through the effect ledger (native files, trees and HKCU keys and
         # values): recovery, then every Noctty and font effect is classified before the first
@@ -2337,13 +2413,19 @@ try {
         LockLedger
         $null = ReadLedger
         RecoverLedger
+        if ($AppFonts) {
+            # The selected fonts must already be exact (read-only here); then the present app's fonts alone.
+            AssertFonts
+            if ($null -ne $appearanceApp -and (AppFontsPresent)) { ConvergeAppFonts }
+            if ($script:appFontDrift.Count) { throw "App font drift: $($script:appFontDrift -join '; ')" }
+        }
         if ($ChromiumFonts) {
             # The selected fonts must already be exact (read-only here); then the profiles' six leaves alone.
             AssertFonts
             ConvergeChromiumFonts
             if ($script:prefDrift.Count) { throw "Chromium font drift: $($script:prefDrift -join '; ')" }
         }
-        if (-not $Typography -and -not $ChromiumFonts) {
+        if (-not $Typography -and -not $ChromiumFonts -and -not $AppFonts) {
             $nocttyPlan = PlanNoctty -Restore:($Mode -eq 'Restore')
             # Packages (all for Restore, those named by -Packages for Apply), classified after recovery;
             # every package refusal comes before the first effect, then installs, then old versions go.
@@ -2358,20 +2440,20 @@ try {
             foreach ($state in @($packageStates | Where-Object { $_.install -or $_.class -ceq 'owned-match' })) { CollectPackageGarbage $state }
             if ($Mode -eq 'Restore') { ConvergeApps }
         }
-        if (-not $ChromiumFonts) {
+        if (-not $ChromiumFonts -and -not $AppFonts) {
             ConvergeFonts
             # The faces and the app's fonts move only onto exact selected fonts, and old fonts go only once nothing names them.
-            if (($uiFont -or $appFonts) -and -not $script:fontDrift.Count) {
+            if (($uiFont -or $appFontScope) -and -not $script:fontDrift.Count) {
                 AssertFonts
                 if ($uiFont) { ConvergeUiFont }
-                if ($appFonts -and (AppFontsPresent)) { ConvergeAppFonts }
+                if ($appFontScope -and (AppFontsPresent)) { ConvergeAppFonts }
             }
             CollectUnselectedFonts
             if ($script:fontDrift.Count) { throw "Font drift: $($script:fontDrift -join '; ')" }
             if ($script:uiFontDrift.Count) { throw "UI font drift: $($script:uiFontDrift -join '; ')" }
             if ($script:appFontDrift.Count) { throw "App font drift: $($script:appFontDrift -join '; ')" }
         }
-        if (-not $Typography -and -not $ChromiumFonts) {
+        if (-not $Typography -and -not $ChromiumFonts -and -not $AppFonts) {
             ApplyNoctty $nocttyPlan
             SelectNoctty -Check:($Mode -eq 'Restore')
             if ($script:nocttyDrift.Count) { throw "Noctty drift: $($script:nocttyDrift -join '; ')" }
@@ -2380,7 +2462,7 @@ try {
     }
     if ($Mode -ne 'Validate') { AssertFonts }
     if ($uiFont) { AssertUiFont }
-    if ($appFonts) { if (AppFontsPresent) { AssertAppFonts; $appFontsResult = 'selected' } else { $appFontsResult = 'appAbsent' } }
+    if ($appFontScope) { if (AppFontsPresent) { AssertAppFonts; $appFontsResult = 'selected' } else { $appFontsResult = 'appAbsent' } }
     if ($Mode -eq 'Restore' -or $Mode -eq 'RestoreTest') {
         $appStates = @(AppStates)
         $script:appDrift += @($appStates | Where-Object { $_.action -cne 'present' } | ForEach-Object {
@@ -2420,7 +2502,7 @@ try {
                 class = $(if ($state.Count) { $state[0].class } else { 'notEvaluated' }) } });
         appFonts = $appFontsResult
         chromiumFonts = $(if ($ChromiumFonts) { @($script:chromiumFontsResult) } else { 'notEvaluated' })
-        uiFont = $(if ($uiFont) { [ordered]@{ face = $uiTypography.face; slots = @(Get-UiFontSlots) } } else { 'notEvaluated' })
+        uiFont = $(if ($uiFont) { UiFontReport } else { 'notEvaluated' })
         # Store apps: the version installed now; the Store moves it, and installing needs the network.
         apps = @($apps | ForEach-Object {
             $package = $_.package

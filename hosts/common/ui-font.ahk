@@ -1,18 +1,12 @@
 #Requires AutoHotkey v2.0
 #NoTrayIcon
 #SingleInstance Off
-; The six conventional Win32 UI font slots, face only, through the documented SystemParametersInfoW:
-; NONCLIENTMETRICSW (caption, small caption, menu, status, message) and the icon title LOGFONTW. Run by
-; win.ps1 with the locked AutoHotkey interpreter (no compiler); no input, hooks, windows or other settings.
-;   get                                  one JSON line: each slot's face, live LOGFONT and persisted value (hex)
-;   set <face> <slot>=<expected face>... each named slot must have its expected face now; only lfFaceName changes
-; set refuses (exit 2, nothing written) unless every slot's persisted HKCU WindowMetrics value equals its live
-; LOGFONT but for the face, or differs only in lfQuality, live 0 and persisted 5 (SPI's GET reports the quality it
-; renders with; the persisted value keeps the one set). It writes the persisted LOGFONTs as they are (in the live
-; NONCLIENTMETRICS for the other metrics), only the named faces changed, so neither a size nor that quality moves.
-; Afterwards every live and, independently, every persisted LOGFONT byte but the named faces, and every other
-; WindowMetrics value, must be unchanged; otherwise the same persisted structures and values are put back (exit 3).
-; Exit 0: done, the new state on stdout; 1: any other failure.
+; Read-only and advisory: the six conventional Win32 UI fonts as this session uses them (SystemParametersInfoW GET:
+; NONCLIENTMETRICSW caption, small caption, menu, status, message, and the icon title LOGFONTW) beside their persisted
+; HKCU WindowMetrics values. win.ps1 writes only those persisted values (face only, through the registry), which take
+; effect at the next sign-in; this tells pendingLogon from active. Nothing is ever set: SPI's SET calls recompute and
+; persist the window geometry too. Run with the locked AutoHotkey interpreter (no compiler); no input, hooks or windows.
+;   get   one JSON line: each slot's face, live LOGFONT and persisted value (hex). Exit 0, or 1 with the error on stderr.
 
 Offsets := Map("caption", 24, "smCaption", 124, "menu", 224, "status", 316, "message", 408, "icon", 0)
 Values := Map("caption", "CaptionFont", "smCaption", "SmCaptionFont", "menu", "MenuFont", "status", "StatusFont",
@@ -24,9 +18,7 @@ OnError((failure, *) => Done(1, "", Describe(failure)))  ; never an error dialog
 try {
     if A_Args.Length = 1 && A_Args[1] == "get"
         Done(0, Json(Snapshot(Read())))
-    if A_Args.Length >= 3 && A_Args[1] == "set"
-        SetFaces(A_Args[2])
-    Done(1, "", "usage: get | set <face> <slot>=<expected face>...")
+    Done(1, "", "usage: get")
 } catch as failure {
     Done(1, "", Describe(failure))
 }
@@ -54,14 +46,6 @@ Read() {
     return {ncm: ncm, icon: icon}
 }
 
-; SPIF_UPDATEINIFILE | SPIF_SENDCHANGE: persisted to HKCU WindowMetrics and announced to open windows.
-Write(live, ncm, icon) {
-    if ncm && !DllCall("SystemParametersInfoW", "UInt", 0x2A, "UInt", 504, "Ptr", live.ncm, "UInt", 3)  ; SPI_SETNONCLIENTMETRICS
-        throw Error("SPI_SETNONCLIENTMETRICS failed (" A_LastError ")")
-    if icon && !DllCall("SystemParametersInfoW", "UInt", 0x22, "UInt", 92, "Ptr", live.icon, "UInt", 3)  ; SPI_SETICONTITLELOGFONT
-        throw Error("SPI_SETICONTITLELOGFONT failed (" A_LastError ")")
-}
-
 Hex(buffer, at, length) {
     text := ""
     loop length
@@ -80,37 +64,10 @@ FaceOf(logfontHex) {
     }
     return face
 }
-Rest(logfontHex) => SubStr(logfontHex, 1, 56) SubStr(logfontHex, 185)
-; lfQuality is byte 26: hex characters 53 and 54.
-Quality(logfontHex) => SubStr(logfontHex, 53, 2)
-Agrees(live, persisted) => Rest(live) == Rest(persisted) || SubStr(Rest(live), 1, 52) SubStr(Rest(live), 55) == SubStr(Rest(persisted), 1, 52) SubStr(Rest(persisted), 55)
-    && Quality(live) == "00" && Quality(persisted) == "05"
 
-; The structures to write: the live NONCLIENTMETRICS with each of its five fonts replaced by the persisted bytes, and the
-; persisted icon font.
-Compose(live, was) {
-    ncm := Buffer(504, 0), icon := Buffer(92, 0)
-    loop 504
-        NumPut("UChar", NumGet(live.ncm, A_Index - 1, "UChar"), ncm, A_Index - 1)
-    for slot in Order {
-        target := slot == "icon" ? icon : ncm
-        loop 92
-            NumPut("UChar", Integer("0x" SubStr(was.slots[slot].persisted, A_Index * 2 - 1, 2)), target, Offsets[slot] + A_Index - 1)
-    }
-    return {ncm: ncm, icon: icon}
-}
-
-PutFace(live, slot, face) {
-    buffer := slot == "icon" ? live.icon : live.ncm, at := Offsets[slot] + 28
-    loop 32
-        NumPut("UShort", 0, buffer, at + (A_Index - 1) * 2)
-    loop parse face
-        NumPut("UShort", Ord(A_LoopField), buffer, at + (A_Index - 1) * 2)
-}
-
-; slot -> {face, live, persisted}, plus every other WindowMetrics value (name -> type:data).
+; slot -> {face, live, persisted}.
 Snapshot(live) {
-    slots := Map(), others := Map()
+    slots := Map()
     for slot in Order {
         buffer := slot == "icon" ? live.icon : live.ncm
         fontHex := Hex(buffer, Offsets[slot], 92)  ; not "hex": names ignore case, so a local hex would shadow Hex()
@@ -118,88 +75,7 @@ Snapshot(live) {
         try persisted := StrUpper(RegRead(Metrics, Values[slot]))
         slots[slot] := {face: FaceOf(fontHex), live: fontHex, persisted: persisted}
     }
-    loop reg, Metrics, "V" {
-        if !IsFontValue(A_LoopRegName)
-            others[A_LoopRegName] := A_LoopRegType ":" RegRead()
-    }
-    return {slots: slots, others: others}
-}
-IsFontValue(name) {
-    for slot, value in Values
-        if value = name
-            return true
-    return false
-}
-
-SetFaces(face) {
-    ; lfFaceName holds 31 UTF-16 units and a terminator; no controls, no surrogates.
-    valid := StrLen(face) >= 1 && StrLen(face) <= 31
-    loop parse face {
-        code := Ord(A_LoopField)
-        if code < 32 || code = 127 || code > 0xD7FF && code < 0xE000 || code > 0xFFFF
-            valid := false
-    }
-    if !valid
-        throw Error("Invalid face name: " face)
-    expected := Map()
-    loop A_Args.Length - 2 {
-        pair := A_Args[A_Index + 2]
-        if !RegExMatch(pair, "^(\w+)=(.+)$", &part) || !Offsets.Has(part[1]) || expected.Has(part[1])
-            throw Error("Invalid slot argument: " pair)
-        expected[part[1]] := part[2]
-    }
-    before := Read(), was := Snapshot(before)
-    for slot in Order {
-        if StrLen(was.slots[slot].persisted) != 184 || !Agrees(was.slots[slot].live, was.slots[slot].persisted)
-            || FaceOf(was.slots[slot].persisted) !== was.slots[slot].face
-            Done(2, "", "HKCU WindowMetrics " Values[slot] " does not match the live " slot " font; nothing written")
-    }
-    for slot, face0 in expected
-        if was.slots[slot].face !== face0
-            Done(2, "", slot " face is '" was.slots[slot].face "', not the expected '" face0 "'; nothing written")
-    original := Compose(before, was), live := Compose(before, was), ncm := false, icon := false
-    for slot in expected {
-        PutFace(live, slot, face)
-        if slot == "icon"
-            icon := true
-        else
-            ncm := true
-    }
-    Write(live, ncm, icon)
-    now := Snapshot(Read())
-    problem := Differs(was, now, expected, face)
-    if problem != "" {
-        Write(original, ncm, icon)
-        for slot in Order
-            RegWrite(was.slots[slot].persisted, "REG_BINARY", Metrics, Values[slot])
-        for name, typed in was.others {
-            split := InStr(typed, ":")
-            RegWrite(SubStr(typed, split + 1), SubStr(typed, 1, split - 1), Metrics, name)
-        }
-        for name in now.others
-            if !was.others.Has(name)
-                RegDelete(Metrics, name)
-        Done(3, "", "verification failed, restored: " problem)
-    }
-    Done(0, Json(now))
-}
-
-Differs(was, now, expected, face) {
-    for slot in Order {
-        want := expected.Has(slot) ? face : was.slots[slot].face
-        state := now.slots[slot]
-        if state.face !== want || FaceOf(state.persisted) !== want
-            return slot " face is '" state.face "' (persisted '" FaceOf(state.persisted) "'), not '" want "'"
-        if Rest(state.live) != Rest(was.slots[slot].live) || Rest(state.persisted) != Rest(was.slots[slot].persisted)
-            return slot " changed beyond its face"
-    }
-    for name, typed in was.others
-        if !now.others.Has(name) || now.others[name] != typed
-            return "WindowMetrics " name " changed"
-    for name in now.others
-        if !was.others.Has(name)
-            return "WindowMetrics " name " appeared"
-    return ""
+    return {slots: slots}
 }
 
 ; ASCII JSON: anything else as \uXXXX.

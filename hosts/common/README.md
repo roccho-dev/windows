@@ -32,6 +32,7 @@ directory, then run:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Validate     # read-only
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Restore      # fonts, UI font faces, Noctty, packages, Store apps (see below)
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Apply -Typography  # fonts, UI font faces, a present app's fonts
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Apply -AppFonts  # the present app's fonts only
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Apply -ChromiumFonts  # the seed's six fonts into existing Chromium profiles; Chromium closed
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RestoreTest  # fail on drift
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Uninstall    # dry run: lists what it would revert
@@ -381,36 +382,58 @@ may.
 
 ### Desktop UI font faces
 
-`typography` in `nix.nix` names a font role (`ui`, IBM Plex Sans JP) and the locked
-interpreter package (AutoHotkey). `Restore`, and `Apply -Typography` (the fonts and
-these faces alone, for a machine where `Restore` stops elsewhere, e.g. at a
-machine-wide Noctty), set that family as the face of the six Win32 UI font slots
-(caption, small caption, menu, status, message; icon title) through
-`SystemParametersInfoW`. The call is made by `ui-font.ahk`, run by the owned (or an
-exact preexisting) `AutoHotkey64.exe` whose SHA-256 is the lock's. No compiler,
-`Add-Type`, input, hook or window is involved. Only `lfFaceName` changes: before writing,
-the script requires each slot's persisted `HKCU\Control Panel\Desktop\WindowMetrics` value to equal its
-live LOGFONTW, except that lfQuality may be 0 live and 5 persisted, as on a real host where SPI's GET reports the
-quality it renders with. It also requires each slot it sets to hold the face the ledger expects. Otherwise it refuses
-and writes nothing. It writes the persisted LOGFONTs as they are, face aside, so the persisted quality is kept. Afterwards every other byte of the six live fonts and, separately, of the six persisted ones, and every other
-WindowMetrics value, must be unchanged, or it puts all of them back and fails.
-Sizes, weights and the DPI are never written. The live and persisted units agree at
-100% scaling; at other scalings that precheck may refuse, which is safe but
-unproven.
+`typography` in `nix.nix` names a font role (`ui`, IBM Plex Sans JP). `Restore`, and
+`Apply -Typography` (fonts, these faces and a present app's fonts alone, for a machine
+where `Restore` stops elsewhere, such as a machine-wide Noctty), stage that family in the
+six classic Win32 UI font slots: caption, small caption, menu, status, message, and icon
+title.
+- **What it writes:** only `lfFaceName` in each slot's persisted
+  `HKCU\Control Panel\Desktop\WindowMetrics` value (a 92-byte REG_BINARY LOGFONTW),
+  through the .NET registry API. Every other byte of each font (height, weight,
+  quality, ...) and every other WindowMetrics value (`CaptionWidth` and the rest) stay.
+- **No SPI:** `SystemParametersInfo` SET is not used. On CI it recomputed and persisted
+  the window geometry along with the face (CI 94), which is not a font-only change.
+- **Checks around each write:**
+  - before: the value must be REG_BINARY, 92 bytes, with a terminated valid face; it must
+    hold the expected face, and its other bytes must be those read for the intent;
+  - after: the face, every other byte and every other WindowMetrics value must read back
+    as required. A failure is reported, never covered by writing anything else.
+- **When it takes effect:** Windows reads these values at sign-in, so the faces apply
+  after the user's next normal sign-in. Running applications are not notified.
+  - Each slot is reported as `pendingLogon` (persisted, not yet in use), `active` (in
+    use; read through `ui-font.ahk get`), `liveUnknown` (no interpreter to read with)
+    or `drift`.
+  - `ui-font.ahk` is now read-only and advisory. It runs on the locked AutoHotkey, never
+    sets anything, and is needed for no write.
+- **Unproven:** this layout is not a documented API contract. It is tested on Windows 11
+  build 26200 (the host, read only) and the CI runner's Windows Server; it is proven only
+  once a real user's sign-in shows the faces `active`. If something calls the SPI SET
+  calls before that sign-in (changing text size, theme or scaling), Windows may write its
+  in-memory fonts back; that shows as drift.
+- **Context guard:** the faces are written only from a normal user context, not one
+  with package identity and not one beneath a packaged app. A shell started inside the
+  ChatGPT app reads "no package" itself while its registry view can be the app's, so its
+  ancestors are checked too. Only `APPMODEL_ERROR_NO_PACKAGE` counts as no identity;
+  any other answer refuses. Neither check proves the registry view is the user's own,
+  so run from a normal user shell or task.
 
-Each slot is a `ui-font-face` ledger effect (target `spi:<slot>`, state `face`,
-prior the face found). Another face in a slot nothing owns is `absent`, taken with
-that face recorded as prior. One set covers every slot to write, then one commit
-per slot read back. Recovery commits a slot that took the face and voids one that
-did not. A face changed after this wrote it is owned-drift: `Apply` reports UI
-font drift and writes nothing, and `Uninstall` refuses it (set it back by hand).
-`Uninstall` writes each prior face back through the interpreter before any tree
-goes. It refuses when the interpreter is missing. Unselected owned fonts are
-collected only after the faces move, and a font whose family a slot still names
-is kept. This covers classic Win32 UI text only: modern Windows shell and XAML
-text, and each application's own fonts, are unaffected. A running application may
-need a restart to pick up the change.
+**Ledger:** each slot is a `ui-font-face` ledger effect: target `winmetrics:<slot>`, state
+`face`, prior the face found.
+- Another face in a slot nothing owns is `absent`, taken with that face recorded as prior.
+- Per slot: intent, the write, a commit read back. Recovery commits a slot that holds the
+  face and voids one that does not.
+- A face changed after this wrote it is owned-drift: `Apply` reports it and writes nothing,
+  and `Uninstall` refuses it (set it back by hand).
+- `Uninstall` writes each prior face back the same way, over whatever the other bytes are
+  then, so a size the user changed later is kept: only the face is owned.
+- Unselected owned fonts are collected only after the faces move, and a font whose family
+  a slot, an owned app font or an owned Chromium font still names is kept.
 
+This covers classic Win32 UI text only. Modern shell and XAML text, and applications' own
+fonts, are not changed: no uniform OS-wide font is claimed.
+
+`-Mode Apply -AppFonts` writes only the fonts of the app already present: no Store
+install, no OS font, Noctty or package. With no app, it does nothing.
 ### Store apps
 
 `apps` in `nix.nix` lists Microsoft Store apps by Store id, package name and publisher
@@ -624,15 +647,20 @@ first run on the default `User Data` and Win+R itself are proven only by the VM 
 Windows 11 VM, as an unelevated user in an Explorer-launched session, Win+R `chromium`
 after `Restore` starts the owned `chrome.exe` (positive), and the same Win+R after
 `Uninstall` finds nothing (negative).
-A31 (UI font faces, while AutoHotkey is owned) first gives the runner's persisted fonts lfQuality 5, as a fixture it
-removes afterwards, and runs `ui-font.ahk get`. A persisted height other than the live one is refused without a write. It
-requires each live LOGFONTW to equal the runner's persisted value, and the script
-to refuse an unexpected face without writing. It then models a crash after the five
-NONCLIENTMETRICS slots took the face (six intents, one set of five). `Apply
--Typography` commits those five, voids the icon, writes it anew and changes
-nothing but the six faces. A second run writes nothing; a changed face is drift and
-is not written. After A27's `Uninstall` every WindowMetrics value is byte-for-byte
-the runner's baseline again. `Restore`'s Store app step (WinGet) is not run on CI;
+A31 (UI font faces, while AutoHotkey is owned) checks the face-only registry writes on
+the runner. CI cannot sign in, so the faces staying `pendingLogon` is the expected
+result, and the live fonts must not change.
+- **Refusals, each writing nothing:** a font value of the wrong length or type, the
+  flags misused, and `-AppFonts` without the app (which must touch nothing).
+- **Crash recovery:** a run that wrote three of six slots is recovered: three committed,
+  three voided and written anew.
+- **What changes:** only the six faces; every other byte and WindowMetrics value
+  (`CaptionWidth` included) and the live fonts stay.
+- **Re-runs:** a second run writes nothing. A changed face is drift, and `Uninstall`
+  refuses it.
+- **Uninstall:** after a later height change, it restores each face only, keeps that
+  height and is byte-exact elsewhere.
+`Restore`'s Store app step (WinGet) is not run on CI;
 only its decision (`Get-AppAction`) is. The runner has no ChatGPT app, so the app fonts
 are proven on CI only as pure rules: complete default themes, font-only themes refused,
 the edits for an existing and an absent theme, records, classes, the undo of a created

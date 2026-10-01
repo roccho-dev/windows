@@ -153,7 +153,7 @@ function Get-HandoffVerdict($Record, $Events, [string]$ExpectedTerminal) {
 #             registry-key-created | tree-extracted | ui-font-face | app-theme-fonts | pref-value
 #   target    absolute file or directory path (drive, backslashes, no . or ..),
 #             or an HKCU\ key for the registry kinds; never HKLM; for ui-font-face
-#             spi:<slot>, one of Get-UiFontSlots
+#             winmetrics:<slot>, one of Get-UiFontSlots
 #   name      registry-value: the value name ('' is the default value); pref-value: the dotted leaf path, one of
 #             Get-ChromiumFontLeaves (target is the profile's Preferences file); no other kind
 #   prior     the state before the effect
@@ -216,6 +216,35 @@ function Get-UiFontSlots { @('caption', 'smCaption', 'menu', 'status', 'message'
 # True for one LOGFONTW face name: 1 to 31 UTF-16 units, no control character or surrogate.
 function Test-UiFontFace($Face) {
     $Face -is [string] -and $Face.Length -ge 1 -and $Face.Length -le 31 -and $Face -cnotmatch '[\x00-\x1f\x7f\ud800-\udfff]'
+}
+
+# The face of one persisted LOGFONTW (the 92-byte REG_BINARY of a WindowMetrics font): lfFaceName, WCHAR[32] at byte 28,
+# terminated within its 32 units; $null when the bytes are not that or the name is not a valid face.
+function Get-LogFontFace($Bytes) {
+    if ($Bytes -isnot [byte[]] -or $Bytes.Length -ne 92) { return $null }
+    $name = [Text.Encoding]::Unicode.GetString($Bytes, 28, 64)
+    $end = $name.IndexOf([char]0)
+    if ($end -lt 0) { return $null }
+    $face = $name.Substring(0, $end)
+    if (Test-UiFontFace $face) { $face } else { $null }
+}
+
+# A copy of a persisted LOGFONTW with only lfFaceName changed: its 64 bytes zeroed, then $Face in UTF-16 with its
+# terminator. Every other byte (height, width, weight, quality, ...) is the input's.
+function Get-LogFontWithFace($Bytes, [string]$Face) {
+    if ($null -eq (Get-LogFontFace $Bytes) -or -not (Test-UiFontFace $Face)) { throw 'Not a LOGFONTW with a valid face, or not a valid face name.' }
+    $copy = [byte[]]$Bytes.Clone()
+    [Array]::Clear($copy, 28, 64)
+    $name = [Text.Encoding]::Unicode.GetBytes($Face)
+    [Array]::Copy($name, 0, $copy, 28, $name.Length)
+    , $copy
+}
+
+# True when two persisted LOGFONTWs differ in nothing but lfFaceName.
+function Test-LogFontFaceOnly($Before, $After) {
+    if ($Before -isnot [byte[]] -or $After -isnot [byte[]] -or $Before.Length -ne 92 -or $After.Length -ne 92) { return $false }
+    for ($i = 0; $i -lt 28; $i++) { if ($Before[$i] -ne $After[$i]) { return $false } }  # the 28 bytes before lfFaceName, which ends the struct
+    $true
 }
 
 # ---- ChatGPT app themes: font leaves of desktop.<theme> in the user's Codex config ----
@@ -551,10 +580,10 @@ function Get-PrefsFontUndo([string]$Text, [string]$Path, [string[]]$Created) {
 # The CSS families an app font value names ('"A", "B"' -> A, B), for font collection.
 function Get-CssFamilies([string]$Value) { @($Value.Split(',') | ForEach-Object { $_.Trim().Trim('"', "'").Trim() } | Where-Object { $_ }) }
 
-# True for an absolute file path, an HKCU key when $Kind is a registry kind, spi:<slot> for ui-font-face, or
+# True for an absolute file path, an HKCU key when $Kind is a registry kind, winmetrics:<slot> for ui-font-face, or
 # codex-config:desktop.<theme> for app-theme-fonts.
 function Test-EffectPath([string]$Kind, $Target) {
-    if ($Kind -ceq 'ui-font-face') { return ($Target -is [string] -and (Get-UiFontSlots | ForEach-Object { "spi:$_" }) -ccontains $Target) }
+    if ($Kind -ceq 'ui-font-face') { return ($Target -is [string] -and (Get-UiFontSlots | ForEach-Object { "winmetrics:$_" }) -ccontains $Target) }
     if ($Kind -ceq 'app-theme-fonts') { return ($Target -is [string] -and (Get-AppThemeKeys | ForEach-Object { "codex-config:desktop.$_" }) -ccontains $Target) }
     $registry = $Kind -cin @('registry-value', 'registry-key-created')
     $root = if ($registry) { '^HKCU\\' } else { '^[A-Za-z]:\\' }
@@ -886,7 +915,7 @@ function Get-UndoSteps($Record) {
         'tree-extracted' { $tree = Get-TreeUndoSteps $Record $null; $tree }
         # Face only, and only while the slot still holds the face the effect wrote.
         'ui-font-face' {
-            [ordered]@{ action = 'set-ui-font-face'; slot = $target.Substring(4); face = (Get-Field $prior 'face'); expectFace = (Get-Field $desired 'face') }
+            [ordered]@{ action = 'set-ui-font-face'; slot = $target.Substring('winmetrics:'.Length); face = (Get-Field $prior 'face'); expectFace = (Get-Field $desired 'face') }
         }
         # Only while the leaf still holds the value written; created parents go only while left empty (Get-PrefsFontUndo).
         'pref-value' {

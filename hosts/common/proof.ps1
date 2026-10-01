@@ -234,7 +234,7 @@ $pureKinds = @(
     @('registry-value', 'HKCU\Software\W', $absent, @{ exists = $true; type = 'String'; data = 'new' }, 'v'),
     @('registry-value', 'HKCU\Software\W', @{ exists = $true; type = 'String'; data = 'old' }, @{ exists = $true; type = 'String'; data = 'new' }, 'v'),
     @('registry-key-created', 'HKCU\Software\Classes\CLSID\{W}', $absent, @{ exists = $true }, $null),
-    @('ui-font-face', 'spi:menu', @{ exists = $true; face = 'Segoe UI' }, @{ exists = $true; face = 'IBM Plex Sans JP' }, $null))
+    @('ui-font-face', 'winmetrics:menu', @{ exists = $true; face = 'Segoe UI' }, @{ exists = $true; face = 'IBM Plex Sans JP' }, $null))
 foreach ($case in $pureKinds) {
     $kind, $target, $prior, $desired, $name = $case
     $committed = @((PureRecord 1 intent $kind $target $prior $desired $null $name), (PureRecord 2 commit $kind $target $prior $desired $desired $name))
@@ -278,26 +278,42 @@ Must (-not (Get-UninstallPlan (@(Owned 1 k registry-key-created $clsid $exists $
 # face unowned is absent (taken, recording it as prior); the undo writes the prior face back only over the one written.
 $segoe, $plex = @{ exists = $true; face = 'Segoe UI' }, @{ exists = $true; face = 'IBM Plex Sans JP' }
 function UiRecord($Seq, $Phase, $Target, $Prior, $Desired, $Observed) { $r = PureRecord $Seq $Phase ui-font-face $Target $Prior $Desired $Observed $null; $r.id = "ui:$Target"; $r }
-Must ($null -eq (Get-EffectRecordProblem (UiRecord 1 intent 'spi:menu' $segoe $plex $null)) -and
-    $null -eq (Get-EffectRecordProblem (UiRecord 2 commit 'spi:icon' $segoe $plex $plex)) -and
-    (Get-EffectRecordProblem (UiRecord 1 intent 'spi:menu' $absent $plex $null)) -ceq 'prior must exist.' -and
-    (Get-EffectRecordProblem (UiRecord 1 intent 'spi:Menu' $segoe $plex $null)) -like 'target*' -and
+Must ($null -eq (Get-EffectRecordProblem (UiRecord 1 intent 'winmetrics:menu' $segoe $plex $null)) -and
+    $null -eq (Get-EffectRecordProblem (UiRecord 2 commit 'winmetrics:icon' $segoe $plex $plex)) -and
+    (Get-EffectRecordProblem (UiRecord 1 intent 'winmetrics:menu' $absent $plex $null)) -ceq 'prior must exist.' -and
+    (Get-EffectRecordProblem (UiRecord 1 intent 'winmetrics:Menu' $segoe $plex $null)) -like 'target*' -and
     (Get-EffectRecordProblem (UiRecord 1 intent 'HKCU\Control Panel\Desktop\WindowMetrics' $segoe $plex $null)) -like 'target*' -and
-    (Get-EffectRecordProblem (UiRecord 1 intent 'spi:menu' $segoe @{ exists = $true; face = 'x' * 32 } $null)) -like 'desired.face*' -and
-    (Get-EffectRecordProblem (UiRecord 1 intent 'spi:menu' $segoe @{ exists = $true; face = "a`tb" } $null)) -like 'desired.face*' -and
-    (Get-EffectRecordProblem (UiRecord 1 intent 'spi:menu' $segoe @{ exists = $true; face = 'SEGOE UI' } $null)) -eq $null -and
-    (Get-EffectRecordProblem (UiRecord 1 intent 'spi:menu' $segoe $segoe $null)) -like 'desired equals prior*' -and
-    (Get-EffectRecordProblem (UiRecord 2 commit 'spi:menu' $segoe $plex $segoe)) -ceq 'observed differs from desired.' -and
-    (Get-EffectRecordProblem ((UiRecord 1 intent 'spi:menu' $segoe $plex $null) + @{ name = 'MenuFont' })) -ceq 'name belongs to registry-value and pref-value only.') 'ui-font-face records'
+    (Get-EffectRecordProblem (UiRecord 1 intent 'winmetrics:menu' $segoe @{ exists = $true; face = 'x' * 32 } $null)) -like 'desired.face*' -and
+    (Get-EffectRecordProblem (UiRecord 1 intent 'winmetrics:menu' $segoe @{ exists = $true; face = "a`tb" } $null)) -like 'desired.face*' -and
+    (Get-EffectRecordProblem (UiRecord 1 intent 'winmetrics:menu' $segoe @{ exists = $true; face = 'SEGOE UI' } $null)) -eq $null -and
+    (Get-EffectRecordProblem (UiRecord 1 intent 'winmetrics:menu' $segoe $segoe $null)) -like 'desired equals prior*' -and
+    (Get-EffectRecordProblem (UiRecord 2 commit 'winmetrics:menu' $segoe $plex $segoe)) -ceq 'observed differs from desired.' -and
+    (Get-EffectRecordProblem ((UiRecord 1 intent 'winmetrics:menu' $segoe $plex $null) + @{ name = 'MenuFont' })) -ceq 'name belongs to registry-value and pref-value only.') 'ui-font-face records'
 Must ((Get-UnownedClass ui-font-face $plex $segoe $null).class -ceq 'absent' -and (Get-UnownedClass ui-font-face $plex $plex $null).class -ceq 'preexisting-match' -and
     (Get-UnownedClass ui-font-face $plex @{ exists = $true; face = 'ibm plex sans jp' } $null).class -ceq 'absent' -and
-    (Get-EffectClass @((UiRecord 1 intent 'spi:menu' $segoe $plex $null), (UiRecord 2 commit 'spi:menu' $segoe $plex $plex)) @{ exists = $true; face = 'Meiryo UI' } '' $null).class -ceq 'owned-drift' -and
-    (Get-EffectClass @((UiRecord 1 intent 'spi:menu' $segoe $plex $null)) $plex '' $null).resolution -ceq 'confirm') 'ui-font-face classes'
-$uiPlan = Get-UninstallPlan @((UiRecord 1 intent 'spi:menu' $segoe $plex $null), (UiRecord 2 commit 'spi:menu' $segoe $plex $plex),
-    (UiRecord 3 intent 'spi:icon' $segoe $plex $null), (UiRecord 4 commit 'spi:icon' $segoe $plex $plex)) @{ 'ui:spi:menu' = $plex; 'ui:spi:icon' = $plex }
+    (Get-EffectClass @((UiRecord 1 intent 'winmetrics:menu' $segoe $plex $null), (UiRecord 2 commit 'winmetrics:menu' $segoe $plex $plex)) @{ exists = $true; face = 'Meiryo UI' } '' $null).class -ceq 'owned-drift' -and
+    (Get-EffectClass @((UiRecord 1 intent 'winmetrics:menu' $segoe $plex $null)) $plex '' $null).resolution -ceq 'confirm') 'ui-font-face classes'
+$uiPlan = Get-UninstallPlan @((UiRecord 1 intent 'winmetrics:menu' $segoe $plex $null), (UiRecord 2 commit 'winmetrics:menu' $segoe $plex $plex),
+    (UiRecord 3 intent 'winmetrics:icon' $segoe $plex $null), (UiRecord 4 commit 'winmetrics:icon' $segoe $plex $plex)) @{ 'ui:winmetrics:menu' = $plex; 'ui:winmetrics:icon' = $plex }
 Must ($uiPlan.ok -and (Actions $uiPlan) -ceq 'set-ui-font-face,set-ui-font-face' -and
     (@($uiPlan.steps | ForEach-Object { "$($_.slot):$($_.expectFace)>$($_.face)" }) -join '|') -ceq 'icon:IBM Plex Sans JP>Segoe UI|menu:IBM Plex Sans JP>Segoe UI' -and
-    -not (Get-UninstallPlan @((UiRecord 1 intent 'spi:menu' $segoe $plex $null), (UiRecord 2 commit 'spi:menu' $segoe $plex $plex)) @{ 'ui:spi:menu' = @{ exists = $true; face = 'Meiryo UI' } }).ok) 'ui-font-face undo writes the prior face over the written one only; a changed face is refused'
+    -not (Get-UninstallPlan @((UiRecord 1 intent 'winmetrics:menu' $segoe $plex $null), (UiRecord 2 commit 'winmetrics:menu' $segoe $plex $plex)) @{ 'ui:winmetrics:menu' = @{ exists = $true; face = 'Meiryo UI' } }).ok) 'ui-font-face undo writes the prior face over the written one only; a changed face is refused'
+# The persisted LOGFONTW: only lfFaceName (bytes 28-91) changes; anything not a 92-byte font with a terminated valid
+# face is refused.
+$logFont = [byte[]]::new(92)
+[BitConverter]::GetBytes([int]-12).CopyTo($logFont, 0); $logFont[16] = 0x90; $logFont[26] = 5
+[Text.Encoding]::Unicode.GetBytes('Segoe UI').CopyTo($logFont, 28)
+$logFont[60] = 0x41  # a stale byte after the terminator, as Windows can leave
+$withPlex = Get-LogFontWithFace $logFont 'IBM Plex Sans JP'
+$unterminated = [byte[]]$logFont.Clone(); for ($i = 28; $i -lt 92; $i += 2) { $unterminated[$i] = 0x41 }
+$taller = [byte[]]$withPlex.Clone(); $taller[0] = 0xF0
+$refusedFaces = @(@(@{ b = [byte[]]::new(91); f = 'x' }, @{ b = $unterminated; f = 'x' }, @{ b = $logFont; f = ('x' * 32) }, @{ b = $logFont; f = "a`tb" }) |
+    Where-Object { try { $null = Get-LogFontWithFace $_.b $_.f; $false } catch { $true } })
+Must ((Get-LogFontFace $logFont) -ceq 'Segoe UI' -and (Get-LogFontFace $withPlex) -ceq 'IBM Plex Sans JP' -and (Test-LogFontFaceOnly $logFont $withPlex) -and
+    [BitConverter]::ToString($withPlex, 0, 28) -ceq [BitConverter]::ToString($logFont, 0, 28) -and $withPlex[28 + 2 * 'IBM Plex Sans JP'.Length] -eq 0 -and $withPlex[60] -eq 0 -and
+    $null -eq (Get-LogFontFace $unterminated) -and $null -eq (Get-LogFontFace ([byte[]]::new(91))) -and $null -eq (Get-LogFontFace 'not bytes') -and
+    -not (Test-LogFontFaceOnly $logFont $taller) -and $refusedFaces.Count -eq 4 -and (Get-LogFontFace (Get-LogFontWithFace $taller 'Segoe UI')) -ceq 'Segoe UI' -and
+    (Get-LogFontWithFace $taller 'Segoe UI')[0] -eq 0xF0) 'LOGFONTW face-only edits: header bytes kept, face region rewritten, invalid input refused, a later height kept by the undo'
 # Store apps: installed only when no package of that name exists; present only as exactly one of that publisher.
 $app = @{ name = 'ChatGPT'; package = 'OpenAI.Codex'; publisherId = '2p2nqsd0c76g0' }
 Must ((Get-AppAction @() $app) -ceq 'install' -and (Get-AppAction @(@{ name = 'Other.App'; publisherId = '2p2nqsd0c76g0' }) $app) -ceq 'install' -and
@@ -2044,13 +2060,13 @@ Craft @{ phase = 'intent'; id = $oldId; kind = 'tree-extracted'; target = $oldTr
 Craft @{ phase = 'commit'; id = $oldId; kind = 'tree-extracted'; target = $oldTree; prior = $absent; desired = $oldDesired; observed = $oldDesired }
 $null = ApplyPackages 'AutoHotkey'
 Must ((Phases $oldId) -ceq 'intent,commit,undone' -and -not (Test-Path -LiteralPath $oldTree) -and (AhkExact)) 'A26: an owned older version is collected'
-# A31: the desktop UI font faces (ui-font-face), set face-only through ui-font.ahk by the owned AutoHotkey. The runner's
-# six slots are the baseline: A27's Uninstall must restore every WindowMetrics value to exactly these bytes.
+# A31: the desktop UI font faces (ui-font-face): only lfFaceName of the six persisted WindowMetrics fonts, through the
+# registry, in effect at the next sign-in (which CI cannot do). The runner's WindowMetrics are the baseline.
 $uiFace = $manifest.typography.face
 $uiSlots = @('caption', 'smCaption', 'menu', 'status', 'message', 'icon')
 $uiValues = @{ caption = 'CaptionFont'; smCaption = 'SmCaptionFont'; menu = 'MenuFont'; status = 'StatusFont'; message = 'MessageFont'; icon = 'IconFont' }
 $ahkExe, $uiScript = (Join-Path $ahkTree $ahk.executable.Replace('/', '\')), (Join-Path $PSScriptRoot 'ui-font.ahk')
-function UiId([string]$Slot) { "ui-font-face:SPI:$($Slot.ToUpperInvariant())" }
+function UiId([string]$Slot) { "ui-font-face:WINMETRICS:$($Slot.ToUpperInvariant())" }
 function Metrics {  # every HKCU WindowMetrics value, name -> kind:data (binary as hex)
     $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Control Panel\Desktop\WindowMetrics')
     try {
@@ -2064,14 +2080,15 @@ function Metrics {  # every HKCU WindowMetrics value, name -> kind:data (binary 
 }
 function MetricsText($Metrics) { @($Metrics.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ';' }
 function SlotHex($Metrics, [string]$Slot) { ([string]$Metrics[$uiValues[$Slot]]).Substring('Binary:'.Length) }
-function HexFace([string]$Hex) { $face = [Text.Encoding]::Unicode.GetString([Convert]::FromHexString($Hex.Substring(56, 128))); $face.Substring(0, ($face + [char]0).IndexOf([char]0)) }
-function HexRest([string]$Hex) { $Hex.Substring(0, 56) + $Hex.Substring(184) }  # all but lfFaceName
+function HexFace([string]$Hex) { Get-LogFontFace ([Convert]::FromHexString($Hex)) }
+function HexRest([string]$Hex) { $Hex.Substring(0, 56) }  # the 28 bytes before lfFaceName, which ends the struct
 function UiRun([string[]]$Arguments) { Bounded $ahkExe (@('/ErrorStdOut', $uiScript) + $Arguments) 60 }
-function UiSet([string]$Face, [hashtable]$Expect) {
-    $run = UiRun (@('set', $Face) + @($Expect.Keys | Sort-Object | ForEach-Object { "$_=$($Expect[$_])" }))
-    if ($run.exit -ne 0) { throw "ui-font.ahk set exited $($run.exit): $(Tail $run.stderr)" }
+function SetSlotValue([string]$Slot, $Value, [Microsoft.Win32.RegistryValueKind]$Kind = 'Binary') {  # proof fixtures only
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Control Panel\Desktop\WindowMetrics', $true)
+    try { $key.SetValue($uiValues[$Slot], $Value, $Kind) } finally { $key.Close() }
 }
-# Everything but the named slots' faces equals $Before; those faces are $Face.
+function SetSlotFace([string]$Slot, [string]$Face) { SetSlotValue $Slot (Get-LogFontWithFace ([Convert]::FromHexString((SlotHex (Metrics) $Slot))) $Face) }
+# Everything but the named slots' faces equals $Before (CaptionWidth and every other value included); those faces are $Face.
 function UiOnlyFaces($Before, [string[]]$Slots, [string]$Face) {
     $now = Metrics
     foreach ($slot in $uiSlots) {
@@ -2081,68 +2098,68 @@ function UiOnlyFaces($Before, [string[]]$Slots, [string]$Face) {
     foreach ($name in @($Before.Keys) + @($now.Keys)) { if (@($uiValues.Values) -notcontains $name -and $Before[$name] -cne $now[$name]) { return $false } }
     return $true
 }
-# Fixture (this runner only; restored after A27): every persisted font gets lfQuality 5, as on a real host whose SPI GET
-# reports 0 for the same fonts. Setting faces must keep both, and must not treat the difference as drift.
-function HexQuality([string]$Hex) { $Hex.Substring(52, 2) }
-function HexNoQuality([string]$Hex) { $r = HexRest $Hex; $r.Substring(0, 52) + $r.Substring(54) }
-function SetSlotHex([string]$Slot, [string]$Hex) {
-    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Control Panel\Desktop\WindowMetrics', $true)
-    try { $key.SetValue($uiValues[$Slot], [Convert]::FromHexString($Hex), [Microsoft.Win32.RegistryValueKind]::Binary) } finally { $key.Close() }
-}
-$uiOriginal = Metrics
-foreach ($slot in $uiSlots) { $hex = SlotHex $uiOriginal $slot; SetSlotHex $slot ($hex.Substring(0, 52) + '05' + $hex.Substring(54)) }
+function OthersSame($A, $B, [string]$Except) { -not @(@($A.Keys) + @($B.Keys) | Where-Object { $_ -cne $Except -and $A[$_] -cne $B[$_] }).Count }
+function UiNoRecords { (NewRecords $mark @($uiSlots | ForEach-Object { UiId $_ })) -eq 0 }
 $uiBefore = Metrics
 $uiGet = UiRun @('get')
 $uiLive = if ($uiGet.exit -eq 0) { $uiGet.stdout | ConvertFrom-Json } else { $null }
-function LiveKept {
+function LiveKept {  # the live fonts (SPI GET) exactly as before: nothing here changes a running session
     $now = UiRun @('get')
-    if ($now.exit -ne 0) { return $false }
-    $slots = ($now.stdout | ConvertFrom-Json).slots
-    -not @($uiSlots | Where-Object { (HexRest $slots.$_.live) -cne (HexRest $uiLive.slots.$_.live) }).Count
+    $now.exit -eq 0 -and -not @($uiSlots | Where-Object { (($now.stdout | ConvertFrom-Json).slots.$_.live) -cne $uiLive.slots.$_.live }).Count
 }
-Write-Host "A31 baseline: $(@($uiSlots | ForEach-Object { "$_='$(HexFace (SlotHex $uiBefore $_))' quality persisted $(HexQuality (SlotHex $uiOriginal $_))->$(HexQuality (SlotHex $uiBefore $_)) live $(if ($null -ne $uiLive) { HexQuality $uiLive.slots.$_.live })" }) -join ', '); get exit $($uiGet.exit) $(Tail $uiGet.stderr)"
-Must ($null -ne $uiLive -and -not @($uiSlots | Where-Object { $s = $uiLive.slots.$_
-        $s.persisted -cne (SlotHex $uiBefore $_) -or (HexNoQuality $s.live) -cne (HexNoQuality $s.persisted) -or $s.face -cne (HexFace $s.persisted) -or
-        (HexQuality $s.persisted) -cne '05' -or (HexQuality $s.live) -cnotin @('00', '05') }).Count) 'A31: ui-font.ahk get reads each live LOGFONTW, equal to its persisted value but for lfQuality (offsets and DPI agree)'
+Write-Host "A31 baseline: $(@($uiSlots | ForEach-Object { "$_='$(HexFace (SlotHex $uiBefore $_))'" }) -join ', '); get exit $($uiGet.exit) $(Tail $uiGet.stderr)"
+Must ($null -ne $uiLive -and -not @($uiSlots | Where-Object { $uiLive.slots.$_.persisted -cne (SlotHex $uiBefore $_) }).Count) 'A31: ui-font.ahk get reads the live fonts and the persisted values'
 $uiBase = @{}
 foreach ($slot in $uiSlots) { $uiBase[$slot] = HexFace (SlotHex $uiBefore $slot) }
 if (@($uiBase.Values) -ccontains $uiFace) { throw "Proof requires no UI font slot naming $uiFace on this runner yet." }
 MustReject { Win51 @('-Mode', 'Validate', '-Typography') } '-Typography is only for -Mode Apply*'
 MustReject { Win51 @('-Mode', 'Apply', '-Typography', '-Packages', 'AutoHotkey') } '-Typography is only for -Mode Apply*'
-# The interpreter refuses a slot whose face is not the expected one, writing nothing.
-$uiRefused = UiRun @('set', $uiFace, 'caption=Not The Caption Face')
-Must ($uiRefused.exit -eq 2 -and (MetricsText (Metrics)) -ceq (MetricsText $uiBefore)) 'A31: ui-font.ahk refuses an unexpected face and writes nothing'
-# A persisted height other than the live one is drift beyond lfQuality: refused, nothing written.
-$captionHex = SlotHex $uiBefore 'caption'
-SetSlotHex 'caption' ('D8FFFFFF' + $captionHex.Substring(8))
-$uiHeight = UiRun @('set', $uiFace, "caption=$(HexFace $captionHex)")
-$heightNow = Metrics
-SetSlotHex 'caption' $captionHex
-Must ($uiHeight.exit -eq 2 -and (SlotHex $heightNow 'caption') -ceq ('D8FFFFFF' + $captionHex.Substring(8)) -and
-    -not @(@($uiBefore.Keys) + @($heightNow.Keys) | Where-Object { $_ -cne 'CaptionFont' -and $uiBefore[$_] -cne $heightNow[$_] }).Count) 'A31: ui-font.ahk refuses a persisted height that differs from the live one, writing nothing'
-# A crash after the five NONCLIENTMETRICS slots took the face and before the icon slot: six intents, one set of five.
-# Recovery commits the five and voids the icon; the icon is then written anew.
+MustReject { Win51 @('-Mode', 'Apply', '-AppFonts', '-Typography') } '-AppFonts is only for -Mode Apply*'
+# -AppFonts alone touches only a present app's fonts: here (no app) nothing at all.
+$mark = LastSeq
+$appOnly = Win51 @('-Mode', 'Apply', '-AppFonts')
+Must ((LastSeq) -eq $mark -and $appOnly.appFonts -ceq 'appAbsent' -and $appOnly.nocttyPlan -ceq 'notEvaluated' -and $appOnly.uiFont -ceq 'notEvaluated' -and (MetricsText (Metrics)) -ceq (MetricsText $uiBefore)) 'A31: -AppFonts leaves OS fonts, Noctty and packages alone'
+# A value that is not a 92-byte REG_BINARY LOGFONTW stops the run before any face is written.
+$captionBytes = [Convert]::FromHexString((SlotHex $uiBefore 'caption'))
+foreach ($wrong in @(@{ value = [byte[]]$captionBytes[0..90]; kind = 'Binary' }, @{ value = (SlotHex $uiBefore 'caption'); kind = 'String' })) {
+    SetSlotValue 'caption' $wrong.value $wrong.kind
+    $mark = LastSeq
+    MustReject { Win51 @('-Mode', 'Apply', '-Typography') } '*CaptionFont is not a 92-byte REG_BINARY LOGFONTW*'
+    $refusedMetrics = Metrics
+    SetSlotValue 'caption' $captionBytes
+    Must ((UiNoRecords) -and (OthersSame $refusedMetrics $uiBefore 'CaptionFont') -and $refusedMetrics['CaptionFont'] -clike "$($wrong.kind):*") "A31: a $($wrong.kind) value of the wrong shape is refused, nothing written"
+}
+Must ((MetricsText (Metrics)) -ceq (MetricsText $uiBefore)) 'A31: the shape fixtures are gone'
+# A crash after three slots were written: six intents, three faces already in place. Recovery commits those three and
+# voids the others, which are then written anew; only the six faces change, the live fonts not at all (pendingLogon).
 $mark = LastSeq
 foreach ($slot in $uiSlots) {
-    Craft @{ phase = 'intent'; id = (UiId $slot); kind = 'ui-font-face'; target = "spi:$slot"
+    Craft @{ phase = 'intent'; id = (UiId $slot); kind = 'ui-font-face'; target = "winmetrics:$slot"
         prior = @{ exists = $true; face = $uiBase[$slot] }; desired = @{ exists = $true; face = $uiFace } }
 }
-$ncm = @{}
-foreach ($slot in @($uiSlots | Where-Object { $_ -cne 'icon' })) { $ncm[$slot] = $uiBase[$slot] }
-UiSet $uiFace $ncm
+$written = @('caption', 'smCaption', 'menu')
+foreach ($slot in $written) { SetSlotFace $slot $uiFace }
 $typographyRun = Win51 @('-Mode', 'Apply', '-Typography')
-Must ($typographyRun.uiFont.face -ceq $uiFace -and $typographyRun.nocttyPlan -ceq 'notEvaluated' -and
-    -not @($uiSlots | Where-Object { $_ -cne 'icon' -and (Phases (UiId $_)) -cne 'intent,commit' }).Count -and (Phases (UiId 'icon')) -ceq 'intent,void,intent,commit' -and
-    (UiOnlyFaces $uiBefore $uiSlots $uiFace) -and (LiveKept)) 'A31: Apply -Typography recovers the interrupted set and writes the rest; only the six faces changed, persisted lfQuality 5 and the live fonts kept'
+Must ($typographyRun.nocttyPlan -ceq 'notEvaluated' -and
+    -not @($uiSlots | Where-Object { (Phases (UiId $_)) -cne $(if ($written -ccontains $_) { 'intent,commit' } else { 'intent,void,intent,commit' }) }).Count -and
+    (UiOnlyFaces $uiBefore $uiSlots $uiFace) -and (LiveKept)) 'A31: Apply -Typography recovers the interrupted run and writes the rest; only the six faces changed (CaptionWidth and all other values kept), the live fonts untouched'
+Must ($typographyRun.uiFont.face -ceq $uiFace -and (@($typographyRun.uiFont.slots | ForEach-Object { "$($_.slot)=$($_.state)" }) -join ',') -ceq
+    (@($uiSlots | ForEach-Object { "$_=pendingLogon" }) -join ',')) 'A31: every slot reports pendingLogon (persisted, not yet in use)'
 $mark = LastSeq
 $null = Win51 @('-Mode', 'Apply', '-Typography')
-Must ((NewRecords $mark @($uiSlots | ForEach-Object { UiId $_ })) -eq 0) 'A31: a second Apply -Typography writes nothing'
-# A face changed after this wrote it is owned-drift: reported, never written.
-UiSet $uiBase.menu @{ menu = $uiFace }
+Must (UiNoRecords) 'A31: a second Apply -Typography writes nothing'
+# A face changed after this wrote it is owned-drift: Apply reports it and writes nothing, Uninstall refuses.
+SetSlotFace 'menu' $uiBase.menu
 $mark = LastSeq
-MustReject { Win51 @('-Mode', 'Apply', '-Typography') } "*UI font drift*spi:menu is '$($uiBase.menu)'*"
-Must ((NewRecords $mark @($uiSlots | ForEach-Object { UiId $_ })) -eq 0 -and (HexFace (SlotHex (Metrics) 'menu')) -ceq $uiBase.menu) 'A31: a changed face is drift, not written'
-UiSet $uiFace @{ menu = $uiBase.menu }
+MustReject { Win51 @('-Mode', 'Apply', '-Typography') } "*UI font drift*winmetrics:menu is '$($uiBase.menu)'*"
+$driftText = MetricsText (Metrics)
+MustReject { RunUninstall -Apply } '*Uninstall refused*owned target differs*'
+Must ((UiNoRecords) -and (MetricsText (Metrics)) -ceq $driftText) 'A31: a changed face is drift, not written; Uninstall refuses it'
+SetSlotFace 'menu' $uiFace
+# A size the user changes later is not this effect's: the undo (A27) puts back the face and keeps the new height.
+$tallCaption = [Convert]::FromHexString((SlotHex (Metrics) 'caption'))
+[BitConverter]::GetBytes([int]-40).CopyTo($tallCaption, 0)
+SetSlotValue 'caption' $tallCaption
 # A25: interrupted package attempts: recovery removes the derived asset and a partial staging and voids the
 # intent; a file the inventory does not name keeps the staging directory and the intent open until it is gone.
 function CrashIntent([string]$Leaf, [string]$Foreign) {
@@ -2209,12 +2226,13 @@ $gone = RunUninstall -Apply
 Must ($gone.ownedOpen -eq 0 -and -not (Test-Path -LiteralPath $ahkTree) -and -not (Test-Path -LiteralPath $chromiumTree) -and
     (Test-Path -LiteralPath "$chromiumProfile\proof.txt") -and [IO.File]::ReadAllText($preferences) -ceq $restored) 'A27: Uninstall removes the package trees, never the profile'
 AssertEmpty
-# A31 after Uninstall: each face went back through the interpreter before its tree went, so every WindowMetrics
-# value is exactly the baseline again and each slot's attempt is closed undone.
-Must ((MetricsText (Metrics)) -ceq (MetricsText $uiBefore) -and (Phases (UiId 'icon')) -ceq 'intent,void,intent,commit,undone' -and
-    -not @($uiSlots | Where-Object { $_ -cne 'icon' -and (Phases (UiId $_)) -cne 'intent,commit,undone' }).Count) 'A31: Uninstall restores the UI font slots exactly'
-foreach ($slot in $uiSlots) { SetSlotHex $slot (SlotHex $uiOriginal $slot) }  # the fixture's lfQuality 5 goes; the runner's own bytes are back
-Must ((MetricsText (Metrics)) -ceq (MetricsText $uiOriginal)) 'A31: the runner''s WindowMetrics are its own again'
+# A31 after Uninstall: each face is back, every other byte and value as it was, the later caption height kept.
+$uiAfter = Metrics
+$expectCaption = [byte[]](Get-LogFontWithFace $tallCaption $uiBase.caption)
+Must ((SlotHex $uiAfter 'caption') -ceq [Convert]::ToHexString($expectCaption) -and (OthersSame $uiAfter $uiBefore 'CaptionFont') -and
+    -not @($uiSlots | Where-Object { (Phases (UiId $_)) -cnotlike '*,undone' }).Count) 'A31: Uninstall restores each face only, byte-exact elsewhere, keeping the later caption height'
+SetSlotValue 'caption' $captionBytes
+Must ((MetricsText (Metrics)) -ceq (MetricsText $uiBefore)) 'A31: the runner''s WindowMetrics are its own again'
 
 # ---- A29 (b3b): the locked Chromium, installed for real (downloaded once), owned, first run, and removed ----
 # Here A27 has removed the stand-in 154 tree and every owned effect; the proof's stand-in profile keeps its restored
