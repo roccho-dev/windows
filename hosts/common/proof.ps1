@@ -1847,7 +1847,7 @@ try {
     $syntaxConfig = Join-Path $env:RUNNER_TEMP ('noctty-syntax-' + [guid]::NewGuid().ToString('N') + '.ghostty')
     try {
         [IO.File]::WriteAllText($syntaxConfig, (SelectedNocttyConfigText $manifest.noctty), [Text.UTF8Encoding]::new($false))
-        $syntax = Vendor (Join-Path $install 'noctty.com') (Join-NativeArguments @('+validate-config', '--config-default-files=false', ('--config-file=' + $syntaxConfig)))
+        $syntax = Vendor (Join-Path $install 'noctty.com') (Join-NativeArguments @('+validate-config', ('--config-file=' + $syntaxConfig)))
         Must ($syntax.exit -ceq 0) "Noctty vendor config syntax (not runtime): $($syntax.output)"
     } finally { [IO.File]::Delete($syntaxConfig) }
     $tree3 = FileSnapshot $install
