@@ -2827,11 +2827,12 @@ Must (Untouched) 'A32: an escaped duplicate key is refused'
 # preexisting-match, never owned); every other byte of both stays.
 $applied = ChromiumFonts
 $p2Now = [IO.File]::ReadAllText($p2Prefs)
-$p2Parsed, $defaultParsed = ($p2Now | ConvertFrom-Json), ([IO.File]::ReadAllText($defaultPrefs) | ConvertFrom-Json)
-function FontOf($Doc, [string]$Leaf) { $v = $Doc; foreach ($k in $Leaf.Split('.')) { if ($null -eq $v -or $null -eq $v.PSObject.Properties[$k]) { return $null }; $v = $v.$k }; [string]$v }
+# -AsHashtable: Profile 2 keeps keys that differ only in case (C, c), which objects cannot hold; lookups are exact.
+$p2Parsed, $defaultParsed = ($p2Now | ConvertFrom-Json -AsHashtable), ([IO.File]::ReadAllText($defaultPrefs) | ConvertFrom-Json -AsHashtable)
+function FontOf($Doc, [string]$Leaf) { $v = $Doc; foreach ($k in $Leaf.Split('.')) { if ($v -isnot [Collections.IDictionary] -or -not $v.Contains($k)) { return $null }; $v = $v[$k] }; [string]$v }
 Must ((@($applied.chromiumFonts | ForEach-Object { "$($_.profile)=$($_.written)" }) -join ',') -ceq 'Default=6,Profile 2=5' -and
     -not @($leaves | Where-Object { (FontOf $defaultParsed $_) -cne (SeedFont $_) -or (FontOf $p2Parsed $_) -cne (SeedFont $_) }).Count -and
-    $defaultParsed.proof -ceq 'a profile restored by hand' -and (Phases (PrefId $p2Prefs 'webkit.webprefs.fonts.standard.Zyyy')) -ceq '' -and
+    $defaultParsed['proof'] -ceq 'a profile restored by hand' -and $p2Parsed['C'] -eq 1 -and $p2Parsed['c'] -eq 2 -and (Phases (PrefId $p2Prefs 'webkit.webprefs.fonts.standard.Zyyy')) -ceq '' -and
     -not @($leaves | Where-Object { $_ -cne 'webkit.webprefs.fonts.standard.Zyyy' -and (Phases (PrefId $p2Prefs $_)) -cne 'intent,commit' }).Count) 'A32: the six leaves are the seed''s in both profiles; a matching one is not owned'
 Must ($p2Now.Contains('[9223372036854775807, -9223372036854775808, 1.7976931348623157e+308, 5e-324, 1e+05, 1.5e-05, 12345678901234567890]') -and
     $p2Now.Contains('"C": 1, "c": 2, "a\"b": "café caf') -and $p2Now.Contains('"default_font_size": 16') -and
