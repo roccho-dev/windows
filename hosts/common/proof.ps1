@@ -1769,7 +1769,8 @@ function VendorConfig([string]$Exe, [string]$ConfigFile) {
     if ($env:OS -cne 'Windows_NT' -or -not (Get-Command Start-Process).Parameters.ContainsKey('Environment')) {
         throw 'Config syntax proof requires Windows Start-Process with child Environment support.'
     }
-    $stdoutPath, $stderrPath = $ConfigFile + '.stdout', $ConfigFile + '.stderr'
+    $stdoutPath = $ConfigFile + '.stdout'
+    $stderrPath = $ConfigFile + '.stderr'
     if (Test-Path -LiteralPath $stdoutPath) { throw 'Config stdout capture already exists.' }
     if (Test-Path -LiteralPath $stderrPath) { throw 'Config stderr capture already exists.' }
     $process = $null
