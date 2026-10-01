@@ -1656,12 +1656,20 @@ $null = New-Item -ItemType Directory -Path (Split-Path -Parent $packagedLauncher
 function Packaged([string[]]$Arguments) {
     $ErrorActionPreference = 'Continue'
     $PSNativeCommandUseErrorActionPreference = $false
-    $out = @(& $packagedLauncher /d /c $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'win.ps1') @Arguments 2>&1 | ForEach-Object { [string]$_ })
+    # cmd.exe passes this PowerShell 7's PSModulePath on to the 5.1 child, which then cannot load its own modules
+    # (Get-FileHash not recognized, CI 99); a direct 5.1 launch is spared that. Without the variable 5.1 builds its
+    # default. Only this variable, only around this launch.
+    $modulePath, $out, $code = $env:PSModulePath, @(), 'not started'
+    try {
+        [Environment]::SetEnvironmentVariable('PSModulePath', $null, 'Process')
+        $out = @(& $packagedLauncher /d /c $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'win.ps1') @Arguments 2>&1 | ForEach-Object { [string]$_ })
+        $code = $LASTEXITCODE
+    } finally { [Environment]::SetEnvironmentVariable('PSModulePath', $modulePath, 'Process') }
     # As Win51 reads it: 5.1 wraps an error at the console width, also inside a path, so the lines are rejoined without
     # a separator up to the "At <script>:<line> char:<n>" line.
     $message, $at = '', $false
     foreach ($line in $out) { if ($line -match '^At .+ char:\d+\s*$') { $at = $true }; if (-not $at) { $message += $line } }
-    [pscustomobject]@{ code = $LASTEXITCODE; text = $message; ledger = (Test-Path -LiteralPath $ledgerDir) }
+    [pscustomobject]@{ code = $code; text = $message; ledger = (Test-Path -LiteralPath $ledgerDir) }
 }
 # On a failure the exit code, the ledger's presence and the start of the synthetic run's message (no profile data) are logged.
 function PackagedText($Run) { $text = [string]$Run.text -replace '\s+', ' '; "exit $($Run.code), ledger $($Run.ledger): $($text.Substring(0, [Math]::Min(600, $text.Length)))" }
