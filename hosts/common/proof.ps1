@@ -1753,18 +1753,44 @@ function FileSnapshot([string]$Directory) {
     $map
 }
 # A vendor command with a deadline, so a window that stays open cannot hold the proof.
-function Vendor([string]$Exe, [string]$Argument, [switch]$ConfigLog) {
+function Vendor([string]$Exe, [string]$Argument) {
     $info = [Diagnostics.ProcessStartInfo]::new($Exe, $Argument)
     $info.UseShellExecute, $info.RedirectStandardOutput, $info.RedirectStandardError, $info.CreateNoWindow = $false, $true, $true, $true
-    if ($ConfigLog) { $info.EnvironmentVariables['GHOSTTY_LOG'] = 'stderr' }
     $process = [Diagnostics.Process]::Start($info)
     $out, $err = $process.StandardOutput.ReadToEndAsync(), $process.StandardError.ReadToEndAsync()
     if (-not $process.WaitForExit(60000)) { $process.Kill($true); return [pscustomobject]@{ exit = 'timeout after 60 s'; output = '' } }
     $process.WaitForExit()
-    $lines = @(($out.Result + "`n" + $err.Result) -split "`r?`n" | Where-Object { $_.Trim() })
-    $sample = @($lines | Select-Object -First 20)
-    if ($ConfigLog -and $lines.Count -gt 20) { $sample += @($lines | Select-Object -Last 5) }
-    [pscustomobject]@{ exit = $process.ExitCode; output = $sample -join ' | ' }
+    [pscustomobject]@{ exit = $process.ExitCode; output = @(($out.Result + "`n" + $err.Result) -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 20) -join ' | ' }
+}
+function VendorConfig([string]$Exe, [string]$ConfigFile) {
+    # v1.3.131 validate_config ends a positional Zig stdout writer even when empty.
+    # Its resize on a Windows pipe returns FileTooBig. Native Start-Process on
+    # Windows supplies actual regular-file handles; keep the real parser/exit gate.
+    if ($env:OS -cne 'Windows_NT' -or -not (Get-Command Start-Process).Parameters.ContainsKey('Environment')) {
+        throw 'Config syntax proof requires Windows Start-Process with child Environment support.'
+    }
+    $stdoutPath, $stderrPath = $ConfigFile + '.stdout', $ConfigFile + '.stderr'
+    if (Test-Path -LiteralPath $stdoutPath) { throw 'Config stdout capture already exists.' }
+    if (Test-Path -LiteralPath $stderrPath) { throw 'Config stderr capture already exists.' }
+    $process = $null
+    try {
+        $process = Start-Process -FilePath $Exe -ArgumentList (Join-NativeArguments @('+validate-config', ('--config-file=' + $ConfigFile))) `
+            -NoNewWindow -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -Environment @{ GHOSTTY_LOG = 'stderr' }
+        if (-not $process.WaitForExit(60000)) {
+            $process.Kill($true); $process.WaitForExit()
+            return [pscustomobject]@{ exit = 'timeout after 60 s'; output = '' }
+        }
+        $process.WaitForExit()
+        $stdout = [IO.File]::ReadAllText($stdoutPath)
+        $stderr = [IO.File]::ReadAllText($stderrPath)
+        $lines = @(($stdout + "`n" + $stderr) -split "`r?`n" | Where-Object { $_.Trim() })
+        $sample = @($lines | Select-Object -First 20)
+        if ($lines.Count -gt 20) { $sample += @($lines | Select-Object -Last 5) }
+        [pscustomobject]@{ exit = $process.ExitCode; diagnostics = $stdout; output = $sample -join ' | ' }
+    } finally {
+        if ($null -ne $process) { $process.Dispose() }
+        [IO.File]::Delete($stdoutPath); [IO.File]::Delete($stderrPath)
+    }
 }
 function Region([string]$Key) { $Key -match '^(Software\\Classes|Console)(\\|$)' }
 # The vendor registers only with HKCU\Console\%%Startup\DelegationConsole selecting
@@ -1852,18 +1878,23 @@ try {
     $version = Vendor (Join-Path $install 'noctty.com') '--version'
     $syntaxConfig = Join-Path $env:RUNNER_TEMP ('noctty-syntax-' + [guid]::NewGuid().ToString('N') + '.ghostty')
     $fontOnlyConfig = $syntaxConfig + '.font-only'
+    $invalidConfig = $syntaxConfig + '.invalid'
     try {
         [IO.File]::WriteAllText($syntaxConfig, (SelectedNocttyConfigText $manifest.noctty), [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText($fontOnlyConfig, ('font-family = ' + $manifest.noctty.fontFamily + "`n"), [Text.UTF8Encoding]::new($false))
-        foreach ($candidate in @($fontOnlyConfig, $syntaxConfig)) {
+        [IO.File]::WriteAllText($invalidConfig, ([IO.File]::ReadAllText($syntaxConfig) + "noctty-iac-invalid-field = true`n"), [Text.UTF8Encoding]::new($false))
+        foreach ($candidate in @($fontOnlyConfig, $syntaxConfig, $invalidConfig)) {
             Say "config syntax input $candidate; bytes $((Get-Item -LiteralPath $candidate).Length); sha256 $((Get-FileHash -LiteralPath $candidate).Hash)"
         }
-        $fontOnly = Vendor (Join-Path $install 'noctty.com') (Join-NativeArguments @('+validate-config', ('--config-file=' + $fontOnlyConfig))) -ConfigLog
-        $syntax = Vendor (Join-Path $install 'noctty.com') (Join-NativeArguments @('+validate-config', ('--config-file=' + $syntaxConfig))) -ConfigLog
+        $fontOnly = VendorConfig (Join-Path $install 'noctty.com') $fontOnlyConfig
+        $syntax = VendorConfig (Join-Path $install 'noctty.com') $syntaxConfig
+        $invalid = VendorConfig (Join-Path $install 'noctty.com') $invalidConfig
         Say "font-only config control exit $($fontOnly.exit): $($fontOnly.output)"
         Say "desired config syntax exit $($syntax.exit): $($syntax.output)"
+        Say "invalid-field config control exit $($invalid.exit): $($invalid.output)"
+        Must ($invalid.exit -ceq 1 -and $invalid.diagnostics -match 'noctty-iac-invalid-field') 'Noctty config negative control must reject the actual invalid field.'
         Must ($syntax.exit -ceq 0) "Noctty vendor config syntax (not runtime): $($syntax.output)"
-    } finally { [IO.File]::Delete($syntaxConfig); [IO.File]::Delete($fontOnlyConfig) }
+    } finally { [IO.File]::Delete($syntaxConfig); [IO.File]::Delete($fontOnlyConfig); [IO.File]::Delete($invalidConfig) }
     $tree3 = FileSnapshot $install
     Say "noctty.com --version exit $($version.exit): $($version.output); install directory changes: $(@(SnapshotDiff $tree2 $tree3).Count)"
 
