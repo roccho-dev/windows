@@ -90,6 +90,36 @@ had no `.js` script engine.
 `Restore` without packages, the Windows Terminal version, COM activation and this
 check; `Test` checks fonts only.
 
+### Manual Noctty launch
+
+The Nix selection keeps `PlemolJP Console NF` and makes ordinary new Noctty
+windows and tabs run the native `%ProgramFiles%\WSL\wslc.exe` directly:
+`--session wslc-cli-resta exec --interactive --tty windows-own /bin/sh -i`.
+The existing G6I3 binding names `windows-own`. The explicit session must already
+be running and the container available; this configuration does not create,
+reopen or start either, and has no fallback to a different session or container.
+After WSL service restart, owner-controlled reopening of the existing storage
+and target is a separate prerequisite. Configuration/CI is not live OCI proof.
+
+`window-save-state = never` gives a fresh ordinary window instead of replaying
+saved profiles/windows. The saved session file is not deleted. This policy is
+not a diagnosis of any previously observed extra windows. Noctty's `-Embedding`
+handoff adopts the original caller's PTY and does not spawn this configured
+command; a Windows console caller therefore retains its command.
+
+From the same user's normal shell outside a packaged app, apply only this file:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode Apply -NocttyConfig
+```
+
+This path recovers only the configuration's ledger ID, replaces an unchanged
+owned older configuration through the existing file lifecycle, and leaves exact
+unowned configuration unowned. User drift refuses without overwriting it.
+Fonts, package trees, COM registration, terminal selection and other app settings
+are not converged by this scope. CI checks the vendor's configuration syntax and
+the owned migration/no-op/drift cases; it does not execute the OCI command.
+
 ## Explicit WSL/WSLC platform recovery
 
 This is source for a separate, deliberate **machine** recovery step. Normal

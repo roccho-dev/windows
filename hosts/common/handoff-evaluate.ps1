@@ -1314,6 +1314,28 @@ function ConvertFrom-TarListing($Lines, $Files) {
 # Windows PowerShell 5.1 has no ProcessStartInfo.ArgumentList: an argument that is empty or holds
 # white space or '"' is quoted, a '"' is escaped, and backslashes before a '"' or the closing
 # quote are doubled. A NUL cannot be passed and stops the run.
+function Get-NocttyLaunchProblem($Launch) {
+    $keys = if ($Launch -is [Collections.IDictionary]) { @($Launch.Keys) } elseif ($null -ne $Launch) { @($Launch.PSObject.Properties.Name) } else { @() }
+    if ($keys.Count -ne 4 -or @($keys | Where-Object { $_ -cnotin @('session','container','shell','windowSaveState') }).Count) { return 'Noctty launch keys differ.' }
+    foreach ($name in 'session','container') {
+        $value = Get-Field $Launch $name
+        if ($value -isnot [string] -or $value -cnotmatch '^[a-z0-9][a-z0-9-]+\z') { return "Invalid Noctty launch $name." }
+    }
+    if ((Get-Field $Launch 'shell') -cne '/bin/sh' -or (Get-Field $Launch 'windowSaveState') -cne 'never') { return 'Noctty launch requires /bin/sh and never restore.' }
+    return $null
+}
+
+function Get-NocttyConfigText($Noctty, [string]$Wslc) {
+    $launch = Get-Field $Noctty 'launch'
+    $problem = Get-NocttyLaunchProblem $launch
+    if ($problem) { throw $problem }
+    $face = Get-Field $Noctty 'fontFamily'
+    if ($face -isnot [string] -or $face -eq '' -or $face -match '[\r\n\x00]') { throw 'Invalid Noctty font family.' }
+    if ($Wslc -cnotmatch '^[A-Za-z]:\\' -or $Wslc -match '[\r\n\x00"]') { throw 'Noctty requires an absolute native WSLc path.' }
+    $arguments = @($Wslc, '--session', $launch.session, 'exec', '--interactive', '--tty', $launch.container, $launch.shell, '-i')
+    return 'font-family = ' + $face + "`ncommand = direct:" + (Join-NativeArguments $arguments) + "`nwindow-save-state = never`n"
+}
+
 function Join-NativeArguments([string[]]$Arguments) {
     @(foreach ($value in @($Arguments)) {
         $argument = [string]$value
