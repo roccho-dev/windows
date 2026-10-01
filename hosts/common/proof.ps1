@@ -1657,15 +1657,24 @@ function Packaged([string[]]$Arguments) {
     $ErrorActionPreference = 'Continue'
     $PSNativeCommandUseErrorActionPreference = $false
     $out = @(& $packagedLauncher /d /c $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'win.ps1') @Arguments 2>&1 | ForEach-Object { [string]$_ })
-    [pscustomobject]@{ code = $LASTEXITCODE; text = ($out -join ' ') }
+    # As Win51 reads it: 5.1 wraps an error at the console width, also inside a path, so the lines are rejoined without
+    # a separator up to the "At <script>:<line> char:<n>" line.
+    $message, $at = '', $false
+    foreach ($line in $out) { if ($line -match '^At .+ char:\d+\s*$') { $at = $true }; if (-not $at) { $message += $line } }
+    [pscustomobject]@{ code = $LASTEXITCODE; text = $message; ledger = (Test-Path -LiteralPath $ledgerDir) }
 }
+# On a failure the exit code, the ledger's presence and the start of the synthetic run's message (no profile data) are logged.
+function PackagedText($Run) { $text = [string]$Run.text -replace '\s+', ' '; "exit $($Run.code), ledger $($Run.ledger): $($text.Substring(0, [Math]::Min(600, $text.Length)))" }
 foreach ($arguments in @(@('-Mode', 'Apply'), @('-Mode', 'Apply', '-AppFonts'), @('-Mode', 'Uninstall', '-Apply'))) {
     $run = Packaged $arguments
-    Must ($run.code -ne 0 -and $run.text -like '*refused, nothing written: it runs beneath the packaged app*\WindowsApps\*' -and -not (Test-Path -LiteralPath $ledgerDir)) "M-L1: $($arguments -join ' ') beneath a packaged app is refused before any ledger write"
+    $refused = $run.code -ne 0 -and -not $run.ledger -and ($run.text -replace '\s', '') -like '*refused,nothingwritten:itrunsbeneaththepackagedapp*\WindowsApps\*'
+    if (-not $refused) { Write-Host "M-L1 $($arguments -join ' '): $(PackagedText $run)" }
+    Must $refused "M-L1: $($arguments -join ' ') beneath a packaged app is refused for that reason before any ledger write"
 }
 foreach ($arguments in @(@('-Mode', 'Validate'), @('-Mode', 'Uninstall'))) {
     $run = Packaged $arguments
-    Must ($run.code -eq 0 -and -not (Test-Path -LiteralPath $ledgerDir)) "M-L1: $($arguments -join ' ') (read-only) still runs beneath a packaged app"
+    if ($run.code -ne 0 -or $run.ledger) { Write-Host "M-L1 $($arguments -join ' '): $(PackagedText $run)" }
+    Must ($run.code -eq 0 -and -not $run.ledger) "M-L1: $($arguments -join ' ') (read-only) still runs beneath a packaged app"
 }
 $n = $fonts.Count
 $shortcut = Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs\noctty.lnk'
