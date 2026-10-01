@@ -586,6 +586,8 @@ function Get-CssFamilies([string]$Value) { @($Value.Split(',') | ForEach-Object 
 # True for an absolute file path, an HKCU key when $Kind is a registry kind, winmetrics:<slot> for ui-font-face, or
 # codex-config:desktop.<theme> for app-theme-fonts.
 function Test-EffectPath([string]$Kind, $Target) {
+    if ($Kind -ceq 'msi-package') { return $Target -ceq 'msi:{6D5B792B-1EDC-4DE9-8EAD-201B820F8E82}' }
+    if ($Kind -ceq 'windows-feature') { return $Target -ceq 'windows-feature:VirtualMachinePlatform' }
     if ($Kind -ceq 'appx-package') { return ($Target -is [string] -and $Target -cmatch '^appx:[A-Za-z0-9][A-Za-z0-9.-]*_[a-z0-9]{13}\z') }
     if ($Kind -ceq 'ui-font-face') { return ($Target -is [string] -and (Get-UiFontSlots | ForEach-Object { "winmetrics:$_" }) -ccontains $Target) }
     if ($Kind -ceq 'app-theme-fonts') { return ($Target -is [string] -and (Get-AppThemeKeys | ForEach-Object { "codex-config:desktop.$_" }) -ccontains $Target) }
@@ -644,6 +646,20 @@ function Get-EffectStateProblem([string]$Kind, $State, [string]$Role) {
             if (@(Get-Field $State 'other' | Where-Object { $null -ne $_ -and $_ -isnot [string] }).Count) { return "$Role.other is not a list of paths." }
         }
         'registry-key-created' { }
+        'msi-package' {
+            if ((Get-Field $State 'complete') -isnot [bool]) { return "$Role.complete is not a boolean." }
+            if (-not (Get-Field $State 'complete')) {
+                if ($Role -cin @('prior', 'desired')) { return "$Role is a partial native installation." }
+                return $null
+            }
+            if ((Get-Field $State 'upgradeCode') -cne '{6D5B792B-1EDC-4DE9-8EAD-201B820F8E82}' -or
+                (Get-Field $State 'productName') -cne 'Windows Subsystem for Linux' -or
+                (Get-Field $State 'manufacturer') -cne 'Microsoft Corporation' -or
+                (Get-Field $State 'context') -ne 4) { return "$Role is not the machine WSL MSI identity." }
+        }
+        'windows-feature' {
+            if ((Get-Field $State 'enabled') -isnot [bool]) { return "$Role.enabled is not a boolean." }
+        }
         'appx-package' {
             if ([string](Get-Field $State 'name') -cnotmatch '^[A-Za-z0-9][A-Za-z0-9.-]*\z' -or
                 [string](Get-Field $State 'publisherId') -cnotmatch '^[a-z0-9]{13}\z') { return "$Role is not a package identity." }
@@ -688,6 +704,16 @@ function Test-EffectStateEqual([string]$Kind, $Expected, $Actual) {
                 (@(Get-Field $Actual 'other' | Where-Object { $null -ne $_ } | Sort-Object) -join '|')
         }
         'registry-key-created' { return $true }
+        'msi-package' {
+            # Version/ProductCode are observed provenance. A partial installation
+            # is neither absent nor a completed family, and cannot close its intent.
+            return ((Get-Field $Expected 'complete') -eq $true -and (Get-Field $Actual 'complete') -eq $true -and
+                (Get-Field $Expected 'upgradeCode') -ceq (Get-Field $Actual 'upgradeCode') -and
+                (Get-Field $Expected 'productName') -ceq (Get-Field $Actual 'productName') -and
+                (Get-Field $Expected 'manufacturer') -ceq (Get-Field $Actual 'manufacturer') -and
+                (Get-Field $Expected 'context') -eq (Get-Field $Actual 'context'))
+        }
+        'windows-feature' { return (Get-Field $Expected 'enabled') -eq (Get-Field $Actual 'enabled') }
         'appx-package' { return ([string](Get-Field $Expected 'name') -ceq [string](Get-Field $Actual 'name') -and
             [string](Get-Field $Expected 'publisherId') -ceq [string](Get-Field $Actual 'publisherId')) }
         'ui-font-face' { return ([string](Get-Field $Expected 'face') -ceq [string](Get-Field $Actual 'face')) }
@@ -713,7 +739,7 @@ function Get-EffectRecordProblem($Record) {
     $phase = $fields.phase
     if ($phase -isnot [string] -or $phase -cnotin @('intent', 'commit', 'void', 'undone')) { return 'phase is not intent, commit, void or undone.' }
     $kind = $fields.kind
-    if ($kind -isnot [string] -or $kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted', 'ui-font-face', 'app-theme-fonts', 'pref-value', 'appx-package')) {
+    if ($kind -isnot [string] -or $kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted', 'ui-font-face', 'app-theme-fonts', 'pref-value', 'appx-package', 'msi-package', 'windows-feature')) {
         return 'kind is not an effect kind.'
     }
     $id = $fields.id
@@ -735,7 +761,19 @@ function Get-EffectRecordProblem($Record) {
     }
     if (-not (Get-Field $desired 'exists')) { return 'desired must exist.' }
     if (Test-EffectStateEqual $kind $prior $desired) { return 'desired equals prior; there is no effect to own.' }
-    if ($kind -in @('file-created', 'tree-extracted', 'registry-key-created', 'pref-value', 'appx-package') -and (Get-Field $prior 'exists')) { return 'prior must be absent.' }
+    if ($kind -in @('file-created', 'tree-extracted', 'registry-key-created', 'pref-value', 'appx-package', 'msi-package') -and (Get-Field $prior 'exists')) { return 'prior must be absent.' }
+    if ($kind -ceq 'windows-feature' -and (-not (Get-Field $prior 'exists') -or (Get-Field $prior 'enabled') -or -not (Get-Field $desired 'enabled'))) {
+        return 'only disabled to enabled VirtualMachinePlatform is owned.'
+    }
+    if ($kind -cin @('msi-package','windows-feature')) {
+        $identity = Get-Field $Record 'identity'
+        if ([string](Get-Field $identity 'sid') -cnotmatch '^S-1-5-[0-9-]+\z' -or (Get-Field $identity 'elevated') -ne $true -or
+            (Get-Field $Record 'scope') -cne 'machine' -or (Get-Field $Record 'removal') -cne 'held' -or (Get-Field $Record 'mode') -cne 'PlatformRestore') {
+            return 'platform provenance needs explicit admin identity, machine scope and held removal.'
+        }
+        if ((Get-Field $Record 'boot') -isnot [string] -or -not (Get-Field $Record 'boot')) { return 'platform provenance needs before-call boot identity.' }
+        if ($kind -ceq 'msi-package') { $problem = Get-PlatformLockProblem (Get-Field $desired 'provenance'); if ($problem) { return "desired.provenance: $problem" } }
+    }
     if ($kind -ceq 'appx-package' -and $target -cne ('appx:' + (Get-Field $desired 'name') + '_' + (Get-Field $desired 'publisherId'))) {
         return 'target differs from the package identity.'
     }
@@ -839,14 +877,14 @@ function Get-EffectAttempt($Records) {
 # holds some face and holds no content of its own, so another face is absent (free to
 # take, recording that face as prior), never preexisting-drift; so do an app theme's fonts.
 function Get-UnownedClass([string]$Kind, $Desired, $Current, $Resolution) {
-    $problem = if ($Kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted', 'ui-font-face', 'app-theme-fonts', 'pref-value', 'appx-package')) {
+    $problem = if ($Kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted', 'ui-font-face', 'app-theme-fonts', 'pref-value', 'appx-package', 'msi-package', 'windows-feature')) {
         'The selection kind is not an effect kind.'
     } else { Get-EffectStateProblem $Kind $Desired 'desired' }
     if (-not $problem) { $problem = Get-EffectStateProblem $Kind $Current 'current' }
     if ($problem) { return New-EffectClass 'indeterminate' $null $problem }
     if (-not (Get-Field $Current 'exists')) { return New-EffectClass 'absent' $Resolution $null }
     if (Test-EffectStateEqual $Kind $Desired $Current) { return New-EffectClass 'preexisting-match' $Resolution $null }
-    if ($Kind -cin @('ui-font-face', 'app-theme-fonts')) { return New-EffectClass 'absent' $Resolution $null }
+    if ($Kind -cin @('ui-font-face', 'app-theme-fonts', 'windows-feature')) { return New-EffectClass 'absent' $Resolution $null }
     return New-EffectClass 'preexisting-drift' $Resolution $null
 }
 
@@ -1025,7 +1063,7 @@ function Test-TargetOverlap($First, $Other) {
     $firstKind, $otherKind = [string](Get-Field $First 'kind'), [string](Get-Field $Other 'kind')
     $a = ([string](Get-Field $First 'target')).ToUpperInvariant()
     $b = ([string](Get-Field $Other 'target')).ToUpperInvariant()
-    if ($firstKind -ceq 'appx-package' -or $otherKind -ceq 'appx-package') { return ($firstKind -ceq $otherKind -and $a -ceq $b) }
+    if ($firstKind -cin @('appx-package', 'msi-package', 'windows-feature') -or $otherKind -cin @('appx-package', 'msi-package', 'windows-feature')) { return ($firstKind -ceq $otherKind -and $a -ceq $b) }
     $registry = @('registry-value', 'registry-key-created')
     if (($firstKind -cin $registry) -ne ($otherKind -cin $registry)) { return $false }
     # Leaves of one Preferences file have separate owners; a leaf and its file do not.
@@ -1438,6 +1476,19 @@ function Get-UninstallPlan($Records, $Observations) {
     foreach ($id in $ids) {
         $attempt = Get-EffectAttempt @($groups[$id])
         $open = @(if (-not $attempt.closed) { $attempt.records })
+        if (-not $attempt.problem -and $attempt.closed -and @($attempt.records).Count -and
+            (Get-Field @($attempt.records)[0] 'kind') -cin @('msi-package','windows-feature')) {
+            $entries += [pscustomobject]@{ id = $id; class = (New-EffectClass 'closed-provenance' $null 'Validated native void/undone; current machine state unobserved.')
+                record = $null; start = 0; refusal = $null }
+            continue
+        }
+        # Machine platform removal is held even without an administrative observer.
+        # Do not invent owned-match from desired state or probe privileged machine state.
+        if (-not $attempt.problem -and $open.Count -and (Get-Field $open[0] 'kind') -cin @('msi-package', 'windows-feature')) {
+            $entries += [pscustomobject]@{ id = $id; class = (New-EffectClass 'indeterminate' $null 'Platform removal held; machine state not observed.')
+                record = $open[0]; start = [long](Get-Field $open[0] 'seq'); refusal = 'Platform removal held; explicit admin PlatformTest/PlatformRestore observes recovery, never removes the shared platform.' }
+            continue
+        }
         $entries += [pscustomobject]@{ id = $id; class = (Get-EffectClass $null (Get-Field $Observations $id) '' $null $attempt)
             record = $(if ($open.Count) { $open[0] } else { $null })
             start = $(if ($open.Count) { [long](Get-Field $open[0] 'seq') } else { 0 }); refusal = $null }
@@ -1488,10 +1539,104 @@ function Get-UninstallPlan($Records, $Observations) {
             foreach ($step in $resume) { $step['id'] = $entry.id; $step['kind'] = [string](Get-Field $entry.record 'kind'); $steps += $step }
         } elseif ($class.class -cin @('owned-drift', 'indeterminate')) {
             $refused += [ordered]@{ id = $entry.id; class = $class.class; reason = $class.reason }
+        } elseif ($class.class -ceq 'closed-provenance') {
+            $kept += [ordered]@{ id = $entry.id; class = $class.class; observed = $false; reason = $class.reason }
         } else { $kept += [ordered]@{ id = $entry.id; class = $class.class } }
     }
     if ($refused.Count) { $steps = @() }
     [ordered]@{ ok = ($refused.Count -eq 0); steps = $steps; refused = $refused; kept = $kept; resolutions = $resolutions; resumed = $resumed }
+}
+
+# The bounded native platform contract. These are data decisions only: neither
+# test nor classification deploys a package, enables a feature or starts WSL.
+function Get-PlatformLockProblem($Lock) {
+    if ($null -eq $Lock) { return 'WSL platform lock missing.' }
+    foreach ($pair in @(@('architecture','x64'), @('feature','VirtualMachinePlatform'), @('appxName','MicrosoftCorporationII.WindowsSubsystemForLinux'),
+            @('publisherId','8wekyb3d8bbwe'), @('productName','Windows Subsystem for Linux'), @('manufacturer','Microsoft Corporation'),
+            @('upgradeCode','{6D5B792B-1EDC-4DE9-8EAD-201B820F8E82}'), @('template','x64;1033'),
+            @('publisher','CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US'))) {
+        if ((Get-Field $Lock $pair[0]) -cne $pair[1]) { return "Unsupported platform $($pair[0])." }
+    }
+    if ((Get-Field $Lock 'minimumBuild') -ne 26100 -or (Get-Field $Lock 'release') -cnotin @('stable','prerelease')) { return 'Unsupported platform support/release metadata.' }
+    foreach ($key in 'productCode','packageCode') {
+        if ([string](Get-Field $Lock $key) -cnotmatch '^\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}\}\z') { return "Invalid platform $key." }
+    }
+    foreach ($key in 'version','minimumVersion') {
+        $version = $null
+        if (-not [version]::TryParse([string](Get-Field $Lock $key), [ref]$version) -or $version.Revision -lt 0) { return "Invalid platform $key." }
+    }
+    if ([string](Get-Field $Lock 'url') -cnotmatch '^https://github\.com/microsoft/WSL/releases/download/[^/]+/wsl\.[0-9.]+\.x64\.msi\z' -or
+        [string](Get-Field $Lock 'sha256') -cnotmatch '^[0-9a-f]{64}\z' -or -not (Test-ByteCount (Get-Field $Lock 'size'))) { return 'Invalid platform asset.' }
+    return $null
+}
+
+function Get-PlatformAction($Lock, $Inventory) {
+    $refuse = { param($Reason) [ordered]@{ action = 'refuse'; reason = $Reason; runtimeProof = 'unproven' } }
+    $problem = Get-PlatformLockProblem $Lock
+    if ($problem) { return & $refuse $problem }
+    if ((Get-Field $Inventory 'readable') -ne $true -or (Get-Field $Inventory 'installReach') -isnot [bool] -or
+        (Get-Field $Inventory 'cliValid') -isnot [bool]) { return & $refuse 'Affected native inventory is unreadable or incomplete.' }
+    $vmp, $inbox = (Get-Field $Inventory 'vmp'), (Get-Field $Inventory 'inbox')
+    if ($vmp -cnotin @('Enabled','Disabled') -or $inbox -cnotin @('Enabled','Disabled')) { return & $refuse 'Native feature state is pending or unsupported.' }
+    $msi, $appx, $provisioned = @(Get-Field $Inventory 'msi'), @(Get-Field $Inventory 'appx'), @(Get-Field $Inventory 'provisioned')
+    $minimum = [version](Get-Field $Lock 'minimumVersion')
+    foreach ($row in $msi) {
+        $version = $null
+        if ((Get-Field $row 'identityVerified') -ne $true -or (Get-Field $row 'context') -ne 4 -or
+            -not [version]::TryParse([string](Get-Field $row 'version'), [ref]$version) -or $version -lt $minimum) { return & $refuse 'Existing WSL MSI is incompatible; preserve it.' }
+    }
+    foreach ($row in @($appx + $provisioned)) {
+        $version = $null
+        if ((Get-Field $row 'publisherId') -cne (Get-Field $Lock 'publisherId') -or
+            -not [version]::TryParse([string](Get-Field $row 'version'), [ref]$version) -or $version -lt $minimum) { return & $refuse 'Existing WSL Appx/provisioning is incompatible; preserve it.' }
+    }
+    # The standard MSI installs/provisions its same-family glue MSIX. Those
+    # matching rows are parts of one provider, not competing extra platforms.
+    $provider = $null
+    if ($msi.Count -eq 1) {
+        $provider = $msi[0]
+    } elseif (-not $msi.Count -and $appx.Count) { $provider = $appx[0] }  # identical all-user rows are one no-write provider
+    if ($null -ne $provider) {
+        foreach ($row in @($appx + $provisioned)) {
+            if ((Get-Field $row 'version') -cne (Get-Field $provider 'version')) { return & $refuse 'WSL provider/glue versions differ; preserve ambiguous state.' }
+        }
+        $cliVersion = $null
+        if ($vmp -cne 'Enabled' -or -not (Get-Field $Inventory 'cliValid') -or
+            -not [version]::TryParse([string](Get-Field $Inventory 'cliVersion'), [ref]$cliVersion) -or $cliVersion -lt $minimum -or
+            $cliVersion -ne [version](Get-Field $provider 'version')) {
+            return & $refuse 'Registered platform is incomplete at ProgramFiles/WSL/wslc.exe or VirtualMachinePlatform; no repair/upgrade.'
+        }
+        return [ordered]@{ action = 'preserved'; reason = 'Compatible registered provider and fixed CLI path configured; no write/adoption.'; runtimeProof = 'unproven' }
+    }
+    if ($msi.Count -or $appx.Count -or $provisioned.Count -or (Get-Field $Inventory 'installReach') -or $inbox -cne 'Disabled') {
+        return & $refuse 'Existing or partial installer-affected WSL platform; introduction refused.'
+    }
+    return [ordered]@{ action = 'install'; enableFeature = ($vmp -ceq 'Disabled'); reason = 'Installer-affected platform absent; historical data unowned.'; runtimeProof = 'unproven' }
+}
+
+function Test-PlatformRebootWait($Records, [string]$Boot) {
+    foreach ($id in @($Records | Where-Object { (Get-Field $_ 'kind') -cin @('msi-package','windows-feature') } | ForEach-Object { Get-Field $_ 'id' } | Sort-Object -Unique -CaseSensitive)) {
+        $attempt = Get-EffectAttempt @($Records | Where-Object { (Get-Field $_ 'id') -ceq $id })
+        if ($attempt.problem) { throw "Malformed platform reboot provenance: $($attempt.problem)" }
+        if ($attempt.closed) { continue }
+        foreach ($record in @($attempt.records)) {
+            if ((Get-Field $record 'phase') -ceq 'commit' -and (Get-Field (Get-Field $record 'observed') 'pendingReboot') -eq $true -and
+                (Get-Field (Get-Field $record 'observed') 'boot') -ceq $Boot) { return $true }
+        }
+    }
+    return $false
+}
+
+function Get-PlatformRecoveryProblem($Records, [string]$Boot) {
+    foreach ($id in @($Records | Where-Object { (Get-Field $_ 'kind') -cin @('msi-package','windows-feature') } | ForEach-Object { Get-Field $_ 'id' } | Sort-Object -Unique -CaseSensitive)) {
+        $attempt = Get-EffectAttempt @($Records | Where-Object { (Get-Field $_ 'id') -ceq $id })
+        if ($attempt.problem) { return [ordered]@{ reason = $attempt.problem; pendingReboot = $false } }
+        if (-not $attempt.closed -and @($attempt.records).Count -and -not @($attempt.records | Where-Object { (Get-Field $_ 'phase') -ceq 'commit' }).Count) {
+            $sameBoot = (Get-Field @($attempt.records)[0] 'boot') -ceq $Boot
+            return [ordered]@{ reason = $(if ($sameBoot) { 'Unknown same-boot native outcome; preserve intent, wait for a later boot before recovery.' } else { 'Unresolved native intent; explicit admin PlatformRestore recovery required.' }); pendingReboot = $sameBoot }
+        }
+    }
+    return $null
 }
 
 # Rollback of the %%Startup values one run wrote, when that same run then fails. $Before is the

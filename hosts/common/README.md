@@ -90,6 +90,88 @@ had no `.js` script engine.
 `Restore` without packages, the Windows Terminal version, COM activation and this
 check; `Test` checks fonts only.
 
+## Explicit WSL/WSLC platform recovery
+
+This is source for a separate, deliberate **machine** recovery step. Normal
+`Restore`, font-only modes and their tests do not install, repair, upgrade or probe
+the WSL platform. From the restored user's normal shell **started as administrator**:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode PlatformTest     # native inventory only, no deployment/ledger write
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode PlatformRestore  # only an absent affected platform; never auto-elevates/reboots
+```
+
+Use the same user's SID/profile as the other modes. An app/sandbox package context
+is refused before the ledger lock or any effect. This bounded direct-MSI method
+supports native **x64 Windows build 26100 or newer**; it does not promise the older
+build/servicing combinations accepted by other WSL installation routes.
+
+`nix.nix` pins Microsoft's **2.9.13.0 prerelease** x64 MSI, hash, size, native
+ProductCode/UpgradeCode/PackageCode, machine identity and signer. CI verifies the
+locked bytes; the asset is not bundled in the distribution. Before the first native
+change, recovery fetches and verifies size/hash, Microsoft signature and the actual
+readonly Windows Installer database/summary identity. It uses inbox DISM to enable
+`VirtualMachinePlatform` only when disabled, then native `msiexec /i /qn /norestart`.
+The official [offline WSL installation method](https://learn.microsoft.com/en-us/windows/wsl/install#offline-install)
+requires the MSI and VirtualMachinePlatform. Already-enabled VMP is shared,
+preserved and unowned. Native 3010 or EnablePending returns **pendingReboot**;
+feature enable requiring reboot does not continue to MSI in that invocation.
+The ledger's boot identity prevents continuing on the same boot. Reboot is always
+the operator's separate action, followed by another explicit invocation.
+An interrupted native call whose exit code was lost conservatively records a
+reboot requirement against its before-call boot, even if registration later appears.
+Native MSI/DISM timeouts do not kill installer/servicing processes. Unknown
+same-boot intents are retained before any observer can void them; readonly test
+reports pendingRecovery, and supported recovery waits for a later boot. A known
+completed native failure in the same invocation is separately reobserved. Verified
+download source is retained on unfinished timeout, its path recorded in the native
+intent; that retention is not a cleanup success. This follows the native
+[installer client/service distinction](https://devblogs.microsoft.com/setup/the-windows-installer-service/).
+
+The preflight covers installed MSI in **all user contexts** with readonly native
+[ProductsEx](https://learn.microsoft.com/en-us/windows/win32/msi/installer-productsex),
+all-user installed and provisioned WSL Appx, service/install/uninstall reach and
+the inbox WSL feature. Unreadable, incompatible, ambiguous or partial affected
+state is preserved/refused. No Win32_Product consistency/repair query is used.
+The OS's `System32\wsl.exe` installation launcher alone is not an installed platform.
+Historical session/VHD paths are untouched and unowned; there is no impossible
+certificate claiming that every volume contains no custom WSLC storage.
+
+A single consistent official registered provider at version **2.9.3.0 or newer**,
+enabled VMP and the signed fixed `%ProgramFiles%\WSL\wslc.exe` at that minimum
+version, matching its registered version, is reported **preserved/configured**, with no adoption or write.
+The MSI's same-version official glue MSIX registration/provisioning, when present,
+is one coherent provider; initial introduction protects any preexisting glue, and
+native observed glue identities/full names are retained as MSI provenance. On this
+supported modern Windows range the native installer can ignore glue deployment
+failure; absent glue alone is not incomplete. Conflicting glue stays protected.
+An enabled
+inbox WSL1 feature alongside that provider is preserved. A registered platform
+with VMP disabled or that CLI missing/incompatible is refused, not repaired.
+Configured identity/binary presence is **not runtime proof**; every platform result
+keeps `runtimeProof = "unproven"`.
+
+Immediately before each changed native effect the affected inventory is observed
+again. Only introduced per-machine MSI family and disabled→enabled VMP get
+write-ahead intents, actual administrator SID/source/asset provenance and observed
+readback. A failed native call is reobserved: a genuinely absent package can void
+its intent, actual registered success commits, and partial service/files/registry
+reach without registration retains an indeterminate open intent. Version and
+ProductCode are provenance; family lifecycle identity uses the machine UpgradeCode.
+Both native platform and feature **removal are held**. Ordinary Uninstall reports
+that hold from validated ledger provenance, without inventing an observed match or
+performing privileged feature probes; it refuses the whole removal plan.
+Validated void/undone native attempts are reported closed/unobserved and own
+nothing; unrelated user effects may be removed without claiming platform cleanup.
+
+CI's focused proof exercises classification, synthetic native failure/readback,
+3010/boot protection and held removal, plus real MSI bytes/signature/readonly parser
+and native inventory. It performs **no real WSL installation, feature change or
+runtime launch**. Fresh native recovery/runtime/removal remain future disposable-VM
+acceptance. This host's active CLI is preserved: the upstream installer stops
+WSLService and can close clients, so the human's noninterruption condition for a
+live CLI replacement is unsatisfied while agents work.
+
 **Run `Restore`, `Apply` and `Uninstall` as the same user.** The effect ledger
 lives in that user's `%LOCALAPPDATA%`; another account (for example an elevated
 token of a different administrator) reads a different or no ledger and would
@@ -813,7 +895,8 @@ limited to the tested Windows builds; modern OS UI, app-owned fonts, browser chr
 and website CSS are not promised to become globally uniform. Clean VM recovery,
 Store install/licensing/removal and formal handoff proof remain user-deferred or
 unproven; current installed-host/no-op and CI success cannot substitute for them.
-The immediate next slice defines legitimate absent-host WSL/WSLC platform recovery.
+The explicit platform modes define legitimate absent-host WSL/WSLC platform recovery;
+their source/CI proof does not replace the deferred fresh native VM proof.
 No CLI replacement was performed: the upstream MSI stops WSLService and can close
 apps, so the user's noninterruption condition is not satisfied during ongoing work.
 
