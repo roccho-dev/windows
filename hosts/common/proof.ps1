@@ -2184,14 +2184,26 @@ Must ($typographyRun.uiFont.face -ceq $uiFace -and (@($typographyRun.uiFont.slot
 $mark = LastSeq
 $null = Win51 @('-Mode', 'Apply', '-Typography')
 Must (UiNoRecords) 'A31: a second Apply -Typography writes nothing'
-# A face changed after this wrote it is owned-drift: Apply reports it and writes nothing, Uninstall refuses.
-SetSlotFace 'menu' $uiBase.menu
+# A face changed after this wrote it to a third face (neither the prior nor the selected one) is owned-drift: Apply reports
+# it and writes nothing, Uninstall refuses.
+$thirdFace = 'Arial'
+if ($thirdFace -ceq $uiBase.menu -or $thirdFace -ceq $uiFace) { throw "Proof requires the runner's menu face not to be $thirdFace." }
+SetSlotFace 'menu' $thirdFace
 $mark = LastSeq
-MustReject { Win51 @('-Mode', 'Apply', '-Typography') } "*UI font drift*winmetrics:menu is '$($uiBase.menu)'*"
+MustReject { Win51 @('-Mode', 'Apply', '-Typography') } "*UI font drift*winmetrics:menu is '$thirdFace'*"
 $driftText = MetricsText (Metrics)
 MustReject { RunUninstall -Apply } '*Uninstall refused*owned target differs*'
-Must ((UiNoRecords) -and (MetricsText (Metrics)) -ceq $driftText) 'A31: a changed face is drift, not written; Uninstall refuses it'
-SetSlotFace 'menu' $uiFace
+Must ((UiNoRecords) -and (MetricsText (Metrics)) -ceq $driftText) 'A31: a third face is drift, not written; Uninstall refuses it'
+# Exactly the prior face again is the generic recovery boundary: a committed attempt whose target equals its prior is
+# closed undone (as after an undo that stopped before its record), so the slot is unowned again and an explicit
+# Apply -Typography takes it once more: undone, intent, commit; only the menu face changes.
+SetSlotFace 'menu' $uiBase.menu
+$beforePrior = Metrics
+$mark = LastSeq
+$null = Win51 @('-Mode', 'Apply', '-Typography')
+$menuPhases = (Phases (UiId 'menu')).Split(',')
+Must ((NewRecords $mark @($uiSlots | ForEach-Object { UiId $_ })) -eq 3 -and ($menuPhases[-3..-1] -join ',') -ceq 'undone,intent,commit' -and
+    (UiOnlyFaces $beforePrior @('menu') $uiFace)) 'A31: the exact prior face again counts as undone; the explicit Apply takes the slot again (3 records), changing only that face'
 # A size the user changes later is not this effect's: the undo (A27) puts back the face and keeps the new height.
 $tallCaption = [Convert]::FromHexString((SlotHex (Metrics) 'caption'))
 [BitConverter]::GetBytes([int]-40).CopyTo($tallCaption, 0)

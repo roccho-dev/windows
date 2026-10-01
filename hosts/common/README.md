@@ -435,6 +435,14 @@ title.
   face and voids one that does not.
 - A face changed after this wrote it is owned-drift: `Apply` reports it and writes nothing,
   and `Uninstall` refuses it (set it back by hand).
+- **Exactly the prior value again:** a committed effect whose target holds exactly its
+  recorded prior again counts as undone (the generic recovery rule, which also closes an
+  undo that stopped before its record). It is unowned again, and the next explicit run
+  writes the selection once more: `Restore`, or `Apply` with the matching flag. This holds
+  for a UI font slot back on its prior face, an app theme whose font leaves are back to
+  their prior values, and a Chromium font leaf that was deleted (Chromium deletes it when
+  set back to its default). Any other change to an owned value is drift: kept, reported,
+  never written. Nothing re-applies in the background; there is no scheduled task.
 - `Uninstall` writes each prior face back the same way, over whatever the other bytes are
   then, so a size the user changed later is kept: only the face is owned.
 - Unselected owned fonts are collected only after the faces move, and a font whose family
@@ -677,8 +685,9 @@ result, and the live fonts must not change.
   three voided and written anew.
 - **What changes:** only the six faces; every other byte and WindowMetrics value
   (`CaptionWidth` included) and the live fonts stay.
-- **Re-runs:** a second run writes nothing. A changed face is drift, and `Uninstall`
-  refuses it.
+- **Re-runs:** a second run writes nothing. A third face (Arial) is drift: not written, and
+  `Uninstall` refuses it. The exact prior face again counts as undone: the next explicit
+  run takes the slot back, writing exactly undone, intent and commit, and changing only that face.
 - **Uninstall:** after a later height change, it restores each face only, keeps that
   height and is byte-exact elsewhere.
 `Restore`'s Store app step (WinGet) is not run on CI;
