@@ -474,10 +474,13 @@ Appx intent/deployment. Bundle version **2026.917.151.0** differs from its x64 a
 VCLibs.140.00.UWPDesktop **14.0.33728.0**, and WindowsAppRuntime.1.8 **8000.616.304.0**.
 
 - Native x64 host inventory is required; ARM64 (including x64 emulation) is refused.
-- Existing same/newer matching x64 packages stay untouched. Existing lower, foreign,
-  non-framework or non-x64/mixed framework families are refused, not upgraded or
-  taken over. This conservative family boundary can refuse a machine with only an
-  x86 framework, even though Windows could add a separate x64 registration.
+- Existing same/newer matching x64 packages stay untouched. Matching x86 frameworks
+  alongside an adequate x64 version also stay untouched (even a lower x86 version).
+  All rows must have the expected publisher/framework identity and valid versions.
+  An inadequate x64 version, foreign identity, non-framework, unsupported architecture,
+  or x86-only family is refused, not upgraded or taken over. This family boundary
+  refuses adding x64 to an existing x86-only family rather than falsely owning it as
+  newly introduced. App Installer remains x64-only.
 - A registered App Installer with a disabled/missing alias is reported untouched;
   there is no guessed package-exe bypass, forced alias setting or re-registration.
   Registering a provisioned package is not mistaken for fully absent recovery.

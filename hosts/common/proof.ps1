@@ -338,6 +338,14 @@ foreach ($version in '14.0.33519.0', '14.0.33520.0') {
     $row = @{ name = $expectedFramework.name; publisherId = $bootstrap.publisherId; architecture = 'x64'; framework = $true; version = $version }
     Must ((Get-BootstrapAction @($row) $expectedFramework $false) -ceq 'present') 'same/newer matching framework is preserved'
 }
+$matchingX64 = @{ name = $expectedFramework.name; publisherId = $bootstrap.publisherId; architecture = 'x64'; framework = $true; version = '14.0.33519.0' }
+$lowerX86 = @{ name = $expectedFramework.name; publisherId = $bootstrap.publisherId; architecture = 'x86'; framework = $true; version = '14.0.33518.0' }
+$foreignX86 = @{ name = $expectedFramework.name; publisherId = 'aaaaaaaaaaaaa'; architecture = 'x86'; framework = $true; version = '14.0.33519.0' }
+Must ((Get-BootstrapAction @($matchingX64, $lowerX86) $expectedFramework $false) -ceq 'present' -and
+    (Get-BootstrapAction @($lowerX86, $matchingX64) $expectedFramework $false) -ceq 'present' -and
+    (Get-BootstrapAction @($matchingX64, $foreignX86) $expectedFramework $false) -ceq 'refuse' -and
+    (Get-BootstrapAction @($foreignX86, $matchingX64) $expectedFramework $false) -ceq 'refuse' -and
+    (Get-BootstrapAction @($lowerX86) $expectedFramework $false) -ceq 'refuse') 'mixed matching framework is no-write, x86-only/foreign family not introduced or updated'
 foreach ($row in @(@{ name = $expectedFramework.name; publisherId = $bootstrap.publisherId; architecture = 'x64'; framework = $true; version = '14.0.33518.0' },
         @{ name = $expectedFramework.name; publisherId = $bootstrap.publisherId; architecture = 'x86'; framework = $true; version = '14.0.33519.0' },
         @{ name = $expectedFramework.name; publisherId = $bootstrap.publisherId; architecture = 'x64'; framework = $false; version = '14.0.33519.0' })) {

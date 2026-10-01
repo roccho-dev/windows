@@ -1589,11 +1589,12 @@ function Get-BootstrapAction($Found, $Expected, [bool]$AliasPresent, [switch]$Ap
     if (-not $named.Count) { return 'install' }
     $adequate = $false
     foreach ($package in $named) {
+        $architecture = [string](Get-Field $package 'architecture')
         if ([string](Get-Field $package 'publisherId') -cne [string](Get-Field $Expected 'publisherId') -or
-            [string](Get-Field $package 'architecture') -cne 'x64' -or
+            ($AppInstaller -and $architecture -cne 'x64') -or (-not $AppInstaller -and $architecture -cnotin @('x64', 'x86')) -or
             (-not $AppInstaller -and (Get-Field $package 'framework') -ne $true)) { return 'refuse' }
         try { $version = [version](Get-Field $package 'version') } catch { return 'refuse' }
-        if ($version -ge [version](Get-Field $Expected 'version')) { $adequate = $true }
+        if ($architecture -ceq 'x64' -and $version -ge [version](Get-Field $Expected 'version')) { $adequate = $true }
     }
     if ($adequate -and (-not $AppInstaller -or $AliasPresent)) { return 'present' }
     return 'refuse'
