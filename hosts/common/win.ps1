@@ -1695,6 +1695,8 @@ function VerifyPrefsEdit([string]$Before, [string]$After, [string[]]$Leaves, [st
 # $Text into $Prefs as UTF-8 without BOM: a temporary file beside it, then, with Chromium still closed and the file still
 # the one read ($Sha), one File.Replace; the result must read back as written.
 function ReplacePrefs([string]$Prefs, [string]$Text, [string]$Sha, [string]$Temp) {
+    $problem = PackageContextProblem  # every Preferences write (converge and undo) passes here
+    if ($problem) { throw "$Prefs is not written: $problem." }
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Text)
     $out = [IO.FileStream]::new($Temp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
     try { $out.Write($bytes, 0, $bytes.Length); $out.Flush($true) } finally { $out.Dispose() }
@@ -1713,6 +1715,8 @@ function ReplacePrefs([string]$Prefs, [string]$Text, [string]$Sha, [string]$Temp
 # another value is the user's (preexisting-drift) and an owned value changed since is owned-drift: both reported, never written.
 function ConvergeChromiumFonts {
     if ($null -eq $chromiumUserData) { throw 'This distribution declares no Chromium profile location.' }
+    $problem = PackageContextProblem  # the profile is user data: never written from a packaged app's view
+    if ($problem) { throw "Chromium font preferences are not written: $problem." }
     $values = ChromiumFontValues
     foreach ($dir in @(ChromiumProfiles)) {
         $name, $prefs = ([IO.Path]::GetFileName($dir)), (Join-Path $dir 'Preferences')
@@ -2341,6 +2345,10 @@ function Uninstall {
         foreach ($dir in @($steps | Where-Object { $_.action -ceq 'delete-pref-value' } | ForEach-Object { [IO.Path]::GetDirectoryName($_.path) } | Sort-Object -Unique)) {
             $problem = ChromiumClosedProblem $dir
             if ($problem) { $refused += "Chromium font preferences in ${dir}: $problem" }
+        }
+        if (@($steps | Where-Object { $_.action -ceq 'delete-pref-value' }).Count) {
+            $problem = PackageContextProblem
+            if ($problem) { $refused += "Chromium font preferences: $problem" }
         }
         # A UI font face is written back only where this process may write the user's HKCU fonts.
         if (@($steps | Where-Object { $_.action -ceq 'set-ui-font-face' }).Count) {

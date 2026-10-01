@@ -526,7 +526,17 @@ declared `protected`) is never written by `Restore`, with one exception, on requ
   - no `User Data\lockfile` (it is never removed here; a stale one is a real gate);
   - no `chrome.exe` running from this install or an owned tree, and none whose path
     cannot be read;
-  - no preference MAC on `webkit` (`protection.macs` or `PreferenceMACs`).
+  - no preference MAC on `webkit`: in the profile's `protection.macs`, or in
+    `HKCU\Software\Chromium\PreferenceMACs\<profile>`. Only that brand key is checked
+    (this build's); a build that keeps its MACs under another key is not covered.
+  - a `chrome.exe` whose path cannot be read refuses the write, because it could be this
+    install. This is code only, not exercised anywhere: neither CI nor the smoke can
+    start such a process.
+- **Only from a normal user context:** the same guard as the UI font faces runs before
+  any intent, before every Preferences write (`Apply` and `Uninstall`'s undo alike) and
+  when `Uninstall` plans. It refuses package identity, an unknown answer, or a packaged
+  app among the ancestors. A write from a packaged app's view could read back correctly
+  and still miss the user's real profile. The guard is not proof of the user's real view.
 - **The write:** one intent per leaf, then the profile's new text goes to a temporary
   file beside it. With Chromium still closed and the file unchanged since it was read
   (SHA-256), one `File.Replace` swaps it in, and each leaf is committed after
