@@ -1753,14 +1753,18 @@ function FileSnapshot([string]$Directory) {
     $map
 }
 # A vendor command with a deadline, so a window that stays open cannot hold the proof.
-function Vendor([string]$Exe, [string]$Argument) {
+function Vendor([string]$Exe, [string]$Argument, [switch]$ConfigLog) {
     $info = [Diagnostics.ProcessStartInfo]::new($Exe, $Argument)
     $info.UseShellExecute, $info.RedirectStandardOutput, $info.RedirectStandardError, $info.CreateNoWindow = $false, $true, $true, $true
+    if ($ConfigLog) { $info.EnvironmentVariables['GHOSTTY_LOG'] = 'stderr' }
     $process = [Diagnostics.Process]::Start($info)
     $out, $err = $process.StandardOutput.ReadToEndAsync(), $process.StandardError.ReadToEndAsync()
     if (-not $process.WaitForExit(60000)) { $process.Kill($true); return [pscustomobject]@{ exit = 'timeout after 60 s'; output = '' } }
     $process.WaitForExit()
-    [pscustomobject]@{ exit = $process.ExitCode; output = @(($out.Result + "`n" + $err.Result) -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 20) -join ' | ' }
+    $lines = @(($out.Result + "`n" + $err.Result) -split "`r?`n" | Where-Object { $_.Trim() })
+    $sample = @($lines | Select-Object -First 20)
+    if ($ConfigLog -and $lines.Count -gt 20) { $sample += @($lines | Select-Object -Last 5) }
+    [pscustomobject]@{ exit = $process.ExitCode; output = $sample -join ' | ' }
 }
 function Region([string]$Key) { $Key -match '^(Software\\Classes|Console)(\\|$)' }
 # The vendor registers only with HKCU\Console\%%Startup\DelegationConsole selecting
@@ -1770,6 +1774,7 @@ function Region([string]$Key) { $Key -match '^(Software\\Classes|Console)(\\|$)'
 # put back afterwards, the result read back and reported.
 $startupPath = 'Console\%%Startup'
 $startupSaved = $null  # the original state, once read; restoration runs only then
+$vendorRegistrationAttempted = $false
 function StartupState {
     $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($startupPath)
     if ($null -eq $key) { return [ordered]@{ keyExisted = $false; values = @{} } }
@@ -1817,6 +1822,7 @@ try {
     Start-Sleep -Seconds 5  # bounded control interval: what changes on its own shows up between S0 and S1
     $s1 = RegistrySnapshot 'CurrentUser' 'Default' @('')
     $h1, $tree1, $user1 = (Machine), (FileSnapshot $install), (FileSnapshot $userDir)
+    $vendorRegistrationAttempted = $true
     $register = Vendor (Join-Path $install 'noctty.com') '+register-default-terminal'
     $s2 = RegistrySnapshot 'CurrentUser' 'Default' @('')
     $h2, $tree2, $user2 = (Machine), (FileSnapshot $install), (FileSnapshot $userDir)
@@ -1845,11 +1851,19 @@ try {
     # G3 on CI: a console entry point must not write into the install directory.
     $version = Vendor (Join-Path $install 'noctty.com') '--version'
     $syntaxConfig = Join-Path $env:RUNNER_TEMP ('noctty-syntax-' + [guid]::NewGuid().ToString('N') + '.ghostty')
+    $fontOnlyConfig = $syntaxConfig + '.font-only'
     try {
         [IO.File]::WriteAllText($syntaxConfig, (SelectedNocttyConfigText $manifest.noctty), [Text.UTF8Encoding]::new($false))
-        $syntax = Vendor (Join-Path $install 'noctty.com') (Join-NativeArguments @('+validate-config', ('--config-file=' + $syntaxConfig)))
+        [IO.File]::WriteAllText($fontOnlyConfig, ('font-family = ' + $manifest.noctty.fontFamily + "`n"), [Text.UTF8Encoding]::new($false))
+        foreach ($candidate in @($fontOnlyConfig, $syntaxConfig)) {
+            Say "config syntax input $candidate; bytes $((Get-Item -LiteralPath $candidate).Length); sha256 $((Get-FileHash -LiteralPath $candidate).Hash)"
+        }
+        $fontOnly = Vendor (Join-Path $install 'noctty.com') (Join-NativeArguments @('+validate-config', ('--config-file=' + $fontOnlyConfig))) -ConfigLog
+        $syntax = Vendor (Join-Path $install 'noctty.com') (Join-NativeArguments @('+validate-config', ('--config-file=' + $syntaxConfig))) -ConfigLog
+        Say "font-only config control exit $($fontOnly.exit): $($fontOnly.output)"
+        Say "desired config syntax exit $($syntax.exit): $($syntax.output)"
         Must ($syntax.exit -ceq 0) "Noctty vendor config syntax (not runtime): $($syntax.output)"
-    } finally { [IO.File]::Delete($syntaxConfig) }
+    } finally { [IO.File]::Delete($syntaxConfig); [IO.File]::Delete($fontOnlyConfig) }
     $tree3 = FileSnapshot $install
     Say "noctty.com --version exit $($version.exit): $($version.output); install directory changes: $(@(SnapshotDiff $tree2 $tree3).Count)"
 
@@ -1885,21 +1899,34 @@ try {
     foreach ($line in $gate) { Say "GATE $line" }
     Say "gate: $(@($wanted.Keys).Count) declared entries, $(@($measured.Keys).Count) measured after exclusions, $($gate.Count) problems"
 
-    $unregister = Vendor (Join-Path $install 'noctty.com') '+unregister-default-terminal'
-    $s3 = RegistrySnapshot 'CurrentUser' 'Default' @('')
-    $remains = @(SnapshotDiff $s1 $s3 | Where-Object { Region $_.key })
-    Say "vendor +unregister-default-terminal exit $($unregister.exit): $($unregister.output)"
-    foreach ($d in $remains) { Say "REMAINS $($d.change) HKCU\$($d.key) [$($d.name)] $($d.before) -> $($d.after)" }
-    $g4 = [ordered]@{ status = 'measured'; registerExit = $register.exit; versionExit = $version.exit; unregisterExit = $unregister.exit
+    $g4 = [ordered]@{ status = 'measured'; registerExit = $register.exit; versionExit = $version.exit
         classesConsoleChanges = $vendorRegion.Count; otherHkcuChanges = $other.Count; mentions = $mentions.Count
         hklmChanges = $machine.Count; installFileChanges = $treeDiff.Count + @(SnapshotDiff $tree2 $tree3).Count
-        userNocttyFileChanges = $userDiff.Count; remainingAfterUnregister = $remains.Count; controlNoise = $noise.Count
+        userNocttyFileChanges = $userDiff.Count; controlNoise = $noise.Count
         windowsTerminal = $wtVersion; seededDelegationConsole = $true; startupKeyCreated = -not $startupSaved.keyExisted
         gate = $(if ($gate.Count) { $gate -join '; ' } else { 'pass' }) }
 } catch {
     $g4 = [ordered]@{ status = "measurement error: $($_.Exception.Message)" }
     Say $g4.status
 } finally {
+    # Even a failed syntax/measurement gate must release the vendor's test registration.
+    # Keep its original failure; cleanup is evidence, not a replacement PASS.
+    if ($vendorRegistrationAttempted) {
+        try {
+            $unregister = Vendor (Join-Path $install 'noctty.com') '+unregister-default-terminal'
+            $s3 = RegistrySnapshot 'CurrentUser' 'Default' @('')
+            $remains = @(SnapshotDiff $s1 $s3 | Where-Object { Region $_.key })
+            Say "vendor +unregister-default-terminal exit $($unregister.exit): $($unregister.output)"
+            foreach ($d in $remains) { Say "REMAINS $($d.change) HKCU\$($d.key) [$($d.name)] $($d.before) -> $($d.after)" }
+            $g4['unregisterExit'] = $unregister.exit
+            $g4['remainingAfterUnregister'] = $remains.Count
+            if ($unregister.exit -ne 0) { throw "vendor unregister exit $($unregister.exit)" }
+        } catch {
+            $g4['unregisterFailure'] = $_.Exception.Message
+            if ($g4.status -ceq 'measured') { $g4.status = "measurement cleanup error: $($_.Exception.Message)" }
+            Say "vendor registration cleanup failed: $($_.Exception.Message)"
+        }
+    }
     # Put back only the two values and, if the measurement created the key and it is empty
     # again, the key itself (never recursively); then read it back and report exactly.
     $restore = 'not seeded'
