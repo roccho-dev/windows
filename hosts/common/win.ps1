@@ -2312,6 +2312,8 @@ function RunIdentity {
 # undoes values, keys and files, checks the guard again, and removes owned trees last.
 function Uninstall {
     $found = Test-Path -LiteralPath $ledgerDirectory -PathType Container
+    # M-L1: a packaged app's view redirects %LOCALAPPDATA% (the ledger) and HKCU: refuse before any write or lock.
+    if ($Apply) { $problem = PackageContextProblem; if ($problem) { throw "Uninstall -Apply refused, nothing written: $problem." } }
     if ($Apply -and $found) { LockLedger }
     $null = ReadLedger
     $observations = @{}
@@ -2418,6 +2420,10 @@ try {
         # one; fonts, then the UI font faces, then Noctty (tree, configuration, keys, values), then
         # the selection. -Typography converges the fonts, the UI font faces and a present app's fonts alone.
         $ledgerFound = Test-Path -LiteralPath $ledgerDirectory -PathType Container
+        # M-L1: a packaged app's view redirects %LOCALAPPDATA% (this ledger), HKCU and app data: every mode that writes the
+        # ledger or an effect refuses there before its first write, the lock included.
+        $problem = PackageContextProblem
+        if ($problem) { throw "$Mode refused, nothing written: $problem. Run from a normal user context (a shell or task outside any packaged app)." }
         LockLedger
         $null = ReadLedger
         RecoverLedger

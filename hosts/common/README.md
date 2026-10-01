@@ -410,12 +410,23 @@ title.
   once a real user's sign-in shows the faces `active`. If something calls the SPI SET
   calls before that sign-in (changing text size, theme or scaling), Windows may write its
   in-memory fonts back; that shows as drift.
-- **Context guard:** the faces are written only from a normal user context, not one
-  with package identity and not one beneath a packaged app. A shell started inside the
-  ChatGPT app reads "no package" itself while its registry view can be the app's, so its
-  ancestors are checked too. Only `APPMODEL_ERROR_NO_PACKAGE` counts as no identity;
-  any other answer refuses. Neither check proves the registry view is the user's own,
-  so run from a normal user shell or task.
+- **Context guard (every mode that writes):** `Apply` (with any flag), `Restore` and
+  `Uninstall -Apply` refuse before their first write, the ledger lock included, unless they
+  run in a normal user context. A context with package identity, or one beneath a packaged
+  app, is refused.
+  - **Why:** the ChatGPT app (OpenAI.Codex) declares file-system and registry write
+    virtualization. From inside it, `%LOCALAPPDATA%` (this ledger, Chromium's profile) and
+    HKCU writes go to the package's private copy (`...\Packages\OpenAI.Codex_...\LocalCache`).
+    They read back correctly there and miss the user's real state.
+  - **How it decides:** a shell started inside such an app reads "no package" itself, so
+    its ancestors are checked too. Only `APPMODEL_ERROR_NO_PACKAGE` counts as no
+    identity; any other answer refuses.
+  - **What it doesn't cover:** `Validate`, `Test`, `RestoreTest` and a dry-run `Uninstall`
+    are not affected. A shell started from Windows Terminal (itself a packaged app) is
+    refused too, which is the safe side.
+  - **Not proof:** neither check proves the view is the user's own, so run from a normal
+    user shell or task. The write-time checks in the face, Chromium and undo paths stay
+    as a second line.
 
 **Ledger:** each slot is a `ui-font-face` ledger effect: target `winmetrics:<slot>`, state
 `face`, prior the face found.

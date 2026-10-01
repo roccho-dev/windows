@@ -1648,6 +1648,25 @@ foreach ($font in $fonts) {
     if ((Test-Path -LiteralPath (FontPath $font)) -or $null -ne (FontValue (ValueName $font))) { throw 'Proof requires a fresh disposable font target.' }
 }
 if (Test-Path -LiteralPath $ledgerDir) { throw 'Proof requires no effect ledger yet.' }
+# M-L1: from beneath a packaged app (here a copy of cmd.exe under a WindowsApps path starts win.ps1), every mode that
+# writes refuses before its first write: no ledger directory appears. Read-only modes are unaffected.
+$packagedLauncher = Join-Path $env:RUNNER_TEMP ('WindowsApps\guard-' + [guid]::NewGuid().ToString('N') + '\cmd.exe')
+$null = New-Item -ItemType Directory -Path (Split-Path -Parent $packagedLauncher)
+[IO.File]::Copy((Join-Path $env:SystemRoot 'System32\cmd.exe'), $packagedLauncher, $false)
+function Packaged([string[]]$Arguments) {
+    $ErrorActionPreference = 'Continue'
+    $PSNativeCommandUseErrorActionPreference = $false
+    $out = @(& $packagedLauncher /d /c $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'win.ps1') @Arguments 2>&1 | ForEach-Object { [string]$_ })
+    [pscustomobject]@{ code = $LASTEXITCODE; text = ($out -join ' ') }
+}
+foreach ($arguments in @(@('-Mode', 'Apply'), @('-Mode', 'Apply', '-AppFonts'), @('-Mode', 'Uninstall', '-Apply'))) {
+    $run = Packaged $arguments
+    Must ($run.code -ne 0 -and $run.text -like '*refused, nothing written: it runs beneath the packaged app*\WindowsApps\*' -and -not (Test-Path -LiteralPath $ledgerDir)) "M-L1: $($arguments -join ' ') beneath a packaged app is refused before any ledger write"
+}
+foreach ($arguments in @(@('-Mode', 'Validate'), @('-Mode', 'Uninstall'))) {
+    $run = Packaged $arguments
+    Must ($run.code -eq 0 -and -not (Test-Path -LiteralPath $ledgerDir)) "M-L1: $($arguments -join ' ') (read-only) still runs beneath a packaged app"
+}
 $n = $fonts.Count
 $shortcut = Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs\noctty.lnk'
 $shortcutBefore = Test-Path -LiteralPath $shortcut
