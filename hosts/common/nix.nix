@@ -47,6 +47,22 @@ let
   # Official stable WinGet recovery, fetched only when a missing Store app needs it.
   # Bundle and inner app versions differ. These assets are not distribution payloads.
   microsoftPublisher = "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US";
+  # Explicit machine-platform recovery only; not a normal Restore prerequisite.
+  # Official prerelease bytes are verified by CI and fetched again before native deployment.
+  wslPlatform = {
+    architecture = "x64"; minimumBuild = 26100; minimumVersion = "2.9.3.0";
+    feature = "VirtualMachinePlatform";
+    appxName = "MicrosoftCorporationII.WindowsSubsystemForLinux"; publisherId = "8wekyb3d8bbwe";
+    url = "https://github.com/microsoft/WSL/releases/download/2.9.13/wsl.2.9.13.0.x64.msi";
+    size = 367693824;
+    sha256 = "a00b0010f802ac461aaf44374b6ecbeae4b620453a77565f31eade5737e8af55";
+    release = "prerelease"; version = "2.9.13.0";
+    productCode = "{861425A4-7173-4B0D-8EC1-7A94FD333418}";
+    upgradeCode = "{6D5B792B-1EDC-4DE9-8EAD-201B820F8E82}";
+    packageCode = "{10B09957-0F00-4852-B522-8E6EDB50249B}";
+    productName = "Windows Subsystem for Linux"; manufacturer = "Microsoft Corporation";
+    publisher = microsoftPublisher; template = "x64;1033";
+  };
   wingetBootstrap = {
     architecture = "x64";
     publisher = microsoftPublisher;
@@ -177,7 +193,7 @@ let
       ];
     };
     cloudflared.version = cloudflaredVersion;
-    inherit wingetBootstrap;
+    inherit wingetBootstrap wslPlatform;
     packages = map (lock: lock // { inventory = "${inventory lock}"; }) packageLocks;
     # The desktop UI font face: the family of this role, set face-only in the six Win32 UI font slots
     # in HKCU WindowMetrics; ui-font.ahk reads the live faces only (no setter or compiler).
@@ -211,6 +227,8 @@ let
     python ${./pack.py} fonts ${policy} "$out"
   '';
   dist = pkgs.runCommand "windows-dist" { nativeBuildInputs = [ python ]; } ''
+    python ${./pack.py} platform ${pkgs.writeText "wsl-platform.json" (builtins.toJSON wslPlatform)} \
+      ${pkgs.fetchurl { inherit (wslPlatform) url sha256; }}
     python ${./pack.py} bootstrap ${pkgs.writeText "winget-bootstrap.json" (builtins.toJSON wingetBootstrap)} \
       ${pkgs.fetchurl { inherit (wingetBootstrap.bundle) url sha256; }} \
       ${pkgs.fetchurl { inherit (wingetBootstrap.dependencies) url sha256; }}

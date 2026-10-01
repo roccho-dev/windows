@@ -538,6 +538,45 @@ def seed_preferences(seed: dict, entries: list[dict]) -> bytes:
     return (json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
 
+def wsl_platform(value: object) -> dict | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("WSL platform is not an object")
+    guid = re.compile(r"\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}\}\Z")
+    if (value.get("architecture") != "x64" or value.get("minimumBuild") != 26100
+            or value.get("feature") != "VirtualMachinePlatform"
+            or value.get("appxName") != "MicrosoftCorporationII.WindowsSubsystemForLinux"
+            or value.get("publisherId") != "8wekyb3d8bbwe"
+            or value.get("release") not in ("stable", "prerelease")
+            or value.get("productName") != "Windows Subsystem for Linux"
+            or value.get("manufacturer") != "Microsoft Corporation"
+            or value.get("upgradeCode") != "{6D5B792B-1EDC-4DE9-8EAD-201B820F8E82}"
+            or value.get("template") != "x64;1033"
+            or value.get("publisher") != "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
+            or any(not isinstance(value.get(k), str) or not guid.fullmatch(value[k])
+                   for k in ("productCode", "upgradeCode", "packageCode"))
+            or any(not isinstance(value.get(k), str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){3}", value[k])
+                   for k in ("version", "minimumVersion"))
+            or not isinstance(value.get("url"), str)
+            or not value["url"].startswith("https://github.com/microsoft/WSL/releases/download/")
+            or not value["url"].endswith(".x64.msi")
+            or type(value.get("size")) is not int or not 0 < value["size"] <= MAX_SIZE
+            or not isinstance(value.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", value["sha256"])):
+        raise ValueError("Invalid supported WSL platform lock")
+    return dict(value)
+
+
+def verify_platform(lock: object, asset: Path) -> None:
+    selected = wsl_platform(lock)
+    if selected is None:
+        raise ValueError("Missing WSL platform lock")
+    verify_asset({"name": selected["productName"], **selected}, asset)
+    with asset.open("rb") as stream:
+        if stream.read(8) != bytes.fromhex("d0cf11e0a1b11ae1"):
+            raise ValueError("WSL installer is not an MSI compound document")
+
+
 def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
                  scripts: Path, source: str, out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
@@ -560,6 +599,7 @@ def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
         ui = typography(selected.get("typography"), entries, packages)
         apps = store_apps(selected.get("apps"), entries)
         bootstrap = winget_bootstrap(selected.get("wingetBootstrap"))
+        platform = wsl_platform(selected.get("wslPlatform"))
         if apps and bootstrap is None:
             raise ValueError("Declared Store apps require absent-AppInstaller recovery metadata")
         for name in ("win.ps1", "proof.ps1", "handoff-proof.ps1", "handoff-evaluate.ps1",
@@ -585,7 +625,7 @@ def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
                               "files": noctty_files, "registration": registration},
                    "cloudflared": {"version": selected["cloudflared"]["version"], "file": "payload/cloudflared.exe",
                                    "sha256": files["payload/cloudflared.exe"]},
-                   "packages": packages, "typography": ui, "apps": apps, "wingetBootstrap": bootstrap, "files": files})
+                   "packages": packages, "typography": ui, "apps": apps, "wingetBootstrap": bootstrap, "wslPlatform": platform, "files": files})
         output = out / "windows-dist.zip"
         archive(root, output)
         (out / "windows-dist.zip.sha256").write_text(digest(output) + "  windows-dist.zip\n", encoding="ascii")
@@ -610,6 +650,9 @@ if __name__ == "__main__":
     bootstrap_parser = sub.add_parser("bootstrap")
     for argument in ("lock", "bundle", "dependencies"):
         bootstrap_parser.add_argument(argument, type=Path)
+    platform_parser = sub.add_parser("platform")
+    for argument in ("lock", "asset"):
+        platform_parser.add_argument(argument, type=Path)
     args = parser.parse_args()
     if args.command == "fonts":
         prepare_fonts(json.loads(args.policy.read_text()), args.out)
@@ -619,6 +662,8 @@ if __name__ == "__main__":
         package_inventory(args.lock, args.archive, args.listing, args.tree, args.out)
     elif args.command == "bootstrap":
         verify_bootstrap(json.loads(args.lock.read_text(encoding="utf-8")), args.bundle, args.dependencies)
+    elif args.command == "platform":
+        verify_platform(json.loads(args.lock.read_text(encoding="utf-8")), args.asset)
     else:
         distribution(args.fonts, args.noctty, args.cloudflared, args.choices,
                      args.scripts, args.source, args.out)

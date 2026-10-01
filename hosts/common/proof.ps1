@@ -362,6 +362,64 @@ Must ($null -eq (Get-EffectRecordProblem $appxIntent) -and
     (Get-EffectClass @($appxIntent, $appxCommit) $absent).resolution -ceq 'undone' -and
     -not (Get-UninstallPlan @($appxIntent, $appxCommit) @{ $appxIntent.id = $appxWant }).ok -and
     (Get-EffectRecordProblem (PureRecord 1 intent appx-package 'appx:Other.App_2p2nqsd0c76g0' $absent $appxWant $null $null)) -ceq 'target differs from the package identity.') 'Appx identity lifecycle and held removal'
+
+# P1: absent native platform decisions, including no-write counterexamples.
+$platformLock = $manifest.wslPlatform
+Must ($null -eq (Get-PlatformLockProblem $platformLock)) 'platform lock valid'
+$emptyPlatform = @{ readable = $true; msi = @(); appx = @(); provisioned = @(); vmp = 'Disabled'; inbox = 'Disabled'; installReach = $false; cliValid = $false; cliVersion = '' }
+Must ((Get-PlatformAction $platformLock $emptyPlatform).action -ceq 'install' -and
+    (Get-PlatformAction $platformLock ($emptyPlatform + @{ ignoredSystem32Launcher = $true; arbitraryHistoricalData = $true })).action -ceq 'install') 'OS launcher and historical unowned data are not foreign-platform evidence'
+$sharedVmp = @{} + $emptyPlatform; $sharedVmp.vmp = 'Enabled'
+Must (-not (Get-PlatformAction $platformLock $sharedVmp).enableFeature) 'shared enabled VMP unowned, no feature effect'
+$registered = @{ identityVerified = $true; context = 4; version = '2.9.13.0' }
+$configuredPlatform = @{} + $sharedVmp; $configuredPlatform.msi = @($registered); $configuredPlatform.cliValid = $true; $configuredPlatform.cliVersion = '2.9.13.0'; $configuredPlatform.installReach = $true; $configuredPlatform.inbox = 'Enabled'
+$configuredPlatform.appx = @(@{ publisherId = '8wekyb3d8bbwe'; version = '2.9.13.0' }); $configuredPlatform.provisioned = @(@{ publisherId = '8wekyb3d8bbwe'; version = '2.9.13.0' })
+Must ((Get-PlatformAction $platformLock $configuredPlatform).action -ceq 'preserved' -and
+    (Get-PlatformAction $platformLock $configuredPlatform).runtimeProof -ceq 'unproven') 'compatible fixed CLI and registered MSI preserve enabled inbox WSL1; not runtime proof'
+$modernWithoutGlue = @{} + $configuredPlatform; $modernWithoutGlue.appx = @(); $modernWithoutGlue.provisioned = @()
+Must ((Get-PlatformAction $platformLock $modernWithoutGlue).action -ceq 'preserved') 'supported modern MSI configured without optional glue; upstream can ignore glue deployment failure'
+$appxOnlyPlatform = @{} + $configuredPlatform; $appxOnlyPlatform.msi = @(); $appxOnlyPlatform.appx = @($configuredPlatform.appx[0], $configuredPlatform.appx[0])
+Must ((Get-PlatformAction $platformLock $appxOnlyPlatform).action -ceq 'preserved') 'identical same-version official all-user Appx rows form one no-write provider'
+foreach ($change in @(@{ installReach = $true }, @{ inbox = 'Enabled' }, @{ vmp = 'EnablePending' }, @{ readable = $false },
+        @{ msi = @(@{ identityVerified = $false; context = 4; version = '2.9.13.0' }) },
+        @{ appx = @(@{ publisherId = 'foreign'; version = '2.9.13.0' }) },
+        @{ provisioned = @(@{ publisherId = '8wekyb3d8bbwe'; version = '2.9.13.0' }) })) {
+    $case = @{} + $emptyPlatform; foreach ($key in $change.Keys) { $case[$key] = $change[$key] }
+    Must ((Get-PlatformAction $platformLock $case).action -ceq 'refuse') 'affected existing/pending/unreadable platform preserved/refused'
+}
+foreach ($change in @(@{ vmp = 'Disabled' }, @{ cliValid = $false }, @{ cliVersion = '2.9.2.0' }, @{ msi = @($registered, $registered) },
+        @{ appx = @(@{ publisherId = '8wekyb3d8bbwe'; version = '2.9.14.0' }) })) {
+    $case = @{} + $configuredPlatform; foreach ($key in $change.Keys) { $case[$key] = $change[$key] }
+    Must ((Get-PlatformAction $platformLock $case).action -ceq 'refuse') 'existing platform incomplete/ambiguous is not repaired or upgraded'
+}
+function PlatformRecord($Seq, $Phase, $Kind, $Target, $Prior, $Desired, $Observed) {
+    $record = PureRecord $Seq $Phase $Kind $Target $Prior $Desired $Observed $null
+    $record.identity = @{ sid = 'S-1-5-21-1-2-3-1001'; elevated = $true }; $record.scope = 'machine'; $record.removal = 'held'; $record.mode = 'PlatformRestore'; $record.boot = 'synthetic-boot'
+    return $record
+}
+$msiWant = @{ exists = $true; complete = $true; upgradeCode = $platformLock.upgradeCode; productName = $platformLock.productName; manufacturer = $platformLock.manufacturer; context = 4; provenance = $platformLock }
+$msiIntent = PlatformRecord 1 intent msi-package ('msi:' + $platformLock.upgradeCode) $absent $msiWant $null
+$partialPlatform = @{ exists = $true; complete = $false; partial = $true }
+Must ($null -eq (Get-EffectRecordProblem $msiIntent) -and
+    (Get-EffectClass @($msiIntent) $partialPlatform).class -ceq 'indeterminate' -and
+    -not (Get-EffectClass @($msiIntent) $partialPlatform).resolution -and
+    (Get-EffectClass @($msiIntent) $absent).resolution -ceq 'void') 'failed MSI partial native reach retains open provenance; genuinely absent voids'
+Must ((Get-PlatformRecoveryProblem @($msiIntent) 'synthetic-boot').pendingReboot -and
+    -not (Get-PlatformRecoveryProblem @($msiIntent) 'after-reboot').pendingReboot) 'read-only platform test reports unresolved native intent rather than eligibility to install'
+$msiCommit = PlatformRecord 2 commit msi-package $msiIntent.target $absent $msiWant ($msiWant + @{ version = '2.9.14.0' })
+Must ($null -eq (Get-EffectRecordProblem $msiCommit) -and
+    (Get-EffectClass @($msiIntent,$msiCommit) $absent).resolution -ceq 'undone' -and
+    -not (Get-UninstallPlan @($msiIntent,$msiCommit) @{}).ok -and
+    -not (Get-UninstallPlan @($msiIntent,$msiCommit) @{}).steps.Count) 'MSI version provenance differs from family lifecycle; no machine probe required for held removal'
+$msiUndone = PlatformRecord 3 undone msi-package $msiIntent.target $absent $msiWant $absent
+$closedNativePlan = Get-UninstallPlan @($msiIntent,$msiCommit,$msiUndone) @{}
+Must ($closedNativePlan.ok -and -not $closedNativePlan.steps.Count -and $closedNativePlan.kept[0].class -ceq 'closed-provenance' -and
+    -not $closedNativePlan.kept[0].observed) 'validated closed platform attempt owns nothing; unobserved native state is not cleanup proof'
+$featurePrior, $featureWant = @{ exists = $true; enabled = $false }, @{ exists = $true; enabled = $true }
+$featureIntent = PlatformRecord 1 intent windows-feature 'windows-feature:VirtualMachinePlatform' $featurePrior $featureWant $null
+Must ($null -eq (Get-EffectRecordProblem $featureIntent) -and
+    (Get-EffectClass @($featureIntent) ($featureWant + @{ pendingReboot = $true; nativeState = 'EnablePending' })).resolution -ceq 'confirm' -and
+    -not (Get-UninstallPlan @($featureIntent) @{}).ok) 'only changed feature is ledgered; pending native state commits enabled identity, removal held'
 # ChatGPT app theme fonts (app-theme-fonts): the manifest's defaults make complete themes and fonts alone do not; an
 # existing theme gets its three font leaves and loses only the Faces it has; the undo removes a created theme only
 # while nobody changed it, and otherwise restores each leaf, keeping a recoloured theme valid; everything else of the
@@ -765,6 +823,7 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
         'PackageEffect', 'SeedHazard', 'WriteSeed', 'AppPathEffects', 'IsAppPathEffect', 'MachineAppPath', 'EffectClass', 'AppPathState',
         'ConvergeAppPath', 'CollectAppPathGarbage', 'ConvergeEffect', 'Classify', 'UndoOwned', 'SharedKey', 'ObserveKeyContent'
     $names += 'AppxEffect', 'ObserveAppx', 'IntroduceAppx', 'ConvergeApps', 'FetchBootstrap', 'AssertAppxManifest', 'AssertMicrosoftSignature'
+    $names += 'PlatformEffect','ObservePlatformEffect','IntroducePlatform','IsPlatformEffect'
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'win.ps1'), [ref]$null, [ref]$null)
     foreach ($definition in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cin $names }, $false)) {
         . ([scriptblock]::Create($definition.Extent.Text))
@@ -1304,6 +1363,74 @@ public static string[] Split(string cmd) {
     function EnsureWinGet([string]$Path) { throw 'present app must not bootstrap or need an alias' }
     ConvergeApps
     Must ($mark + 1 -eq $script:nextSeq) 'present app has no bootstrap/alias prerequisite or effects'
+    # P2: production write-ahead/recovery with native platform observation and
+    # deployment substituted. No MSI/feature installation or service operation.
+    $wslPlatform = $manifest.wslPlatform
+    $script:runIdentity = @{ sid = 'S-1-5-21-1-2-3-1001'; elevated = $true }; $script:platformBoot = 'synthetic-boot'
+    $Mode = 'PlatformRestore'
+    $script:completedPlatformId = $null
+    $script:platformInventory = @{ readable = $true; msi = @(); appx = @(); provisioned = @(); vmp = 'Enabled'; inbox = 'Disabled'; installReach = $false; cliValid = $false; cliVersion = '' }
+    function PlatformInventory { $script:platformInventory }
+    $nativePlatform = PlatformEffect msi-package @{ exists = $false }
+    function CompletedNativeFailure([string]$Message) { $failure = [InvalidOperationException]::new($Message); $failure.Data['platformCompleted'] = $true; throw $failure }
+    Refused { IntroducePlatform $nativePlatform { CompletedNativeFailure 'native MSI denied' } } 'native MSI denied'
+    Must ((Phases $nativePlatform) -ceq 'intent,void') 'native MSI genuinely no-effect failure voids'
+    Refused { IntroducePlatform $nativePlatform { $script:platformInventory.installReach = $true; CompletedNativeFailure 'native MSI partial failure' } } 'native MSI partial failure'
+    Must ((Phases $nativePlatform) -ceq 'intent,void,intent' -and
+        (Get-EffectClass @(RecordsOf $nativePlatform.id) (ObservePlatformEffect $nativePlatform)).class -ceq 'indeterminate') 'MSI partial service/PF reach leaves open native provenance'
+    $script:platformInventory.msi = @(@{ identityVerified = $true; context = 4; version = '2.9.13.0'; productCode = $wslPlatform.productCode })
+    $script:platformInventory.provisioned = @(@{ publisherId = $wslPlatform.publisherId; version = '2.9.13.0' })
+    $script:completedPlatformId = $null
+    Refused { RecoverId $nativePlatform.id } '*same-boot native platform outcome is unknown*'
+    $script:platformBoot = 'after-reboot'
+    RecoverId $nativePlatform.id
+    Must ((Phases $nativePlatform) -ceq 'intent,void,intent,commit') 'later native registration confirms partial intent through actual recovery'
+    $script:platformInventory.msi = @(); $script:platformInventory.provisioned = @(); $script:platformInventory.installReach = $false
+    RecoverId $nativePlatform.id
+    Must ((Phases $nativePlatform) -ceq 'intent,void,intent,commit,undone') 'actual admin absence closes introduced platform undone'
+    $script:platformBoot = 'synthetic-boot'
+    Refused { IntroducePlatform $nativePlatform {
+        $failure = [InvalidOperationException]::new('unfinished native timeout'); $failure.Data['platformUnfinished'] = $true; throw $failure
+    } } 'unfinished native timeout'
+    Must ((Phases $nativePlatform) -ceq 'intent,void,intent,commit,undone,intent' -and
+        (Get-PlatformRecoveryProblem @(RecordsOf $nativePlatform.id) 'synthetic-boot').pendingReboot) 'unfinished native timeout is not killed/voided; same-boot recovery remains unknown'
+    Refused { RecoverId $nativePlatform.id } '*same-boot native platform outcome is unknown*'
+    $script:platformBoot = 'after-reboot'; RecoverId $nativePlatform.id
+    Must ((Phases $nativePlatform) -ceq 'intent,void,intent,commit,undone,intent,void') 'after explicit later boot genuinely absent timed-out operation voids through production observer'
+    $script:platformBoot = 'synthetic-boot'
+    $result = IntroducePlatform $nativePlatform {
+        $script:platformInventory.msi = @(@{ identityVerified = $true; context = 4; version = '2.9.13.0'; productCode = $wslPlatform.productCode })
+        $script:platformInventory.provisioned = @()  # supported modern native MSI may ignore glue failure
+        $script:platformInventory.installReach = $true
+        @{ exitCode = 3010 }
+    }
+    Must ($result.exitCode -eq 3010 -and @(RecordsOf $nativePlatform.id)[-1].observed.pendingReboot -and
+        (Test-PlatformRebootWait @(RecordsOf $nativePlatform.id) 'synthetic-boot') -and
+        -not (Test-PlatformRebootWait @(RecordsOf $nativePlatform.id) 'after-reboot')) '3010 committed as pending reboot with durable same-boot wait; no automatic reboot'
+    $mark = $script:nextSeq
+    Refused { IntroducePlatform $nativePlatform { throw 'must not deploy over changed platform' } } '*changed before intent*'
+    Must ($mark -eq $script:nextSeq) 'changed native platform refuses before intent/native call'
+    $feature = PlatformEffect windows-feature @{ exists = $true; enabled = $false }
+    $script:featureState = 'Disabled'
+    function Get-WindowsOptionalFeature { [pscustomobject]@{ State = $script:featureState } }
+    $result = IntroducePlatform $feature { $script:featureState = 'EnablePending'; @{ exitCode = 3010 } }
+    Must ($result.exitCode -eq 3010 -and @(RecordsOf $feature.id)[-1].observed.nativeState -ceq 'EnablePending' -and
+        (Test-PlatformRebootWait @(RecordsOf $feature.id) 'synthetic-boot') -and
+        -not (Get-UninstallPlan @(RecordsOf $feature.id) @{}).ok) 'feature enable pending commits exact changed identity and holds removal without privileged observation'
+    RecoverId $feature.id
+    Must ((Phases $feature) -ceq 'intent,commit') 'existing-prior feature is supported by actual OpenAttempt/recovery'
+    $script:featureState = 'Disabled'; RecoverId $feature.id
+    WriteRecord 'intent' $feature $null
+    $script:completedPlatformId = $null
+    $script:featureState = 'EnablePending'
+    Refused { RecoverId $feature.id } '*same-boot native platform outcome is unknown*'
+    $script:platformBoot = 'after-reboot'; RecoverId $feature.id
+    Must ((Phases $feature) -ceq 'intent,commit,undone,intent,commit' -and
+        @(RecordsOf $feature.id)[-1].observed.nativeOutcome -ceq 'recovered/exitUnknown' -and
+        (Test-PlatformRebootWait @(RecordsOf $feature.id) 'synthetic-boot') -and
+        -not (Test-PlatformRebootWait @(RecordsOf $feature.id) 'after-reboot')) 'interrupted feature commit preserves intent boot and unknown native reboot requirement'
+    $Mode = 'Apply'
+    $mark = $script:nextSeq - 1  # following byte/signature refusals must write no records
     # Actual fetched-byte verifier with a synthetic native transfer, no download/deployment.
     function Invoke-Native([string]$Exe, [string[]]$Arguments, [int]$Seconds) {
         $at = [Array]::IndexOf($Arguments, '--output'); [IO.File]::WriteAllText($Arguments[$at + 1], 'abc', [Text.UTF8Encoding]::new($false))
@@ -1336,6 +1463,34 @@ function Primitive51([string]$Scratch) {
     $out[-1]
 }
 $primitives7 = PrimitiveProof $PSScriptRoot (Join-Path $env:RUNNER_TEMP ('primitives-' + [guid]::NewGuid().ToString('N')))
+
+# P3: real official bytes + production signature/MSI parser and native readonly
+# affected inventory on CI. No platform deploy, DISM setter, WSL start or repair.
+function PlatformAssetProof([string]$Root) {
+    $manifest = [IO.File]::ReadAllText((Join-Path $Root 'manifest.json')) | ConvertFrom-Json
+    $wslPlatform = $manifest.wslPlatform
+    $names = 'FetchBootstrap','AssertMicrosoftSignature','ComRead','ComCall','ReleaseCom','MsiProperty','MsiIdentity','AssertPlatformMsi',
+        'Invoke-Native','Join-NativeArguments','PlatformMsiRows','PlatformRegistryReach','PlatformDirectory','PlatformInventory'
+    $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'win.ps1'), [ref]$null, [ref]$null)
+    foreach ($definition in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cin $names }, $false)) {
+        . ([scriptblock]::Create($definition.Extent.Text))
+    }
+    $scratch = Join-Path $env:RUNNER_TEMP ('platform-asset-' + [guid]::NewGuid().ToString('N'))
+    $null = [IO.Directory]::CreateDirectory($scratch)
+    $asset = Join-Path $scratch 'wsl.x64.msi'; $handle = $null
+    try {
+        $handle = FetchBootstrap $wslPlatform $asset
+        $identity = AssertPlatformMsi $asset
+        $inventory = PlatformInventory
+        Must ($inventory.readable -and $identity.productCode -ceq $wslPlatform.productCode) 'real native MSI identity and readonly affected platform inventory'
+        'PASS platform asset/signature/native MSI parser/inventory; no deployment/runtime proof'
+    } finally {
+        if ($null -ne $handle) { $handle.Dispose() }
+        if ([IO.File]::Exists($asset)) { [IO.File]::Delete($asset) }
+        if ([IO.Directory]::Exists($scratch)) { [IO.Directory]::Delete($scratch, $false) }
+    }
+}
+$platformAssetProof = PlatformAssetProof $PSScriptRoot
 
 # The Noctty effect descriptions and observers on synthetic targets: a fresh RUNNER_TEMP
 # directory (never deleted), where the 5.1 child creates the tree and config, and a proof HKCU key.
@@ -3046,4 +3201,5 @@ if ($g4.status -cne 'measured' -or (Get-Field $g4 'gate') -cne 'pass' -or $g4.st
     g4Measurement = $g4;
     noctty = 'native owned tree, configuration, COM keys and values and the default-terminal selection through Apply and Uninstall (A15-A21)'
     appPathsLaunch = $appPathsLaunch
+    platform = $platformAssetProof; platformRuntime = 'unproven'; platformInstallation = 'notPerformed'; platformRemoval = 'held'
     scope = 'current-user owned fonts, Noctty, SSH client and locked packages (AutoHotkey ZIP and Chromium 7z with its font seed: install, ownership, its App Paths registration' + $(if ($appPathsLaunch -ceq 'proven') { ' and its resolution by ShellExecute' } else { '; App Paths launch unproven on this elevated runner, VM S7 required' }) + ', first run on scratch profiles, Uninstall) on an elevated Windows Server runner with Windows Terminal 1.23; not Restore (activation, package view, rollback), a clean unelevated Windows 11 user, Chromium on the default profile or started from Win+R itself, default-terminal handoff, real-host UX or a Cloudflare connection' } | ConvertTo-Json

@@ -1,7 +1,7 @@
 #requires -Version 5.1
 [CmdletBinding()]
 param(
-    [ValidateSet('Validate', 'Test', 'Apply', 'Restore', 'RestoreTest', 'Uninstall', 'RentSsh', 'RentSshTest')][string]$Mode = 'Validate',
+    [ValidateSet('Validate', 'Test', 'Apply', 'Restore', 'RestoreTest', 'Uninstall', 'RentSsh', 'RentSshTest', 'PlatformRestore', 'PlatformTest')][string]$Mode = 'Validate',
     # RentSsh/RentSshTest only: the live binding, known only after envs and the first rent start. Nothing is guessed.
     [string]$Alias = 'windows-rent',
     [string]$Hostname,
@@ -160,6 +160,8 @@ foreach ($app in $apps) {
 }
 if (@($apps | Where-Object { $null -ne (Get-Field $_ 'appearance') }).Count -gt 1) { throw 'Two apps preconfigure the one Codex config.' }
 $wingetBootstrap = Get-Field $manifest 'wingetBootstrap'
+$wslPlatform = Get-Field $manifest 'wslPlatform'
+if ($null -ne $wslPlatform) { $problem = Get-PlatformLockProblem $wslPlatform; if ($problem) { throw "Invalid platform metadata: $problem" } }
 $problem = Get-BootstrapProblem $wingetBootstrap
 if ($problem -or ($apps.Count -and $null -eq $wingetBootstrap)) { throw "Invalid WinGet recovery metadata: $problem" }
 $packageDirectories = @($manifest.packages | ForEach-Object { $_.directory })
@@ -500,6 +502,7 @@ function WriteRecord([string]$Phase, $Effect, $Observed, [string]$Temp, [string]
         $entry.package = $Package
     }
     $entry.utc, $entry.source, $entry.mode = [DateTime]::UtcNow.ToString('o'), $manifest.source, $Mode
+    if ($entry.kind -cin @('msi-package','windows-feature')) { $entry.identity = $script:runIdentity; $entry.scope = 'machine'; $entry.removal = 'held'; $entry.boot = $script:platformBoot }
     $problem = Get-EffectRecordProblem $entry
     if ($problem) { throw "Refusing to write a malformed ledger record for $($entry.id): $problem" }
     # A package intent names exactly one locked package, and its own staging directory must yield
@@ -665,6 +668,7 @@ function IsPackageTree([string]$Target) {
 # Anything else is outside this version and stops the run.
 function Observe($Effect) {
     $kind, $target = [string](Get-Field $Effect 'kind'), [string](Get-Field $Effect 'target')
+    if ($kind -cin @('msi-package','windows-feature') -and (Test-EffectPath $kind $target)) { return ObservePlatformEffect $Effect }
     if ($kind -ceq 'appx-package' -and (Test-EffectPath $kind $target)) { return ObserveAppx (Get-Field $Effect 'desired') }
     if ($kind -ceq 'ui-font-face' -and (Test-EffectPath $kind $target)) { return ObserveUiFont $target.Substring('winmetrics:'.Length) }
     if ($kind -ceq 'pref-value' -and (IsChromiumPrefs $target)) { return ObservePref $target ([string](Get-Field $Effect 'name')) }
@@ -696,7 +700,7 @@ function OpenAttempt([string]$Id) {
     if ($attempt.closed) { return @() }
     $open = @($attempt.records)
     # A UI font slot always holds a face, and an app theme some fonts: the prior is written back, not content owned.
-    if ($open.Count -and (Get-Field (Get-Field $open[0] 'prior') 'exists') -and (Get-Field $open[0] 'kind') -cnotin @('ui-font-face', 'app-theme-fonts')) {
+    if ($open.Count -and (Get-Field (Get-Field $open[0] 'prior') 'exists') -and (Get-Field $open[0] 'kind') -cnotin @('ui-font-face', 'app-theme-fonts', 'windows-feature')) {
         throw "Effect ledger id $Id owns a target that existed before; this version owns only what it created."
     }
     return $open
@@ -744,7 +748,15 @@ function ResolveAttempt($Open, [string]$Phase) {
         if ((Get-Field $intent 'kind') -ceq 'tree-extracted') { CleanStaging $intent }
         elseif (Test-Path -LiteralPath $temp -PathType Leaf) { [IO.File]::Delete($temp) }
     }
-    WriteRecord $Phase $Open[0] (Observe $Open[0])
+    $observed = Observe $Open[0]
+    if ($Phase -ceq 'commit' -and (IsPlatformEffect $Open[0])) {
+        # An interrupted call lost its exit code (possibly 3010). Preserve the
+        # before-call boot identity and require a subsequent boot conservatively.
+        $observed.pendingReboot = $true
+        $observed.boot = Get-Field $Open[0] 'boot'
+        $observed.nativeOutcome = 'recovered/exitUnknown'
+    }
+    WriteRecord $Phase $Open[0] $observed
 }
 
 # Recovery of one id: an interrupted intent that took effect is committed, one
@@ -753,13 +765,24 @@ function ResolveAttempt($Open, [string]$Phase) {
 function RecoverId([string]$Id) {
     $open = @(OpenAttempt $Id)
     if (-not $open.Count) { return }
+    if ((IsPlatformEffect $open[0]) -and -not @($open | Where-Object { $_.phase -ceq 'commit' }).Count -and
+        (Get-Field $open[0] 'boot') -ceq $script:platformBoot -and $script:completedPlatformId -cne $Id) {
+        throw 'Interrupted same-boot native platform outcome is unknown; intent retained until a later boot and explicit admin recovery.'
+    }
     $class = Get-EffectClass $null (Observe $open[0]) '' $null (AttemptOf $Id)
     if ($class.class -ceq 'indeterminate') { throw "Effect ledger id $Id is indeterminate: $($class.reason)" }
     if ($class.resolution) { ResolveAttempt $open ($(if ($class.resolution -ceq 'confirm') { 'commit' } else { $class.resolution })) }
 }
 
 # App font effects are read through the app's config service, so only ConvergeAppFonts and Uninstall (-All) recover them.
-function RecoverLedger([switch]$All) { foreach ($id in @(LedgerIds)) { if ($All -or -not (IsAppFontEffect @(RecordsOf $id)[0])) { RecoverId $id } } }
+function IsPlatformEffect($Effect) { (Get-Field $Effect 'kind') -cin @('msi-package','windows-feature') }
+function RecoverLedger([switch]$All, [switch]$Platform) {
+    foreach ($id in @(LedgerIds)) {
+        $first = @(RecordsOf $id)[0]
+        if (IsPlatformEffect $first) { if ($Platform) { RecoverId $id }; continue }
+        if (-not $Platform -and ($All -or -not (IsAppFontEffect $first))) { RecoverId $id }
+    }
+}
 
 # Every Fonts value that names a file, in HKCU and both HKLM views, resolved to a
 # full path (a bare file name is under %WINDIR%\Fonts). $Excluded are HKCU value
@@ -1466,6 +1489,292 @@ function AssertBootstrapHost {
     $processors = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)
     if (-not [Environment]::Is64BitOperatingSystem -or -not $processors.Count -or
         @($processors | Where-Object { $_.Architecture -ne 9 }).Count) { throw 'Absent-AppInstaller recovery supports native x64 Windows only.' }
+}
+
+# Native MSI automation: readonly database mode 0 and ProductsEx, never
+# Win32_Product (which can repair), InstallProduct or ConfigureProduct.
+function ComRead($Object, [string]$Name, [object[]]$Arguments = @()) {
+    $Object.GetType().InvokeMember($Name, [Reflection.BindingFlags]::GetProperty, $null, $Object, $Arguments)
+}
+function ComCall($Object, [string]$Name, [object[]]$Arguments = @()) {
+    $Object.GetType().InvokeMember($Name, [Reflection.BindingFlags]::InvokeMethod, $null, $Object, $Arguments)
+}
+function ReleaseCom($Object) { if ($null -ne $Object -and [Runtime.InteropServices.Marshal]::IsComObject($Object)) { $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($Object) } }
+function MsiProperty($Database, [string]$Name) {
+    if ($Name -cnotmatch '^[A-Za-z][A-Za-z0-9]*\z') { throw 'Invalid MSI property query.' }
+    $view, $record = $null, $null
+    try {
+        $view = ComCall $Database 'OpenView' @("SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = '$Name'")
+        $null = ComCall $view 'Execute'
+        $record = ComCall $view 'Fetch'
+        if ($null -eq $record) { return '' }
+        return [string](ComRead $record 'StringData' @(1))
+    } finally { if ($null -ne $view) { $null = ComCall $view 'Close' }; ReleaseCom $record; ReleaseCom $view }
+}
+function MsiIdentity([string]$Path) {
+    $installer, $database, $summary = $null, $null, $null
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $database = ComCall $installer 'OpenDatabase' @($Path, 0)
+        $summary = ComRead $database 'SummaryInformation' @(0)
+        [ordered]@{ productCode = MsiProperty $database 'ProductCode'; upgradeCode = MsiProperty $database 'UpgradeCode'
+            version = MsiProperty $database 'ProductVersion'; productName = MsiProperty $database 'ProductName'
+            manufacturer = MsiProperty $database 'Manufacturer'; allUsers = MsiProperty $database 'ALLUSERS'
+            rmShutdown = MsiProperty $database 'MSIRMSHUTDOWN'; template = [string](ComRead $summary 'Property' @(7))
+            packageCode = [string](ComRead $summary 'Property' @(9)) }
+    } finally { ReleaseCom $summary; ReleaseCom $database; ReleaseCom $installer }
+}
+function AssertPlatformMsi([string]$Path) {
+    AssertMicrosoftSignature $Path $wslPlatform.publisher
+    $identity = MsiIdentity $Path
+    foreach ($key in 'productCode','upgradeCode','version','productName','manufacturer','template','packageCode') {
+        if ($identity[$key] -cne (Get-Field $wslPlatform $key)) { throw "MSI $key differs from locked official native identity." }
+    }
+    if ($identity.allUsers -cne '1' -or $identity.rmShutdown -cne '1') { throw 'MSI machine/restart-manager contract differs.' }
+    return $identity
+}
+function PlatformMsiRows {
+    $installer, $products = $null, $null
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        # Everyone SID and all three contexts cover installed MSI reach beyond
+        # current-user RelatedProducts. No unrelated product metadata is emitted.
+        $products = ComRead $installer 'ProductsEx' @('', 'S-1-1-0', 7)
+        foreach ($product in $products) {
+            try {
+                $code = [string](ComRead $product 'ProductCode')
+                $state = [string](ComRead $product 'InstallProperty' @('State'))  # INSTALLPROPERTY_PRODUCTSTATE literal in msi.h
+                $name = [string](ComRead $product 'InstallProperty' @($(if ($state -ceq '5') { 'InstalledProductName' } else { 'ProductName' })))
+                if ($name -cne $wslPlatform.productName -and $code -cne $wslPlatform.productCode) { continue }
+                if ($state -cne '5') { throw 'WSL MSI is advertised/incomplete; preserve its registration.' }
+                $version = [string](ComRead $product 'InstallProperty' @('VersionString'))
+                $cache = [string](ComRead $product 'InstallProperty' @('LocalPackage'))
+                $identity = MsiIdentity $cache
+                [ordered]@{ productCode = $code; context = [int](ComRead $product 'Context'); version = $version
+                    identityVerified = ($identity.upgradeCode -ceq $wslPlatform.upgradeCode -and
+                        $identity.productCode -ceq $code -and $identity.version -ceq $version -and
+                        $identity.productName -ceq $wslPlatform.productName -and $identity.manufacturer -ceq $wslPlatform.manufacturer -and
+                        $identity.template -ceq $wslPlatform.template)
+                    upgradeCode = $identity.upgradeCode; productName = $name; manufacturer = $identity.manufacturer }
+            } finally { ReleaseCom $product }
+        }
+    } finally { ReleaseCom $products; ReleaseCom $installer }
+}
+function PlatformRegistryReach {
+    foreach ($view in [Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32) {
+        $base, $rootKey = $null, $null
+        try {
+            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $view)
+            if ($view -eq [Microsoft.Win32.RegistryView]::Registry64) {
+                $lxss = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Lxss\MSI', $false)
+                if ($null -ne $lxss) {
+                    try {
+                        foreach ($value in 'InstallLocation','ProductCode','Version') {
+                            if ($lxss.GetValueNames() -ccontains $value) { return $true }
+                        }
+                    } finally { $lxss.Dispose() }
+                }
+            }
+            $rootKey = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', $false)
+            if ($null -eq $rootKey) { throw 'Machine uninstall inventory unavailable.' }
+            foreach ($name in $rootKey.GetSubKeyNames()) {
+                $key = $rootKey.OpenSubKey($name, $false)
+                try { if ([string]$key.GetValue('DisplayName') -ceq $wslPlatform.productName) { return $true } } finally { $key.Dispose() }
+            }
+        } finally { if ($null -ne $rootKey) { $rootKey.Dispose() }; if ($null -ne $base) { $base.Dispose() } }
+    }
+    return $false
+}
+function PlatformDirectory {
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $key = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion', $false)
+        try { $directory = [string]$key.GetValue('ProgramFilesDir') } finally { $key.Dispose() }
+    } finally { $base.Dispose() }
+    if (-not [IO.Path]::IsPathRooted($directory)) { throw 'Native ProgramFiles directory unavailable.' }
+    return Join-Path $directory 'WSL'
+}
+function PlatformInventory {
+    $msi = @(PlatformMsiRows)
+    $appx = @(Get-AppxPackage -AllUsers -Name $wslPlatform.appxName -ErrorAction Stop | ForEach-Object {
+        [ordered]@{ publisherId = [string]$_.PublisherId; version = [string]$_.Version; name = [string]$_.Name; fullName = [string]$_.PackageFullName }
+    })
+    $provisioned = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object { $_.DisplayName -ceq $wslPlatform.appxName } | ForEach-Object {
+        $parts = ([string]$_.PackageName).Split('_')
+        if ($parts.Count -ne 5) { throw 'Unreadable provisioned WSL identity.' }
+        [ordered]@{ publisherId = $parts[4]; version = $parts[1]; packageName = [string]$_.PackageName }
+    })
+    $vmp = [string](Get-WindowsOptionalFeature -Online -FeatureName 'VirtualMachinePlatform' -ErrorAction Stop).State
+    $inbox = [string](Get-WindowsOptionalFeature -Online -FeatureName 'Microsoft-Windows-Subsystem-Linux' -ErrorAction Stop).State
+    $directory = PlatformDirectory
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $service = $base.OpenSubKey('SYSTEM\CurrentControlSet\Services\WSLService', $false)
+        $hasService = $null -ne $service
+        if ($null -ne $service) { $service.Dispose() }
+        $legacyService = $base.OpenSubKey('SYSTEM\CurrentControlSet\Services\LxssManager', $false)
+        $hasLegacyService = $null -ne $legacyService
+        if ($null -ne $legacyService) { $legacyService.Dispose() }
+    } finally { $base.Dispose() }
+    # System32/wsl.exe is the OS install launcher, not an installed platform.
+    $reach = $hasService -or $hasLegacyService -or (Test-Path -LiteralPath $directory) -or (PlatformRegistryReach)
+    $cli = Join-Path $directory 'wslc.exe'
+    $cliVersion, $cliValid = '', $false
+    if (Test-Path -LiteralPath $cli -PathType Leaf) {
+        $item = Get-Item -LiteralPath $cli -Force
+        if (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $cli -ErrorAction Stop
+            $cliVersion = [string]$item.VersionInfo.ProductVersion
+            $cliValid = $signature.Status -eq 'Valid' -and $null -ne $signature.SignerCertificate -and $signature.SignerCertificate.Subject -ceq $wslPlatform.publisher
+        }
+    }
+    [ordered]@{ readable = $true; msi = $msi; appx = $appx; provisioned = $provisioned; vmp = $vmp; inbox = $inbox
+        installReach = [bool]$reach; cliValid = [bool]$cliValid; cliVersion = $cliVersion; cliPath = $cli }
+}
+function PlatformEffect([string]$Kind, $Prior) {
+    if ($Kind -ceq 'msi-package') {
+        $target = 'msi:' + $wslPlatform.upgradeCode
+        $desired = [ordered]@{ exists = $true; complete = $true; upgradeCode = $wslPlatform.upgradeCode
+            productName = $wslPlatform.productName; manufacturer = $wslPlatform.manufacturer; context = 4
+            provenance = $wslPlatform }
+    } else {
+        $target = 'windows-feature:VirtualMachinePlatform'
+        $desired = [ordered]@{ exists = $true; enabled = $true; provenance = @{ method = 'inbox DISM /online /enable-feature /all /norestart' } }
+    }
+    [ordered]@{ id = $Kind + ':' + $target; kind = $Kind; target = $target; prior = $Prior; desired = $desired }
+}
+function ObservePlatformEffect($Effect) {
+    if ((Get-Field $Effect 'kind') -ceq 'windows-feature') {
+        $state = [string](Get-WindowsOptionalFeature -Online -FeatureName 'VirtualMachinePlatform' -ErrorAction Stop).State
+        if ($state -cnotin @('Enabled','Disabled','EnablePending')) { throw "Unresolved VirtualMachinePlatform state: $state" }
+        return [ordered]@{ exists = $true; enabled = ($state -cne 'Disabled'); nativeState = $state; pendingReboot = ($state -ceq 'EnablePending') }
+    }
+    $inventory = PlatformInventory
+    $rows = @($inventory.msi)
+    $glue = @($inventory.appx) + @($inventory.provisioned)
+    $matchingGlue = $rows.Count -eq 1 -and
+        -not @($glue | Where-Object { $_.publisherId -cne $wslPlatform.publisherId -or $_.version -cne $rows[0].version }).Count
+    # complete here means a registered MSI identity and no conflicting glue,
+    # not configured CLI/reboot/runtime. On supported modern Windows upstream
+    # can return native success even when glue deployment is unavailable.
+    if ($rows.Count -eq 1 -and $rows[0].identityVerified -and $rows[0].context -eq 4 -and $matchingGlue) {
+        return [ordered]@{ exists = $true; complete = $true; upgradeCode = $wslPlatform.upgradeCode; productName = $wslPlatform.productName
+            manufacturer = $wslPlatform.manufacturer; context = 4; products = $rows; gluePackages = $inventory.appx; glueProvisioned = $inventory.provisioned }
+    }
+    if (-not $rows.Count -and -not $inventory.appx.Count -and -not $inventory.provisioned.Count -and -not $inventory.installReach -and $inventory.inbox -ceq 'Disabled') {
+        return [ordered]@{ exists = $false }
+    }
+    return [ordered]@{ exists = $true; complete = $false; partial = $true; inventory = $inventory }
+}
+function AssertPlatformContext {
+    if (-not $script:runIdentity.elevated) { throw 'Explicit platform mode needs a normal user shell started as administrator; no automatic elevation.' }
+    $problem = PackageContextProblem
+    if ($problem) { throw "Platform mode refused before ledger/effects: $problem" }
+    AssertBootstrapHost
+    $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+    if ([int]$os.BuildNumber -lt $wslPlatform.minimumBuild) { throw 'This direct MSI recovery supports native x64 Windows build 26100 or newer only.' }
+    $script:platformBoot = $os.LastBootUpTime.ToUniversalTime().ToString('o')
+    $script:completedPlatformId = $null
+}
+function IntroducePlatform($Effect, [scriptblock]$Deploy) {
+    $current = ObservePlatformEffect $Effect
+    if (-not (Test-EffectStateEqual $Effect.kind $Effect.prior $current)) { throw 'Platform state changed before intent; preserve/refuse.' }
+    WriteRecord 'intent' $Effect $null
+    $script:completedPlatformId = $null
+    $result = Recovering $Effect {
+        try { $native = & $Deploy }
+        catch {
+            if ($_.Exception.Data['platformCompleted'] -eq $true) { $script:completedPlatformId = $Effect.id }
+            throw
+        }
+        $script:completedPlatformId = $Effect.id
+        $observed = ObservePlatformEffect $Effect
+        if (-not (Test-EffectStateEqual $Effect.kind $Effect.desired $observed)) { throw 'Native platform call did not reach the desired observable state.' }
+        $observed.nativeExit = $native.exitCode
+        $observed.pendingReboot = ($native.exitCode -eq 3010 -or (Get-Field $observed 'pendingReboot') -eq $true)
+        $observed.boot = $script:platformBoot
+        WriteRecord 'commit' $Effect $observed
+        $script:changed++
+        return $native
+    }
+    return $result
+}
+function PlatformRestore {
+    AssertPlatformContext
+    if ($Mode -ceq 'PlatformRestore') { LockLedger }
+    $null = ReadLedger
+    if ($Mode -ceq 'PlatformRestore') { RecoverLedger -Platform }
+    $recoveryProblem = Get-PlatformRecoveryProblem $script:ledgerRecords $script:platformBoot
+    if ($null -ne $recoveryProblem) {
+        [ordered]@{ mode = $Mode; source = $manifest.source; action = 'pendingRecovery'; changed = $false; pendingReboot = $recoveryProblem.pendingReboot
+            reason = $recoveryProblem.reason; runtimeProof = 'unproven'; handoffProof = 'unproven'; removal = 'held'; recordsWritten = $script:recordsWritten } | ConvertTo-Json -Compress
+        return
+    }
+    # A successful native 3010 may expose Enabled before reboot. The boot identity
+    # keeps a second invocation from treating that same-boot prerequisite as ready.
+    if (Test-PlatformRebootWait $script:ledgerRecords $script:platformBoot) {
+        [ordered]@{ mode = $Mode; source = $manifest.source; action = 'pendingReboot'; changed = $false; pendingReboot = $true
+            runtimeProof = 'unproven'; handoffProof = 'unproven'; removal = 'held'; recordsWritten = $script:recordsWritten } | ConvertTo-Json -Compress
+        return
+    }
+    $inventory = PlatformInventory
+    $decision = Get-PlatformAction $wslPlatform $inventory
+    if ($decision.action -ceq 'refuse') { throw "Platform preserved/refused: $($decision.reason)" }
+    $pending, $changed = $false, $false
+    if ($Mode -ceq 'PlatformRestore' -and $decision.action -ceq 'install') {
+        # All bytes/signature/database identity before the first native effect.
+        $scratch = Join-Path ([IO.Path]::GetTempPath()) ('wsl-platform-' + [guid]::NewGuid().ToString('N'))
+        $null = [IO.Directory]::CreateDirectory($scratch)
+        $asset = Join-Path $scratch 'wsl.x64.msi'
+        $handle, $keepAsset = $null, $false
+        try {
+            $handle = FetchBootstrap $wslPlatform $asset
+            $null = AssertPlatformMsi $asset
+            $decision = Get-PlatformAction $wslPlatform (PlatformInventory)
+            if ($decision.action -cne 'install') { throw 'Platform changed during download/verification; preserve/refuse before first intent.' }
+            if ($decision.enableFeature) {
+                $effect = PlatformEffect 'windows-feature' @{ exists = $true; enabled = $false }
+                $effect.desired.assetPath = $asset
+                $result = IntroducePlatform $effect {
+                    $fresh = Get-PlatformAction $wslPlatform (PlatformInventory)
+                    if ($fresh.action -cne 'install' -or -not $fresh.enableFeature) { throw 'Platform changed before native feature call.' }
+                    Invoke-Native (Join-Path $env:SystemRoot 'System32\dism.exe') @('/online','/enable-feature','/featurename:VirtualMachinePlatform','/all','/norestart') 600 -AcceptedExitCodes @(0,3010) -Result -PlatformOperation
+                }
+                $pending = $result.exitCode -eq 3010 -or (ObservePlatformEffect $effect).pendingReboot
+                $changed = $true
+            }
+            if (-not $pending) {
+                $decision = Get-PlatformAction $wslPlatform (PlatformInventory)
+                if ($decision.action -cne 'install' -or $decision.enableFeature) { throw 'Platform changed before MSI intent; preserve/refuse.' }
+                $effect = PlatformEffect 'msi-package' @{ exists = $false }
+                $effect.desired.assetPath = $asset  # before-call verified source, retained if native outcome unfinished
+                $result = IntroducePlatform $effect {
+                    $fresh = Get-PlatformAction $wslPlatform (PlatformInventory)
+                    if ($fresh.action -cne 'install' -or $fresh.enableFeature) { throw 'Platform changed before native MSI call.' }
+                    Invoke-Native (Join-Path $env:SystemRoot 'System32\msiexec.exe') @('/i',$asset,'/qn','/norestart') 900 -AcceptedExitCodes @(0,3010) -Result -PlatformOperation
+                }
+                $pending = $result.exitCode -eq 3010
+                $changed = $true
+                if (-not $pending -and (Get-PlatformAction $wslPlatform (PlatformInventory)).action -cne 'preserved') {
+                    throw 'MSI identity introduced and ledgered, but fixed CLI/prerequisite configuration is incomplete; runtime unproven.'
+                }
+            }
+        } catch {
+            if ($_.Exception.Data['platformUnfinished'] -eq $true) { $keepAsset = $true }
+            throw
+        } finally {
+            if ($null -ne $handle) { $handle.Dispose() }
+            # Only this invocation's two scratch paths, never runtime/session data.
+            if (-not $keepAsset) {
+                if ([IO.File]::Exists($asset)) { [IO.File]::Delete($asset) }
+                if ([IO.Directory]::Exists($scratch)) { [IO.Directory]::Delete($scratch, $false) }
+            }
+        }
+    }
+    $action = if ($pending) { 'pendingReboot' } elseif ($changed) { 'introduced' } else { $decision.action }
+    [ordered]@{ mode = $Mode; source = $manifest.source; identity = $script:runIdentity; action = $action
+        changed = $changed; pendingReboot = $pending; runtimeProof = 'unproven'; handoffProof = 'unproven'
+        removal = 'held'; historicalSessionData = 'untouched/unowned'; recordsWritten = $script:recordsWritten } | ConvertTo-Json -Compress -Depth 5
 }
 
 # Lazy: ConvergeApps calls this only for absent apps. Present apps have no WinGet
@@ -2389,16 +2698,28 @@ function SelectedPackages {
 # Runs an inbox program ($Exe, an absolute path) with its arguments quoted for Windows (Join-NativeArguments)
 # and no shell, reading stdout and stderr asynchronously. A run past $Seconds is killed and waited for; a
 # nonzero exit fails with the end of its stderr. Returns stdout.
-function Invoke-Native([string]$Exe, [string[]]$Arguments, [int]$Seconds) {
+function Invoke-Native([string]$Exe, [string[]]$Arguments, [int]$Seconds, [int[]]$AcceptedExitCodes = @(0), [switch]$Result, [switch]$PlatformOperation) {
     $info = [Diagnostics.ProcessStartInfo]::new($Exe, (Join-NativeArguments $Arguments))
     $info.UseShellExecute, $info.RedirectStandardOutput, $info.RedirectStandardError, $info.CreateNoWindow = $false, $true, $true, $true
     $name = [IO.Path]::GetFileName($Exe)
     $process = [Diagnostics.Process]::Start($info)
     try {
         $out, $err = $process.StandardOutput.ReadToEndAsync(), $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($Seconds * 1000)) { $process.Kill(); $process.WaitForExit(); throw "$name did not finish within $Seconds s." }
+        if (-not $process.WaitForExit($Seconds * 1000)) {
+            if ($PlatformOperation) {
+                $failure = [InvalidOperationException]::new("$name has not completed within $Seconds s; process not killed, native outcome unfinished, intent/asset retained.")
+                $failure.Data['platformUnfinished'] = $true
+                throw $failure
+            }
+            $process.Kill(); $process.WaitForExit(); throw "$name did not finish within $Seconds s."
+        }
         $process.WaitForExit()
-        if ($process.ExitCode -ne 0) { throw "$name exited $($process.ExitCode): $((@($err.Result -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -Last 3) -join ' | ')" }
+        if ($process.ExitCode -notin $AcceptedExitCodes) {
+            $failure = [InvalidOperationException]::new("$name exited $($process.ExitCode): $((@($err.Result -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -Last 3) -join ' | ')")
+            if ($PlatformOperation) { $failure.Data['platformCompleted'] = $true }
+            throw $failure
+        }
+        if ($Result) { return [ordered]@{ exitCode = $process.ExitCode; stdout = $out.Result } }
         return $out.Result
     } finally { $process.Dispose() }
 }
@@ -2527,7 +2848,7 @@ function Uninstall {
     $observations = @{}
     try {
         if ($Apply -and $found) { RecoverLedger -All }
-        foreach ($id in @(LedgerIds)) { $observations[$id] = Observe @(RecordsOf $id)[0] }
+        foreach ($id in @(LedgerIds)) { $first = @(RecordsOf $id)[0]; if (-not (IsPlatformEffect $first)) { $observations[$id] = Observe $first } }
     } catch {
         throw "Uninstall refused for $($script:runIdentity.sid) (elevated: $($script:runIdentity.elevated)): $($_.Exception.Message)"
     }
@@ -2589,16 +2910,18 @@ function Uninstall {
         # A malformed id has no attempt records; it stays open (the plan already refused it).
         if ($attempt.problem -or (-not $attempt.closed -and @($attempt.records).Count)) { $open += $id; continue }
         $first = @($attempt.records)[0]
+        if (IsPlatformEffect $first) { continue }  # no privileged machine observation in ordinary Uninstall
         if (-not (Test-EffectStateEqual ([string](Get-Field $first 'kind')) (Get-Field $first 'prior') (Observe $first))) { $changedAfterClose += $id }
     }
     $answer = [ordered]@{ mode = $Mode; apply = [bool]$Apply; source = $manifest.source; identity = $script:runIdentity
         ledgerFound = $found; siloCheck = 'notPerformed'
-        scope = 'owned fonts, UI and app theme fonts, six Chromium preferences, Noctty, package trees, App Paths and terminal selection; introduced locked Appx and declared Store packages are ledgered with removal held; user data, preexisting apps, other Store dependencies and RentSsh are unowned'
+        scope = 'owned fonts, UI and app theme fonts, six Chromium preferences, Noctty, package trees, App Paths and terminal selection; introduced locked Appx/Store packages and explicit machine WSL platform/feature effects have removal held; platform state unobserved here; user data, preexisting apps, other Store dependencies and RentSsh are unowned'
         planned = @($steps | ForEach-Object { StepText $_ })
         resolutions = @($plan.resolutions | ForEach-Object { "$($_.id): $($_.resolution)" }); resumed = @($plan.resumed)
         defaultTerminal = $legacy.action
         refused = $refused; removed = $script:removed; recordsWritten = $script:recordsWritten
         ownedOpen = $open.Count; changedAfterClose = $changedAfterClose.Count
+        platformState = 'unobserved; open native effects held, validated closed provenance owns nothing'
         retained = @($ledgerDirectory, (Split-Path -Parent $terminalProvenance))
         notInLedger = [ordered]@{ nocttyShortcut = (Test-Path -LiteralPath $nocttyShortcut)
             defaultTerminalRecord = (Test-Path -LiteralPath $terminalProvenance)
@@ -2611,6 +2934,7 @@ function Uninstall {
 
 $script:runIdentity = RunIdentity
 try {
+    if ($Mode -cin @('PlatformRestore','PlatformTest')) { PlatformRestore; return }
     if ($Mode -eq 'Uninstall') { Uninstall; return }
     # RestoreTest reads the ledger without the lock or recovery; an unrecovered attempt reads as indeterminate.
     if ($Mode -eq 'RestoreTest') {

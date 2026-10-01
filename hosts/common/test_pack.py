@@ -11,6 +11,17 @@ from fontTools.pens.ttGlyphPen import TTGlyphPen
 
 import pack
 
+WSL_LOCK = {
+    "architecture": "x64", "minimumBuild": 26100, "minimumVersion": "2.9.3.0", "feature": "VirtualMachinePlatform",
+    "appxName": "MicrosoftCorporationII.WindowsSubsystemForLinux", "publisherId": "8wekyb3d8bbwe",
+    "url": "https://github.com/microsoft/WSL/releases/download/2.9.13/wsl.2.9.13.0.x64.msi",
+    "size": 367693824, "sha256": "a00b0010f802ac461aaf44374b6ecbeae4b620453a77565f31eade5737e8af55",
+    "release": "prerelease", "version": "2.9.13.0", "productCode": "{861425A4-7173-4B0D-8EC1-7A94FD333418}",
+    "upgradeCode": "{6D5B792B-1EDC-4DE9-8EAD-201B820F8E82}", "packageCode": "{10B09957-0F00-4852-B522-8E6EDB50249B}",
+    "productName": "Windows Subsystem for Linux", "manufacturer": "Microsoft Corporation", "template": "x64;1033",
+    "publisher": "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
+}
+
 PROXY = "{1D349824-21FB-46C7-ACF3-746EDC991D52}"
 # The six values nix.nix declares (CI #58 G4).
 REGISTRATION = [
@@ -25,6 +36,23 @@ REGISTRATION = [
 
 
 class CompilerTests(unittest.TestCase):
+    def test_platform_bytes_and_supported_scope(self):
+        self.assertEqual(pack.wsl_platform(WSL_LOCK), WSL_LOCK)
+        self.assertIsNone(pack.wsl_platform(None))
+        for key, value in (("architecture", "arm64"), ("minimumBuild", 19041), ("feature", "Other"),
+                           ("productCode", "bad"), ("publisher", "Other"), ("size", True), ("minimumVersion", "2.9")):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                pack.wsl_platform(dict(WSL_LOCK, **{key: value}))
+        path = self.root / "fixture.msi"
+        path.write_bytes(bytes.fromhex("d0cf11e0a1b11ae1") + b"synthetic")
+        lock = dict(WSL_LOCK, size=path.stat().st_size, sha256=pack.digest(path))
+        pack.verify_platform(lock, path)
+        with self.assertRaises(ValueError):
+            pack.verify_platform(dict(lock, size=lock["size"] + 1), path)
+        path.write_bytes(b"not MSI")
+        with self.assertRaisesRegex(ValueError, "not an MSI"):
+            pack.verify_platform(dict(lock, size=path.stat().st_size, sha256=pack.digest(path)), path)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
