@@ -201,7 +201,15 @@ jobs:
           # Every name, size and mtime under the nix volume: "nothing written" is an exact comparison.
           listing() { docker run --rm -v own-smoke-nix:/n "$image" /bin/bash -c 'cd /n && find . -printf "%p %s %T@\n" | LC_ALL=C sort | sha256sum'; }
           # The seed copies exactly the image's GC-rooted closure, so no store entry's name (after its hash) may name Xpra.
-          no_xpra_store() { if docker run --rm -v own-smoke-nix:/n "$image" /bin/ls /n/store | sed 's/^[0-9a-z]*-//' | grep -qi xpra; then fail "xpra in the $1 seeded store"; fi; }
+          # The listing is read whole first (a failed read ends the step) and must show the seeded roots; the match then
+          # runs on that text, so neither a read failure nor an early-exiting reader can pass for absence.
+          no_xpra_store() {
+            local names
+            names=$(docker run --rm -v own-smoke-nix:/n "$image" /bin/ls /n/store)
+            [[ $names == *-own-nix-roots* ]] || fail "the $1 seeded store listing has no own-nix-roots"
+            names=$(sed 's/^[0-9a-z]*-//' <<<"$names")
+            if [[ ${names,,} == *xpra* ]]; then fail "xpra in the $1 seeded store"; fi
+          }
           refuse() {
             local want=$1; shift
             if timeout 60 docker run --rm "$@" "$image" > "$d/out" 2>&1; then fail "started despite: $want"; fi
@@ -267,7 +275,13 @@ jobs:
               done
               fail "no CDP page own p$p"
             done
-            if docker top own-smoke | sed -E 's|/nix/store/[0-9a-z]{32}-|/nix/store/|g' | grep -qi xpra; then fail 'an xpra process runs'; fi
+            # The process list is read whole first and must show own-start and sshd; store hashes are dropped before the
+            # match (base32 can spell it).
+            local procs
+            procs=$(docker top own-smoke)
+            [[ $procs == *own-start* && $procs == *sshd* ]] || fail 'docker top did not list own-start and sshd'
+            procs=$(sed -E 's|/nix/store/[0-9a-z]{32}-|/nix/store/|g' <<<"$procs")
+            if [[ ${procs,,} == *xpra* ]]; then fail 'an xpra process runs'; fi
             "${ssh_cmd[@]}" 'if command -v xpra; then exit 1; fi' || fail 'xpra is on the SSH PATH'
           }
           run -e "OWN_AUTHORIZED_KEY=$(cat "$d/key.pub")" "$image"

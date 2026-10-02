@@ -175,7 +175,7 @@ let
     browser_pid=$!
     # On stop, Chromium gets SIGTERM and time to flush its profiles before the container exits.
     trap 'kill "$ssh_pid" "$nd_pid" 2>/dev/null || true; kill -TERM "$browser_pid" 2>/dev/null || true; wait "$browser_pid" 2>/dev/null || true' TERM INT
-    # Only sshd and nix-daemon are essential: either exiting ends own; a browser exit does not.
+    # sshd and nix-daemon are the essential services; either exiting ends own. The browsers stay outside, as before.
     wait -n "$ssh_pid" "$nd_pid"
   '';
   # own-only tools beside the common dev profile (which carries Nix, Git/SSH, gh, Codex, Claude and basic tools).
