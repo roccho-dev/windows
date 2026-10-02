@@ -676,13 +676,31 @@ function IsHostEffect($Effect) {
 }
 
 function OwnTaskName([string]$Target) { 'windows-own-logon-' + $Target.Substring('task:windows-own-logon:'.Length) }
+function ResolveOwnTaskTriggerUser([string]$Xml) {
+    # LogonTrigger.UserId accepts a name or SID. Resolve only the actual XML
+    # identity through Windows, never the desired/caller SID. Failure preserves
+    # the raw conflicting identity; no task or account setting is changed.
+    $document=Read-OwnTaskXml $Xml
+    $ns=[Xml.XmlNamespaceManager]::new($document.NameTable)
+    $ns.AddNamespace('t','http://schemas.microsoft.com/windows/2004/02/mit/task')
+    $nodes=@($document.SelectNodes('/t:Task/t:Triggers/t:LogonTrigger/t:UserId',$ns))
+    if ($nodes.Count -eq 1 -and $nodes[0].InnerText) {
+        try {
+            $user=$nodes[0].InnerText
+            $sid=if ($user -cmatch '^S-1-[0-9-]+\z') { [Security.Principal.SecurityIdentifier]::new($user) }
+                else { [Security.Principal.NTAccount]::new($user).Translate([Security.Principal.SecurityIdentifier]) }
+            $nodes[0].InnerText=$sid.Value
+        } catch { }  # unresolved stays different; never fabricate an identity
+    }
+    return $document.OuterXml
+}
 function ObserveOwnTask([string]$Target) {
     if (-not (Test-EffectPath 'scheduled-task' $Target)) { throw 'Invalid own Task target.' }
     try { $tasks = @(Get-ScheduledTask -TaskName (OwnTaskName $Target) -TaskPath '\' -ErrorAction Stop) }
     catch { if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { return [ordered]@{ exists = $false } }; throw }
     if ($tasks.Count -ne 1) { throw 'Native Task inventory is ambiguous.' }
     $xml = Export-ScheduledTask -TaskName (OwnTaskName $Target) -TaskPath '\' -ErrorAction Stop
-    [ordered]@{ exists = $true; descriptor = (ConvertFrom-OwnTaskXml $xml); running = ([string]$tasks[0].State -ceq 'Running') }
+    [ordered]@{ exists = $true; descriptor = (ConvertFrom-OwnTaskXml (ResolveOwnTaskTriggerUser $xml)); running = ([string]$tasks[0].State -ceq 'Running') }
 }
 function ObserveHostEffect($Effect) {
     if (-not (IsHostEffect $Effect)) { throw 'Not a supported current-user host effect.' }

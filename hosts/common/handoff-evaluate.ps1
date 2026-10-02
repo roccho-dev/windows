@@ -1890,11 +1890,16 @@ function Get-OwnTaskPolicyProblem($Policies) {
     return 'Default Restricted task execution policy blocks unsigned runtime; policy is not changed.'
 }
 
-function ConvertFrom-OwnTaskXml([string]$Text) {
+function Read-OwnTaskXml([string]$Text) {
     $xml = [Xml.XmlDocument]::new(); $xml.XmlResolver = $null
     $settings = [Xml.XmlReaderSettings]::new(); $settings.DtdProcessing = [Xml.DtdProcessing]::Prohibit; $settings.MaxCharactersInDocument = 65536
     $reader = [Xml.XmlReader]::Create([IO.StringReader]::new($Text), $settings)
     try { $xml.Load($reader) } finally { $reader.Dispose() }
+    return ,$xml
+}
+
+function ConvertFrom-OwnTaskXml([string]$Text) {
+    $xml=Read-OwnTaskXml $Text
     $ns = [Xml.XmlNamespaceManager]::new($xml.NameTable); $ns.AddNamespace('t','http://schemas.microsoft.com/windows/2004/02/mit/task')
     $get = { param($path) $node = $xml.SelectSingleNode($path,$ns); if ($node) { $node.InnerText } else { '' } }
     $other = @()
@@ -1923,8 +1928,8 @@ function ConvertFrom-OwnTaskXml([string]$Text) {
     $enabled=if ($null -eq $enabledNode) { 'true' } else { $enabledNode.InnerText }
     $runLevelNode=$xml.SelectSingleNode('/t:Task/t:Principals/t:Principal/t:RunLevel',$ns)
     $runLevel=if ($null -eq $runLevelNode) { 'LeastPrivilege' } else { $runLevelNode.InnerText }
-    if ($enabled -cne 'true' -or
-        (& $get '/t:Task/t:Triggers/t:LogonTrigger/t:UserId') -cne (& $get '/t:Task/t:Principals/t:Principal/t:UserId')) { $other += 'trigger user/enabled' }
+    if ($enabled -cne 'true') { $other += 'trigger enabled' }
+    if ((& $get '/t:Task/t:Triggers/t:LogonTrigger/t:UserId') -cne (& $get '/t:Task/t:Principals/t:Principal/t:UserId')) { $other += 'trigger user' }
     # Task Scheduler schema defaults, not this artifact's desired values. An
     # omitted setting must never fabricate StartWhenAvailable=true, etc.
     $values = [ordered]@{ MultipleInstancesPolicy = 'IgnoreNew'; DisallowStartIfOnBatteries = 'true'; StopIfGoingOnBatteries = 'true'

@@ -1525,7 +1525,7 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
     . (Join-Path $Root 'handoff-evaluate.ps1')
     $names = 'WriteRecord','IndexRecord','NewLedgerIndex','AttemptOf','RecordsOf','LedgerIds','ReadLedger','OpenAttempt',
         'IntentTemp','CleanStaging','ResolveAttempt','RecoverId','Recovering','IsPlatformEffect','IsHostEffect','Observe',
-        'ObserveFile','ObserveTree','ObserveHostEffect','ObserveOwnTask','OwnTaskName','OwnTaskEffect','OwnTaskXml','RegisterOwnTask','ConvergeOwnTask',
+        'ObserveFile','ObserveTree','ObserveHostEffect','ObserveOwnTask','ResolveOwnTaskTriggerUser','OwnTaskName','OwnTaskEffect','OwnTaskXml','RegisterOwnTask','ConvergeOwnTask',
         'HostTreeEffect','InstallHostTree','Classify','HostHash','WriteHostTemp','HostFileState','ConvergeHostBytes','HostPrefix','FileEffect','CreateOwnedFile',
         'HostUndoPlan','UndoHostEffect','HostRemove','HostLogon','AssertPlainPath','HostProfile','AssertHostRuntimeStreams',
         'OwnResume','OwnInspect','OwnInfo','OwnSshReady','SshConfigFiles','SshDeclaredCount','SshEffective','SshPath','AssertSshEffective','AssertOwnedSsh','HostSsh','Invoke-Native','QuickHttp','HostTreeReferences'
@@ -1774,7 +1774,17 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
         $nativeDefaults.Replace('<LogonTrigger><UserId>'+ $script:runIdentity.sid +'</UserId>','<LogonTrigger>'),
         $nativeDefaults.Replace('<LogonTrigger><UserId>'+ $script:runIdentity.sid +'</UserId>','<LogonTrigger><UserId>S-1-5-99</UserId>'))) {
         Must ($null -ne (Get-OwnTaskDescriptorProblem (ConvertFrom-OwnTaskXml $foreignXml))) 'explicit empty/elevated/disabled or unspecified/foreign trigger user remains refused'
+        Must ($null -ne (Get-OwnTaskDescriptorProblem (ConvertFrom-OwnTaskXml (ResolveOwnTaskTriggerUser $foreignXml)))) 'native identity observation never repairs missing/foreign or conflicting task fields'
     }
+    # Actual native identity translation, with no Task/account mutation. Only
+    # the trigger name changes; the independent principal remains its real SID.
+    $account=[Security.SecurityElement]::Escape([Security.Principal.WindowsIdentity]::GetCurrent().Name)
+    $namedXml=$xml.Replace('<LogonTrigger><Enabled>true</Enabled><UserId>'+$script:runIdentity.sid+'</UserId>',
+        '<LogonTrigger><Enabled>true</Enabled><UserId>'+$account+'</UserId>')
+    Must (Test-EffectStateEqual 'scheduled-task' $v1.desired @{exists=$true;descriptor=(ConvertFrom-OwnTaskXml (ResolveOwnTaskTriggerUser $namedXml))}) 'native actual account-name trigger resolves to independent principal SID'
+    $unknownAccount=[Security.SecurityElement]::Escape([Environment]::MachineName+'\windows-proof-absent-'+[guid]::NewGuid().ToString('N'))
+    $unknownXml=$namedXml.Replace('<UserId>'+$account+'</UserId>','<UserId>'+$unknownAccount+'</UserId>')
+    Must ($null -ne (Get-OwnTaskDescriptorProblem (ConvertFrom-OwnTaskXml (ResolveOwnTaskTriggerUser $unknownXml)))) 'unresolvable actual trigger name stays conflicting'
     Must ($null -ne (Get-OwnTaskDescriptorProblem (ConvertFrom-OwnTaskXml ($xml.Replace('<StartWhenAvailable>true</StartWhenAvailable>',''))))) 'omitted setting does not fabricate desired value'
     $policies=@('MachinePolicy','UserPolicy','CurrentUser','LocalMachine' | ForEach-Object { @{Scope=$_;ExecutionPolicy='Undefined'} })
     Must ($null -ne (Get-OwnTaskPolicyProblem ($policies + @{Scope='Process';ExecutionPolicy='Bypass'}))) 'bootstrap Process bypass never proves future task policy'
