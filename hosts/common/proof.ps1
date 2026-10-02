@@ -1836,19 +1836,50 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
         foreach ($name in 'ObserveOwnTask','RegisterOwnTask') { . ([scriptblock]::Create($ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name},$false).Extent.Text)) }
         $native=OwnTaskEffect $tree.target $script:runIdentity.sid
         Must (-not (ObserveOwnTask $native.target).exists) 'native disposable task initially absent'
-        $registered=$false
+        $registered=$false; $nativeFailure=$null; $cleanupFailure=$null
         try {
             $registered=$true; RegisterOwnTask $native
             $readback=ObserveOwnTask $native.target
-            Must ((Test-EffectStateEqual 'scheduled-task' $native.desired $readback) -and -not $readback.running) 'real native limited/logon action descriptor roundtrip, not execution proof'
-        } finally {
-            if ($registered) {
-                $readback=ObserveOwnTask $native.target
-                if ($readback.exists -and (Test-EffectStateEqual 'scheduled-task' $native.desired $readback) -and -not $readback.running) {
-                    ScheduledTasks\Unregister-ScheduledTask -TaskName (OwnTaskName $native.target) -TaskPath '\' -Confirm:$false -ErrorAction Stop
-                } elseif ($readback.exists) { throw 'Native proof task changed/running; retained, cleanup not PASS.' }
+            $matches=Test-EffectStateEqual 'scheduled-task' $native.desired $readback
+            if (-not $matches -or $readback.running) {
+                # Never print observed command/arguments/paths/SID or arbitrary
+                # XML. Compare those fields, and show only finite native metadata.
+                $descriptor=Get-Field $readback 'descriptor'
+                $equal=@{}
+                foreach ($field in 'sid','execute','arguments','directory') {
+                    $equal[$field]=((Get-Field $descriptor $field) -ceq (Get-Field $native.desired.descriptor $field))
+                }
+                $metadata=@{}
+                foreach ($field in 'delay','logonType','runLevel') {
+                    $value=[string](Get-Field $descriptor $field)
+                    $metadata[$field]=if ($value -cmatch '^(PT[0-9]+[HMS]|InteractiveToken|Password|S4U|ServiceAccount|InteractiveTokenOrPassword|LeastPrivilege|HighestAvailable)$') { $value } else { '<unexpected>' }
+                }
+                $settings=@{}
+                foreach ($field in (Get-OwnTaskSettings).Keys) {
+                    $value=[string](Get-Field (Get-Field $descriptor 'settings') $field)
+                    $settings[$field]=if ($value -cmatch '^(true|false|IgnoreNew|Parallel|Queue|StopExisting|PT[0-9]+[HMS]|[0-9]|10)$') { $value } else { '<unexpected>' }
+                }
+                Write-Host ('Native proof task readback: '+(ConvertTo-CanonicalJson @{exists=$readback.exists;running=$readback.running
+                    identityActionEqual=$equal;metadata=$metadata;settings=$settings;other=(Get-Field $descriptor 'other')}))
             }
+            Must ($matches -and -not $readback.running) 'real native limited/logon action descriptor roundtrip, not execution proof'
+        } catch {
+            $nativeFailure=$_
+        } finally {
+            try {
+                if ($registered) {
+                    $readback=ObserveOwnTask $native.target
+                    if ($readback.exists -and (Test-EffectStateEqual 'scheduled-task' $native.desired $readback) -and -not $readback.running) {
+                        ScheduledTasks\Unregister-ScheduledTask -TaskName (OwnTaskName $native.target) -TaskPath '\' -Confirm:$false -ErrorAction Stop
+                    } elseif ($readback.exists) { throw 'Native proof task changed/running; retained, cleanup not PASS.' }
+                }
+            } catch { $cleanupFailure=$_ }
         }
+        if ($nativeFailure) {
+            if ($cleanupFailure) { Write-Warning ('Native proof cleanup failure: '+$cleanupFailure.Exception.Message) }
+            throw $nativeFailure
+        }
+        if ($cleanupFailure) { throw $cleanupFailure }
         Must (-not (ObserveOwnTask $native.target).exists) 'native task removed to original absence'
     }
     "PASS host primitives PowerShell $($PSVersionTable.PSVersion); runtime/logon/Quick/authentication unproven"
