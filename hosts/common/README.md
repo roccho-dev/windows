@@ -328,8 +328,12 @@ differences and later user drift are refused. The writer neither copies a privat
 key nor writes Access credentials. Unknown/recursive Includes, multiple alias
 declarations and `Match` are refused before `ssh -G` (which otherwise could execute
 `Match exec`). The prior backup must be exact and owned for prefix undo. A client
-tree installed before the launcher existed differs from the new tree and is refused,
-never overwritten: `HostRemove` it first.
+tree or `windows-rent` configuration from before this launcher differs from the new
+desired state and is refused: never overwritten, adopted or repaired. Moving such a
+host to this version is not part of this release: a separately authorized deployment
+step first inventories its exact owned ledger records and references, then defines a
+transition scoped to those effects. `HostRemove` is not a migration step: it undoes
+every owned host effect, including the own logon Task and SSH.
 
 **Access client credential.** One G6I3 normal-user service credential serves every
 surface that uses the `windows-rent` alias (terminal `ssh`, Windows Codex Remote

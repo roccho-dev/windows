@@ -692,16 +692,11 @@ jobs:
           image="$repo:sha-${GITHUB_SHA}"
           docker tag "$repo:nix" "$image"
           docker push "$image" | tee push.log
-          # The digest this push reported, its one RepoDigest for this repository, and the registry's answer for the
-          # tag must be the same single sha256; anything else publishes no image reference.
+          # The one digest this push reported must be the image's one RepoDigest for this repository; anything else
+          # publishes no image reference. The consumer verifies the registry's digest for the tag itself (anonymously).
           pushed=$(sed -nE 's/^sha-[0-9a-f]{40}: digest: (sha256:[0-9a-f]{64}) size: [0-9]+$/\1/p' push.log)
           [ "$(printf '%s\n' "$pushed" | grep -c .)" = 1 ] || { echo 'RED: push reported no single digest' >&2; exit 1; }
           repo_digests=$(docker image inspect "$image" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep -F "$repo@" || true)
           [ "$repo_digests" = "$repo@$pushed" ] || { echo 'RED: local RepoDigest differs from the pushed digest' >&2; exit 1; }
-          token=$(curl -fsS -u "${{ github.actor }}:$GH_TOKEN" "https://ghcr.io/token?scope=repository:roccho-dev/windows-rent:pull" | jq -r .token)
-          remote=$(curl -fsSI -H "Authorization: Bearer $token" \
-            -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
-            "https://ghcr.io/v2/roccho-dev/windows-rent/manifests/sha-${GITHUB_SHA}" | tr -d '\r' | sed -nE 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: (sha256:[0-9a-f]{64})$/\1/p')
-          [ "$remote" = "$pushed" ] || { echo 'RED: registry tag digest differs from the pushed digest' >&2; exit 1; }
           echo "image=$repo@$pushed" >> "$GITHUB_OUTPUT"
           echo "$repo@$pushed" >> "$GITHUB_STEP_SUMMARY"
