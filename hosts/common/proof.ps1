@@ -3665,3 +3665,6 @@ if ($g4.status -cne 'measured' -or (Get-Field $g4 'gate') -cne 'pass' -or $g4.st
     appPathsLaunch = $appPathsLaunch
     platform = $platformAssetProof; platformRuntime = 'unproven'; platformInstallation = 'notPerformed'; platformRemoval = 'held'
     scope = 'current-user owned fonts, Noctty, SSH client and locked packages (AutoHotkey ZIP and Chromium 7z with its font seed: install, ownership, its App Paths registration' + $(if ($appPathsLaunch -ceq 'proven') { ' and its resolution by ShellExecute' } else { '; App Paths launch unproven on this elevated runner, VM S7 required' }) + ', first run on scratch profiles, Uninstall) on an elevated Windows Server runner with Windows Terminal 1.23; not Restore (activation, package view, rollback), a clean unelevated Windows 11 user, Chromium on the default profile or started from Win+R itself, default-terminal handoff, real-host UX or a Cloudflare connection' } | ConvertTo-Json
+# All expected failing children were checked above; the completed proof owns
+# its success exit instead of inheriting the last negative child's status.
+exit 0
