@@ -1576,6 +1576,9 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
     Must ((Get-OwnContainerAction $contract $container) -ceq 'start') 'actual native inspect shape'
     $container.Mounts = @($container.Mounts[0]); Refused { Get-OwnContainerAction $contract $container } '*accepted three volumes*'
     $container.Mounts = @($contract.volumes | ForEach-Object { @{Type='volume';Name=$_.name;Destination=$_.destination;ReadWrite=$true} })
+    # Native JSON snapshots are separate objects. Do not resolve OwnResume's
+    # dynamically scoped $container and mutate its first snapshot in the mock.
+    $script:inspectFixture = $container
     $script:calls = @(); $script:inspects = 0; $script:sessionRunning = $false; $script:race = 'running'
     $script:sessionName=$contract.session; $script:cold='correct'; $script:defaults=0
     $resumeRuntime = $false
@@ -1592,12 +1595,12 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
             }
             $script:inspects++
             if ($script:inspects -ge 2) {
-                if ($script:race -ceq 'replace') { $container.Id = 'b' * 64 }
-                if ($script:race -ceq 'running') { $container.State = @{Running=$true;Status='running'} }
+                if ($script:race -ceq 'replace') { $script:inspectFixture.Id = 'b' * 64 }
+                if ($script:race -ceq 'running') { $script:inspectFixture.State = @{Running=$true;Status='running'} }
             }
-            return '[' + ($container | ConvertTo-Json -Depth 12 -Compress) + ']'
+            return '[' + ($script:inspectFixture | ConvertTo-Json -Depth 12 -Compress) + ']'
         }
-        if ($Arguments -contains 'start') { $container.State = @{Running=$true;Status='running'}; return '' }
+        if ($Arguments -contains 'start') { $script:inspectFixture.State = @{Running=$true;Status='running'}; return '' }
         return ''
     }
     $cold = OwnResume -Test
