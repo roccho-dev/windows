@@ -1632,9 +1632,19 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
         identityfile=@('~/.ssh/id_ed25519_windows_own');userknownhostsfile=@('~/.ssh/known_hosts_windows_own')}
     AssertSshEffective $values 'g6i3-own' '127.0.0.1' (Join-Path $profile '.ssh\id_ed25519_windows_own') (Join-Path $profile '.ssh\known_hosts_windows_own') '' $profile
     $master=Join-Path $profile '.ssh\config'; $backup=Join-Path $profile '.ssh\config.before-windows-rent'
+    $include='Include windows-rent/config windows-own/config'
+    HostPrefix $master $backup $include
+    Must ([IO.File]::ReadAllText($master) -ceq ($include+"`n") -and -not (Test-Path -LiteralPath $backup)) 'absent SSH master is created without a backup'
+    UndoHostEffect (HostUndoPlan @(OpenAttempt ('file-created:'+$master.ToUpperInvariant())))
+    Must (-not (Test-Path -LiteralPath $master)) 'created SSH master undo returns original absence'
+    [IO.File]::WriteAllBytes($master,[byte[]]@())
+    HostPrefix $master $backup $include
+    UndoHostEffect (HostUndoPlan @(OpenAttempt ('prefix-inserted:'+$master.ToUpperInvariant())))
+    Must ((Get-Item -LiteralPath $master).Length -eq 0) 'empty preexisting master prefix undo returns exact empty bytes'
+    UndoHostEffect (HostUndoPlan @(OpenAttempt ('file-created:'+$backup.ToUpperInvariant())))
+    Must (-not (Test-Path -LiteralPath $backup)) 'empty baseline backup undo returns original absence'
     $original=[Text.UTF8Encoding]::new($false).GetBytes("Host nixos-vm`n  HostName 100.124.250.91`n")
     [IO.File]::WriteAllBytes($master,$original)
-    $include='Include windows-rent/config windows-own/config'
     # Simulate interruption after the durable backup, before prefix intent.
     ConvergeHostBytes $backup $original
     $prefixId='prefix-inserted:'+$master.ToUpperInvariant()

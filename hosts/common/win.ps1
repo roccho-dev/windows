@@ -719,7 +719,7 @@ function ConvergeOwnTask($Selected) {
     if ($attempt.problem) { throw $attempt.problem }
     $current = ObserveHostEffect $Selected
     if ($current.exists -and (Get-Field $current 'running')) { throw 'Owned Task is running; no switch or deletion.' }
-    $open = if (-not $attempt.closed) { @($attempt.records) } else { @() }
+    $open = @(if (-not $attempt.closed) { $attempt.records })
     if ($open.Count) {
         $effect = $open[0]
         $class = Get-EffectClass $null $current '' $null $attempt
@@ -828,7 +828,7 @@ function ConvergeHostBytes([string]$Path, [byte[]]$Bytes) {
 }
 function HostPrefix([string]$Config, [string]$Backup, [string]$Line, [switch]$CheckOnly) {
     AssertPlainPath $Config; AssertPlainPath $Backup
-    $bytes = if ((ObserveFile $Config).exists) { [IO.File]::ReadAllBytes($Config) } else { [byte[]]@() }
+    [byte[]]$bytes = @(if ((ObserveFile $Config).exists) { [IO.File]::ReadAllBytes($Config) })
     $text = [Text.UTF8Encoding]::new($false,$true).GetString($bytes)
     if ($text.StartsWith($Line + "`n") -or $text.StartsWith($Line + "`r`n")) { return }
     if ($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191) { throw 'SSH master config has a BOM; preserved.' }
