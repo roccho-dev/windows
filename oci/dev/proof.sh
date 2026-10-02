@@ -85,13 +85,13 @@ jev_proof() {
   prod_init=$(readlink -f "$profile/bin/jev-age-init")
   prod_ops=$(readlink -f "$profile/bin/ops-jev")
   for raw in sops age age-keygen jev; do test ! -e "$profile/bin/$raw"; done
-  sed -E 's/^[[:space:]]*//' "$prod_launch" | grep -qxF "envs_remote=https://github.com/roccho-dev/envs"
-  sed -E 's/^[[:space:]]*//' "$prod_launch" | grep -qxF "apps_remote=https://github.com/roccho-dev/apps"
-  sed -E 's/^[[:space:]]*//' "$prod_launch" | grep -qxF "identity=/work/repos/.auth/roccho-dev/age/oci-dev.key"
-  sed -E 's/^[[:space:]]*//' "$prod_init" | grep -qxF "identity=/work/repos/.auth/roccho-dev/age/oci-dev.key"
-  sed -E 's/^[[:space:]]*//' "$prod_ops" | grep -qxF "envs_remote=https://github.com/roccho-dev/envs"
-  sed -E 's/^[[:space:]]*//' "$prod_ops" | grep -qxF "ops_remote=https://github.com/roccho-dev/ops"
-  sed -E 's/^[[:space:]]*//' "$prod_ops" | grep -qxF "identity=/work/repos/.auth/roccho-dev/age/oci-dev.key"
+  sed -E 's/^[[:space:]]*//' "$prod_launch" | grep -xF "envs_remote=https://github.com/roccho-dev/envs" >/dev/null
+  sed -E 's/^[[:space:]]*//' "$prod_launch" | grep -xF "apps_remote=https://github.com/roccho-dev/apps" >/dev/null
+  sed -E 's/^[[:space:]]*//' "$prod_launch" | grep -xF "identity=/work/repos/.auth/roccho-dev/age/oci-dev.key" >/dev/null
+  sed -E 's/^[[:space:]]*//' "$prod_init" | grep -xF "identity=/work/repos/.auth/roccho-dev/age/oci-dev.key" >/dev/null
+  sed -E 's/^[[:space:]]*//' "$prod_ops" | grep -xF "envs_remote=https://github.com/roccho-dev/envs" >/dev/null
+  sed -E 's/^[[:space:]]*//' "$prod_ops" | grep -xF "ops_remote=https://github.com/roccho-dev/ops" >/dev/null
+  sed -E 's/^[[:space:]]*//' "$prod_ops" | grep -xF "identity=/work/repos/.auth/roccho-dev/age/oci-dev.key" >/dev/null
   if grep -qE '^[[:space:]]*(apps_remote|port|host)=' "$prod_ops"; then echo 'ops-jev carries apps constants' >&2; return 1; fi
   if grep -qE '^[[:space:]]*set -(x|o xtrace)' "$prod_launch" "$prod_init" "$prod_ops"; then echo 'a jev tool enables xtrace' >&2; return 1; fi
 
