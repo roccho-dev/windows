@@ -1,5 +1,11 @@
 { pkgs, source }:
 let
+  # Read-only projection: the remote owner changes the accepted image/mount binding.
+  # Windows never writes that source or depends on the retired Xpra fields.
+  ownBinding = builtins.fromJSON (builtins.readFile ../own/bindings/G6I3.json);
+  ownSpec = builtins.fromJSON (builtins.readFile ../own/spec.json);
+  nocttyLaunch = { session = "wslc-cli-resta"; container = "windows-own";
+    shell = "/bin/sh"; windowSaveState = "never"; };
   # One selection, reused by Linux and the Windows compiler. The existing
   # nixpkgs lock owns font versions and upstream content hashes.
   choices = [
@@ -181,8 +187,7 @@ let
       fontFamily = "PlemolJP Console NF";
       # Ordinary windows/tabs enter this existing normal-user OCI. Handoff
       # adopts the caller's PTY instead. No session/container is started here.
-      launch = { session = "wslc-cli-resta"; container = "windows-own";
-        shell = "/bin/sh"; windowSaveState = "never"; };
+      launch = nocttyLaunch;
       # The HKCU String values the default-terminal handoff needs, as the vendor registration
       # wrote them on CI #58 (G4) without its own bookkeeping and descriptions; {install} is
       # %LOCALAPPDATA%\Programs\noctty-<version>. win.ps1 derives the keys to create below the
@@ -197,6 +202,17 @@ let
       ];
     };
     cloudflared.version = cloudflaredVersion;
+    ownResume = {
+      inherit (ownBinding) expectHost container hostPort image;
+      session = nocttyLaunch.session;
+      volumes = [
+        { name = ownBinding.volume; destination = ownSpec.stateMount; }
+        { name = ownBinding.workVolume; destination = ownSpec.workMount; }
+        { name = ownBinding.nixVolume; destination = ownSpec.nixMount; }
+      ];
+      ssh = { alias = "g6i3-own"; identity = ".ssh/id_ed25519_windows_own";
+        knownHosts = ".ssh/known_hosts_windows_own"; };
+    };
     inherit wingetBootstrap wslPlatform;
     packages = map (lock: lock // { inventory = "${inventory lock}"; }) packageLocks;
     # The desktop UI font face: the family of this role, set face-only in the six Win32 UI font slots

@@ -315,14 +315,135 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RentSsh 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RentSshTest <same arguments>  # fail on drift
 ```
 
-It installs the client under `LocalAppData\Programs\cloudflared-<version>`,
-writes `%USERPROFILE%\.ssh\windows-rent\{config,known_hosts}` (host `windows-rent`,
-`ProxyCommand ... access ssh`, `HostKeyAlias`, `StrictHostKeyChecking yes`), and
-makes `Include windows-rent/config` the first line of `%USERPROFILE%\.ssh\config`
-so Windows OpenSSH and Codex Remote SSH resolve the alias. The prior bytes of that
-file stay below the line and are kept once as `config.before-windows-rent`; it
-refuses a byte-order mark, an Include elsewhere, or an existing backup. Access
-credentials are never written here.
+On **G6I3, as its normal user outside a packaged app**, it installs the client under
+`LocalAppData\Programs\cloudflared-<version>` and converges only absent owned SSH
+objects. `%USERPROFILE%\.ssh\windows-rent\{config,known_hosts}` uses the same
+`windows-rent` alias, `ProxyCommand ... access ssh`, `HostKeyAlias` and strict host
+key checking. A fresh master gets `Include windows-rent/config windows-own/config`
+first; the previous bytes remain below it and in the owned
+`config.before-windows-rent`. Existing equivalent objects are not adopted, foreign
+differences and later user drift are refused. The writer neither copies a private
+key nor writes Access credentials. Unknown/recursive Includes, multiple alias
+declarations and `Match` are refused before `ssh -G` (which otherwise could execute
+`Match exec`). The prior backup must be exact and owned for prefix undo.
+
+`OwnSsh` / `OwnSshTest` handle only the existing local **g6i3-own** alias:
+127.0.0.1:2223, dev, `~/.ssh/id_ed25519_windows_own`,
+`~/.ssh/known_hosts_windows_own`, strict key checking. An equivalent existing alias
+is left untouched, including absent optional `IdentitiesOnly`/`UpdateHostKeys`
+settings. A fresh fragment requires an explicitly supplied public host key; the
+OCI Linux private-key path is never used as a Windows identity. The unrelated
+`nixos-vm` alias is preserved. The existing native Windows OpenSSH client is used;
+if it is missing the adapter refuses, rather than adding another distribution.
+
+### G6I3 host recovery (#8 / #14)
+
+This slice reuses the seven common source files and the single CI distribution.
+The remote owner continues to write `hosts/own/spec.json` and
+`hosts/own/bindings/G6I3.json`. Nix reads only their needed nonsecret host/container,
+image, port and three-volume fields into the artifact. It does not require Xpra
+fields or write another binding. A later accepted remote binding produces a fresh
+artifact; the legacy home-only container is never accepted for logon activation.
+
+```text
+repo
+  hosts/common/{nix.nix,pack.py,test_pack.py,handoff-evaluate.ps1,win.ps1,proof.ps1,README.md}
+  hosts/own/{spec.json,bindings/G6I3.json}                 read-only build inputs
+CI windows-dist.zip                                     same release checksum
+  existing root scripts / manifest / fonts / payload
+  host-runtime/
+    win.ps1                                             same production script
+    handoff-evaluate.ps1                                 same pure evaluator
+    package-view.ps1                                    same context reader
+    manifest.json                                      generated subset/contract
+installed %LOCALAPPDATA%\Programs\windows-host-<source40> exactly these four files
+native Task windows-own-logon-<current SID>
+  Limited / InteractiveToken / this user's Logon + 30s / one finite action
+  powershell.exe -NoProfile -NonInteractive -File "<stable>\win.ps1" -Mode OwnResume
+```
+
+The full artifact inventories all four runtime files, including its generated
+manifest. The subset inventories the three identical scripts, permits only
+`OwnResume` / `OwnResumeTest` and rejects extra/missing/case-mismatched files before
+host operations. Its installed four-file snapshot must match a committed owned
+tree, including the contract manifest. No fonts/Noctty payload is duplicated, and
+no task depends on a worktree or download directory. This integrity check is not
+a signature or a second trust root.
+
+```powershell
+# Read-only: cold storage is reported, never opened by Test.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode OwnResumeTest
+# Enable only after accepted remote adoption, Running target and strict local SSH.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode OwnLogon
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode OwnLogonTest
+# Explicit scoped recovery/removal; ordinary Uninstall holds these host effects.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode HostRemove
+# Approved loopback origin must already serve HTTP. Foreground temporary public URL.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode QuickHttp -Origin http://127.0.0.1:8080/
+```
+
+`OwnResume` requires the real G6I3 normal user's existing default
+`%LOCALAPPDATA%\wslc\sessions\wslc-cli-resta\storage.vhdx`, no custom WSLC settings,
+native WSLC3 and existing Windows SSH identity/known-host files. With no live named
+session it uses the supported native default resolution to reopen that already
+guarded storage; missing storage is never created. Starting its Docker daemon may
+activate other stored restart policies; the adapter never directly starts another
+container. It inspects the exact existing `windows-own` image, three named writable
+volumes and loopback SSH port using the native WSLC schema. It starts an exited
+target at most once, by freshly inspected ID, then checks Running and strict local
+SSH. Replacement, transient state, exit/start failure or any mismatch is reported;
+there is no pull/create/replace/retry, legacy X100 repair, bridge change or volume
+cleanup. Recreated accepted targets are guarded by binding, not an obsolete ID.
+
+Any preexisting unowned Task, even an equivalent one, refuses activation before
+runtime writes. Task updates stage and verify the new runtime first. Write-ahead task records bind
+each version to the immediately committed old descriptor while keeping the initial
+absent baseline. Failed native registration is reobserved: exact old remains
+pending, exact new is recorded with failure still reported, unknown holds both
+runtimes. Retry uses the same pending transition. Obsolete runtimes go only after
+a confirmed switch, with no native Task/SSH reference or running process. Scoped
+undo deletes only an exact owned descriptor and returns to original absence;
+it never resurrects an obsolete action. Shared SSH master bytes return before their
+owned backup is removed. Changed/missing backups, foreign state and unknown native
+outcomes are retained, not reported as cleanup success.
+
+Task files are copied as new default-stream bytes; source Zone.Identifier is not
+carried and installed alternate streams refuse activation. Task policy checks
+the actual Windows PowerShell 5.1 executable's
+MachinePolicy/UserPolicy/CurrentUser/LocalMachine, ignoring a bootstrap process's
+Bypass. Restricted/AllSigned/unknown policy refuses; no policy or registry changes
+are made. The maintainer's RemoteSigned policy is compatible, but a default
+Restricted clean OS is not thereby proven recoverable. Task descriptor registration
+does not prove execution, cold VM recovery or invisible UI; Noctty delegation may
+show a console window. Actual logon/reboot/UX remains a host acceptance gate.
+
+Quick uses pinned **2026.6.1** with exactly
+`tunnel --config= --no-autoupdate --url <explicit loopback HTTP origin>`. Empty
+config bypasses user YAML without changing files or HOME. Any nonempty `TUNNEL_*`
+environment causes refusal before launch; values are not logged, the parent
+environment is unchanged, and no extra flags/credentials are forwarded. Named,
+HelloWorld and Bastion environment modes therefore cannot replace the requested
+origin. The temporary HTTP tunnel is foreground only and ends when its process
+ends. It is not SSH, a permanent service or an authentication substitute. The user
+approved 127.0.0.1:8080; the observed host currently has no listener there, so no
+public Quick endpoint has been established by this slice.
+
+| Gate | CI evidence | Live acceptance / owner |
+| --- | --- | --- |
+| Artifact / four-file runtime | compiler subset/inventory; native early refusals; default-stream copy | trusted exact CI archive before application |
+| Task lifecycle | production old/new/unknown failure, version chain, undo; disposable native descriptor register/export/remove | final remote adoption, real logon/reboot, cold WSLC behavior and console UX |
+| SSH configuration | production prefix backup/interruption/drift/undo; existing local alias compatibility | local g6i3-own strict SSH and Codex after logon; host→rent Access permitted/denied behavior |
+| Quick | fixed argv and environment/origin negatives; no publication | approved existing HTTP response and actual temporary public response |
+| Tail retirement | no stop/uninstall in source or CI | actual noninteractive **rentR→G6I3→own OCI Nix gh** alternative route plus required SSH/Codex/reboot paths |
+
+Permanent Cloudflare/OCI configuration remains remote-owned; credential/policy
+authority remains envs. Access browser login in an interactive test does not prove
+unattended rentR authentication. No Access login is run from the logon Task and no
+token is stored in its XML/manifest. Source completion, host application and issue
+closure are distinct: #8/#14 cannot close from these fixtures alone. Tail removal
+waits for the active own/rent dependency proofs. The historical `nixos-vm` SSH
+stanza stays byte-for-byte untouched; its reach is neither claimed nor an added
+acceptance requirement for this slice.
 
 ## Owned fonts and the effect ledger
 
@@ -728,11 +849,12 @@ closes the attempt from the machine's state. A record that parses but is invalid
 is never removed: stop and investigate.
 **Stale lock.** A power loss can also leave `ledger\.lock`, and every writer then stops with "Another run holds the effect ledger lock"; delete that one file by hand only when no `win.ps1` (`powershell.exe`) process is running.
 
-**#14 (RentSsh).** The ledger owns only what it created (prior absent), except a UI
-font face, whose slot always holds one (above). A
-`prefix-inserted` or `file-replaced` effect cannot be moved to a new version by
-undo-then-rewrite, because the restored prior classifies as `preexisting-*`; #14
-must define an explicit transition record first.
+**#14 scoped host objects.** Existing file/tree and prefix kinds own new SSH
+objects and the exact backed-up master prefix. Only `scheduled-task` adds finite
+version transitions, with the original absent baseline. Rebinding a changed owned
+SSH leaf is refused until explicit scoped removal; there is no overwrite of user
+configuration or general update framework. Ordinary `Uninstall` reports open host
+effects held/unobserved and directs their owner to `HostRemove`.
 
 The ZIP checksum binds transported bytes. The embedded inventory detects
 post-extraction corruption, not publisher authenticity. The manifest records
