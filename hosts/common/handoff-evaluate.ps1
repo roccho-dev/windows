@@ -1123,12 +1123,12 @@ function Test-TargetOverlap($First, $Other) {
 
 # Why the temporary path an intent names (field temp, named before it exists) is not
 # one only that intent could have made, or $null when it is absent or valid: exactly
-# <target>.<guid32>.tmp for a file-created file, or <target>.<guid32>.staging for a
+# <target>.<guid32>.tmp for a created file, prefix replacement or preference, or <target>.<guid32>.staging for a
 # tree-extracted extraction directory, beside its target. Other kinds name none.
 function Get-IntentTempProblem($Record) {
     $temp, $target = (Get-Field $Record 'temp'), [string](Get-Field $Record 'target')
     if ($null -eq $temp) { return $null }
-    $suffix = switch -CaseSensitive ([string](Get-Field $Record 'kind')) { 'file-created' { 'tmp' } 'pref-value' { 'tmp' } 'tree-extracted' { 'staging' } }
+    $suffix = switch -CaseSensitive ([string](Get-Field $Record 'kind')) { 'file-created' { 'tmp' } 'prefix-inserted' { 'tmp' } 'pref-value' { 'tmp' } 'tree-extracted' { 'staging' } }
     if (-not $suffix) { return "A $(Get-Field $Record 'kind') intent names no temporary path." }
     if ($temp -isnot [string] -or $temp -cnotmatch ('^' + [regex]::Escape($target) + '\.[0-9a-f]{32}\.' + $suffix + '\z')) {
         return "The temporary path is not $target.<guid32>.$suffix."

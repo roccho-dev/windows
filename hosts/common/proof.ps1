@@ -1637,8 +1637,26 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
     $include='Include windows-rent/config windows-own/config'
     # Simulate interruption after the durable backup, before prefix intent.
     ConvergeHostBytes $backup $original
-    HostPrefix $master $backup $include
     $prefixId='prefix-inserted:'+$master.ToUpperInvariant()
+    $prefixed=[byte[]]([Text.UTF8Encoding]::new($false).GetBytes($include+"`n")+$original)
+    $prefixEffect=@{id=$prefixId;kind='prefix-inserted';target=$master
+        prior=@{exists=$true;sha256=(HostHash $original);backup=$backup}
+        desired=@{exists=$true;sha256=(HostHash $prefixed);line=$include}}
+    $prefixTemp=$master+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
+    foreach ($invalidTemp in @($backup+'.'+[guid]::NewGuid().ToString('N')+'.tmp',$master+'.invalid.tmp')) {
+        Must ($null -ne (Get-IntentTempProblem @{kind='prefix-inserted';target=$master;temp=$invalidTemp})) 'prefix temporary path must bind exact target and nonce'
+    }
+    Must ($null -ne (Get-IntentTempProblem @{kind='registry-value';target=$master;temp=$prefixTemp})) 'unsupported kinds cannot name a temporary file'
+    WriteRecord 'intent' $prefixEffect $null $prefixTemp
+    WriteHostTemp $prefixTemp $prefixed
+    $unnamedTemp=$master+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
+    WriteHostTemp $unnamedTemp $original
+    RecoverId $prefixId
+    Must ((AttemptOf $prefixId).closed -and @(RecordsOf $prefixId)[-1].phase -ceq 'void' -and
+        -not (Test-Path -LiteralPath $prefixTemp) -and (Test-Path -LiteralPath $unnamedTemp) -and
+        (HostHash ([IO.File]::ReadAllBytes($master))) -ceq (HostHash $original)) 'interrupted prefix before replacement voids and cleans only its named temp'
+    [IO.File]::Delete($unnamedTemp)
+    HostPrefix $master $backup $include
     Must (@(OpenAttempt $prefixId).Count -eq 2 -and [IO.File]::ReadAllText($master).StartsWith($include)) 'interrupted backup creation resumes prefix with original bytes'
     $plan=HostUndoPlan @(OpenAttempt $prefixId)
     [IO.File]::AppendAllText($master,"# later user change`n")
@@ -1651,6 +1669,14 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
     [IO.File]::WriteAllBytes($backup,$original)
     UndoHostEffect (HostUndoPlan @(OpenAttempt $prefixId))
     Must ((HostHash ([IO.File]::ReadAllBytes($master))) -ceq (HostHash $original)) 'real prefix undo restores exact unrelated alias bytes'
+    $prefixTemp=$master+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
+    WriteRecord 'intent' $prefixEffect $null $prefixTemp
+    WriteHostTemp $prefixTemp $prefixed
+    [IO.File]::WriteAllBytes($master,$prefixed)
+    RecoverId $prefixId
+    Must (@(OpenAttempt $prefixId)[-1].phase -ceq 'commit' -and -not (Test-Path -LiteralPath $prefixTemp)) 'interrupted applied prefix confirms and cleans its named temp'
+    UndoHostEffect (HostUndoPlan @(OpenAttempt $prefixId))
+    Must ((HostHash ([IO.File]::ReadAllBytes($master))) -ceq (HostHash $original)) 'recovered prefix undo preserves original baseline'
     UndoHostEffect (HostUndoPlan @(OpenAttempt ('file-created:'+$backup.ToUpperInvariant())))
     foreach ($directive in 'Match exec anything','Match=exec anything','Include=unknown') {
         [IO.File]::WriteAllBytes($master,$original); [IO.File]::AppendAllText($master,$directive+"`n")
