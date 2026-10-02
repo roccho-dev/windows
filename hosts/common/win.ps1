@@ -848,7 +848,7 @@ function HostPrefix([string]$Config, [string]$Backup, [string]$Line, [switch]$Ch
     Recovering $effect {
         WriteHostTemp $temp $desiredBytes
         if (-not (Test-EffectStateEqual 'prefix-inserted' $effect.prior (ObserveFile $Config))) { throw 'SSH config changed before prefix replacement.' }
-        [IO.File]::Replace($temp,$Config,$null)
+        [IO.File]::Replace($temp,$Config,[NullString]::Value)
         WriteRecord 'commit' $effect (ObserveFile $Config)
     }
 }
@@ -1063,7 +1063,7 @@ function UndoHostEffect($Plan) {
             try {
                 WriteHostTemp $temp $bytes
                 if (-not (Test-EffectStateEqual 'prefix-inserted' $Plan.current (ObserveFile $effect.target))) { throw 'SSH master changed before restoring prior bytes.' }
-                [IO.File]::Replace($temp,$effect.target,$null)
+                [IO.File]::Replace($temp,$effect.target,[NullString]::Value)
             } finally { if (Test-Path -LiteralPath $temp -PathType Leaf) { [IO.File]::Delete($temp) } }
         }
         'file-created' { [IO.File]::Delete($effect.target) }
