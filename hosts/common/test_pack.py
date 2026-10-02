@@ -36,6 +36,43 @@ REGISTRATION = [
 
 
 class CompilerTests(unittest.TestCase):
+    OWN = {"expectHost": "G6I3", "container": "windows-own", "hostPort": 2223,
+           "image": "ghcr.io/roccho-dev/windows-own@sha256:" + "6" * 64,
+           "session": "wslc-cli-resta", "volumes": [
+               {"name": "windows-own-home", "destination": "/home/dev"},
+               {"name": "windows-own-work", "destination": "/work/repos"},
+               {"name": "windows-own-nix", "destination": "/nix"}],
+           "ssh": {"alias": "g6i3-own", "identity": ".ssh/id_ed25519_windows_own",
+                   "knownHosts": ".ssh/known_hosts_windows_own"}}
+
+    def test_resume_projection_and_installed_subset(self):
+        launch = {"session": "wslc-cli-resta", "container": "windows-own"}
+        self.assertEqual(pack.own_resume(self.OWN, launch), self.OWN)
+        for change in ({"expectHost": "PC7337"}, {"hostPort": True}, {"image": "latest"},
+                       {"volumes": self.OWN["volumes"][:1]}, {"session": "other"},
+                       {"ssh": {"identity": "/work/repos/private"}}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                pack.own_resume(dict(self.OWN, **change), launch)
+        fonts = self.payload()
+        noctty, cloudflared, choices, scripts = self.inputs()
+        selected = json.loads(choices.read_text())
+        selected["ownResume"] = self.OWN
+        choices.write_text(json.dumps(selected))
+        pack.distribution(fonts, noctty, cloudflared, choices, scripts, "a" * 40, self.root / "resume")
+        with zipfile.ZipFile(self.root / "resume/windows-dist.zip") as z:
+            manifest = json.loads(z.read("manifest.json"))
+            runtime = json.loads(z.read("host-runtime/manifest.json"))
+            self.assertEqual(runtime["contract"], self.OWN)
+            self.assertEqual(set(runtime["files"]), {"win.ps1", "handoff-evaluate.ps1", "package-view.ps1"})
+            self.assertEqual(set(manifest["ownResume"]["files"]), set(runtime["files"]) | {"manifest.json"})
+            for name in runtime["files"]:
+                self.assertEqual(z.read("host-runtime/" + name), z.read(name))
+                self.assertEqual(manifest["files"]["host-runtime/" + name], runtime["files"][name])
+            self.assertIn("host-runtime/manifest.json", manifest["files"])
+        # A later accepted image is projected; the old image is not a permanent authority.
+        next_binding = dict(self.OWN, image=self.OWN["image"].replace("6" * 64, "7" * 64))
+        self.assertEqual(pack.own_resume(next_binding, launch)["image"], next_binding["image"])
+
     def test_noctty_existing_session_selection(self):
         launch = {"session": "wslc-cli-resta", "container": "windows-own", "shell": "/bin/sh", "windowSaveState": "never"}
         self.assertEqual(pack.noctty_launch(launch), launch)

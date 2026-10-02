@@ -586,6 +586,7 @@ function Get-CssFamilies([string]$Value) { @($Value.Split(',') | ForEach-Object 
 # True for an absolute file path, an HKCU key when $Kind is a registry kind, winmetrics:<slot> for ui-font-face, or
 # codex-config:desktop.<theme> for app-theme-fonts.
 function Test-EffectPath([string]$Kind, $Target) {
+    if ($Kind -ceq 'scheduled-task') { return ($Target -is [string] -and $Target -cmatch '^task:windows-own-logon:S-1-5-[0-9-]+\z') }
     if ($Kind -ceq 'msi-package') { return $Target -ceq 'msi:{6D5B792B-1EDC-4DE9-8EAD-201B820F8E82}' }
     if ($Kind -ceq 'windows-feature') { return $Target -ceq 'windows-feature:VirtualMachinePlatform' }
     if ($Kind -ceq 'appx-package') { return ($Target -is [string] -and $Target -cmatch '^appx:[A-Za-z0-9][A-Za-z0-9.-]*_[a-z0-9]{13}\z') }
@@ -635,6 +636,10 @@ function Get-EffectStateProblem([string]$Kind, $State, [string]$Role) {
     if ($exists -isnot [bool]) { return "$Role.exists is not a boolean." }
     if (-not $exists) { return $null }
     switch ($Kind) {
+        'scheduled-task' {
+            $problem = Get-OwnTaskDescriptorProblem (Get-Field $State 'descriptor')
+            if ($problem) { return "$Role task: $problem" }
+        }
         'registry-value' {
             if ((Get-Field $State 'type') -cnotin @('String', 'ExpandString', 'MultiString', 'DWord', 'QWord', 'Binary')) {
                 return "$Role.type is not a registry value type."
@@ -689,6 +694,7 @@ function Test-EffectStateEqual([string]$Kind, $Expected, $Actual) {
     if ($e -isnot [bool] -or $a -isnot [bool] -or $e -ne $a) { return $false }
     if (-not $e) { return $true }
     switch ($Kind) {
+        'scheduled-task' { return (ConvertTo-CanonicalJson (Get-Field $Expected 'descriptor')) -ceq (ConvertTo-CanonicalJson (Get-Field $Actual 'descriptor')) }
         'registry-value' {
             $want, $have = (Get-Fields $Expected @('type', 'data')), (Get-Fields $Actual @('type', 'data'))
             return ([string]$want.type -ceq [string]$have.type -and
@@ -739,7 +745,7 @@ function Get-EffectRecordProblem($Record) {
     $phase = $fields.phase
     if ($phase -isnot [string] -or $phase -cnotin @('intent', 'commit', 'void', 'undone')) { return 'phase is not intent, commit, void or undone.' }
     $kind = $fields.kind
-    if ($kind -isnot [string] -or $kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted', 'ui-font-face', 'app-theme-fonts', 'pref-value', 'appx-package', 'msi-package', 'windows-feature')) {
+    if ($kind -isnot [string] -or $kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted', 'ui-font-face', 'app-theme-fonts', 'pref-value', 'appx-package', 'msi-package', 'windows-feature', 'scheduled-task')) {
         return 'kind is not an effect kind.'
     }
     $id = $fields.id
@@ -762,6 +768,12 @@ function Get-EffectRecordProblem($Record) {
     if (-not (Get-Field $desired 'exists')) { return 'desired must exist.' }
     if (Test-EffectStateEqual $kind $prior $desired) { return 'desired equals prior; there is no effect to own.' }
     if ($kind -in @('file-created', 'tree-extracted', 'registry-key-created', 'pref-value', 'appx-package', 'msi-package') -and (Get-Field $prior 'exists')) { return 'prior must be absent.' }
+    if ($kind -ceq 'scheduled-task') {
+        if (Get-Field $prior 'exists') { return 'task ownership starts at absence.' }
+        if ($target -cne ('task:windows-own-logon:' + (Get-Field (Get-Field $desired 'descriptor') 'sid'))) { return 'task target differs from its SID.' }
+        $previous = Get-Field $Record 'previous'
+        if ($null -ne $previous -and ((Get-EffectStateProblem $kind $previous 'previous') -or -not (Get-Field $previous 'exists'))) { return 'invalid previous task version.' }
+    } elseif ($null -ne (Get-Field $Record 'previous')) { return 'only a task version names previous.' }
     if ($kind -ceq 'windows-feature' -and (-not (Get-Field $prior 'exists') -or (Get-Field $prior 'enabled') -or -not (Get-Field $desired 'enabled'))) {
         return 'only disabled to enabled VirtualMachinePlatform is owned.'
     }
@@ -830,7 +842,8 @@ function Test-SameEffect($First, $Other) {
         [string]$one.target -eq [string]$two.target -and [string]$one.name -ceq [string]$two.name -and
         (Test-EffectStateEqual $kind $fp $op) -and (Test-EffectStateEqual $kind $fd $od) -and
         [string](Get-Field $fp 'backup') -eq [string](Get-Field $op 'backup') -and
-        [string](Get-Field $fd 'line') -ceq [string](Get-Field $od 'line'))
+        [string](Get-Field $fd 'line') -ceq [string](Get-Field $od 'line') -and
+        (ConvertTo-CanonicalJson (Get-Field $First 'previous')) -ceq (ConvertTo-CanonicalJson (Get-Field $Other 'previous')))
 }
 
 function New-EffectClass([string]$Class, $Resolution, [string]$Reason) {
@@ -857,6 +870,22 @@ function Get-EffectAttempt($Records) {
             }
             $attempt = @($record)
             $closed = $false
+            if ($null -ne (Get-Field $record 'previous')) { return [ordered]@{ problem = 'Initial task intent has previous.'; records = @(); closed = $false } }
+            continue
+        }
+        if ($phase -ceq 'intent' -and (Get-Field $record 'kind') -ceq 'scheduled-task') {
+            # A version transition is bound to the last committed native descriptor,
+            # retaining the original absent baseline. It never grants foreign ownership.
+            $lastRecord = $attempt[-1]
+            if ((Get-Field $lastRecord 'phase') -cne 'commit' -or
+                (Get-Field $lastRecord 'kind') -cne 'scheduled-task' -or
+                [string](Get-Field $lastRecord 'id') -cne [string](Get-Field $record 'id') -or
+                [string](Get-Field $lastRecord 'target') -cne [string](Get-Field $record 'target') -or
+                -not (Test-EffectStateEqual 'scheduled-task' (Get-Field $lastRecord 'desired') (Get-Field $record 'previous')) -or
+                -not (Test-EffectStateEqual 'scheduled-task' (Get-Field $lastRecord 'prior') (Get-Field $record 'prior'))) {
+                return [ordered]@{ problem = 'Task version is not bound to the immediately committed version.'; records = @(); closed = $false }
+            }
+            $attempt = @($record)
             continue
         }
         if (-not (Test-SameEffect $attempt[0] $record)) {
@@ -877,7 +906,7 @@ function Get-EffectAttempt($Records) {
 # holds some face and holds no content of its own, so another face is absent (free to
 # take, recording that face as prior), never preexisting-drift; so do an app theme's fonts.
 function Get-UnownedClass([string]$Kind, $Desired, $Current, $Resolution) {
-    $problem = if ($Kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted', 'ui-font-face', 'app-theme-fonts', 'pref-value', 'appx-package', 'msi-package', 'windows-feature')) {
+    $problem = if ($Kind -cnotin @('file-created', 'file-replaced', 'prefix-inserted', 'registry-value', 'registry-key-created', 'tree-extracted', 'ui-font-face', 'app-theme-fonts', 'pref-value', 'appx-package', 'msi-package', 'windows-feature', 'scheduled-task')) {
         'The selection kind is not an effect kind.'
     } else { Get-EffectStateProblem $Kind $Desired 'desired' }
     if (-not $problem) { $problem = Get-EffectStateProblem $Kind $Current 'current' }
@@ -921,6 +950,11 @@ function Get-EffectClass($Records, $Current, [string]$Kind, $Desired, $Attempt) 
     # Not $desired: PowerShell variable names ignore case, so it would overwrite $Desired.
     $recordedPrior, $recordedDesired = (Get-Field $records[0] 'prior'), (Get-Field $records[0] 'desired')
     $committed = @($records | Where-Object { (Get-Field $_ 'phase') -ceq 'commit' }).Count -gt 0
+    if ($recorded -ceq 'scheduled-task' -and -not $committed -and
+        $null -ne (Get-Field $records[0] 'previous') -and
+        (Test-EffectStateEqual $recorded (Get-Field $records[0] 'previous') $Current)) {
+        return New-EffectClass 'owned-match' 'pendingPrevious' 'Task switch did not converge; previous owned action preserved.'
+    }
     if (Test-EffectStateEqual $recorded $recordedDesired $Current) {
         return New-EffectClass 'owned-match' $(if ($committed) { $null } else { 'confirm' }) $null
     }
@@ -1089,12 +1123,12 @@ function Test-TargetOverlap($First, $Other) {
 
 # Why the temporary path an intent names (field temp, named before it exists) is not
 # one only that intent could have made, or $null when it is absent or valid: exactly
-# <target>.<guid32>.tmp for a file-created file, or <target>.<guid32>.staging for a
+# <target>.<guid32>.tmp for a created file, prefix replacement or preference, or <target>.<guid32>.staging for a
 # tree-extracted extraction directory, beside its target. Other kinds name none.
 function Get-IntentTempProblem($Record) {
     $temp, $target = (Get-Field $Record 'temp'), [string](Get-Field $Record 'target')
     if ($null -eq $temp) { return $null }
-    $suffix = switch -CaseSensitive ([string](Get-Field $Record 'kind')) { 'file-created' { 'tmp' } 'pref-value' { 'tmp' } 'tree-extracted' { 'staging' } }
+    $suffix = switch -CaseSensitive ([string](Get-Field $Record 'kind')) { 'file-created' { 'tmp' } 'prefix-inserted' { 'tmp' } 'pref-value' { 'tmp' } 'tree-extracted' { 'staging' } }
     if (-not $suffix) { return "A $(Get-Field $Record 'kind') intent names no temporary path." }
     if ($temp -isnot [string] -or $temp -cnotmatch ('^' + [regex]::Escape($target) + '\.[0-9a-f]{32}\.' + $suffix + '\z')) {
         return "The temporary path is not $target.<guid32>.$suffix."
@@ -1768,6 +1802,155 @@ function Get-BootstrapAction($Found, $Expected, [bool]$AliasPresent, [switch]$Ap
 }
 
 # Same release-lock shape as pack.py; actual archive manifests/signatures are checked by win.ps1.
+# ---- G6I3 host-only startup and native task predicates ----------------------
+function Get-OwnResumeProblem($Contract) {
+    if ((Get-Field $Contract 'expectHost') -cne 'G6I3' -or (Get-Field $Contract 'container') -cne 'windows-own' -or
+        [string](Get-Field $Contract 'session') -cnotmatch '^wslc-cli-[a-z0-9][a-z0-9-]*\z' -or
+        (Get-Field $Contract 'hostPort') -ne 2223 -or
+        [string](Get-Field $Contract 'image') -cnotmatch '^ghcr\.io/roccho-dev/windows-own@sha256:[a-f0-9]{64}\z') { return 'Invalid G6I3 own binding.' }
+    $volumes = @(Get-Field $Contract 'volumes')
+    if ($volumes.Count -ne 3 -or (@($volumes | ForEach-Object { Get-Field $_ 'destination' }) -join ',') -cne '/home/dev,/work/repos,/nix' -or
+        @($volumes | ForEach-Object { Get-Field $_ 'name' } | Sort-Object -Unique -CaseSensitive).Count -ne 3 -or
+        @($volumes | Where-Object { [string](Get-Field $_ 'name') -cnotmatch '^[a-z0-9][a-z0-9-]*\z' }).Count) { return 'Invalid three-volume binding.' }
+    $ssh = Get-Field $Contract 'ssh'
+    if ((Get-Field $ssh 'alias') -cne 'g6i3-own' -or (Get-Field $ssh 'identity') -cne '.ssh/id_ed25519_windows_own' -or
+        (Get-Field $ssh 'knownHosts') -cne '.ssh/known_hosts_windows_own') { return 'Invalid Windows SSH binding.' }
+    return $null
+}
+
+function Get-OwnContainerAction($Contract, $Container) {
+    $problem = Get-OwnResumeProblem $Contract
+    if ($problem) { throw $problem }
+    if ($null -eq $Container) { throw 'Existing own container is missing; never created by Resume.' }
+    if ([string](Get-Field $Container 'Id') -cnotmatch '^[a-f0-9]{64}\z' -or
+        (Get-Field $Container 'Name') -cne ('/' + $Contract.container) -or
+        (Get-Field (Get-Field $Container 'Config') 'Image') -cne $Contract.image) { throw 'Own container name/image differs from this artifact.' }
+    $mounts = @(Get-Field $Container 'Mounts')
+    if ($mounts.Count -ne 3) { throw 'Own container does not have the accepted three volumes.' }
+    foreach ($volume in $Contract.volumes) {
+        $match = @($mounts | Where-Object { (Get-Field $_ 'Type') -ceq 'volume' -and
+            (Get-Field $_ 'Name') -ceq $volume.name -and (Get-Field $_ 'Destination') -ceq $volume.destination -and (Get-Field $_ 'ReadWrite') -eq $true })
+        if ($match.Count -ne 1) { throw 'Own container volume binding differs.' }
+    }
+    $ports = @(Get-Field (Get-Field $Container 'Ports') '2223/tcp')
+    if ($ports.Count -ne 1 -or (Get-Field $ports[0] 'HostIp') -cne '127.0.0.1' -or
+        (Get-Field $ports[0] 'HostPort') -cne '2223') { throw 'Own SSH port is not the declared loopback binding.' }
+    $state = Get-Field $Container 'State'
+    if ((Get-Field $state 'Running') -eq $true -and (Get-Field $state 'Status') -ceq 'running') { return 'running' }
+    if ((Get-Field $state 'Running') -eq $false -and (Get-Field $state 'Status') -cin @('exited','created')) { return 'start' }
+    throw 'Own container has an unsupported transient/paused/dead state.'
+}
+
+function Get-QuickHttpArguments([string]$Origin, $EnvironmentNames) {
+    if (@($EnvironmentNames | Where-Object { $_ -match '^TUNNEL_' }).Count) { throw 'QuickHttp refuses nonempty TUNNEL_* environment; values are not logged.' }
+    $uri = $null
+    if (-not [Uri]::TryCreate($Origin, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -cne 'http' -or
+        $uri.Host -notin @('127.0.0.1','[::1]','::1') -or $uri.Port -lt 1 -or
+        $uri.UserInfo -or $uri.Query -or $uri.Fragment -or $uri.AbsolutePath -cne '/') { throw 'QuickHttp needs an explicit nonsecret loopback HTTP origin.' }
+    @('tunnel','--config=','--no-autoupdate','--url',$Origin)
+}
+
+function Get-SshDirective([string]$Line) {
+    if ($Line -match '^[ \t\r]*([A-Za-z][A-Za-z0-9]*)(?:[ \t\r]*=[ \t\r]*|[ \t\r]+|$)(.*)$') {
+        return @{ keyword = $Matches[1].ToLowerInvariant(); value = $Matches[2].Trim() }
+    }
+    return $null
+}
+
+function Get-OwnTaskDescriptorProblem($Descriptor) {
+    $directory = [string](Get-Field $Descriptor 'directory')
+    if ([string](Get-Field $Descriptor 'sid') -cnotmatch '^S-1-5-[0-9-]+\z' -or
+        -not (Test-EffectPath 'file' (Get-Field $Descriptor 'execute')) -or
+        [string](Get-Field $Descriptor 'execute') -notmatch '\\WindowsPowerShell\\v1\.0\\powershell\.exe\z' -or
+        -not (Test-EffectPath 'file' $directory) -or $directory -cnotmatch '\\windows-host-[a-f0-9]{40}\z' -or
+        [string](Get-Field $Descriptor 'arguments') -cne ('-NoProfile -NonInteractive -File "' + $directory + '\win.ps1" -Mode OwnResume') -or
+        (Get-Field $Descriptor 'delay') -cne 'PT30S' -or (Get-Field $Descriptor 'logonType') -cne 'InteractiveToken' -or
+        (Get-Field $Descriptor 'runLevel') -cne 'LeastPrivilege' -or @(Get-Field $Descriptor 'other' | Where-Object { $null -ne $_ }).Count) { return 'Unsupported task identity/action/trigger.' }
+    if ((ConvertTo-CanonicalJson (Get-Field $Descriptor 'settings')) -cne (ConvertTo-CanonicalJson (Get-OwnTaskSettings))) { return 'Task settings differ.' }
+    return $null
+}
+
+function Get-OwnTaskSettings {
+    [ordered]@{ MultipleInstancesPolicy = 'IgnoreNew'; DisallowStartIfOnBatteries = 'false'; StopIfGoingOnBatteries = 'false'
+        AllowHardTerminate = 'false'; StartWhenAvailable = 'true'; RunOnlyIfNetworkAvailable = 'false'
+        AllowStartOnDemand = 'true'; Enabled = 'true'; Hidden = 'false'; RunOnlyIfIdle = 'false'; WakeToRun = 'false'
+        ExecutionTimeLimit = 'PT2M'; Priority = '7' }
+}
+
+function Get-OwnTaskPolicyProblem($Policies) {
+    # A bootstrapper's process-only Bypass is not inherited by future logon.
+    foreach ($scope in 'MachinePolicy','UserPolicy','CurrentUser','LocalMachine') {
+        $rows = @($Policies | Where-Object { [string](Get-Field $_ 'Scope') -ceq $scope })
+        if ($rows.Count -ne 1) { return 'Task execution policy is unavailable/ambiguous.' }
+        $value = [string](Get-Field $rows[0] 'ExecutionPolicy')
+        if ($value -ceq 'Undefined') { continue }
+        if ($value -cin @('RemoteSigned','Unrestricted','Bypass')) { return $null }
+        return 'Existing task execution policy blocks unsigned runtime; policy is not changed.'
+    }
+    return 'Default Restricted task execution policy blocks unsigned runtime; policy is not changed.'
+}
+
+function Read-OwnTaskXml([string]$Text) {
+    $xml = [Xml.XmlDocument]::new(); $xml.XmlResolver = $null
+    $settings = [Xml.XmlReaderSettings]::new(); $settings.DtdProcessing = [Xml.DtdProcessing]::Prohibit; $settings.MaxCharactersInDocument = 65536
+    $reader = [Xml.XmlReader]::Create([IO.StringReader]::new($Text), $settings)
+    try { $xml.Load($reader) } finally { $reader.Dispose() }
+    return ,$xml
+}
+
+function ConvertFrom-OwnTaskXml([string]$Text) {
+    $xml=Read-OwnTaskXml $Text
+    $ns = [Xml.XmlNamespaceManager]::new($xml.NameTable); $ns.AddNamespace('t','http://schemas.microsoft.com/windows/2004/02/mit/task')
+    $get = { param($path) $node = $xml.SelectSingleNode($path,$ns); if ($node) { $node.InnerText } else { '' } }
+    $other = @()
+    if (@($xml.SelectNodes('/t:Task/t:Actions/*',$ns)).Count -ne 1 -or -not $xml.SelectSingleNode('/t:Task/t:Actions/t:Exec',$ns) -or
+        @($xml.SelectNodes('/t:Task/t:Triggers/*',$ns)).Count -ne 1 -or -not $xml.SelectSingleNode('/t:Task/t:Triggers/t:LogonTrigger',$ns) -or
+        @($xml.SelectNodes('/t:Task/t:Principals/*',$ns)).Count -ne 1) { $other += 'multiple/foreign action, principal or trigger' }
+    foreach ($part in 'Actions','Triggers','Principals','Settings') {
+        if (@($xml.SelectNodes('/t:Task/t:' + $part,$ns)).Count -ne 1) { $other += 'missing/duplicate:' + $part }
+    }
+    foreach ($pair in @(@('/t:Task/t:Actions/t:Exec',@('Command','Arguments','WorkingDirectory')),
+        @('/t:Task/t:Principals/t:Principal',@('UserId','LogonType','RunLevel')),
+        @('/t:Task/t:Triggers/t:LogonTrigger',@('UserId','Delay','Enabled')))) {
+        $seen = @{}
+        foreach ($node in @($xml.SelectNodes($pair[0] + '/*',$ns))) {
+            if ($seen.ContainsKey($node.LocalName) -or $pair[1] -cnotcontains $node.LocalName) { $other += 'foreign/duplicate:' + $node.LocalName }
+            $seen[$node.LocalName] = $true
+        }
+    }
+    foreach ($node in @($xml.SelectNodes('/t:Task/t:Triggers/t:LogonTrigger/*',$ns))) {
+        if ($node.LocalName -cnotin @('UserId','Delay','Enabled')) { $other += 'trigger:' + $node.LocalName }
+    }
+    # MS-TSCH SchRpcRegisterTask: missing trigger Enabled is true, and
+    # missing principal RunLevel is LeastPrivilege. Only an absent node gets
+    # that native default; explicit empty/foreign values remain conflicting.
+    $enabledNode=$xml.SelectSingleNode('/t:Task/t:Triggers/t:LogonTrigger/t:Enabled',$ns)
+    $enabled=if ($null -eq $enabledNode) { 'true' } else { $enabledNode.InnerText }
+    $runLevelNode=$xml.SelectSingleNode('/t:Task/t:Principals/t:Principal/t:RunLevel',$ns)
+    $runLevel=if ($null -eq $runLevelNode) { 'LeastPrivilege' } else { $runLevelNode.InnerText }
+    if ($enabled -cne 'true') { $other += 'trigger enabled' }
+    if ((& $get '/t:Task/t:Triggers/t:LogonTrigger/t:UserId') -cne (& $get '/t:Task/t:Principals/t:Principal/t:UserId')) { $other += 'trigger user' }
+    # Task Scheduler schema defaults, not this artifact's desired values. An
+    # omitted setting must never fabricate StartWhenAvailable=true, etc.
+    $values = [ordered]@{ MultipleInstancesPolicy = 'IgnoreNew'; DisallowStartIfOnBatteries = 'true'; StopIfGoingOnBatteries = 'true'
+        AllowHardTerminate = 'true'; StartWhenAvailable = 'false'; RunOnlyIfNetworkAvailable = 'false'
+        AllowStartOnDemand = 'true'; Enabled = 'true'; Hidden = 'false'; RunOnlyIfIdle = 'false'; WakeToRun = 'false'
+        ExecutionTimeLimit = 'PT72H'; Priority = '7' }
+    $seen = @{}
+    foreach ($node in @($xml.SelectNodes('/t:Task/t:Settings/*',$ns))) {
+        if ($seen.ContainsKey($node.LocalName)) { $other += 'duplicate setting:' + $node.LocalName }
+        $seen[$node.LocalName] = $true
+        if ($values.Contains($node.LocalName)) { $values[$node.LocalName] = $node.InnerText }
+        elseif ($node.LocalName -ceq 'IdleSettings') { }
+        elseif ($node.LocalName -cin @('UseUnifiedSchedulingEngine','DisallowStartOnRemoteAppSession') -and $node.InnerText -ceq 'false') { }
+        else { $other += 'settings:' + $node.LocalName }
+    }
+    [ordered]@{ sid = (& $get '/t:Task/t:Principals/t:Principal/t:UserId'); execute = (& $get '/t:Task/t:Actions/t:Exec/t:Command')
+        arguments = (& $get '/t:Task/t:Actions/t:Exec/t:Arguments'); directory = (& $get '/t:Task/t:Actions/t:Exec/t:WorkingDirectory')
+        delay = (& $get '/t:Task/t:Triggers/t:LogonTrigger/t:Delay'); logonType = (& $get '/t:Task/t:Principals/t:Principal/t:LogonType')
+        runLevel = $runLevel; settings = $values; other = @($other) }
+}
+
 function Get-BootstrapProblem($Value) {
     if ($null -eq $Value) { return $null }
     if ((Get-Field $Value 'architecture') -cne 'x64' -or (Get-Field $Value 'publisherId') -cne '8wekyb3d8bbwe' -or
