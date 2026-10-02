@@ -41,6 +41,10 @@ git_clear() {
 # Everything the Jev proof creates under $evidence/jev, including the fixture test identity.
 jev_clear() {
   local fx=$evidence/jev r
+  if [ -e "$fx/formal" ]; then
+    for r in provenance.json merged-pr-proof.json voice-ui-target-runtime.nix-export voice-ui-target-runtime.nix-export.sha256; do plain "$fx/formal/deploy/$r" || return 1; done
+    empty "$fx/formal/deploy" && empty "$fx/formal" || return 1
+  fi
   for r in envs apps ops neg; do if [ -e "$fx/$r/.git" ]; then git_clear "$fx/$r" || return 1; fi; done
   plain "$fx/envs/side" && plain "$fx/envs/ciphertexts/dev-jev-api.oci-dev.sops.yaml" &&
     empty "$fx/envs/ciphertexts" && empty "$fx/envs" &&
@@ -81,13 +85,13 @@ jev_proof() {
   prod_init=$(readlink -f "$profile/bin/jev-age-init")
   prod_ops=$(readlink -f "$profile/bin/ops-jev")
   for raw in sops age age-keygen jev; do test ! -e "$profile/bin/$raw"; done
-  grep -qxF "envs_remote=https://github.com/roccho-dev/envs" "$prod_launch"
-  grep -qxF "apps_remote=https://github.com/roccho-dev/apps" "$prod_launch"
-  grep -qxF "identity=/work/repos/.auth/roccho-dev/age/oci-dev.key" "$prod_launch"
-  grep -qxF "identity=/work/repos/.auth/roccho-dev/age/oci-dev.key" "$prod_init"
-  grep -qxF "envs_remote=https://github.com/roccho-dev/envs" "$prod_ops"
-  grep -qxF "ops_remote=https://github.com/roccho-dev/ops" "$prod_ops"
-  grep -qxF "identity=/work/repos/.auth/roccho-dev/age/oci-dev.key" "$prod_ops"
+  sed -E 's/^[[:space:]]*//' "$prod_launch" | grep -qxF "envs_remote=https://github.com/roccho-dev/envs"
+  sed -E 's/^[[:space:]]*//' "$prod_launch" | grep -qxF "apps_remote=https://github.com/roccho-dev/apps"
+  sed -E 's/^[[:space:]]*//' "$prod_launch" | grep -qxF "identity=/work/repos/.auth/roccho-dev/age/oci-dev.key"
+  sed -E 's/^[[:space:]]*//' "$prod_init" | grep -qxF "identity=/work/repos/.auth/roccho-dev/age/oci-dev.key"
+  sed -E 's/^[[:space:]]*//' "$prod_ops" | grep -qxF "envs_remote=https://github.com/roccho-dev/envs"
+  sed -E 's/^[[:space:]]*//' "$prod_ops" | grep -qxF "ops_remote=https://github.com/roccho-dev/ops"
+  sed -E 's/^[[:space:]]*//' "$prod_ops" | grep -qxF "identity=/work/repos/.auth/roccho-dev/age/oci-dev.key"
   if grep -qE '^[[:space:]]*(apps_remote|port|host)=' "$prod_ops"; then echo 'ops-jev carries apps constants' >&2; return 1; fi
   if grep -qE '^[[:space:]]*set -(x|o xtrace)' "$prod_launch" "$prod_init" "$prod_ops"; then echo 'a jev tool enables xtrace' >&2; return 1; fi
 
@@ -99,7 +103,7 @@ jev_proof() {
   launch=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($tools).launch")/bin/voice-ui-jev-dev
   init=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($tools).init")/bin/jev-age-init
   ops=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($tools).ops")/bin/ops-jev
-  same() { grep -vE '^(envs_remote|apps_remote|ops_remote|identity)=' "$1" | sha256sum; }
+  same() { grep -vE '^[[:space:]]*(envs_remote|apps_remote|ops_remote|identity)=' "$1" | sha256sum; }
   test "$(same "$launch")" = "$(same "$prod_launch")"
   test "$(same "$init")" = "$(same "$prod_init")"
   test "$(same "$ops")" = "$(same "$prod_ops")"
@@ -107,6 +111,108 @@ jev_proof() {
   test "$init" != "$prod_init"
   test "$ops" != "$prod_ops"
 
+  # Reuse the workflow's literal classifier, not a second path algorithm.
+  local classify_source
+  classify_source=$(sed -n '/^          classify() {$/,/^          }$/p' .github/workflows/ci.yml | sed 's/^          //')
+  test -n "$classify_source"
+  eval "$classify_source"
+  test "$(classify '')" = false
+  test "$(classify .github/workflows/ci.yml)" = false
+  test "$(classify oci/dev/nix.nix)" = true
+  test "$(classify oci/dev/proof.sh)" = true
+  test "$(classify $'oci/dev/nix.nix\noci/dev/proof.sh\n.github/workflows/ci.yml')" = true
+  for changed in flake.nix hosts/own/win.ps1 hosts/rent/win.ps1 bundle.ps1; do
+    test "$(classify "$changed")" = false
+    test "$(classify $'oci/dev/nix.nix\n'"$changed")" = false
+  done
+  # Exercise the literal preload in the built tool, not a second budget implementation.
+  local node
+  node=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($pkgs).nodejs")/bin/node
+  "$node" --input-type=module - "$prod_launch" <<'JS'
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+const text=fs.readFileSync(process.argv[2],'utf8');
+const match=text.match(/preload="(data:text\/javascript,[^"]+)"/);
+assert(match); const uri=match[1].replace('__LIMIT__','12');
+let nativeCalls=0; const forwarded=[], counters=[];
+const write=process.stderr.write;
+process.stderr.write=s=>{counters.push(s);return true;};
+globalThis.fetch=async(input,init)=>{nativeCalls++;forwarded.push(init.redirect);return {fixture:'transparent'};};
+try {
+  await import(uri);
+  for(const [url,method] of [['https://invalid.example/','POST'],['https://api.typesafe.ai/v1/systemone','GET']])
+    await assert.rejects(fetch(url,{method}),/upstream_boundary/);
+  assert.equal(nativeCalls,0);
+  const results=await Promise.allSettled(Array.from({length:13},()=>fetch('https://api.typesafe.ai/v1/systemone',{method:'POST'})));
+  assert.equal(nativeCalls,12); assert.equal(results.filter(r=>r.status==='fulfilled').length,12);
+  assert.equal(results[12].reason.message,'upstream_budget');
+  assert(results.slice(0,12).every(r=>r.value.fixture==='transparent'));
+  assert(forwarded.every(r=>r==='error'));
+  assert.deepEqual(counters,Array.from({length:12},(_,i)=>'jev-upstream-send:'+(i+1)+'\n'));
+} finally { process.stderr.write=write; }
+console.log('PASS fixed built-tool upstream limit: boundary0, concurrent12, 13th0, redirect:error, transparent response');
+JS
+  # Formal rejection must precede identity, ciphertext, network and child access.
+  # The supplied C tuple's real positive case is a separate final-operand proof.
+  local formal_code=0 formal_out
+  formal_out=$(NODE_OPTIONS=--invalid-formal-bootstrap-option NODE_EXTRA_CA_CERTS=/not-a-formal-ca "$launch" --formal --envs-sha 0000000000000000000000000000000000000000 \
+    --deploy-sha 0000000000000000000000000000000000000000 \
+    --deploy-provenance-sha256 $(printf '%064d' 0) --deploy-proof-sha256 $(printf '%064d' 0) \
+    --artifacts "$fx/not-provided" --port 23001 2>&1) || formal_code=$?
+  test "$formal_code" -ne 0
+  grep -qF 'RED: formal_admission' <<< "$formal_out"
+  if grep -qE 'decrypt|target identity|cannot fetch' <<< "$formal_out"; then echo 'formal rejection reached target bootstrap' >&2; return 1; fi
+
+  # Supplied empty formal values cannot masquerade as omitted options or hide duplicates.
+  local formal_args=(--envs-sha 0000000000000000000000000000000000000000 --deploy-sha 0000000000000000000000000000000000000000
+    --deploy-provenance-sha256 "$(printf '%064d' 0)" --deploy-proof-sha256 "$(printf '%064d' 0)" --artifacts "$fx/not-provided" --port 23001)
+  local bad_args i variant original flag
+  for i in 1 3 5 7 9 11; do
+    for variant in empty empty-duplicate duplicate nextflag; do
+      bad_args=("${formal_args[@]}"); original=${bad_args[$i]}
+      case "$variant" in empty|empty-duplicate) bad_args[$i]='';; nextflag) bad_args[$i]=--post-limit;; esac
+      case "$variant" in empty-duplicate|duplicate) bad_args+=("${formal_args[$((i-1))]}" "$original");; esac
+      formal_code=0
+      formal_out=$("$launch" --formal "${bad_args[@]}" 2>&1) || formal_code=$?
+      test "$formal_code" -eq 2
+      if grep -qE 'formal_admission|decrypt|target identity|cannot fetch|jev-upstream-send:' <<< "$formal_out"; then echo 'empty formal value reached admission/target' >&2; return 1; fi
+    done
+  done
+  for flag in --post-limit --host; do
+  for variant in empty empty-duplicate duplicate nextflag; do
+    if [ "$flag" = --post-limit ]; then original=12; else original=127.0.0.1; fi
+    bad_args=("${formal_args[@]}" "$flag" "$original")
+    case "$variant" in empty|empty-duplicate) bad_args[13]='';; nextflag) bad_args[13]=--port;; esac
+    case "$variant" in empty-duplicate|duplicate) bad_args+=("$flag" "$original");; esac
+    formal_code=0
+    formal_out=$("$launch" --formal "${bad_args[@]}" 2>&1) || formal_code=$?
+    test "$formal_code" -eq 2
+    if grep -qE 'formal_admission|decrypt|target identity|cannot fetch|jev-upstream-send:' <<< "$formal_out"; then echo 'invalid optional formal value reached admission/target' >&2; return 1; fi
+  done
+  done
+  # Crafted public metadata reaches distinct admission stages, never target bootstrap.
+  mkdir "$fx/formal" "$fx/formal/deploy"
+  printf '{}' > "$fx/formal/deploy/provenance.json"
+  printf '{}' > "$fx/formal/deploy/merged-pr-proof.json"
+  printf x > "$fx/formal/deploy/voice-ui-target-runtime.nix-export"
+  printf x > "$fx/formal/deploy/voice-ui-target-runtime.nix-export.sha256"
+  local prov_hash proof_hash expected_stage
+  prov_hash=$(sha256sum "$fx/formal/deploy/provenance.json"); prov_hash=${prov_hash%% *}
+  proof_hash=$(sha256sum "$fx/formal/deploy/merged-pr-proof.json"); proof_hash=${proof_hash%% *}
+  for expected_stage in deploy_provenance deploy_proof; do
+    local expected_prov=$prov_hash expected_proof=$proof_hash
+    if [ "$expected_stage" = deploy_provenance ]; then expected_prov=$(printf '%064d' 0); else expected_proof=$(printf '%064d' 0); fi
+    formal_code=0
+    formal_out=$("$launch" --formal --envs-sha 0000000000000000000000000000000000000000 \
+      --deploy-sha 0000000000000000000000000000000000000000 \
+      --deploy-provenance-sha256 "$expected_prov" --deploy-proof-sha256 "$expected_proof" \
+      --artifacts "$fx/formal" --port 23001 --post-limit 12 2>&1) || formal_code=$?
+    test "$formal_code" -ne 0
+    grep -qF "RED: formal_admission_$expected_stage" <<< "$formal_out"
+    if grep -qE 'decrypt|target identity|cannot fetch|jev-upstream-send:' <<< "$formal_out"; then echo 'formal rejection reached target/provider' >&2; return 1; fi
+  done
+  for name in provenance.json merged-pr-proof.json voice-ui-target-runtime.nix-export voice-ui-target-runtime.nix-export.sha256; do plain "$fx/formal/deploy/$name"; done
+  empty "$fx/formal/deploy"; empty "$fx/formal"
   # jev-age-init: refuses an unsafe parent and any overwrite, writes 0600, prints only the public recipient.
   local recipient other
   mkdir "$fx/age"
@@ -345,8 +451,8 @@ NIX
   test -z "$(ls -A "$fx/tmp")"
   # scratch_clear as built into the launcher: it removes exactly the scratch the launcher writes, and keeps and refuses
   # anything else (here a loose object and a foreign pack name).
-  sed -n '/^scratch_clear() {$/,/^}$/p' "$launch" > "$fx/scratch-clear.sh"
-  grep -q '^scratch_clear() {$' "$fx/scratch-clear.sh"
+  sed -n '/^[[:space:]]*scratch_clear() {$/,/^[[:space:]]*}$/p' "$launch" > "$fx/scratch-clear.sh"
+  grep -q '^[[:space:]]*scratch_clear() {$' "$fx/scratch-clear.sh"
   # scratch_case KIND ENTRY: plant a foreign file, FIFO or link at ENTRY (none for clean); the launcher's own
   # scratch_clear must keep it and fail, and after the test removes its own plant, remove everything.
   scratch_case() {
@@ -402,6 +508,7 @@ NIX
   jev_clear
   test ! -e "$fx"
   rm -f "$marker" "$marker.fds"
+  echo 'PASS formal admission: absent operand refused before identity/cipher/network/child; classifier owner-only true, empty/CI-only/mixed/product false;'
   echo 'PASS jev tools (fixtures): production profile has only the three bounded tools and exact constants; same source;'
   echo 'PASS jev launch: closed child environment, loopback unless --host 0.0.0.0 is explicit, no core, absent HOME, only stdio descriptors, no temp left after any launch, key never in argv or output, build before decrypt;'
   echo 'PASS ops-jev: caller stdin is the request, one stdout JSON line, exit status passed through, launcher messages on stderr only, PATH HOME LANG JEV_API_KEY only, only stdio descriptors, build before decrypt, RED on arguments/stale/off/unbuildable/unknown/identity;'
