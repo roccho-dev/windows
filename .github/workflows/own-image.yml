@@ -390,7 +390,7 @@ jobs:
             }
             down() { docker stop -t 30 own-smoke >/dev/null; docker rm own-smoke >/dev/null; }
             # The image's own bash and coreutils, so the legacy image needs nothing it lacks.
-            state() { docker exec own-smoke /bin/bash -c 'cd /home/dev && sha256sum .ssh/ssh_host_ed25519_key.pub .ssh/authorized_keys .config/gh/hosts.yml .codex/ci-marker mig-marker && stat -c "%n %a %u:%g %F" .config/gh/hosts.yml .codex/ci-marker'; }
+            state() { docker exec own-smoke /bin/bash -c 'cd /home/dev && sha256sum .ssh/ssh_host_ed25519_key.pub .ssh/authorized_keys .config/gh/config.yml .config/gh/hosts.yml .codex/ci-marker mig-marker && stat -c "%n %a %u:%g %F" .config/gh/config.yml .config/gh/hosts.yml .codex/ci-marker'; }
             # The executables actually run: each must resolve (-e, not -f) to an executable store file; its path and
             # content hash are compared, so a tool missing from both images cannot compare equal.
             paths() {
@@ -423,8 +423,11 @@ jobs:
             "${ssh_cmd[@]}" 'set -eu
               echo mig > ~/mig-marker
               install -d -m 700 ~/.config/gh ~/.codex
-              printf "github.com:\n    user: ci\n    git_protocol: ssh\n" > ~/.config/gh/hosts.yml
-              chmod 600 ~/.config/gh/hosts.yml
+              # gh 2.96 config already in its multi-account form (config version 1, a users map), as gh itself
+              # leaves it; the old single-account form would make gh migrate it, which needs a token. No token here.
+              printf "version: \"1\"\n" > ~/.config/gh/config.yml
+              printf "github.com:\n    git_protocol: ssh\n    users:\n        ci:\n    user: ci\n" > ~/.config/gh/hosts.yml
+              chmod 600 ~/.config/gh/config.yml ~/.config/gh/hosts.yml
               echo session > ~/.codex/ci-marker'
             state > "$d/mig-a"
             paths > "$d/mig-paths"
