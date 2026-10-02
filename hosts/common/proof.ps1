@@ -1763,6 +1763,18 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
     $v4=OwnTaskEffect (Join-Path $Scratch ('Programs\windows-host-'+('4'*40))) $script:runIdentity.sid
     $xml=OwnTaskXml $v1.desired.descriptor
     Must (-not (Get-OwnTaskDescriptorProblem (ConvertFrom-OwnTaskXml $xml))) 'pure task XML roundtrip'
+    # The renderer puts Enabled before UserId; restrict removal to the trigger,
+    # leaving the separate Settings Enabled field intact.
+    $nativeDefaults=$xml.Replace('<RunLevel>LeastPrivilege</RunLevel>','').Replace('<LogonTrigger><Enabled>true</Enabled>','<LogonTrigger>')
+    Must (Test-EffectStateEqual 'scheduled-task' $v1.desired @{exists=$true;descriptor=(ConvertFrom-OwnTaskXml $nativeDefaults)}) 'native omitted defaults retain least privilege and enabled trigger'
+    foreach ($foreignXml in @($xml.Replace('<RunLevel>LeastPrivilege</RunLevel>','<RunLevel/>'),
+        $xml.Replace('<RunLevel>LeastPrivilege</RunLevel>','<RunLevel>HighestAvailable</RunLevel>'),
+        $xml.Replace('<LogonTrigger><Enabled>true</Enabled>','<LogonTrigger><Enabled/>'),
+        $xml.Replace('<LogonTrigger><Enabled>true</Enabled>','<LogonTrigger><Enabled>false</Enabled>'),
+        $nativeDefaults.Replace('<LogonTrigger><UserId>'+ $script:runIdentity.sid +'</UserId>','<LogonTrigger>'),
+        $nativeDefaults.Replace('<LogonTrigger><UserId>'+ $script:runIdentity.sid +'</UserId>','<LogonTrigger><UserId>S-1-5-99</UserId>'))) {
+        Must ($null -ne (Get-OwnTaskDescriptorProblem (ConvertFrom-OwnTaskXml $foreignXml))) 'explicit empty/elevated/disabled or unspecified/foreign trigger user remains refused'
+    }
     Must ($null -ne (Get-OwnTaskDescriptorProblem (ConvertFrom-OwnTaskXml ($xml.Replace('<StartWhenAvailable>true</StartWhenAvailable>',''))))) 'omitted setting does not fabricate desired value'
     $policies=@('MachinePolicy','UserPolicy','CurrentUser','LocalMachine' | ForEach-Object { @{Scope=$_;ExecutionPolicy='Undefined'} })
     Must ($null -ne (Get-OwnTaskPolicyProblem ($policies + @{Scope='Process';ExecutionPolicy='Bypass'}))) 'bootstrap Process bypass never proves future task policy'
@@ -1840,8 +1852,8 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
         try {
             $registered=$true; RegisterOwnTask $native
             $readback=ObserveOwnTask $native.target
-            $matches=Test-EffectStateEqual 'scheduled-task' $native.desired $readback
-            if (-not $matches -or $readback.running) {
+            $descriptorMatches=Test-EffectStateEqual 'scheduled-task' $native.desired $readback
+            if (-not $descriptorMatches -or $readback.running) {
                 # Never print observed command/arguments/paths/SID or arbitrary
                 # XML. Compare those fields, and show only finite native metadata.
                 $descriptor=Get-Field $readback 'descriptor'
@@ -1862,7 +1874,7 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
                 Write-Host ('Native proof task readback: '+(ConvertTo-CanonicalJson @{exists=$readback.exists;running=$readback.running
                     identityActionEqual=$equal;metadata=$metadata;settings=$settings;other=(Get-Field $descriptor 'other')}))
             }
-            Must ($matches -and -not $readback.running) 'real native limited/logon action descriptor roundtrip, not execution proof'
+            Must ($descriptorMatches -and -not $readback.running) 'real native limited/logon action descriptor roundtrip, not execution proof'
         } catch {
             $nativeFailure=$_
         } finally {

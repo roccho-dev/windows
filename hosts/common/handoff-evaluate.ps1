@@ -1916,7 +1916,14 @@ function ConvertFrom-OwnTaskXml([string]$Text) {
     foreach ($node in @($xml.SelectNodes('/t:Task/t:Triggers/t:LogonTrigger/*',$ns))) {
         if ($node.LocalName -cnotin @('UserId','Delay','Enabled')) { $other += 'trigger:' + $node.LocalName }
     }
-    if ((& $get '/t:Task/t:Triggers/t:LogonTrigger/t:Enabled') -cne 'true' -or
+    # MS-TSCH SchRpcRegisterTask: missing trigger Enabled is true, and
+    # missing principal RunLevel is LeastPrivilege. Only an absent node gets
+    # that native default; explicit empty/foreign values remain conflicting.
+    $enabledNode=$xml.SelectSingleNode('/t:Task/t:Triggers/t:LogonTrigger/t:Enabled',$ns)
+    $enabled=if ($null -eq $enabledNode) { 'true' } else { $enabledNode.InnerText }
+    $runLevelNode=$xml.SelectSingleNode('/t:Task/t:Principals/t:Principal/t:RunLevel',$ns)
+    $runLevel=if ($null -eq $runLevelNode) { 'LeastPrivilege' } else { $runLevelNode.InnerText }
+    if ($enabled -cne 'true' -or
         (& $get '/t:Task/t:Triggers/t:LogonTrigger/t:UserId') -cne (& $get '/t:Task/t:Principals/t:Principal/t:UserId')) { $other += 'trigger user/enabled' }
     # Task Scheduler schema defaults, not this artifact's desired values. An
     # omitted setting must never fabricate StartWhenAvailable=true, etc.
@@ -1936,7 +1943,7 @@ function ConvertFrom-OwnTaskXml([string]$Text) {
     [ordered]@{ sid = (& $get '/t:Task/t:Principals/t:Principal/t:UserId'); execute = (& $get '/t:Task/t:Actions/t:Exec/t:Command')
         arguments = (& $get '/t:Task/t:Actions/t:Exec/t:Arguments'); directory = (& $get '/t:Task/t:Actions/t:Exec/t:WorkingDirectory')
         delay = (& $get '/t:Task/t:Triggers/t:LogonTrigger/t:Delay'); logonType = (& $get '/t:Task/t:Principals/t:Principal/t:LogonType')
-        runLevel = (& $get '/t:Task/t:Principals/t:Principal/t:RunLevel'); settings = $values; other = @($other) }
+        runLevel = $runLevel; settings = $values; other = @($other) }
 }
 
 function Get-BootstrapProblem($Value) {
