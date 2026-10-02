@@ -315,17 +315,58 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RentSsh 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\win.ps1 -Mode RentSshTest <same arguments>  # fail on drift
 ```
 
-On **G6I3, as its normal user outside a packaged app**, it installs the client under
+On **G6I3, as its normal user outside a packaged app**, it installs the client and
+the packaged launcher `rent-access.ps1` as one owned tree under
 `LocalAppData\Programs\cloudflared-<version>` and converges only absent owned SSH
 objects. `%USERPROFILE%\.ssh\windows-rent\{config,known_hosts}` uses the same
-`windows-rent` alias, `ProxyCommand ... access ssh`, `HostKeyAlias` and strict host
-key checking. A fresh master gets `Include windows-rent/config windows-own/config`
+`windows-rent` alias, `HostKeyAlias`, strict host key checking and
+`ProxyCommand "<System32>\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -File "<tree>\rent-access.ps1" %h`.
+A fresh master gets `Include windows-rent/config windows-own/config`
 first; the previous bytes remain below it and in the owned
 `config.before-windows-rent`. Existing equivalent objects are not adopted, foreign
 differences and later user drift are refused. The writer neither copies a private
 key nor writes Access credentials. Unknown/recursive Includes, multiple alias
 declarations and `Match` are refused before `ssh -G` (which otherwise could execute
-`Match exec`). The prior backup must be exact and owned for prefix undo.
+`Match exec`). The prior backup must be exact and owned for prefix undo. A client
+tree installed before the launcher existed differs from the new tree and is refused,
+never overwritten: `HostRemove` it first.
+
+**Access client credential.** One G6I3 normal-user service credential serves every
+surface that uses the `windows-rent` alias (terminal `ssh`, Windows Codex Remote
+SSH). Its only slot is `%USERPROFILE%\.ssh\windows-rent\access`, exactly
+`<client id>LF<client secret>LF` (each line 1-1024 printable ASCII). Only
+`win.ps1 -Mode RentAccess` writes it, and only from redirected stdin — never argv,
+environment or a file it reads; envs' placement entrance is the intended caller:
+
+```powershell
+<private byte stream> | powershell.exe -NoProfile -NonInteractive -File .\win.ps1 -Mode RentAccess
+```
+
+The slot is a `file-created` host effect like the SSH files: created owner-only
+(current-user owner, protected DACL with one FullControl entry, set in the same
+native call that creates the temporary file), committed with its SHA-256 in the
+ledger, which no answer prints. The same bytes again write nothing. Other bytes
+rotate: the scoped host undo removes the slot only while it is exactly its last
+commit and owner-only, then it is created fresh, so no old value is kept and the
+slot is briefly absent (connections then fail closed). An unrecorded slot, changed
+bytes (even of the same length), a wider ACL or a leftover `access.*` file is
+refused and kept; an interruption at any step is closed by the same recovery as
+every owned file. `HostRemove` removes it with the other host effects.
+
+`rent-access.ps1` refuses before starting any child unless the slot is a plain,
+owner-only, well-formed file whose bytes are the latest ledger record of that slot,
+a commit, and no `access.*` file is beside it. Then it starts the `cloudflared.exe`
+beside it with exactly `access ssh --hostname <host>` and, in that child's
+environment only, `TUNNEL_SERVICE_TOKEN_ID`/`TUNNEL_SERVICE_TOKEN_SECRET` (other
+`TUNNEL_*` removed). The child inherits the launcher's standard handles, so SSH
+bytes never pass through PowerShell; the launcher writes nothing to stdout, exits
+with the child's code, and a refusal is one fixed stderr line. It reads ACLs through
+.NET, not `Get-Acl`, because a Windows PowerShell started from PowerShell 7 inherits
+a module path that cannot load that module. Non-disclosure holds only for this
+fixed start: cloudflared's own debug logging (`--loglevel debug`) dumps request
+headers, including the secret. An invalid credential that Access answers with a
+login redirect makes cloudflared start its own browser login, and a token stored
+by an earlier interactive login could then be used; neither is prevented here.
 
 `OwnSsh` / `OwnSshTest` handle only the existing local **g6i3-own** alias:
 127.0.0.1:2223, dev, `~/.ssh/id_ed25519_windows_own`,
@@ -433,6 +474,7 @@ public Quick endpoint has been established by this slice.
 | Artifact / four-file runtime | compiler subset/inventory; native early refusals; default-stream copy | trusted exact CI archive before application |
 | Task lifecycle | production old/new/unknown failure, version chain, undo; disposable native descriptor register/export/remove | final remote adoption, real logon/reboot, cold WSLC behavior and console UX |
 | SSH configuration | native generated-fragment parsing; production prefix backup/interruption/drift/undo; existing local alias compatibility | real-home relative Include integration; local g6i3-own strict SSH and Codex after logon; host→rent Access permitted/denied behavior |
+| Access client slot and launcher | synthetic owner-only slot through the ledger in PowerShell 7 and 5.1 (create, repeat, scoped-undo rotation, three interruptions, foreign/same-length/ACL/temp refusal); launcher with a native test child: byte-exact duplex, EOF, separate stderr, exit code, exact argv and `TUNNEL_*`, no value in command lines; real OpenSSH `-T`/`-tt` reach it with bytes both ways; real pinned client starts from it without printing values; an isolated debug control shows the values become request headers | envs' real placement; provider acceptance and service-only denial; no-browser on rejection; stored-token fallback; packaged Windows Codex reading the alias, slot and ledger |
 | Quick | fixed argv and environment/origin negatives; no publication | approved existing HTTP response and actual temporary public response |
 | Tail retirement | no stop/uninstall in source or CI | actual noninteractive **rentR→G6I3→own OCI Nix gh** alternative route plus required SSH/Codex/reboot paths |
 

@@ -1,7 +1,8 @@
 #requires -Version 5.1
 [CmdletBinding()]
 param(
-    [ValidateSet('Validate', 'Test', 'Apply', 'Restore', 'RestoreTest', 'Uninstall', 'RentSsh', 'RentSshTest', 'OwnSsh', 'OwnSshTest', 'QuickHttp', 'OwnLogon', 'OwnLogonTest', 'HostRemove', 'OwnResume', 'OwnResumeTest', 'PlatformRestore', 'PlatformTest')][string]$Mode = 'Validate',
+    [ValidateSet('Validate', 'Test', 'Apply', 'Restore', 'RestoreTest', 'Uninstall', 'RentSsh', 'RentSshTest', 'RentAccess', 'OwnSsh', 'OwnSshTest', 'QuickHttp', 'OwnLogon', 'OwnLogonTest', 'HostRemove', 'OwnResume', 'OwnResumeTest', 'PlatformRestore', 'PlatformTest')][string]$Mode = 'Validate',
+    # RentAccess takes no argument: its only input is the Access client credential on redirected stdin.
     # RentSsh/RentSshTest only: the live binding, known only after envs and the first rent start. Nothing is guessed.
     [string]$Alias = 'windows-rent',
     [string]$Hostname,
@@ -672,7 +673,7 @@ function IsHostEffect($Effect) {
     $ssh = Join-Path (HostProfile) '.ssh'
     if ($kind -cnotin @('file-created','prefix-inserted')) { return $false }
     return @(@('config','config.before-windows-rent','config.before-g6i3-own','windows-rent\config','windows-rent\known_hosts',
-        'windows-own\config','known_hosts_windows_own') | Where-Object { (Join-Path $ssh $_) -eq $target }).Count -gt 0
+        'windows-rent\access','windows-own\config','known_hosts_windows_own') | Where-Object { (Join-Path $ssh $_) -eq $target }).Count -gt 0
 }
 
 function OwnTaskName([string]$Target) { 'windows-own-logon-' + $Target.Substring('task:windows-own-logon:'.Length) }
@@ -924,7 +925,7 @@ function SshPath([string]$Path, [string]$Profile) {
     if ($path.StartsWith('~\')) { $path = Join-Path $Profile $path.Substring(2) }
     return [IO.Path]::GetFullPath($path)
 }
-function AssertSshEffective($Values, [string]$Name, [string]$HostName, [string]$IdentityPath, [string]$KnownHosts, [string]$Client, [string]$Profile) {
+function AssertSshEffective($Values, [string]$Name, [string]$HostName, [string]$IdentityPath, [string]$KnownHosts, [string]$Proxy, [string]$Profile) {
     if (@($Values.hostname).Count -ne 1 -or $Values.hostname[0] -cne $HostName -or @($Values.user).Count -ne 1 -or $Values.user[0] -cne 'dev' -or
         $Values.stricthostkeychecking[0] -cne 'true' -or ($Name -cne 'g6i3-own' -and $Values.identitiesonly[0] -cne 'yes') -or @($Values.identityfile).Count -ne 1 -or
         (SshPath $Values.identityfile[0] $Profile) -ne $IdentityPath -or @($Values.userknownhostsfile).Count -ne 1 -or
@@ -932,7 +933,12 @@ function AssertSshEffective($Values, [string]$Name, [string]$HostName, [string]$
     if ($Name -ceq 'g6i3-own') {
         if ($Values.port[0] -cne '2223' -or ($Values.ContainsKey('proxycommand') -and $Values.proxycommand[0] -cne 'none')) { throw 'Local own alias has a different port/proxy.' }
     } elseif (-not $Values.ContainsKey('hostkeyalias') -or $Values.hostkeyalias[0] -cne $Name -or
-        -not $Values.ContainsKey('proxycommand') -or $Values.proxycommand[0] -cne ('"' + $Client + '" access ssh --hostname %h')) { throw 'Rent Access ProxyCommand/host key alias differs.' }
+        -not $Values.ContainsKey('proxycommand') -or $Values.proxycommand[0] -cne $Proxy) { throw 'Rent Access ProxyCommand/host key alias differs.' }
+}
+# The one rent ProxyCommand: Windows PowerShell runs the packaged launcher beside the pinned client. Every
+# execution surface that reads the windows-rent alias (terminal ssh, Windows Codex Remote SSH) runs this same line.
+function RentProxyCommand([string]$Launcher) {
+    '"' + (Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe') + '" -NoProfile -NonInteractive -File "' + $Launcher + '" %h'
 }
 
 function HostCaller {
@@ -965,13 +971,16 @@ function HostSsh([switch]$Test, [switch]$Local) {
     if ($Local) {
         $contract = OwnContract; $name = $contract.ssh.alias; $hostName = '127.0.0.1'
         $identityPath = Join-Path $profile $contract.ssh.identity; $knownHosts = Join-Path $profile $contract.ssh.knownHosts
-        $fragment = Join-Path $directory 'windows-own\config'; $clientExe = $null
+        $fragment = Join-Path $directory 'windows-own\config'; $clientExe = $null; $proxy = $null
     } else {
         if ($Alias -cne 'windows-rent' -or $Hostname -cnotmatch '^(?=.{1,253}$)[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+\z') { throw 'Explicit windows-rent Access hostname is required.' }
         $name = $Alias; $hostName = $Hostname; $identityPath = [IO.Path]::GetFullPath($Identity)
         $knownHosts = Join-Path $directory 'windows-rent\known_hosts'; $fragment = Join-Path $directory 'windows-rent\config'
         $clientDirectory = Join-Path $localAppData ('Programs\cloudflared-' + $manifest.cloudflared.version)
         $clientExe = Join-Path $clientDirectory 'cloudflared.exe'
+        # The pinned client and the packaged launcher are one owned tree; the launcher reads the RentAccess slot.
+        $clientFiles = @{ 'cloudflared.exe' = $manifest.cloudflared.sha256; 'rent-access.ps1' = $manifest.files.'rent-access.ps1' }
+        $proxy = RentProxyCommand (Join-Path $clientDirectory 'rent-access.ps1')
     }
     AssertPlainPath $identityPath -Required
     AssertOwnedSsh @((Join-Path $directory 'config'),$fragment,$knownHosts) -Test:$Test
@@ -979,14 +988,14 @@ function HostSsh([switch]$Test, [switch]$Local) {
     if ($count -gt 1) { throw 'SSH alias is declared more than once; preserved.' }
     if ($count -eq 1) {
         AssertPlainPath $knownHosts -Required
-        AssertSshEffective (SshEffective $ssh $name) $name $hostName $identityPath $knownHosts $clientExe $profile
+        AssertSshEffective (SshEffective $ssh $name) $name $hostName $identityPath $knownHosts $proxy $profile
         if ($Local) { return [ordered]@{ alias = $name; configured = $true; ownership = 'existing'; authenticationProof = 'unproven' } }
     } elseif ($Test) { throw 'SSH alias is absent.' }
     if ($count -eq 0) { $null = SshDeclaredCount $files $name -Creating }
     if ($HostKey -cnotmatch '^ssh-ed25519 [A-Za-z0-9+/]+={0,2}\z') { throw 'An explicitly authorized public SSH host key is required; never discovered as trust.' }
     $text = "Host $name`n  HostName $hostName`n  User dev`n"
     if ($Local) { $text += "  Port 2223`n"; $known = "[127.0.0.1]:2223 $HostKey`n" }
-    else { $text += "  ProxyCommand `"$clientExe`" access ssh --hostname %h`n  HostKeyAlias $name`n"; $known = "$name $HostKey`n" }
+    else { $text += "  ProxyCommand $proxy`n  HostKeyAlias $name`n"; $known = "$name $HostKey`n" }
     if ($identityPath -match '["\r\n]' -or $knownHosts -match '["\r\n]') { throw 'Unsupported SSH path quoting.' }
     $text += "  IdentityFile `"$identityPath`"`n  IdentitiesOnly yes`n  StrictHostKeyChecking yes`n  UserKnownHostsFile `"$knownHosts`"`n  UpdateHostKeys no`n"
     $utf8 = [Text.UTF8Encoding]::new($false)
@@ -1005,17 +1014,73 @@ function HostSsh([switch]$Test, [switch]$Local) {
         -not @(OpenAttempt ('file-created:' + (Join-Path $directory 'config.before-windows-rent').ToUpperInvariant())).Count) { throw 'Unowned SSH backup exists; no deployment.' }
     if (-not $Test) {
         if (-not $Local) {
-            $client = HostTreeEffect $clientDirectory @{ 'cloudflared.exe' = $manifest.cloudflared.sha256 }
-            InstallHostTree $client @{ 'cloudflared.exe' = (BundlePath $manifest.cloudflared.file) }
+            $client = HostTreeEffect $clientDirectory $clientFiles
+            InstallHostTree $client @{ 'cloudflared.exe' = (BundlePath $manifest.cloudflared.file); 'rent-access.ps1' = (BundlePath 'rent-access.ps1') }
         }
         ConvergeHostBytes $fragment $utf8.GetBytes($text)
         ConvergeHostBytes $knownHosts $utf8.GetBytes($known)
         if ($count -eq 0) { HostPrefix $config (Join-Path $directory 'config.before-windows-rent') $include }
     }
     $null = SshConfigFiles $directory
-    AssertSshEffective (SshEffective $ssh $name) $name $hostName $identityPath $knownHosts $clientExe $profile
-    if (-not $Local -and -not (Test-EffectStateEqual 'tree-extracted' (HostTreeEffect $clientDirectory @{ 'cloudflared.exe' = $manifest.cloudflared.sha256 }).desired (ObserveTree $clientDirectory))) { throw 'Pinned cloudflared client differs.' }
-    [ordered]@{ alias = $name; configured = $true; client = $clientExe; authenticationProof = 'unproven'; rebootProof = 'unproven' }
+    AssertSshEffective (SshEffective $ssh $name) $name $hostName $identityPath $knownHosts $proxy $profile
+    if (-not $Local -and -not (Test-EffectStateEqual 'tree-extracted' (HostTreeEffect $clientDirectory $clientFiles).desired (ObserveTree $clientDirectory))) { throw 'Pinned cloudflared client or rent launcher differs.' }
+    [ordered]@{ alias = $name; configured = $true; client = $clientExe; launcher = (Join-Path $clientDirectory 'rent-access.ps1')
+        credential = 'RentAccess stdin slot; never written here'; authenticationProof = 'unproven'; rebootProof = 'unproven' }
+}
+
+# The Access client credential slot (#14): one owner-only file, exactly '<client id>LF<client secret>LF', each line
+# 1-1024 printable ASCII characters. Only RentAccess writes it, from stdin; only the packaged rent-access.ps1 reads it.
+# Its content is committed in the host ledger like every owned file, and that integrity record is never printed.
+function RentAccessSlot { Join-Path (HostProfile) '.ssh\windows-rent\access' }
+function Get-RentAccessProblem([byte[]]$Bytes) {
+    if ($null -eq $Bytes -or $Bytes.Length -lt 4 -or $Bytes.Length -gt 2050) { return 'is not 4 to 2050 bytes' }
+    # ISO-8859-1 maps every byte to one character, so any byte outside printable ASCII and LF fails the pattern.
+    if ([Text.Encoding]::GetEncoding(28591).GetString($Bytes) -cnotmatch '^[!-~]{1,1024}\n[!-~]{1,1024}\n\z') { return 'is not two printable ASCII lines' }
+    return $null
+}
+function ReadRentAccessInput {
+    if (-not [Console]::IsInputRedirected) { throw 'RentAccess reads the credential from redirected stdin only; nothing written.' }
+    $stream, $buffer, $chunk = [Console]::OpenStandardInput(), [IO.MemoryStream]::new(), [byte[]]::new(4096)
+    try {
+        while (($count = $stream.Read($chunk, 0, $chunk.Length)) -gt 0) {
+            $buffer.Write($chunk, 0, $count)
+            if ($buffer.Length -gt 2050) { throw 'Access credential on stdin is too long; nothing written.' }
+        }
+        return ,$buffer.ToArray()
+    } finally { [Array]::Clear($chunk, 0, $chunk.Length); $buffer.Dispose(); $stream.Dispose() }
+}
+# Absent: create. The same bytes: nothing. Other bytes: the owned slot is undone by the scoped host undo (it must be
+# exactly its last commit and still owner-only), then created fresh, so a rotation never keeps the old value and the
+# slot is briefly absent: rent-access.ps1 then refuses before any child. Anything else is refused and kept.
+function PlaceRentAccess([byte[]]$Bytes) {
+    $problem = Get-RentAccessProblem $Bytes
+    if ($problem) { throw "Access credential on stdin $problem; nothing written." }
+    $slot = RentAccessSlot
+    AssertPlainPath $slot
+    $effect = FileEffect $slot (HostHash $Bytes)
+    RecoverId $effect.id
+    $directory = Split-Path -Parent $slot
+    if ((Test-Path -LiteralPath $directory -PathType Container) -and
+        @(Get-ChildItem -LiteralPath $directory -Force | Where-Object { $_.Name.StartsWith('access.', [StringComparison]::OrdinalIgnoreCase) }).Count) {
+        throw 'An unnamed Access slot temporary file is present; retained for review, nothing written.'
+    }
+    $open = @(OpenAttempt $effect.id)
+    $action = 'created'
+    if ($open.Count) {
+        $plan = HostUndoPlan $open
+        $problem = OwnerOnlyProblem $slot
+        if ($problem) { throw "Access slot $problem; retained, nothing written." }
+        if ($open[0].desired.sha256 -ceq $effect.desired.sha256) { return [ordered]@{ mode = $Mode; slot = $slot; action = 'unchanged'; recordsWritten = $script:recordsWritten; providerProof = 'unproven' } }
+        UndoHostEffect $plan
+        $action = 'rotated'
+    } elseif ((ObserveFile $slot).exists) { throw 'Access slot exists without ownership; never adopted, nothing written.' }
+    $null = [IO.Directory]::CreateDirectory($directory)
+    CreateOwnedFile $effect $Bytes -OwnerOnly
+    [ordered]@{ mode = $Mode; slot = $slot; action = $action; recordsWritten = $script:recordsWritten; providerProof = 'unproven' }
+}
+function RentAccess {
+    $bytes = ReadRentAccessInput
+    try { PlaceRentAccess $bytes } finally { [Array]::Clear($bytes, 0, $bytes.Length) }
 }
 
 # One scoped undo path for host removal and obsolete runtime collection. The
@@ -1545,20 +1610,55 @@ function Recovering($Effect, [scriptblock]$Act) {
 
 # Creates an absent file from a path or bytes: intent (naming its temporary file), a new
 # temporary file written through and flushed, a rename that fails if the target exists, and the commit.
-function CreateOwnedFile($Effect, $Source) {
+# -OwnerOnly creates the temporary file with OwnerOnlySecurity already applied (no moment with an inherited
+# DACL), and the rename keeps that descriptor; the commit is written only once the target reads back owner-only.
+function CreateOwnedFile($Effect, $Source, [switch]$OwnerOnly) {
     $temp = $Effect.target + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
     WriteRecord 'intent' $Effect $null $temp
     Recovering $Effect {
         $in = if ($Source -is [byte[]]) { [IO.MemoryStream]::new($Source) } else { [IO.File]::OpenRead($Source) }
         try {
-            $out = [IO.FileStream]::new($temp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None,
-                65536, [IO.FileOptions]::WriteThrough)
+            $out = if ($OwnerOnly) { NewOwnerOnlyFile $temp } else {
+                [IO.FileStream]::new($temp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None,
+                    65536, [IO.FileOptions]::WriteThrough) }
             try { $in.CopyTo($out); $out.Flush($true) } finally { $out.Dispose() }
         } finally { $in.Dispose() }
         [IO.File]::Move($temp, $Effect.target)
+        if ($OwnerOnly) { $problem = OwnerOnlyProblem $Effect.target; if ($problem) { throw "Owner-only file $problem after creation." } }
         WriteRecord 'commit' $Effect (ObserveFile $Effect.target)
         $script:copied++
     }
+}
+
+# The current user owns the file and a protected DACL holds exactly one explicit Allow FullControl ACE for that
+# user: no inherited, group or administrator entry. Set at creation and checked before every write and every use.
+function OwnerOnlySecurity {
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $security = [Security.AccessControl.FileSecurity]::new()
+    $security.SetOwner($sid)
+    $security.SetAccessRuleProtection($true, $false)
+    $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,
+        [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))
+    return $security
+}
+# CreateNew with the descriptor in the same native call (Windows PowerShell 5.1 and PowerShell 7 spell it differently).
+function NewOwnerOnlyFile([string]$Path) {
+    $mode, $rights, $share, $options = [IO.FileMode]::CreateNew, [Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::None, [IO.FileOptions]::WriteThrough
+    if ($PSVersionTable.PSEdition -ceq 'Desktop') { return [IO.FileStream]::new($Path, $mode, $rights, $share, 4096, $options, (OwnerOnlySecurity)) }
+    return [IO.FileSystemAclExtensions]::Create([IO.FileInfo]::new($Path), $mode, $rights, $share, 4096, $options, (OwnerOnlySecurity))
+}
+function OwnerOnlyProblem([string]$Path) {
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    # .NET directly (no Microsoft.PowerShell.Security module, which an inherited PowerShell 7 PSModulePath breaks in 5.1).
+    $sections = [Security.AccessControl.AccessControlSections]'Owner, Access'
+    $security = if ($PSVersionTable.PSEdition -ceq 'Desktop') { [IO.File]::GetAccessControl($Path, $sections) } else { [IO.FileSystemAclExtensions]::GetAccessControl([IO.FileInfo]::new($Path), $sections) }
+    if ($security.GetOwner([Security.Principal.SecurityIdentifier]) -ne $sid) { return 'is not owned by the current user' }
+    if (-not $security.AreAccessRulesProtected) { return 'inherits access rules' }
+    $rules = @($security.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    if ($rules.Count -ne 1 -or $rules[0].IsInherited -or $rules[0].IdentityReference -ne $sid -or
+        $rules[0].AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+        $rules[0].FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl) { return 'grants access beyond the current user' }
+    return $null
 }
 
 # Writes a String value into its existing HKCU key (the effect's target).
@@ -3570,7 +3670,7 @@ function Uninstall {
 
 $script:runIdentity = RunIdentity
 try {
-    if ($Mode -cin @('RentSsh','RentSshTest','OwnSsh','OwnSshTest','OwnLogon','OwnLogonTest','HostRemove','QuickHttp')) {
+    if ($Mode -cin @('RentSsh','RentSshTest','RentAccess','OwnSsh','OwnSshTest','OwnLogon','OwnLogonTest','HostRemove','QuickHttp')) {
         $null = HostCaller
         if ($Mode -ceq 'QuickHttp') { QuickHttp; return }
         $test = $Mode.EndsWith('Test')
@@ -3579,6 +3679,7 @@ try {
         $answer = switch ($Mode) {
             'RentSsh' { HostSsh }
             'RentSshTest' { HostSsh -Test }
+            'RentAccess' { RentAccess }
             'OwnSsh' { HostSsh -Local }
             'OwnSshTest' { HostSsh -Local -Test }
             'OwnLogon' { HostLogon }

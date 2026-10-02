@@ -127,8 +127,10 @@ jobs:
           Expand-Archive windows-dist.zip bundle
           & ./bundle/proof.ps1 -ExpectedSource $env:EXPECTED_SOURCE
 
+  # One Release per source: the proved Windows distribution and rent-image.json, the rent image this same run
+  # tested and pushed (by registry digest), so a consumer binds both to the source and runs the image by digest.
   publish:
-    needs: [scope, build, windows]
+    needs: [scope, build, windows, rent]
     if: needs.scope.outputs.launcher_only != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/proposals'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -144,9 +146,14 @@ jobs:
           GH_REPO: ${{ github.repository }}
           SOURCE: ${{ needs.build.outputs.source }}
           EXPECTED_SHA256: ${{ needs.build.outputs.checksum }}
+          RENT_IMAGE: ${{ needs.rent.outputs.image }}
         run: |
+          set -euo pipefail
           test "$SOURCE" = "$GITHUB_SHA"
           printf '%s  windows-dist.zip\n' "$EXPECTED_SHA256" | sha256sum --check --strict
-          gh release create "windows-$SOURCE" windows-dist.zip windows-dist.zip.sha256 \
+          [[ $RENT_IMAGE =~ ^ghcr\.io/roccho-dev/windows-rent@sha256:[0-9a-f]{64}$ ]] || { echo 'RED: no pushed rent image digest from this run' >&2; exit 1; }
+          jq -n --arg source "$SOURCE" --arg image "$RENT_IMAGE" \
+            '{kind: "windows.rentImage.v1", source: $source, image: $image}' > rent-image.json
+          gh release create "windows-$SOURCE" windows-dist.zip windows-dist.zip.sha256 rent-image.json \
             --target "$SOURCE" --title "Windows $SOURCE" --latest=false \
-            --notes "Exact artifact from passing build and Windows proof; source $SOURCE. Real-host UX is not claimed."
+            --notes "Exact artifacts from this run's passing build, Windows proof and rent image job (stub-twin smoke plus limited checks of the pushed image); source $SOURCE. Real-host UX, WSLC and Cloudflare are not claimed."
