@@ -432,7 +432,7 @@ public Quick endpoint has been established by this slice.
 | --- | --- | --- |
 | Artifact / four-file runtime | compiler subset/inventory; native early refusals; default-stream copy | trusted exact CI archive before application |
 | Task lifecycle | production old/new/unknown failure, version chain, undo; disposable native descriptor register/export/remove | final remote adoption, real logon/reboot, cold WSLC behavior and console UX |
-| SSH configuration | production prefix backup/interruption/drift/undo; existing local alias compatibility | local g6i3-own strict SSH and Codex after logon; host→rent Access permitted/denied behavior |
+| SSH configuration | native generated-fragment parsing; production prefix backup/interruption/drift/undo; existing local alias compatibility | real-home relative Include integration; local g6i3-own strict SSH and Codex after logon; host→rent Access permitted/denied behavior |
 | Quick | fixed argv and environment/origin negatives; no publication | approved existing HTTP response and actual temporary public response |
 | Tail retirement | no stop/uninstall in source or CI | actual noninteractive **rentR→G6I3→own OCI Nix gh** alternative route plus required SSH/Codex/reboot paths |
 

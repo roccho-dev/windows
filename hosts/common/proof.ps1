@@ -1685,9 +1685,26 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
     Refused { SshDeclaredCount @(@{text="Host *`n User foreign"}) 'windows-rent' -Creating } '*Host pattern prevents*'
     [IO.File]::WriteAllBytes($master,$original)
 
-    # Same production Rent renderer and real Windows OpenSSH -G, with only the
-    # normal-caller/profile boundary replaced by the disposable CI fixture.
+    # Same production Rent renderer and real Windows OpenSSH -G. Relative Include
+    # uses the native user's ~/.ssh, not the directory of -F's master. This
+    # disposable-profile boundary parses the actual generated fragment instead;
+    # master prefix ownership is proved separately above. Real-home Include
+    # integration remains a live gate, not a synthetic-profile proof.
     . ([scriptblock]::Create($ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Invoke-Native'},$false).Extent.Text))
+    $script:hostNativeInvoke=(Get-Command Invoke-Native).ScriptBlock
+    $script:sshFragmentParses=0
+    function Invoke-Native([string]$Exe,[string[]]$Arguments,[int]$Seconds,[int[]]$AcceptedExitCodes=@(0),[switch]$Result,[switch]$PlatformOperation) {
+        if ($Exe -eq (Join-Path ([Environment]::SystemDirectory) 'OpenSSH\ssh.exe')) {
+            if ($Arguments.Count -ne 4 -or $Arguments[0] -cne '-F' -or
+                $Arguments[1] -ne (Join-Path (HostProfile) '.ssh\config') -or
+                $Arguments[2] -cne '-G' -or $Arguments[3] -cne 'windows-rent') { throw 'Unexpected SSH fixture argv.' }
+            $fragmentPath=Join-Path (HostProfile) '.ssh\windows-rent\config'
+            AssertPlainPath $fragmentPath -Required
+            $PSBoundParameters['Arguments']=[string[]]@('-F',$fragmentPath,'-G','windows-rent')
+            $script:sshFragmentParses++
+        }
+        & $script:hostNativeInvoke @PSBoundParameters
+    }
     function HostCaller { $script:runIdentity.sid }
     function BundlePath([string]$Relative) { Join-Path $Root $Relative }
     $Alias='windows-rent'; $Hostname='rent.example.invalid'
@@ -1701,6 +1718,7 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
     $ssh=HostSsh
     $mark=$script:nextSeq; $null=HostSsh; $null=HostSsh -Test
     Must ($script:nextSeq -eq $mark) 'Rent client/config/prefix repeat no-op'
+    Must ($script:sshFragmentParses -ge 3) 'native generated-fragment parsing drives production SSH binding checks'
     $version=Invoke-Native $ssh.client @('--version') 10
     Must ($version -match ('^cloudflared version '+[regex]::Escape($manifest.cloudflared.version)+'( |$)')) 'real pinned native client version, no network'
     $fragment=Join-Path $profile '.ssh\windows-rent\config'
@@ -3576,7 +3594,7 @@ if ($g4.status -cne 'measured' -or (Get-Field $g4 'gate') -cne 'pass' -or $g4.st
     secondApplyChanges = 0; ownedDriftRepaired = $true; unownedDriftRefused = $true; corruptionRejected = $true
     ledger = 'intent/commit per owned font file and value; crash recovery, lock, torn record, GC, update, Uninstall (dry run, locked file, references) proven on synthetic state'
     uninstallEmptiedOwnedFonts = $true;
-    rentSsh = "cloudflared $($manifest.cloudflared.version) native version; guarded strict config/prefix lifecycle on synthetic profile; user drift refused; live connection unproven"
+    rentSsh = "cloudflared $($manifest.cloudflared.version) native version; native generated-fragment parsing and guarded strict config/prefix lifecycle on synthetic profile; user drift refused; real-home Include integration/live connection unproven"
     hostPrimitives = @($hostPrimitives7,$host51Lines[-1])
     winReportsHandoffUnproven = $true; handoffProbeRefusedOnRunner = $true; handoffEvaluatorCases = $handoffCases;
     g4Measurement = $g4;
