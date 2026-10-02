@@ -123,11 +123,11 @@ let
     exec ${cdpTty}/bin/cdp-tty "$ws"
   '';
   # PID 1. Fails closed on mounts, holds the /nix root lock for the container's lifetime (a seed takes the same lock),
-  # checks the seeded store, then supervises nix-daemon, sshd and xpra. It runs from the /nix volume, so an unseeded
-  # volume cannot start it at all.
+  # checks the seeded store, then supervises nix-daemon and sshd; the headless browsers are started beside them and are
+  # not essential services. It runs from the /nix volume, so an unseeded volume cannot start it at all.
   start = pkgs.writeShellScriptBin "own-start" ''
     set -eu
-    export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.util-linux pkgs.openssh pkgs.xpra pkgs.nix ]}:$PATH
+    export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.util-linux pkgs.openssh pkgs.nix ]}:$PATH
     ${mountLib}
     homevol=''${OWN_HOME_VOLUME:-}
     workvol=''${OWN_WORK_VOLUME:-}
@@ -171,25 +171,17 @@ let
     chmod 600 ${home}/.ssh/ssh_host_ed25519_key
     ${pkgs.openssh}/bin/sshd -D -e -f ${sshConfig} &
     ssh_pid=$!
-    ${pkgs.util-linux}/bin/setpriv --reuid=1000 --regid=1000 --clear-groups \
-      ${pkgs.coreutils}/bin/env HOME=${home} XDG_RUNTIME_DIR=/tmp/own-runtime \
-      FONTCONFIG_FILE=${fontConfig} \
-      ${pkgs.xpra}/bin/xpra seamless :100 \
-      --bind-tcp=127.0.0.1:${toString spec.xpraPort} --html=on --websocket-upgrade=on \
-      --daemon=no --exit-with-client=no --exit-with-children=no \
-      --mdns=no --pulseaudio=no --dbus-launch=no --dbus-control=no \
-      --printing=no --notifications=no --webcam=no &
-    xpra_pid=$!
     ${pkgs.util-linux}/bin/setpriv --reuid=1000 --regid=1000 --clear-groups ${browser} &
     browser_pid=$!
     # On stop, Chromium gets SIGTERM and time to flush its profiles before the container exits.
-    trap 'kill "$ssh_pid" "$xpra_pid" "$nd_pid" 2>/dev/null || true; kill -TERM "$browser_pid" 2>/dev/null || true; wait "$browser_pid" 2>/dev/null || true' TERM INT
-    wait -n "$ssh_pid" "$xpra_pid" "$nd_pid"
+    trap 'kill "$ssh_pid" "$nd_pid" 2>/dev/null || true; kill -TERM "$browser_pid" 2>/dev/null || true; wait "$browser_pid" 2>/dev/null || true' TERM INT
+    # sshd and nix-daemon are the essential services; either exiting ends own. The browsers stay outside, as before.
+    wait -n "$ssh_pid" "$nd_pid"
   '';
   # own-only tools beside the common dev profile (which carries Nix, Git/SSH, gh, Codex, Claude and basic tools).
   tools = pkgs.buildEnv {
     name = "own-tools";
-    paths = (with pkgs; [ bubblewrap chromium curl fontconfig ripgrep util-linux xpra ]) ++ [ cdpTty view ];
+    paths = (with pkgs; [ bubblewrap chromium curl fontconfig ripgrep util-linux ]) ++ [ cdpTty view ];
     pathsToLink = [ "/bin" ];
   };
   # The GC-rooted runtime seeded into the own /nix volume; own-nix-seed is not among them (it runs only against the

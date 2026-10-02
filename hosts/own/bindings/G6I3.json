@@ -4,7 +4,6 @@
   "expectHost": "G6I3",
   "container": "windows-own",
   "hostPort": 2223,
-  "tunnelPort": 14500,
   "volume": "windows-own-home",
   "workVolume": "windows-own-work",
   "nixVolume": "windows-own-nix",
