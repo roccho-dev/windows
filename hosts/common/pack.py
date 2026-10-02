@@ -656,8 +656,9 @@ def distribution(fonts: Path, noctty: Path, cloudflared: Path, choices: Path,
         platform = wsl_platform(selected.get("wslPlatform"))
         if apps and bootstrap is None:
             raise ValueError("Declared Store apps require absent-AppInstaller recovery metadata")
+        # rent-access.ps1 is the rent ProxyCommand launcher RentSsh installs beside the pinned client.
         for name in ("win.ps1", "proof.ps1", "handoff-proof.ps1", "handoff-evaluate.ps1",
-                     "package-view.ps1", "ui-font.ahk", "README.md"):
+                     "package-view.ps1", "ui-font.ahk", "rent-access.ps1", "README.md"):
             shutil.copyfile(scripts / name, root / name)
         (root / "payload").mkdir()
         shutil.copyfile(noctty, root / "payload/noctty.zip")

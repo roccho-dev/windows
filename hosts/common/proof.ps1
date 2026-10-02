@@ -1528,7 +1528,8 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
         'ObserveFile','ObserveTree','ObserveHostEffect','ObserveOwnTask','ResolveOwnTaskTriggerUser','OwnTaskName','OwnTaskEffect','OwnTaskXml','RegisterOwnTask','ConvergeOwnTask',
         'HostTreeEffect','InstallHostTree','Classify','HostHash','WriteHostTemp','HostFileState','ConvergeHostBytes','HostPrefix','FileEffect','CreateOwnedFile',
         'HostUndoPlan','UndoHostEffect','HostRemove','HostLogon','AssertPlainPath','HostProfile','AssertHostRuntimeStreams',
-        'OwnResume','OwnInspect','OwnInfo','OwnSshReady','SshConfigFiles','SshDeclaredCount','SshEffective','SshPath','AssertSshEffective','AssertOwnedSsh','HostSsh','Invoke-Native','QuickHttp','HostTreeReferences'
+        'OwnResume','OwnInspect','OwnInfo','OwnSshReady','SshConfigFiles','SshDeclaredCount','SshEffective','SshPath','AssertSshEffective','AssertOwnedSsh','HostSsh','Invoke-Native','QuickHttp','HostTreeReferences',
+        'OwnerOnlySecurity','NewOwnerOnlyFile','OwnerOnlyProblem','RentProxyCommand','RentAccessSlot','Get-RentAccessProblem','PlaceRentAccess'
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'win.ps1'),[ref]$null,[ref]$null)
     foreach ($definition in $ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cin $names},$false)) {
         . ([scriptblock]::Create($definition.Extent.Text))
@@ -1539,7 +1540,8 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
         throw "Host negative control passed: $Pattern"
     }
     $manifest = [IO.File]::ReadAllText((Join-Path $Root 'manifest.json')) | ConvertFrom-Json
-    $Mode,$localAppData,$ledgerDirectory = 'OwnLogon',$Scratch,(Join-Path $Scratch 'ledger')
+    # The production ledger layout under the scratch %LOCALAPPDATA%: the packaged rent launcher reads it there.
+    $Mode,$localAppData,$ledgerDirectory = 'OwnLogon',$Scratch,(Join-Path $Scratch 'windows-iac\ledger')
     $profile = Join-Path $Scratch 'profile'
     function HostProfile { $profile }
     $script:runIdentity = @{ sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; elevated = $false }
@@ -1737,6 +1739,204 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
     Refused { HostSsh } '*Owned SSH file/prefix is changed*'
     Must ($script:nextSeq -eq $mark) 'user SSH drift refused without repair or ledger writes'
     [IO.File]::WriteAllBytes($fragment,$fragmentBytes)
+    Must ((Get-Item -LiteralPath $ssh.launcher).Directory.FullName -eq (Get-Item -LiteralPath $ssh.client).Directory.FullName -and
+        [IO.File]::ReadAllText($fragment).Contains('ProxyCommand ' + (RentProxyCommand $ssh.launcher) + "`n")) 'Rent alias runs the packaged launcher beside the pinned client'
+
+    # RentAccess (#14): the owner-only Access client slot through the same host ledger, synthetic values only. The
+    # integrity record stays in the ledger; no answer, refusal or log line carries a value or its SHA-256.
+    $synthId='ci-synthetic.access'; $synthSecret='ci'+[guid]::NewGuid().ToString('N')+'synthetic'
+    $ascii=[Text.Encoding]::ASCII
+    $value=$ascii.GetBytes("$synthId`n$synthSecret`n"); $value2=$ascii.GetBytes("$synthId`n${synthSecret}2`n")
+    $slot=RentAccessSlot; $slotId='file-created:'+$slot.ToUpperInvariant()
+    function Phases([int]$Last) { (@(RecordsOf $slotId) | Select-Object -Last $Last | ForEach-Object { $_.phase }) -join ',' }
+    function Quiet($Answer) {
+        $json=$Answer | ConvertTo-Json -Compress -Depth 4
+        Must (-not $json.Contains($synthSecret) -and -not $json.Contains($synthId) -and -not $json.Contains((HostHash $value)) -and
+            -not $json.Contains((HostHash $value2))) 'RentAccess answer carries no credential or integrity value'
+        $Answer
+    }
+    # Launcher (rent-access.ps1) runs, PowerShell 7 run only: the production ProxyCommand line, a scratch profile,
+    # stdin/stdout/stderr as pipes like ssh's, and a native test child in place of cloudflared that records argv and
+    # TUNNEL_* environment, copies stdin to stdout byte for byte, writes one stderr marker and exits 37.
+    $launcherRuns=$NativeTask
+    if ($launcherRuns) {
+        $childDir=Join-Path $Scratch 'rent-access-child'; $recordDir=Join-Path $Scratch 'rent-access-records'
+        $null=[IO.Directory]::CreateDirectory($childDir); $null=[IO.Directory]::CreateDirectory($recordDir)
+        [IO.File]::WriteAllText((Join-Path $recordDir 'child.cs'), @'
+using System; using System.IO; using System.Collections;
+static class Child { static int Main(string[] args) {
+  using (var w = new StreamWriter(Environment.GetEnvironmentVariable("RENT_ACCESS_PROOF_RECORD"))) {
+    w.WriteLine(string.Join("|", args));
+    foreach (DictionaryEntry e in Environment.GetEnvironmentVariables()) {
+      string k = (string)e.Key; if (k.StartsWith("TUNNEL_", StringComparison.OrdinalIgnoreCase)) w.WriteLine(k + "=" + e.Value); } }
+  Stream i = Console.OpenStandardInput(), o = Console.OpenStandardOutput(); byte[] b = new byte[65536]; int n;
+  string banner = Environment.GetEnvironmentVariable("RENT_ACCESS_PROOF_BANNER");
+  if (banner != null) {
+    // For real ssh: send a server identification, record the client's identification line, then end the stream.
+    byte[] s = System.Text.Encoding.ASCII.GetBytes(banner + "\r\n"); o.Write(s, 0, s.Length); o.Flush();
+    var line = new MemoryStream(); int c; while ((c = i.ReadByte()) >= 0 && c != '\n') line.WriteByte((byte)c);
+    File.AppendAllText(Environment.GetEnvironmentVariable("RENT_ACCESS_PROOF_RECORD"), "ident=" + System.Text.Encoding.ASCII.GetString(line.ToArray()).TrimEnd('\r') + "\n");
+    return 0; }
+  while ((n = i.Read(b, 0, b.Length)) > 0) { o.Write(b, 0, n); o.Flush(); }
+  byte[] m = System.Text.Encoding.ASCII.GetBytes("child-stderr-marker\n"); Stream e2 = Console.OpenStandardError(); e2.Write(m, 0, m.Length); e2.Flush();
+  return 37; } }
+'@)
+        $csc=Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+        $null=& $csc /nologo /target:exe ('/out:'+(Join-Path $childDir 'cloudflared.exe')) (Join-Path $recordDir 'child.cs')
+        Must ($LASTEXITCODE -eq 0) 'native test child compiled'
+        Copy-Item -LiteralPath (Join-Path $Root 'rent-access.ps1') -Destination $childDir
+        function RunLauncher([string]$Directory, [byte[]]$Bytes, [switch]$Child) {
+            $line=RentProxyCommand (Join-Path $Directory 'rent-access.ps1')
+            $exe=$line.Substring(1,$line.IndexOf('"',1)-1)
+            $info=[Diagnostics.ProcessStartInfo]::new($exe,$line.Substring($line.IndexOf('"',1)+2).Replace('%h','rent.example.invalid'))
+            $info.UseShellExecute=$false; $info.RedirectStandardInput=$true; $info.RedirectStandardOutput=$true; $info.RedirectStandardError=$true
+            $record=Join-Path $recordDir ([guid]::NewGuid().ToString('N'))
+            $info.Environment['USERPROFILE']=$profile; $info.Environment['LOCALAPPDATA']=$Scratch
+            $info.Environment['TUNNEL_PROOF_FOREIGN']='never-reaches-the-child'; $info.Environment['RENT_ACCESS_PROOF_RECORD']=$record
+            $process=[Diagnostics.Process]::Start($info)
+            try {
+                $out=[IO.MemoryStream]::new(); $copy=$process.StandardOutput.BaseStream.CopyToAsync($out); $err=$process.StandardError.ReadToEndAsync()
+                $lines=@()
+                if ($Child) {
+                    $clock=[Diagnostics.Stopwatch]::StartNew()
+                    while (-not @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($process.Id)").Count -and $clock.Elapsed.TotalSeconds -lt 30) { Start-Sleep -Milliseconds 100 }
+                    $lines=@(@(Get-CimInstance Win32_Process -Filter "ProcessId=$($process.Id) OR ParentProcessId=$($process.Id)") | ForEach-Object { [string]$_.CommandLine })
+                }
+                # A refusing launcher may exit before reading: its closed pipe is expected there, never with a child.
+                try { $process.StandardInput.BaseStream.Write($Bytes,0,$Bytes.Length); $process.StandardInput.BaseStream.Flush(); $process.StandardInput.Close() }
+                catch { if ($Child) { throw } }
+                if (-not $process.WaitForExit(90000)) { $process.Kill($true); throw 'Host primitive failed: launcher did not exit' }
+                $process.WaitForExit(); $copy.Wait()
+                [pscustomobject]@{ code=$process.ExitCode; stdout=$out.ToArray(); stderr=$err.Result; record=$record
+                    commandLines=$lines; recorded=$(if (Test-Path -LiteralPath $record) { @([IO.File]::ReadAllLines($record)) } else { $null }) }
+            } finally { $process.Dispose() }
+        }
+        function LauncherRefuses([string]$Rule) {
+            $run=RunLauncher $childDir ([byte[]]@(1,2,3))
+            Must ($run.code -eq 2 -and $run.stdout.Length -eq 0 -and $run.stderr -like 'rent-access: *; cloudflared not started.*' -and
+                -not $run.stderr.Contains($synthSecret) -and $null -eq $run.recorded) "launcher refuses before any child: $Rule"
+        }
+        LauncherRefuses 'absent slot'
+    }
+
+    $mark=$script:nextSeq
+    foreach ($bad in @([byte[]]@(), $ascii.GetBytes("one-line`n"), $ascii.GetBytes("a`r`nb`r`n"), $ascii.GetBytes("a b`nc`n"),
+            [byte[]]@(0x61,0x0A,0xC3,0xA9,0x0A), $ascii.GetBytes(('x'*1025)+"`ny`n"), $ascii.GetBytes("a`nb`nc`n"))) {
+        Refused { PlaceRentAccess $bad } '*nothing written*'
+    }
+    Must ($script:nextSeq -eq $mark -and -not (Test-Path -LiteralPath $slot)) 'malformed credential refused before any record or file'
+    $null=Quiet (PlaceRentAccess $value)
+    Must ((Phases 2) -ceq 'intent,commit' -and -not (OwnerOnlyProblem $slot) -and [IO.File]::ReadAllText($slot) -ceq "$synthId`n$synthSecret`n") 'first write is owner-only from creation and committed'
+    $mark=$script:nextSeq
+    Must ((Quiet (PlaceRentAccess $value)).action -ceq 'unchanged' -and $script:nextSeq -eq $mark) 'repeat of the same credential writes nothing'
+    $rotated=Quiet (PlaceRentAccess $value2)
+    Must ($rotated.action -ceq 'rotated' -and (Phases 3) -ceq 'undone,intent,commit' -and -not (OwnerOnlyProblem $slot) -and
+        [IO.File]::ReadAllText($slot) -ceq "$synthId`n${synthSecret}2`n" -and
+        @(Get-ChildItem -LiteralPath (Split-Path -Parent $slot) -Force | Where-Object { $_.Name -like 'access*' }).Count -eq 1) 'rotation is scoped undo then fresh owner-only create, no old value kept'
+    if ($launcherRuns) {
+        $payload=[byte[]]::new(262144); for ($i=0; $i -lt $payload.Length; $i++) { $payload[$i]=[byte]($i % 256) }
+        $run=RunLauncher $childDir $payload -Child
+        Must ($run.code -eq 37) 'launcher returns the child exit code'
+        Must ([Convert]::ToBase64String($run.stdout) -ceq [Convert]::ToBase64String($payload)) 'all byte values cross launcher and child unchanged in both directions, ending at stdin EOF'
+        Must ($run.stderr -ceq "child-stderr-marker`n") 'stderr is the child stream alone, separate from stdout'
+        Must ($null -ne $run.recorded -and $run.recorded[0] -ceq 'access|ssh|--hostname|rent.example.invalid' -and
+            ((@($run.recorded | Select-Object -Skip 1 | Sort-Object) -join '|') -ceq "TUNNEL_SERVICE_TOKEN_ID=$synthId|TUNNEL_SERVICE_TOKEN_SECRET=${synthSecret}2")) 'child receives exact argv and only the two slot values as TUNNEL_*'
+        Must ($run.commandLines.Count -ge 2 -and -not @($run.commandLines | Where-Object { $_.Contains($synthSecret) -or $_.Contains($synthId) }).Count) 'no credential in any launcher or child command line'
+    }
+    $forged=$ascii.GetBytes("$synthId`n${synthSecret}3`n")
+    [IO.File]::WriteAllBytes($slot,$forged)
+    $mark=$script:nextSeq
+    Refused { PlaceRentAccess $value } '*differs or is indeterminate*'
+    Must ($script:nextSeq -eq $mark -and -not (OwnerOnlyProblem $slot)) 'same-length overwrite keeping the ACL is drift, refused and retained'
+    if ($launcherRuns) { LauncherRefuses 'same-length overwrite with the ACL kept' }
+    [IO.File]::WriteAllBytes($slot,$value2)
+    # SID-only owner and DACL through .NET: no audit section and no account-name translation.
+    function SetSlotSecurity($Security) {
+        if ($PSVersionTable.PSEdition -ceq 'Desktop') { [IO.File]::SetAccessControl($slot,$Security) } else { [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($slot),$Security) }
+    }
+    $wider=OwnerOnlySecurity
+    $wider.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-1-0'),'Read','Allow'))
+    SetSlotSecurity $wider
+    Refused { PlaceRentAccess $value } '*grants access beyond the current user*'
+    if ($launcherRuns) { LauncherRefuses 'unsafe ACL' }
+    SetSlotSecurity (OwnerOnlySecurity)
+    Must (-not (OwnerOnlyProblem $slot) -and $script:nextSeq -eq $mark) 'ACL drift refused without repair'
+    $stray=$slot+'.'+[guid]::NewGuid().ToString('N')+'.tmp'; [IO.File]::WriteAllBytes($stray,$value)
+    Refused { PlaceRentAccess $value } '*temporary file is present*'
+    if ($launcherRuns) { LauncherRefuses 'leftover temporary file' }
+    [IO.File]::Delete($stray)
+    # Interruptions: after the undo's delete (before its record), after a fresh intent (before the rename), and
+    # after the rename (before the commit). Production RecoverId closes each; the next placement continues.
+    [IO.File]::Delete($slot)
+    Must ((Quiet (PlaceRentAccess $value)).action -ceq 'created' -and (Phases 3) -ceq 'undone,intent,commit' -and
+        [IO.File]::ReadAllText($slot) -ceq "$synthId`n$synthSecret`n") 'interrupted undo recovers undone, then a fresh create'
+    UndoHostEffect (HostUndoPlan @(OpenAttempt $slotId))
+    $pending=FileEffect $slot (HostHash $value2); $temp=$slot+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
+    WriteRecord 'intent' $pending $null $temp
+    $stream=NewOwnerOnlyFile $temp; try { $stream.Write($value2,0,$value2.Length) } finally { $stream.Dispose() }
+    Must ((Quiet (PlaceRentAccess $value2)).action -ceq 'created' -and (Phases 3) -ceq 'void,intent,commit' -and
+        -not (Test-Path -LiteralPath $temp)) 'intent before the rename is voided, its named temp removed, then created'
+    UndoHostEffect (HostUndoPlan @(OpenAttempt $slotId))
+    $pending=FileEffect $slot (HostHash $value); $temp=$slot+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
+    WriteRecord 'intent' $pending $null $temp
+    $stream=NewOwnerOnlyFile $temp; try { $stream.Write($value,0,$value.Length) } finally { $stream.Dispose() }
+    [IO.File]::Move($temp,$slot)
+    Must ((Quiet (PlaceRentAccess $value)).action -ceq 'unchanged' -and (Phases 1) -ceq 'commit' -and -not (OwnerOnlyProblem $slot)) 'rename before the commit is confirmed by recovery'
+    UndoHostEffect (HostUndoPlan @(OpenAttempt $slotId))
+    [IO.File]::WriteAllBytes($slot,$value)
+    Refused { PlaceRentAccess $value } '*exists without ownership*'
+    if ($launcherRuns) { LauncherRefuses 'foreign unrecorded slot' }
+    [IO.File]::Delete($slot)
+    $null=Quiet (PlaceRentAccess $value)
+
+    if ($launcherRuns) {
+        # Both declared execution shapes: real Windows OpenSSH with the production ProxyCommand reaches the packaged
+        # launcher and its child in a non-interactive (-T, as Windows Codex Remote SSH) and a forced-tty (-tt) run. The
+        # child sends a fixed server identification, which ssh reports as the remote version, and records ssh's own
+        # identification line: bytes crossed both ways. It then ends the stream; no key exchange or authentication.
+        $config=Join-Path $recordDir 'ssh_config'; $known=Join-Path $recordDir 'known_hosts'
+        [IO.File]::WriteAllText($known,"windows-rent $HostKey`n")
+        [IO.File]::WriteAllText($config,"Host windows-rent`n  HostName rent.example.invalid`n  User dev`n  ProxyCommand $(RentProxyCommand (Join-Path $childDir 'rent-access.ps1'))`n  HostKeyAlias windows-rent`n  IdentityFile `"$Identity`"`n  IdentitiesOnly yes`n  StrictHostKeyChecking yes`n  UserKnownHostsFile `"$known`"`n  BatchMode yes`n")
+        $sshExe=Join-Path ([Environment]::SystemDirectory) 'OpenSSH\ssh.exe'
+        foreach ($shape in '-T','-tt') {
+            $info=[Diagnostics.ProcessStartInfo]::new($sshExe,"-F `"$config`" $shape -v windows-rent exit")
+            $info.UseShellExecute=$false; $info.RedirectStandardInput=$true; $info.RedirectStandardOutput=$true; $info.RedirectStandardError=$true
+            $record=Join-Path $recordDir ([guid]::NewGuid().ToString('N'))
+            $info.Environment['USERPROFILE']=$profile; $info.Environment['LOCALAPPDATA']=$Scratch; $info.Environment['RENT_ACCESS_PROOF_RECORD']=$record
+            $info.Environment['RENT_ACCESS_PROOF_BANNER']='SSH-2.0-rent-access-proof'
+            $process=[Diagnostics.Process]::Start($info)
+            try {
+                $out=$process.StandardOutput.ReadToEndAsync(); $err=$process.StandardError.ReadToEndAsync()
+                if (-not $process.WaitForExit(60000)) { $process.Kill($true); throw "Host primitive failed: ssh $shape did not exit" }
+                $process.WaitForExit()
+                $recorded=@([IO.File]::ReadAllLines($record))
+                Must ($err.Result -match 'remote software version rent-access-proof' -and $recorded[0] -ceq 'access|ssh|--hostname|rent.example.invalid' -and
+                    @($recorded | Where-Object { $_ -cmatch '^ident=SSH-2\.0-OpenSSH_for_Windows' }).Count -eq 1 -and
+                    -not $err.Result.Contains($synthSecret) -and -not $out.Result.Contains($synthSecret)) "ssh $shape runs the same ProxyCommand and slot through the launcher, bytes both ways"
+            } finally { $process.Dispose() }
+        }
+
+        # The real pinned client through the installed launcher, production argv: the .invalid host fails natively and
+        # no value appears in its stdout, stderr or any new file. This is not provider, denial or no-browser evidence.
+        $before=@(Get-ChildItem -LiteralPath $Scratch -Recurse -Force -File | ForEach-Object { $_.FullName })
+        $run=RunLauncher (Split-Path -Parent $ssh.launcher) ([byte[]]@())
+        Must (-not $run.stderr.StartsWith('rent-access:') -and $run.stdout.Length -eq 0 -and -not $run.stderr.Contains($synthSecret) -and -not $run.stderr.Contains($synthId)) 'real pinned client starts from the launcher and ends without printing the credential'
+        $new=@(Get-ChildItem -LiteralPath $Scratch -Recurse -Force -File | Where-Object { $before -notcontains $_.FullName -and $_.DirectoryName -ne $recordDir })
+        Must (-not @($new | Where-Object { [IO.File]::ReadAllText($_.FullName).Contains($synthSecret) }).Count) 'no new file holds the credential'
+        # Isolated control, never the production argv or launcher: debug logging to a file is the exposure the fixed
+        # argv excludes. The same binary with the values set directly writes them into its request dump.
+        $control=Join-Path $recordDir 'debug-control.log'
+        $info=[Diagnostics.ProcessStartInfo]::new($ssh.client,"access ssh --hostname rent.example.invalid --loglevel debug --logfile `"$control`"")
+        $info.UseShellExecute=$false; $info.RedirectStandardInput=$true; $info.RedirectStandardOutput=$true; $info.RedirectStandardError=$true
+        $info.Environment['TUNNEL_SERVICE_TOKEN_ID']=$synthId; $info.Environment['TUNNEL_SERVICE_TOKEN_SECRET']=$synthSecret
+        $process=[Diagnostics.Process]::Start($info)
+        try {
+            $null=$process.StandardOutput.ReadToEndAsync(); $null=$process.StandardError.ReadToEndAsync(); $process.StandardInput.Close()
+            if (-not $process.WaitForExit(90000)) { $process.Kill($true); throw 'Host primitive failed: debug control did not exit' }
+        } finally { $process.Dispose() }
+        Must ((Test-Path -LiteralPath $control) -and [IO.File]::ReadAllText($control).Contains($synthSecret)) 'isolated debug control: the pinned client sends the TUNNEL_* values as request headers'
+        [IO.File]::Delete($control)
+    }
     $guardTree=Join-Path $Scratch ('Programs\windows-host-'+('d'*40))
     & {
         function Get-ScheduledTask { @{TaskPath='\';TaskName='foreign';Actions=@(@{Execute='C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe';Arguments='';WorkingDirectory=$guardTree})} }
@@ -3658,6 +3858,7 @@ if ($g4.status -cne 'measured' -or (Get-Field $g4 'gate') -cne 'pass' -or $g4.st
     ledger = 'intent/commit per owned font file and value; crash recovery, lock, torn record, GC, update, Uninstall (dry run, locked file, references) proven on synthetic state'
     uninstallEmptiedOwnedFonts = $true;
     rentSsh = "cloudflared $($manifest.cloudflared.version) native version; native generated-fragment parsing and guarded strict config/prefix lifecycle on synthetic profile; user drift refused; real-home Include integration/live connection unproven"
+    rentAccess = 'synthetic owner-only Access slot through the host ledger (create, repeat, scoped-undo rotation, three interruptions, foreign/drift/ACL/temp refusal) in PowerShell 7 and 5.1; packaged launcher byte-exact duplex, EOF, separate stderr, exit code, exact argv and TUNNEL_* with a native test child; real OpenSSH -T/-tt reach it; real pinned client starts from it without printing values; isolated debug control shows header use; provider acceptance/denial, no-browser, packaged Codex, real placement and WSLC unproven'
     hostPrimitives = @($hostPrimitives7,$host51Lines[-1])
     winReportsHandoffUnproven = $true; handoffProbeRefusedOnRunner = $true; handoffEvaluatorCases = $handoffCases;
     g4Measurement = $g4;

@@ -399,7 +399,7 @@ class CompilerTests(unittest.TestCase):
         scripts = self.root / "scripts"
         scripts.mkdir(exist_ok=True)
         for name in ("win.ps1", "proof.ps1", "handoff-proof.ps1", "handoff-evaluate.ps1",
-                     "package-view.ps1", "ui-font.ahk", "README.md"):
+                     "package-view.ps1", "ui-font.ahk", "rent-access.ps1", "README.md"):
             (scripts / name).write_text("fixture")
         return noctty, cloudflared, choices, scripts
 
@@ -601,7 +601,7 @@ class CompilerTests(unittest.TestCase):
             self.assertEqual(manifest["packages"], [self.lock(files={"bin/fixture.exe": "1" * 64}, unpackedSize=10)])
             self.assertNotIn("packages.dsc.json", z.namelist())
             self.assertEqual(set(manifest["files"]), set(z.namelist()) - {"manifest.json"})
-            for name in ("handoff-proof.ps1", "handoff-evaluate.ps1", "package-view.ps1"):
+            for name in ("handoff-proof.ps1", "handoff-evaluate.ps1", "package-view.ps1", "rent-access.ps1"):
                 self.assertIn(name, manifest["files"])
             for name, sha in manifest["files"].items():
                 self.assertEqual(pack.hashlib.sha256(z.read(name)).hexdigest(), sha)
