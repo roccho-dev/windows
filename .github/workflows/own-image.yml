@@ -24,6 +24,8 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          # The legacy migration below reads the base commit's binding.
+          fetch-depth: 0
       - uses: cachix/install-nix-action@v31
       - name: Record source commit and own-image drvPath
         id: source
@@ -179,6 +181,8 @@ jobs:
       # restart and a recreation on the same volumes, each with strict SSH and the three loopback CDP pages.
       - name: Seed, lock, restart and recreation with short SSH/Nix/CDP checks (no real logins)
         shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           set -euo pipefail
           docker load < result
@@ -187,10 +191,10 @@ jobs:
           next=$(docker image inspect ghcr.io/roccho-dev/windows-own:next --format '{{.Id}}')
           d="$(mktemp -d)"
           # Every file this step writes under $d; the exit trap removes exactly these, then the empty directory.
-          d_files=(after head1 key key.pub known_hosts out)
+          d_files=(after head1 key key.pub known_hosts out key2 key2.pub mig-a mig-b mig-head mig-paths)
           # Removes one of those regular files; a link or other type is kept and fails the step.
           plain() { if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then echo "kept unexpected entry $1" >&2; return 1; fi; rm -f -- "$1"; }
-          trap 'status=$?; [ "$status" -eq 0 ] || docker logs own-smoke 2>&1 | tail -n 40 || true; docker rm -f own-smoke own-hold >/dev/null 2>&1 || true; docker volume rm own-smoke-home own-smoke-work own-smoke-nix own-smoke-empty own-smoke-foreign >/dev/null 2>&1 || true; for f in "${d_files[@]}"; do plain "$d/$f" || exit 1; done; rmdir -- "$d" || { echo "kept $d: unexpected entries" >&2; exit 1; }' EXIT
+          trap 'status=$?; [ "$status" -eq 0 ] || docker logs own-smoke 2>&1 | tail -n 40 || true; docker rm -f own-smoke own-hold >/dev/null 2>&1 || true; docker volume rm own-smoke-home own-smoke-work own-smoke-nix own-smoke-empty own-smoke-foreign own-smoke-mig-home own-smoke-mig-work own-smoke-mig-nix >/dev/null 2>&1 || true; for f in "${d_files[@]}"; do plain "$d/$f" || exit 1; done; rmdir -- "$d" || { echo "kept $d: unexpected entries" >&2; exit 1; }' EXIT
           fail() { echo "FAIL $*" >&2; exit 1; }
           ssh-keygen -q -t ed25519 -N '' -f "$d/key"
           for v in home work nix empty foreign; do docker volume create "own-smoke-$v" >/dev/null; done
@@ -349,6 +353,113 @@ jobs:
           docker exec own-smoke /bin/nix-store --verify --check-contents
           display
           echo 'PASS own seed, lock, gate, restart and recreation with SSH/Nix/CDP and no Xpra' | tee -a "$GITHUB_STEP_SUMMARY"
+
+          # Legacy migration: the legacy home-only image -> the bound image -> back -> forward again on one synthetic
+          # home, in the order hosts/own/win.ps1 Replace and its recorded rollback argv use. It runs only when this change
+          # re-pins the binding away from the legacy image; otherwise it reports not applicable and never prints PASS.
+          docker stop -t 30 own-smoke >/dev/null
+          docker rm own-smoke >/dev/null
+          legacy=ghcr.io/roccho-dev/windows-own@sha256:6583bf6e5735ff6c3ebc31bf8d20ab9797511305cf2ffc0452920e65db4ec8dc
+          [[ $BASE =~ ^[0-9a-f]{40}$ ]] || fail 'no comparison base for the legacy migration'
+          old=$(git show "$BASE:hosts/own/bindings/G6I3.json" | jq -er .image) || fail 'base binding unreadable'
+          new=$(jq -er .image hosts/own/bindings/G6I3.json) || fail 'binding unreadable'
+          if [ "$old" != "$legacy" ] || [ "$new" = "$old" ]; then
+            echo 'own legacy migration: not applicable (the binding is not re-pinned from the legacy image)' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            docker pull -q "$old" >/dev/null
+            docker pull -q "$new" >/dev/null
+            test "$(docker image inspect "$new" --format '{{.Id}}')" = "$image" || fail 'the bound image is not the image this job built and tested'
+            ssh-keygen -q -t ed25519 -N '' -f "$d/key2"
+            for v in mig-home mig-work mig-nix; do docker volume create "own-smoke-$v" >/dev/null; done
+            mig=(-v own-smoke-mig-home:/home/dev)
+            line='own-mounts ok home=own-smoke-mig-home work=own-smoke-mig-work nix=own-smoke-mig-nix'
+            # The legacy form as the live host and its rollback argv run it: home only, the key and the trial env.
+            old_run() {
+              docker run -d --name own-smoke --shm-size 1g -p 127.0.0.1:2223:2223 "${mig[@]}" \
+                -e "OWN_AUTHORIZED_KEY=$(cat "$d/key.pub")" -e OWN_TRIAL_UNSANDBOXED=1 "$old" >/dev/null
+            }
+            # The new form as Replace runs it; a different key in the environment must not replace authorized_keys.
+            new_up() {
+              docker run -d --name own-smoke --shm-size 1g -p 127.0.0.1:2223:2223 "${mig[@]}" -v own-smoke-mig-work:/work/repos \
+                --mount "$(nixm own-smoke-mig-nix)" -e OWN_HOME_VOLUME=own-smoke-mig-home -e OWN_WORK_VOLUME=own-smoke-mig-work \
+                -e OWN_NIX_VOLUME=own-smoke-mig-nix -e "OWN_AUTHORIZED_KEY=$(cat "$d/key2.pub")" -e OWN_TRIAL_UNSANDBOXED=1 "$new" >/dev/null
+              local _
+              for _ in {1..60}; do [ "$(docker logs own-smoke 2>&1 | grep -cxF "$line")" = 1 ] && break; sleep 1; done
+              [ "$(docker logs own-smoke 2>&1 | grep -cxF "$line")" = 1 ] || fail 'the new own did not pass its gate'
+              ssh_ready
+            }
+            down() { docker stop -t 30 own-smoke >/dev/null; docker rm own-smoke >/dev/null; }
+            # The image's own bash and coreutils, so the legacy image needs nothing it lacks.
+            state() { docker exec own-smoke /bin/bash -c 'cd /home/dev && sha256sum .ssh/ssh_host_ed25519_key.pub .ssh/authorized_keys .config/gh/config.yml .config/gh/hosts.yml .codex/ci-marker mig-marker && stat -c "%n %a %u:%g %F" .config/gh/config.yml .config/gh/hosts.yml .codex/ci-marker'; }
+            # The executables actually run: each must resolve (-e, not -f) to an executable store file; its path and
+            # content hash are compared, so a tool missing from both images cannot compare equal.
+            paths() {
+              docker exec own-smoke /bin/bash -c 'set -eu
+                for t in chromium codex gh; do
+                  r=$(readlink -e "/bin/$t")
+                  case $r in /nix/store/*) ;; *) echo "$t is not a store path: $r" >&2; exit 1 ;; esac
+                  test -f "$r" && test -x "$r"
+                  sha256sum "$r"
+                done'
+            }
+            new_checks() {
+              "${ssh_cmd[@]}" 'set -eu
+                test -z "${GH_CONFIG_DIR-}"
+                test "$(gh config get git_protocol -h github.com)" = ssh
+                test "$NIX_REMOTE" = daemon
+                test "$(codex --version)" = "codex-cli 0.157.1"
+                test "$(claude --version)" = "2.1.283 (Claude Code)"
+                test "$(readlink /nix/var/nix/profiles/own-dev)" = own-dev-1-link
+                test ! -e /work/repos/.auth
+                nix build --impure --no-link --expr "derivation { name = \"own-mig\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; args = [ \"-c\" \"echo ok > \$out\" ]; }" >/dev/null'
+              test "$(state)" = "$(cat "$d/mig-a")" || fail 'home keys or synthetic state changed'
+              test "$(paths)" = "$(cat "$d/mig-paths")" || fail 'chromium, codex or gh differ from the legacy image'
+            }
+            # 1. Legacy: pin its host key from the home volume and write synthetic, credential-free state.
+            old_run
+            for _ in {1..60}; do docker exec own-smoke /bin/test -s /home/dev/.ssh/ssh_host_ed25519_key.pub && break; sleep 1; done
+            printf '[127.0.0.1]:2223 %s\n' "$(docker exec own-smoke /bin/cut -d' ' -f1,2 /home/dev/.ssh/ssh_host_ed25519_key.pub)" > "$d/known_hosts"
+            ssh_ready
+            "${ssh_cmd[@]}" 'set -eu
+              echo mig > ~/mig-marker
+              install -d -m 700 ~/.config/gh ~/.codex
+              # gh 2.96 config already in its multi-account form (config version 1, a users map), as gh itself
+              # leaves it; the old single-account form would make gh migrate it, which needs a token. No token here.
+              printf "version: \"1\"\n" > ~/.config/gh/config.yml
+              printf "github.com:\n    git_protocol: ssh\n    users:\n        ci:\n    user: ci\n" > ~/.config/gh/hosts.yml
+              chmod 600 ~/.config/gh/config.yml ~/.config/gh/hosts.yml
+              echo session > ~/.codex/ci-marker'
+            state > "$d/mig-a"
+            paths > "$d/mig-paths"
+            # 2. Forward in Replace's order: stop, seed, remove (never -v), run.
+            docker stop -t 30 own-smoke >/dev/null
+            out=$(seed "$new" mig-nix)
+            [ "$(grep -cE '^own-nix-seed ok volume=own-smoke-mig-nix roots=.* copied=[1-9][0-9]*$' <<<"$out")" = 1 ] || fail 'migration seed'
+            docker rm own-smoke >/dev/null
+            new_up
+            new_checks
+            "${ssh_cmd[@]}" 'set -eu
+              git init -q /work/repos/mig && cd /work/repos/mig
+              git -c user.name=ci -c user.email=ci@example.invalid commit -q --allow-empty -m mig
+              git rev-parse HEAD' > "$d/mig-head"
+            # 3. Back to the legacy form with the argv the rollback records.
+            down
+            old_run
+            ssh_ready
+            test "$(state)" = "$(cat "$d/mig-a")" || fail 'rollback changed home keys or synthetic state'
+            test "$(paths)" = "$(cat "$d/mig-paths")" || fail 'rollback changed chromium, codex or gh'
+            # 4. Forward again: the reseed copies nothing and the work commit is kept.
+            docker stop -t 30 own-smoke >/dev/null
+            out=$(seed "$new" mig-nix)
+            [ "$(grep -cE '^own-nix-seed ok volume=own-smoke-mig-nix roots=.* copied=0$' <<<"$out")" = 1 ] || fail 'reseed was not a no-op'
+            docker rm own-smoke >/dev/null
+            new_up
+            new_checks
+            "${ssh_cmd[@]}" 'cd /work/repos/mig && git rev-parse HEAD' > "$d/mig-b"
+            test "$(cat "$d/mig-b")" = "$(cat "$d/mig-head")" || fail 'work commit lost'
+            printf 'own legacy migration %s -> %s, image %s\n' "$old" "$new" "$image" >> "$GITHUB_STEP_SUMMARY"
+            echo 'PASS own legacy migration: legacy -> bound -> legacy -> bound with unchanged host and authorized keys, synthetic state, tool paths and work' | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Keep the tested image for publishing
         if: inputs.publish
         run: cp -L result own-image.tar.gz
