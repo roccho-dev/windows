@@ -2,7 +2,6 @@
   "role": "own",
   "imageRepository": "ghcr.io/roccho-dev/windows-own",
   "sshPort": 2223,
-  "xpraPort": 14500,
   "cdpPort": 9222,
   "publishAddress": "127.0.0.1",
   "stateMount": "/home/dev",

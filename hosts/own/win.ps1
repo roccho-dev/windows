@@ -48,20 +48,20 @@ function Assert-Name([string] $Name, $Value) {
 }
 
 $Spec = Read-Exact (Join-Path $PSScriptRoot 'spec.json') @(
-    'role', 'imageRepository', 'sshPort', 'xpraPort', 'cdpPort', 'publishAddress',
+    'role', 'imageRepository', 'sshPort', 'cdpPort', 'publishAddress',
     'stateMount', 'workMount', 'nixMount', 'shmSize', 'authorizedKeyEnv', 'syntheticTrialEnv')
 $Site = Read-Exact $Binding @(
-    'role', 'site', 'expectHost', 'container', 'hostPort', 'tunnelPort', 'volume', 'workVolume', 'nixVolume',
+    'role', 'site', 'expectHost', 'container', 'hostPort', 'volume', 'workVolume', 'nixVolume',
     'publicKeyFile', 'privateKeyFile', 'knownHostsFile', 'image', 'imageFrom')
 
 if ($Site.role -cne $Spec.role) { throw "Binding role $($Site.role) does not match Spec role $($Spec.role)" }
-foreach ($Name in 'sshPort', 'xpraPort', 'cdpPort') { Assert-Port $Name $Spec.$Name 1 }
+foreach ($Name in 'sshPort', 'cdpPort') { Assert-Port $Name $Spec.$Name 1 }
 if ($Spec.publishAddress -cne '127.0.0.1') { throw 'Spec publishAddress must stay loopback-only (127.0.0.1).' }
 foreach ($Name in 'stateMount', 'workMount') {
     if ($Spec.$Name -cnotmatch '^/[a-z0-9/_-]+$') { throw "Invalid ${Name}: $($Spec.$Name)" }
 }
 if ($Spec.nixMount -cne '/nix') { throw 'Spec nixMount must be /nix.' }
-foreach ($Name in 'hostPort', 'tunnelPort') { Assert-Port $Name $Site.$Name 1024 }
+Assert-Port 'hostPort' $Site.hostPort 1024
 Assert-Name 'container' $Site.container
 foreach ($Name in 'volume', 'workVolume', 'nixVolume') { Assert-Name $Name $Site.$Name }
 # home state, work and the own /nix: three distinct named volumes, never deleted by this script.
@@ -109,7 +109,7 @@ $Proof = "own-mounts ok home=$($Site.volume) work=$($Site.workVolume) nix=$($Sit
 
 if ($Step -eq 'Plan') {
     # Runtime = instantiate(Spec, Binding) for the whole runbook, as exact argv; touches nothing.
-    # keygenOnce, identity and tunnel run inside the bound Nix-defined WSLC dev runtime, with its OpenSSH client and
+    # keygenOnce and identity run inside the bound Nix-defined WSLC dev runtime, with its OpenSSH client and
     # the key generated there; no Windows SSH. The client reaches sshd at the container's WSLC address (addressRead)
     # and first writes "[<address>]:<sshPort> <pinned key from knownHostsFile>" to its /tmp/known_hosts.
     $Ssh = @('ssh', '-F', '/dev/null', '-p', "$($Spec.sshPort)", '-i', $PrivateKey, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes',
@@ -140,10 +140,6 @@ if ($Step -eq 'Plan') {
         knownHostsEntryPrefix = "[$($Spec.publishAddress)]:$($Site.hostPort)"
         addressRead = @($Wslc, 'container', 'inspect', '-f', 'json', $Site.container)
         identity = $Ssh + @($Target, 'id', '-un')
-        # B2 (held): this reaches a Windows browser only if that client Run also publishes publishAddress:tunnelPort.
-        tunnel = $Ssh + @('-N', '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=30',
-            '-L', "0.0.0.0:$($Site.tunnelPort):127.0.0.1:$($Spec.xpraPort)", $Target)
-        browserUrl = "http://$($Spec.publishAddress):$($Site.tunnelPort)/"
     }
     $Plan | ConvertTo-Json -Depth 3
     exit 0

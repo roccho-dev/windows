@@ -174,9 +174,10 @@ jobs:
           $global:LASTEXITCODE = 0
       - name: Build actual own OCI image and the CI-only upgrade image
         run: nix build .#own-image .#own-image-next --no-write-lock-file --print-build-logs
-      # The completed own SSH/B2 trial (browsers, CDP, xpra tunnel, restart) is not rerun here; its step text stays in
-      # history (own-image.yml at 21b31e1) with its passing runs. This checks only what own adoption changes.
-      - name: Seed, lock and a short SSH/Nix check after recreation (no real logins)
+      # The completed own B2 interaction trial is not rerun here; its step text stays in history (own-image.yml at
+      # 21b31e1) with its passing runs. This checks own adoption without Xpra: a fresh start, a successful same-image
+      # restart and a recreation on the same volumes, each with strict SSH and the three loopback CDP pages.
+      - name: Seed, lock, restart and recreation with short SSH/Nix/CDP checks (no real logins)
         shell: bash
         run: |
           set -euo pipefail
@@ -199,6 +200,8 @@ jobs:
           seed() { docker run --rm -v "own-smoke-$2:/seed" -e "OWN_NIX_VOLUME=own-smoke-$2" "$1" /bin/own-nix-seed; }
           # Every name, size and mtime under the nix volume: "nothing written" is an exact comparison.
           listing() { docker run --rm -v own-smoke-nix:/n "$image" /bin/bash -c 'cd /n && find . -printf "%p %s %T@\n" | LC_ALL=C sort | sha256sum'; }
+          # The seed copies exactly the image's GC-rooted closure, so no store entry's name (after its hash) may name Xpra.
+          no_xpra_store() { if docker run --rm -v own-smoke-nix:/n "$image" /bin/ls /n/store | sed 's/^[0-9a-z]*-//' | grep -qi xpra; then fail "xpra in the $1 seeded store"; fi; }
           refuse() {
             local want=$1; shift
             if timeout 60 docker run --rm "$@" "$image" > "$d/out" 2>&1; then fail "started despite: $want"; fi
@@ -213,6 +216,7 @@ jobs:
           # Fresh seed: store, DB, profile and GC root; no lock file (the lock is the volume root); a rerun copies 0.
           roots=$(docker run --rm "$image" /bin/readlink /etc/own-nix-roots)
           seed "$image" nix | grep -qE "^own-nix-seed ok volume=own-smoke-nix roots=$roots copied=[1-9][0-9]*$" || fail 'fresh seed'
+          no_xpra_store fresh
           test "$(docker run --rm -v own-smoke-nix:/n "$image" /bin/ls -A /n | tr '\n' ' ')" = 'store var ' || fail 'unexpected top-level entries'
           seed "$image" nix | grep -qxF "own-nix-seed ok volume=own-smoke-nix roots=$roots copied=0" || fail 'reseed was not a no-op'
           # An interrupted copy leaves its staging directory: the seed refuses, writes nothing and never deletes it.
@@ -235,18 +239,37 @@ jobs:
           refuse 'own-mounts: /nix must be exactly volume own-smoke-nix, rw' "${home[@]}" "${work[@]}" --mount "$(nixm own-smoke-nix),readonly" "${ids[@]}"
           refuse 'own-mounts: exactly three volumes are allowed' "${home[@]}" "${work[@]}" "${nixv[@]}" -v own-smoke-empty:/extra "${ids[@]}"
 
-          run() {
-            docker run -d --name own-smoke --shm-size 1g -p 127.0.0.1:2223:2223 "${home[@]}" "${work[@]}" "${nixv[@]}" "${ids[@]}" \
-              -e OWN_TRIAL_UNSANDBOXED=1 "$@" >/dev/null
+          # Waits for one more gate line than $1: a restarted container keeps its earlier log.
+          gate() {
             for _ in {1..60}; do
-              docker logs own-smoke 2>&1 | grep -qxF 'own-mounts ok home=own-smoke-home work=own-smoke-work nix=own-smoke-nix' && return 0
+              [ "$(docker logs own-smoke 2>&1 | grep -cxF 'own-mounts ok home=own-smoke-home work=own-smoke-work nix=own-smoke-nix')" -gt "$1" ] && return 0
               sleep 1
             done
             fail 'own-start did not pass its gate'
           }
+          run() {
+            docker run -d --name own-smoke --shm-size 1g -p 127.0.0.1:2223:2223 "${home[@]}" "${work[@]}" "${nixv[@]}" "${ids[@]}" \
+              -e OWN_TRIAL_UNSANDBOXED=1 "$@" >/dev/null
+            gate 0
+          }
           ssh_cmd=(ssh -F /dev/null -p 2223 -i "$d/key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
             -o GlobalKnownHostsFile=/dev/null -o "UserKnownHostsFile=$d/known_hosts" dev@127.0.0.1)
           ssh_ready() { for _ in {1..60}; do "${ssh_cmd[@]}" true 2>/dev/null && return 0; sleep 1; done; fail 'ssh'; }
+          # Each headless profile serves its own page on its loopback CDP port, read through strict SSH; no Xpra
+          # process runs and none is on the SSH PATH.
+          display() {
+            local p
+            for p in 1 2 3; do
+              for _ in {1..60}; do
+                "${ssh_cmd[@]}" "curl -fsS --max-time 5 http://127.0.0.1:$((9221 + p))/json/list" 2>/dev/null |
+                  jq -e --arg t "own p$p" 'any(.[]; .type == "page" and .title == $t)' >/dev/null && continue 2
+                sleep 1
+              done
+              fail "no CDP page own p$p"
+            done
+            if docker top own-smoke | sed -E 's|/nix/store/[0-9a-z]{32}-|/nix/store/|g' | grep -qi xpra; then fail 'an xpra process runs'; fi
+            "${ssh_cmd[@]}" 'if command -v xpra; then exit 1; fi' || fail 'xpra is on the SSH PATH'
+          }
           run -e "OWN_AUTHORIZED_KEY=$(cat "$d/key.pub")" "$image"
           # The host key is pinned from the home volume, never accepted anew.
           printf '[127.0.0.1]:2223 %s\n' "$(docker exec own-smoke /bin/cat /home/dev/.ssh/ssh_host_ed25519_key.pub | cut -d' ' -f1,2)" > "$d/known_hosts"
@@ -256,6 +279,7 @@ jobs:
             git init -q /work/repos/p && cd /work/repos/p
             git -c user.name=ci -c user.email=ci@example.invalid commit -q --allow-empty -m first
             git rev-parse HEAD' > "$d/head1"
+          display
 
           # Lock: a seed is refused while own holds the volume, and writes nothing.
           before=$(listing)
@@ -273,8 +297,21 @@ jobs:
           docker logs own-smoke 2>&1 | grep -qF 'own-nix: own-smoke-nix is in use by another own container or a seed' || fail 'held-lock start refusal'
           docker rm -f own-hold >/dev/null
 
+          # Successful restart of the same container and image: the pinned host key, home and work state are kept.
+          same=$(docker inspect --format '{{.Id}} {{.Image}}' own-smoke)
+          test "${same#* }" = "$image" || fail 'not the first image'
+          docker start own-smoke >/dev/null
+          gate 1
+          test "$(docker inspect --format '{{.Id}} {{.Image}}' own-smoke)" = "$same" || fail 'restart changed the container or image'
+          ssh_ready
+          "${ssh_cmd[@]}" 'test "$(cat ~/own-home-marker)" = home && cd /work/repos/p && git rev-parse HEAD' > "$d/after"
+          test "$(cat "$d/after")" = "$(cat "$d/head1")" || fail 'restart lost home or work state'
+          display
+          docker stop -t 30 own-smoke >/dev/null
+
           # Package addition by definition: seed the next image, recreate on the same volumes, short SSH/Nix check.
           seed "$next" nix | grep -qE "^own-nix-seed ok volume=own-smoke-nix roots=.* copied=[1-9][0-9]*$" || fail 'upgrade seed'
+          no_xpra_store next
           old_id=$(docker inspect --format '{{.Id}}' own-smoke)
           docker rm own-smoke >/dev/null
           run "$next"
@@ -296,7 +333,8 @@ jobs:
             if touch /nix/store/dev-write 2>/dev/null; then exit 1; fi' > "$d/after"
           test "$(head -n1 "$d/after")" = "$(cat "$d/head1")" || fail 'work commit lost'
           docker exec own-smoke /bin/nix-store --verify --check-contents
-          echo 'PASS own seed, lock, gate and short SSH/Nix check after recreation' | tee -a "$GITHUB_STEP_SUMMARY"
+          display
+          echo 'PASS own seed, lock, gate, restart and recreation with SSH/Nix/CDP and no Xpra' | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Keep the tested image for publishing
         if: inputs.publish
         run: cp -L result own-image.tar.gz
@@ -330,7 +368,14 @@ jobs:
           test "$SOURCE" = "$GITHUB_SHA"
           docker load < own-image.tar.gz
           echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          image="ghcr.io/roccho-dev/windows-own:sha-${SOURCE}"
-          docker tag ghcr.io/roccho-dev/windows-own:nix "$image"
-          docker push "$image"
-          printf 'source %s\ndrvPath %s\ndigest %s\n' "$SOURCE" "$DRV" "$(docker image inspect "$image" --format '{{index .RepoDigests 0}}')" >> "$GITHUB_STEP_SUMMARY"
+          repo=ghcr.io/roccho-dev/windows-own
+          image="$repo:sha-${SOURCE}"
+          docker tag "$repo:nix" "$image"
+          docker push "$image" | tee push.log
+          # The one digest this push reported must be the image's one RepoDigest for this repository; otherwise the job
+          # fails and records no digest.
+          pushed=$(sed -nE 's/^sha-[0-9a-f]{40}: digest: (sha256:[0-9a-f]{64}) size: [0-9]+$/\1/p' push.log)
+          [ "$(printf '%s\n' "$pushed" | grep -c .)" = 1 ] || { echo 'RED: push reported no single digest' >&2; exit 1; }
+          repo_digests=$(docker image inspect "$image" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep -F "$repo@" || true)
+          [ "$repo_digests" = "$repo@$pushed" ] || { echo 'RED: local RepoDigest differs from the pushed digest' >&2; exit 1; }
+          printf 'source %s\ndrvPath %s\ndigest %s\n' "$SOURCE" "$DRV" "$repo@$pushed" >> "$GITHUB_STEP_SUMMARY"
