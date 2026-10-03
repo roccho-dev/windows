@@ -187,8 +187,8 @@
         volume_at /nix "$nixvol" rw || { echo "rent-mounts: /nix must be exactly volume $nixvol, rw" >&2; exit 1; }
         if mounted /home/dev; then echo 'rent-mounts: /home/dev must not be a mount' >&2; exit 1; fi
         [ "$(volume_count)" = 3 ] || { echo 'rent-mounts: exactly three volumes are allowed' >&2; exit 1; }
-        # One writer per volume: an exclusive lock on each volume root, held for the container's life (fds 7-9 stay open
-        # in PID 1 and every service it starts). A second rent, a seed, a state import or a receiver taking the same
+        # One writer per volume: an exclusive lock on each volume root, held for the container's life (PID 1 keeps fds
+        # 7-9 open until it exits). A second rent, a seed, a state import or a receiver taking the same
         # lock is refused; a writer that takes no lock is not stopped by it.
         exec 7</work/repos 8<"$state" 9</nix
         for fd in 7 8 9; do
