@@ -2,18 +2,12 @@
 # owner-auth helper) remain open; this profile is the bounded CI0 bootstrap, not F1 acceptance.
 { pkgs }:
 rec {
-  # One-owner GitHub routing per execution.md: a gh wrapper and a git credential helper, immutable outputs that call
-  # the absolute in-closure gh with that owner's root as GH_CONFIG_DIR. Tools binds each clone to the helper; Run
-  # excludes system and global Git configuration and prompts.
-  ghRoot = "/work/repos/.auth/roccho-dev/gh";
-  ghWrapper = pkgs.writeShellScriptBin "gh" ''
-    export GH_CONFIG_DIR=${ghRoot}
-    exec ${pkgs.gh}/bin/gh "$@"
-  '';
-  ghCredential = pkgs.writeShellScriptBin "git-credential-github-roccho-dev" ''
-    export GH_CONFIG_DIR=${ghRoot}
-    exec ${pkgs.gh}/bin/gh auth git-credential "$@"
-  '';
+  # One-owner GitHub routing per execution.md, the same outputs own and rent use (hosts/profile/gh.nix): the gh wrapper
+  # selects the owner root only in a clone bound in its own config, and the owner's git credential helper. Tools binds
+  # each clone to the helper; Run excludes system and global Git configuration and prompts.
+  github = import ../../hosts/profile/gh.nix { inherit pkgs; };
+  ghWrapper = github.wrapper;
+  ghCredential = github.helper;
 
   # Local real-Jev prerequisite (roccho-dev/adrs#460): three bounded tools over exactly four build-time constants.
   # Only the production instance below is linked into the profile; oci/dev/proof.sh builds a fixture instance of this
