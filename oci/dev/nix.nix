@@ -331,6 +331,25 @@ rec {
       };
       # Runs the exact ops Jev CLI once: the caller's stdin is its request, its single stdout line is the result, and
       # the launcher's own messages go to stderr. Only the fixed package output; no attribute, program or argument choice.
+      # R-ENTRY1.1: agreed fixed semlint finite-real target contract; implementation pending.
+      # Preserve this existing four-argument legacy Jev mode unchanged. The planned
+      # --semlint-real mode supplies only the exact pinned #jev-review Node/source
+      # tests/run.mjs --semlint-real, built and closure-verified before the existing
+      # target-owned SOPS bootstrap and its one key-bearing child. No program,
+      # module, endpoint, preload or arbitrary argument selector is accepted.
+      # Public stdin is {schema:ops.semlint.real-input.v1,cases:[{id,input}]};
+      # exact keys/unique neutral IDs, nonempty <=24 cases, stdin <=1MiB, exact
+      # semlint v1/v2 inputs and whole-plan admission before any provider POST.
+      # Each child permits <=24 attempted POSTs to the fixed official endpoint,
+      # 15s whole-response deadline, redirect:error and no retry. Missing Core
+      # context/empty checks remain no-send, not success; all failures are retained.
+      # Output projects known model/qN numeric Noul, original-wire digest (not
+      # truth), input_tokens/output_tokens safe nonnegative integers or null,
+      # and closed attempt/received-response/validation accounting. Never raw
+      # body/header/exception/key, arbitrary answer/usage fields or gold/threshold.
+      # Availability does not grant live permission, prove quality, or adopt a
+      # finite population/series spend. Existing CI launcher-only isolation applies;
+      # no own/rent/Cloudflare/profile/host effect or new CLI command is introduced.
       ops = mkLaunch {
         name = "ops-jev";
         usage = "--envs-sha <40-hex> --ops-sha <40-hex>";
