@@ -93,7 +93,7 @@
       # read-only at /old into the state volume. Never run by rent-start; prints target names and sizes only.
       stateImport = pkgs.writeShellScriptBin "rent-state-import" ''
         set -eu
-        export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.diffutils ]}
+        export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.diffutils pkgs.util-linux ]}
         fail() { echo "rent-state-import: $*" >&2; exit 1; }
         id=''${1:-}
         [[ $id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] ||
@@ -104,6 +104,9 @@
         volume_name "$oldvol" && volume_name "$statevol" || fail 'set RENT_OLD_VOLUME and RENT_STATE_VOLUME to volume names'
         volume_at /old "$oldvol" ro || fail "/old must be exactly volume $oldvol, mounted read-only"
         volume_at ${rentState} "$statevol" rw || fail "${rentState} must be exactly volume $statevol, writable"
+        # The state-root lock a running rent holds: no import while it (or another writer) runs.
+        exec 9<${rentState}
+        flock -x -n 9 || fail "${rentState} is in use by a running rent or another writer"
         s=${rentState}/dev
         p=projects/-home-dev
         same() { if [ -d "$1" ]; then diff -r -q --no-dereference "$1" "$2" > /dev/null 2>&1; else cmp -s "$1" "$2"; fi; }
@@ -153,10 +156,11 @@
           echo "imported $dst ($(du -sb "$dst" | cut -f1) bytes)"
         done
       '';
-      # rent-only tools beside the common dev profile.
+      # rent-only tools beside the common dev profile. /bin/flock is the image's own lock tool for a one-shot writer
+      # such as the envs token receiver, which runs with the image's default PATH.
       rentTools = pkgs.buildEnv {
         name = "rent-tools";
-        paths = [ stateImport ];
+        paths = [ stateImport (pkgs.linkFarm "rent-flock" [ { name = "bin/flock"; path = "${pkgs.util-linux}/bin/flock"; } ]) ];
         pathsToLink = [ "/bin" ];
       };
       sshConfig = pkgs.writeText "rent-sshd-config" (import ./hosts/rent/nix.nix {
@@ -169,7 +173,7 @@
       # tunnel is the cloudflared package; only the CI-only stub image passes anything else.
       rentStart = devProfile: tunnel: pkgs.writeShellScriptBin "rent-start" ''
         set -eu
-        export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.gnugrep pkgs.openssh pkgs.nix ]}
+        export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.gnugrep pkgs.openssh pkgs.nix pkgs.util-linux ]}
         state=${rentState}
         # One gate before any service: exactly the Binding repos, state and nix volumes, all writable, nothing else.
         ${mountLib}
@@ -183,6 +187,13 @@
         volume_at /nix "$nixvol" rw || { echo "rent-mounts: /nix must be exactly volume $nixvol, rw" >&2; exit 1; }
         if mounted /home/dev; then echo 'rent-mounts: /home/dev must not be a mount' >&2; exit 1; fi
         [ "$(volume_count)" = 3 ] || { echo 'rent-mounts: exactly three volumes are allowed' >&2; exit 1; }
+        # One writer per volume: an exclusive lock on each volume root, held for the container's life (fds 7-9 stay open
+        # in PID 1 and every service it starts). A second rent, a seed, a state import or a receiver taking the same
+        # lock is refused; a writer that takes no lock is not stopped by it.
+        exec 7</work/repos 8<"$state" 9</nix
+        for fd in 7 8 9; do
+          flock -x -n "$fd" || { echo 'rent-lock: repos, state or nix is in use by another rent, seed, import or receiver' >&2; exit 1; }
+        done
         echo "rent-mounts ok repos=$repos state=$statevol nix=$nixvol"
         # This image's runtime closure must be seeded completely: marker, GC root last, every path valid in the DB.
         roots=$(readlink /etc/rent-nix-roots)
@@ -212,7 +223,6 @@
         dir 755 0:0 "$state/ssh"
         dir 755 0:0 "$state/dev"
         dir 700 1000:1000 "$state/dev/codex"
-        dir 700 1000:1000 "$state/dev/gh"
         dir 700 1000:1000 "$state/dev/claude"
         # Claude writes ~/.claude.json through the link; the placeholder lets it start in a root-owned directory.
         if [ ! -e "$state/dev/claude.json" ] && [ ! -L "$state/dev/claude.json" ]; then
@@ -236,7 +246,8 @@
           fi
         }
         link "$state/dev/codex" /home/dev/.codex
-        link "$state/dev/gh" /home/dev/.config/gh
+        # gh keeps no state here: the owner root /work/repos/.auth/<owner>/gh is selected per repository (#8-C). An
+        # existing $state/dev/gh is left untouched and unused.
         link "$state/dev/claude" /home/dev/.claude
         link "$state/dev/claude.json" /home/dev/.claude.json
 
@@ -290,7 +301,7 @@
           # (each appears only complete), register the closure, set the rent-dev profile, then the GC root, last.
           seed = pkgs.writeShellScriptBin "rent-nix-seed" ''
             set -eu
-            export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.nix ]}
+            export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.nix pkgs.util-linux ]}
             fail() { echo "rent-nix-seed: $*" >&2; exit 1; }
             ${mountLib}
             nixvol=''${RENT_NIX_VOLUME:-}
@@ -298,6 +309,9 @@
             volume_at /seed "$nixvol" rw || fail "/seed must be exactly volume $nixvol, rw"
             if mounted /nix; then fail '/nix must be the image store, not a mount'; fi
             [ "$(volume_count)" = 1 ] || fail 'exactly one volume is allowed'
+            # The /nix root lock a running rent holds: no seed while it (or another seed) uses the volume.
+            exec 9</seed
+            flock -x -n 9 || fail "$nixvol is in use by a running rent or another seed"
             if [ -e /seed/var/rent-nix ]; then
               [ "$(cat /seed/var/rent-nix)" = '${rentNixMarker}' ] || fail '/seed has a different marker'
             elif [ -n "$(ls -A /seed)" ]; then

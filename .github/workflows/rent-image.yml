@@ -343,7 +343,7 @@ jobs:
           docker load < result-1
           key_dir="$(mktemp -d)"
           # Every file this step writes under $key_dir; the exit trap removes exactly these, then the empty directory.
-          key_files=(answer cand cand-visible cf-help cf-version closure cmdlines gate gh host.pub import imported key key.pub
+          key_files=(answer busy cand cand-visible cf-help cf-version closure cmdlines gate gh host.pub import imported key key.pub
             known_hosts logs modes mountinfo mountlib.sh procs refuse start-real start-stub visible)
           # Removes one of those regular files; a link or other type is kept and fails the step.
           plain() { if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then echo "kept unexpected entry $1" >&2; return 1; fi; rm -f -- "$1"; }
@@ -567,13 +567,16 @@ jobs:
           test "$("${ssh_cmd[@]}" claude --version)" = '2.1.283 (Claude Code)'
           docker exec rent-smoke /bin/stat -c '%a %u %n' /home/dev /var/lib/rent/cloudflared /var/lib/rent/cloudflared/token /var/lib/rent/ssh \
             /var/lib/rent/ssh/ssh_host_ed25519_key /var/lib/rent/ssh/authorized_keys \
-            /var/lib/rent/dev/codex /var/lib/rent/dev/gh /var/lib/rent/dev/claude /var/lib/rent/dev/claude.json > "$key_dir/modes"
+            /var/lib/rent/dev/codex /var/lib/rent/dev/claude /var/lib/rent/dev/claude.json > "$key_dir/modes"
           printf '%s\n' '700 1000 /home/dev' '700 0 /var/lib/rent/cloudflared' '600 0 /var/lib/rent/cloudflared/token' '755 0 /var/lib/rent/ssh' \
             '600 0 /var/lib/rent/ssh/ssh_host_ed25519_key' '644 0 /var/lib/rent/ssh/authorized_keys' \
-            '700 1000 /var/lib/rent/dev/codex' '700 1000 /var/lib/rent/dev/gh' \
+            '700 1000 /var/lib/rent/dev/codex' \
             '700 1000 /var/lib/rent/dev/claude' '600 1000 /var/lib/rent/dev/claude.json' | diff - "$key_dir/modes"
           test "$(docker exec rent-smoke /bin/readlink /home/dev/.codex)" = /var/lib/rent/dev/codex
-          test "$(docker exec rent-smoke /bin/readlink /home/dev/.config/gh)" = /var/lib/rent/dev/gh
+          # gh keeps no rent state: no ~/.config/gh link and no $state/dev/gh is made (#8-C).
+          if docker exec rent-smoke /bin/bash -c 'test -e /home/dev/.config/gh || test -L /home/dev/.config/gh || test -e /var/lib/rent/dev/gh'; then
+            echo 'rent still lays out the old gh root' >&2; exit 1
+          fi
           test "$(docker exec rent-smoke /bin/readlink /home/dev/.claude)" = /var/lib/rent/dev/claude
           test "$(docker exec rent-smoke /bin/readlink /home/dev/.claude.json)" = /var/lib/rent/dev/claude.json
           # A real unauthenticated Claude start writes its config through the link; nothing is logged in.
@@ -588,10 +591,93 @@ jobs:
           "${ssh_cmd[@]}" 'echo codex > ~/.codex/ci-marker && echo claude > ~/.claude/ci-marker && echo home > ~/home-marker'
           markers='test "$(cat ~/.codex/ci-marker)" = codex && test "$(cat ~/.claude/ci-marker)" = claude'
 
+          # One writer for all three volumes while rent runs (#8-C): a second rent, a seed, a state import and a writer
+          # taking the state-root lock through the image's own /bin/flock (the form the envs receiver will use) are
+          # refused and change nothing; read-only consumers still read and cannot write. P1 neither runs nor changes the
+          # envs receiver. A writer that takes no lock is not stopped by this, and nothing here proves real WSLC mounts.
+          for i in "$real" "$image"; do test "$(docker run --rm "$i" /bin/bash -c 'command -v flock')" = /bin/flock; done
+          docker run --rm "$real" flock --version > /dev/null
+          state_listing() { docker run --rm -v rent-smoke-state:/s:ro "$image" /bin/bash -c 'cd /s && find . -printf "%p %s %T@\n" | LC_ALL=C sort | sha256sum'; }
+          nix_listing() {
+            docker run --rm --mount type=volume,source=rent-smoke-nix,target=/n,readonly "$image" /bin/bash -c \
+              'cd /n/var && find rent-nix nix/gcroots nix/profiles -printf "%p %s %T@\n" | LC_ALL=C sort | sha256sum'
+          }
+          busy() {
+            local want=$1; shift
+            if timeout 60 "$@" > "$key_dir/busy" 2>&1; then echo "ran beside the running rent: $want" >&2; exit 1; fi
+            grep -qF "$want" "$key_dir/busy" || { cat "$key_dir/busy" >&2; exit 1; }
+          }
+          state_before=$(state_listing)
+          nix_before=$(nix_listing)
+          busy 'rent-lock: repos, state or nix is in use' docker run --rm --name rent-refuse -v rent-smoke-repos:/work/repos \
+            -v rent-smoke-state:/var/lib/rent "${nixm[@]}" "${ids[@]}" "${env_args[@]}" "$image"
+          busy 'rent-smoke-nix is in use by a running rent or another seed' docker run --rm -v rent-smoke-nix:/seed \
+            -e RENT_NIX_VOLUME=rent-smoke-nix "$image" /bin/rent-nix-seed
+          busy '/var/lib/rent is in use by a running rent or another writer' docker run --rm -v rent-smoke-old:/old:ro \
+            -v rent-smoke-state:/var/lib/rent -e RENT_OLD_VOLUME=rent-smoke-old -e RENT_STATE_VOLUME=rent-smoke-state "$image" \
+            /bin/rent-state-import "$sid"
+          busy 'state root locked' docker run --rm -v rent-smoke-state:/var/lib/rent "$real" /bin/bash -c \
+            'exec 9</var/lib/rent; flock -x -n 9 || { echo state root locked >&2; exit 1; }'
+          test "$(state_listing)" = "$state_before"
+          test "$(nix_listing)" = "$nix_before"
+          docker run --rm -v rent-smoke-repos:/r:ro -v rent-smoke-state:/s:ro "$image" /bin/bash -c \
+            'test "$(cat /r/marker)" = repo; if touch /r/ro-write 2>/dev/null || touch /s/ro-write 2>/dev/null; then exit 1; fi'
+
+          # Owner GitHub routing (#8-C), offline with synthetic tokens only, through the image's own gh and helper: the
+          # owner root /work/repos/.auth/roccho-dev/gh serves only a repository bound in its own config. Elsewhere gh has
+          # no credentials and writes no store; the four token variables, GH_HOST, HOME, XDG, the old rent root and a
+          # global Git helper never win in a bound repository. GH_REPO is checked statically (unset in the wrapper text).
+          docker run --rm "$image" /bin/grep -qF 'unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_REPO GH_HOST' /bin/gh
+          docker exec rent-smoke /bin/bash -euc '
+            hosts() {
+              install -d -m 700 -o 1000 -g 1000 "$1"
+              printf "github.com:\n    users:\n        ci:\n            oauth_token: %s\n    git_protocol: https\n    user: ci\n    oauth_token: %s\n" "$2" "$2" > "$1/hosts.yml"
+              chown 1000:1000 "$1/hosts.yml"; chmod 600 "$1/hosts.yml"
+            }
+            install -d -m 755 /work/repos/.auth
+            install -d -m 700 -o 1000 -g 1000 /work/repos/.auth/roccho-dev /work/repos/gh-proof
+            hosts /work/repos/.auth/roccho-dev/gh ci-owner-token
+            hosts /var/lib/rent/dev/gh ci-legacy-token
+            install -d -m 755 -o 1000 -g 1000 /home/dev/xdg
+            hosts /home/dev/.config/gh ci-home-token
+            hosts /home/dev/xdg/gh ci-xdg-token'
+          "${ssh_cmd[@]}" 'set -eu
+            h=/nix/var/nix/profiles/rent-dev/bin/git-credential-github-roccho-dev
+            test -x "$h"
+            export XDG_CONFIG_HOME="$HOME/xdg" GH_TOKEN=ci-env-gh GITHUB_TOKEN=ci-env-github GH_ENTERPRISE_TOKEN=ci-env-ghe \
+              GITHUB_ENTERPRISE_TOKEN=ci-env-ghes GH_HOST=evil.example GH_REPO=other/elsewhere GIT_TERMINAL_PROMPT=0
+            gh --version | grep -q "^gh version "
+            snap() { find "$HOME/.config" "$HOME/xdg" /work/repos/.auth -type f -exec sha256sum {} + | LC_ALL=C sort; }
+            before=$(snap)
+            cd "$HOME"
+            if gh auth token > /dev/null 2>&1; then echo "gh outside a bound repository returned a token" >&2; exit 1; fi
+            if gh config set editor vi > /dev/null 2>&1; then echo "gh outside a bound repository wrote a config" >&2; exit 1; fi
+            test "$(snap)" = "$before"
+            cd /work/repos/gh-proof
+            for r in bound unbound other; do git init -q "$r"; done
+            bind() {
+              git -C "$1" config remote.origin.url "$2"
+              git -C "$1" config --replace-all credential.helper ""
+              git -C "$1" config --replace-all "credential.$2.helper" "$h"
+              git -C "$1" config credential.useHttpPath true
+              git -C "$1" config http.followRedirects false
+            }
+            bind bound https://github.com/roccho-dev/windows
+            git -C unbound config remote.origin.url https://github.com/roccho-dev/windows
+            bind other https://github.com/other/windows
+            git config --global credential.helper "!echo password=ci-global-token #"
+            test "$(cd bound && gh auth token)" = ci-owner-token
+            for r in unbound other; do if (cd "$r" && gh auth token) > /dev/null 2>&1; then echo "$r: gh returned a token" >&2; exit 1; fi; done
+            fill() { printf "protocol=https\nhost=github.com\npath=%s\n\n" "$2" | (cd "$1" && git credential fill 2>/dev/null) | sed -n "s/^password=//p"; }
+            test "$(fill bound roccho-dev/windows)" = ci-owner-token
+            test "$(fill unbound roccho-dev/windows)" != ci-owner-token'
+
           # Restart: same container; TERM reaches the supervisor, and home, state, and host key remain.
           before="$(docker inspect --format '{{.Id}}' rent-smoke)"
           docker stop -t 30 rent-smoke
           test "$(docker inspect --format '{{.State.ExitCode}}' rent-smoke)" = 143
+          # Released with the container: the same lock-taking writer now proceeds.
+          docker run --rm -v rent-smoke-state:/var/lib/rent "$real" /bin/bash -c 'exec 9</var/lib/rent; flock -x -n 9'
           docker start rent-smoke
           test "$(docker inspect --format '{{.Id}}' rent-smoke)" = "$before"
           ssh_ready

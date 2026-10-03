@@ -16,10 +16,12 @@ let
     export DISABLE_AUTOUPDATER=1
     exec ${pkgs.glibc}/lib/ld-linux-x86-64.so.2 --library-path ${pkgs.glibc}/lib ${claudeBin} "$@"
   '';
+  # gh is the shared owner-routing wrapper, with the owner's Git credential helper (#8-C).
+  github = import ./gh.nix { inherit pkgs; };
 in
 pkgs.buildEnv {
   name = "dev-profile";
-  paths = (with pkgs; [ bash coreutils diffutils findutils gnugrep gnused gnutar gzip nix git openssh gh ])
-    ++ [ codex claude ] ++ extra;
+  paths = (with pkgs; [ bash coreutils diffutils findutils gnugrep gnused gnutar gzip nix git openssh ])
+    ++ [ github.wrapper github.helper codex claude ] ++ extra;
   pathsToLink = [ "/bin" ];
 }
