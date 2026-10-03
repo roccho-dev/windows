@@ -586,12 +586,15 @@ cp "$evidence/page" "$evidence/before"
 old_id=$(docker inspect "$core" --format '{{.Id}}')
 echo 'PASS fresh -> develop (real apps build and HTTP response with uncommitted edit)'
 
-# Owner GitHub routing shared with own and rent (hosts/profile/gh.nix), on this image's own gh, offline with synthetic
-# tokens only. win.ps1's Tools bind still recognises the wrapper by its exact check; only a clone bound in its own config
-# selects the owner root, and elsewhere gh has no credentials and writes no store. The four token variables, GH_HOST,
-# HOME, XDG and a global Git helper never win in a bound clone; GH_REPO is checked statically (unset in the wrapper).
+# Owner GitHub routing shared with own and rent (hosts/profile/gh.nix), on this image's own Git, gh and helper, offline
+# with synthetic tokens only, in the image's default exec environment entered as is. win.ps1's Tools bind still
+# recognises the wrapper by its exact check. Synthetic global (~/.gitconfig, ~/.config/git/config) and system
+# (/etc/gitconfig) Git helpers are planted as files: real Git returns no credential at all outside a bound clone, only the
+# owner token in one and none for another owner; the controls show those helpers answer once their files are read. gh:
+# elsewhere no credentials and no store; token variables, GH_HOST, HOME and XDG never win; GH_REPO is checked statically.
 inside '
   # This image ships no grep, sed or find: bash builtins and coreutils only.
+  test "$GIT_CONFIG_NOSYSTEM" = 1 && test "$GIT_CONFIG_GLOBAL" = /dev/null
   gh_text=$(cat /bin/gh)
   case $gh_text in *GH_CONFIG_DIR=/work/repos/.auth/roccho-dev/gh*) ;; *) echo "Tools bind would refuse this gh" >&2; exit 1 ;; esac
   case $gh_text in *"unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_REPO GH_HOST"*) ;; *) exit 1 ;; esac
@@ -602,24 +605,14 @@ inside '
     printf "github.com:\n    users:\n        ci:\n            oauth_token: %s\n    git_protocol: https\n    user: ci\n    oauth_token: %s\n" "$2" "$2" > "$1/hosts.yml"
     chmod 600 "$1/hosts.yml"
   }
-  install -d -m 700 /work/repos/.auth /work/repos/.auth/roccho-dev /work/repos/gh-proof
+  helper() { printf "[credential]\n\thelper = \"!echo username=ci; echo password=%s #\"\n" "$2" > "$1"; }
+  install -d -m 700 /work/repos/.auth /work/repos/.auth/roccho-dev /work/repos/gh-proof "$HOME/.config/git"
   hosts /work/repos/.auth/roccho-dev/gh ci-owner-token
   hosts "$HOME/.config/gh" ci-home-token
   hosts "$HOME/xdg/gh" ci-xdg-token
-  # The image excludes global Git configuration; this session names one, only to show a bound clone ignores it.
-  export XDG_CONFIG_HOME="$HOME/xdg" GH_TOKEN=ci-env-gh GITHUB_TOKEN=ci-env-github GH_ENTERPRISE_TOKEN=ci-env-ghe \
-    GITHUB_ENTERPRISE_TOKEN=ci-env-ghes GH_HOST=evil.example GH_REPO=other/elsewhere GIT_TERMINAL_PROMPT=0 \
-    GIT_CONFIG_GLOBAL="$HOME/gitconfig-ci"
-  case $(gh --version) in "gh version "*) ;; *) exit 1 ;; esac
-  snap() {
-    ls -lAR --time-style=+%s.%N "$HOME/.config" "$HOME/xdg" /work/repos/.auth
-    sha256sum "$HOME/.config/gh/hosts.yml" "$HOME/xdg/gh/hosts.yml" /work/repos/.auth/roccho-dev/gh/hosts.yml
-  }
-  before=$(snap)
-  cd "$HOME"
-  if gh auth token > /dev/null 2>&1; then echo "gh outside a bound clone returned a token" >&2; exit 1; fi
-  if gh config set editor vi > /dev/null 2>&1; then echo "gh outside a bound clone wrote a config" >&2; exit 1; fi
-  test "$(snap)" = "$before"
+  helper /etc/gitconfig ci-system-token
+  helper "$HOME/.gitconfig" ci-global-token
+  helper "$HOME/.config/git/config" ci-xdg-git-token
   cd /work/repos/gh-proof
   for r in bound unbound other; do git init -q "$r"; done
   bind() {
@@ -632,19 +625,31 @@ inside '
   bind bound https://github.com/roccho-dev/windows
   git -C unbound config remote.origin.url https://github.com/roccho-dev/windows
   bind other https://github.com/other/windows
-  git config --global credential.helper "!echo password=ci-global-token #"
-  test "$(cd bound && gh auth token)" = ci-owner-token
-  for r in unbound other; do if (cd "$r" && gh auth token) > /dev/null 2>&1; then echo "$r: gh returned a token" >&2; exit 1; fi; done
   fill() {
-    local out l
-    out=$(printf "protocol=https\nhost=github.com\npath=%s\n\n" "$2" | (cd "$1" && git credential fill 2>/dev/null)) || true
+    local d=$1 p=$2 out l; shift 2
+    out=$(printf "protocol=https\nhost=github.com\npath=%s\n\n" "$p" | (cd "$d" && env "$@" GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null)) || true
     while IFS= read -r l; do case $l in password=*) printf %s "${l#password=}" ;; esac; done <<< "$out"
   }
+  test -n "$(fill unbound roccho-dev/windows -u GIT_CONFIG_GLOBAL)"
+  test "$(fill unbound roccho-dev/windows -u GIT_CONFIG_NOSYSTEM)" = ci-system-token
+  test -z "$(fill unbound roccho-dev/windows)"
   test "$(fill bound roccho-dev/windows)" = ci-owner-token
-  test "$(fill unbound roccho-dev/windows)" != ci-owner-token
-  # Another owner never gets the owner token, even through a clone bound to the owner helper; the helper itself answers
-  # only https://github.com/roccho-dev/<repo>, for get, store and erase, silently otherwise.
   test -z "$(fill other other/windows)"
+  export XDG_CONFIG_HOME="$HOME/xdg" GH_TOKEN=ci-env-gh GITHUB_TOKEN=ci-env-github GH_ENTERPRISE_TOKEN=ci-env-ghe \
+    GITHUB_ENTERPRISE_TOKEN=ci-env-ghes GH_HOST=evil.example GH_REPO=other/elsewhere GIT_TERMINAL_PROMPT=0
+  case $(gh --version) in "gh version "*) ;; *) exit 1 ;; esac
+  snap() {
+    ls -lAR --time-style=+%s.%N "$HOME/.config" "$HOME/xdg" /work/repos/.auth
+    sha256sum "$HOME/.config/gh/hosts.yml" "$HOME/xdg/gh/hosts.yml" /work/repos/.auth/roccho-dev/gh/hosts.yml
+  }
+  before=$(snap)
+  if (cd "$HOME" && gh auth token) > /dev/null 2>&1; then echo "gh outside a bound clone returned a token" >&2; exit 1; fi
+  if (cd "$HOME" && gh config set editor vi) > /dev/null 2>&1; then echo "gh outside a bound clone wrote a config" >&2; exit 1; fi
+  test "$(snap)" = "$before"
+  test "$(cd bound && gh auth token)" = ci-owner-token
+  for r in unbound other; do if (cd "$r" && gh auth token) > /dev/null 2>&1; then echo "$r: gh returned a token" >&2; exit 1; fi; done
+  # The helper itself answers only https://github.com/roccho-dev/<repo>, for get, store and erase, and is silent
+  # otherwise, even when a clone of another owner is bound to it.
   pw() { local l; while IFS= read -r l; do case $l in password=*) printf %s "${l#password=}" ;; esac; done; }
   test "$(printf "%b" "protocol=https\nhost=github.com\npath=roccho-dev/windows\n\n" | "$h" get | pw)" = ci-owner-token
   for r in "protocol=https\nhost=github.com\npath=other/windows\n\n" "protocol=https\nhost=github.com\n\n" \
@@ -655,7 +660,7 @@ inside '
   done
   test "$(snap)" = "$before"
 '
-echo 'PASS owner gh routing (dev image): bind check holds; bound clone selects the owner root; unbound/other owner/outside get no token or store; overrides never win'
+echo 'PASS owner gh/Git routing (dev image): bind check holds; real Git gives no credential outside a bound clone despite global/system helper files; bound clone selects the owner only; other owner/outside get nothing; overrides never win'
 
 docker rm -f "$core" >/dev/null
 # No network on the successor: neither the old HOME nor a silent re-download can rescue it.

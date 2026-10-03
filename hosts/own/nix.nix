@@ -55,7 +55,7 @@ let
     PermitRootLogin no
     AllowUsers dev
     UsePAM no
-    SetEnv SSL_CERT_FILE=${cert} NIX_SSL_CERT_FILE=${cert} NIX_REMOTE=daemon
+    SetEnv SSL_CERT_FILE=${cert} NIX_SSL_CERT_FILE=${cert} NIX_REMOTE=daemon GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
     PidFile /tmp/own-sshd.pid
     Subsystem sftp internal-sftp
   '';
@@ -237,7 +237,9 @@ let
   '';
   config = {
     Cmd = [ "${start}/bin/own-start" ];
-    Env = [ "HOME=${home}" "PATH=/bin:/usr/bin" "SSL_CERT_FILE=${cert}" ];
+    # SSH sessions (sshConfig SetEnv) and default exec read no global or system Git configuration: credentials come
+    # only from a repository's own binding to the owner helper (#8-C).
+    Env = [ "HOME=${home}" "PATH=/bin:/usr/bin" "SSL_CERT_FILE=${cert}" "GIT_CONFIG_NOSYSTEM=1" "GIT_CONFIG_GLOBAL=/dev/null" ];
     ExposedPorts."${toString spec.sshPort}/tcp" = {};
     # No Volumes: an image-declared volume would silently satisfy a missing mount.
     Labels."org.opencontainers.image.source" = "https://github.com/roccho-dev/windows";

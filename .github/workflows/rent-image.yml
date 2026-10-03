@@ -623,10 +623,12 @@ jobs:
           docker run --rm -v rent-smoke-repos:/r:ro -v rent-smoke-state:/s:ro "$image" /bin/bash -c \
             'test "$(cat /r/marker)" = repo; if touch /r/ro-write 2>/dev/null || touch /s/ro-write 2>/dev/null; then exit 1; fi'
 
-          # Owner GitHub routing (#8-C), offline with synthetic tokens only, through the image's own gh and helper: the
-          # owner root /work/repos/.auth/roccho-dev/gh serves only a repository bound in its own config. Elsewhere gh has
-          # no credentials and writes no store; the four token variables, GH_HOST, HOME, XDG, the old rent root and a
-          # global Git helper never win in a bound repository. GH_REPO is checked statically (unset in the wrapper text).
+          # Owner GitHub routing (#8-C), offline with synthetic tokens only, through the image's own Git, gh and helper.
+          # Synthetic global (~/.gitconfig, ~/.config/git/config) and system (/etc/gitconfig) Git helpers are planted as
+          # files; in an ordinary SSH session and an image-default Docker exec, entered as is, real Git returns no
+          # credential at all outside a bound repository, only the owner token in one, and none for another owner. The
+          # controls show those helpers do answer once their files are read. gh: elsewhere no credentials and no store;
+          # the four token variables, GH_HOST, HOME, XDG and the old rent root never win. GH_REPO is checked statically.
           docker run --rm "$image" /bin/grep -qF 'unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_REPO GH_HOST' /bin/gh
           docker exec rent-smoke /bin/bash -euc '
             hosts() {
@@ -634,25 +636,22 @@ jobs:
               printf "github.com:\n    users:\n        ci:\n            oauth_token: %s\n    git_protocol: https\n    user: ci\n    oauth_token: %s\n" "$2" "$2" > "$1/hosts.yml"
               chown 1000:1000 "$1/hosts.yml"; chmod 600 "$1/hosts.yml"
             }
+            helper() { printf "[credential]\n\thelper = \"!echo username=ci; echo password=%s #\"\n" "$2" > "$1"; }
             install -d -m 755 /work/repos/.auth
             install -d -m 700 -o 1000 -g 1000 /work/repos/.auth/roccho-dev /work/repos/gh-proof
             hosts /work/repos/.auth/roccho-dev/gh ci-owner-token
             hosts /var/lib/rent/dev/gh ci-legacy-token
-            install -d -m 755 -o 1000 -g 1000 /home/dev/xdg
+            install -d -m 755 -o 1000 -g 1000 /home/dev/xdg /home/dev/.config/git
             hosts /home/dev/.config/gh ci-home-token
-            hosts /home/dev/xdg/gh ci-xdg-token'
+            hosts /home/dev/xdg/gh ci-xdg-token
+            helper /etc/gitconfig ci-system-token
+            helper /home/dev/.gitconfig ci-global-token
+            helper /home/dev/.config/git/config ci-xdg-git-token
+            chown 1000:1000 /home/dev/.gitconfig /home/dev/.config/git/config'
           "${ssh_cmd[@]}" 'set -eu
+            test "$GIT_CONFIG_NOSYSTEM" = 1 && test "$GIT_CONFIG_GLOBAL" = /dev/null
             h=/nix/var/nix/profiles/rent-dev/bin/git-credential-github-roccho-dev
             test -x "$h"
-            export XDG_CONFIG_HOME="$HOME/xdg" GH_TOKEN=ci-env-gh GITHUB_TOKEN=ci-env-github GH_ENTERPRISE_TOKEN=ci-env-ghe \
-              GITHUB_ENTERPRISE_TOKEN=ci-env-ghes GH_HOST=evil.example GH_REPO=other/elsewhere GIT_TERMINAL_PROMPT=0
-            gh --version | grep -q "^gh version "
-            snap() { find "$HOME/.config" "$HOME/xdg" /work/repos/.auth -type f -exec sha256sum {} + | LC_ALL=C sort; }
-            before=$(snap)
-            cd "$HOME"
-            if gh auth token > /dev/null 2>&1; then echo "gh outside a bound repository returned a token" >&2; exit 1; fi
-            if gh config set editor vi > /dev/null 2>&1; then echo "gh outside a bound repository wrote a config" >&2; exit 1; fi
-            test "$(snap)" = "$before"
             cd /work/repos/gh-proof
             for r in bound unbound other; do git init -q "$r"; done
             bind() {
@@ -665,15 +664,28 @@ jobs:
             bind bound https://github.com/roccho-dev/windows
             git -C unbound config remote.origin.url https://github.com/roccho-dev/windows
             bind other https://github.com/other/windows
-            git config --global credential.helper "!echo password=ci-global-token #"
+            fill() {
+              d=$1 p=$2; shift 2
+              printf "protocol=https\nhost=github.com\npath=%s\n\n" "$p" | (cd "$d" && env "$@" GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null) |
+                sed -n "s/^password=//p"
+            }
+            test -n "$(fill unbound roccho-dev/windows -u GIT_CONFIG_GLOBAL)"
+            test "$(fill unbound roccho-dev/windows -u GIT_CONFIG_NOSYSTEM)" = ci-system-token
+            test -z "$(fill unbound roccho-dev/windows)"
+            test "$(fill bound roccho-dev/windows)" = ci-owner-token
+            test -z "$(fill other other/windows)"
+            export XDG_CONFIG_HOME="$HOME/xdg" GH_TOKEN=ci-env-gh GITHUB_TOKEN=ci-env-github GH_ENTERPRISE_TOKEN=ci-env-ghe \
+              GITHUB_ENTERPRISE_TOKEN=ci-env-ghes GH_HOST=evil.example GH_REPO=other/elsewhere GIT_TERMINAL_PROMPT=0
+            gh --version | grep -q "^gh version "
+            snap() { find "$HOME/.config" "$HOME/xdg" /work/repos/.auth -type f -exec sha256sum {} + | LC_ALL=C sort; }
+            before=$(snap)
+            if (cd "$HOME" && gh auth token) > /dev/null 2>&1; then echo "gh outside a bound repository returned a token" >&2; exit 1; fi
+            if (cd "$HOME" && gh config set editor vi) > /dev/null 2>&1; then echo "gh outside a bound repository wrote a config" >&2; exit 1; fi
+            test "$(snap)" = "$before"
             test "$(cd bound && gh auth token)" = ci-owner-token
             for r in unbound other; do if (cd "$r" && gh auth token) > /dev/null 2>&1; then echo "$r: gh returned a token" >&2; exit 1; fi; done
-            fill() { printf "protocol=https\nhost=github.com\npath=%s\n\n" "$2" | (cd "$1" && git credential fill 2>/dev/null) | sed -n "s/^password=//p"; }
-            test "$(fill bound roccho-dev/windows)" = ci-owner-token
-            test "$(fill unbound roccho-dev/windows)" != ci-owner-token
-            # Another owner never gets the owner token, even through a repository bound to the owner helper; the helper
-            # itself answers only https://github.com/roccho-dev/<repo>, for get, store and erase, silently otherwise.
-            test -z "$(fill other other/windows)"
+            # The helper itself answers only https://github.com/roccho-dev/<repo>, for get, store and erase, and is
+            # silent otherwise, even when a repository of another owner is bound to it.
             ask() { printf "$1" | "$h" "${2:-get}"; }
             test "$(ask "protocol=https\nhost=github.com\npath=roccho-dev/windows\n\n" | sed -n "s/^password=//p")" = ci-owner-token
             for r in "protocol=https\nhost=github.com\npath=other/windows\n\n" "protocol=https\nhost=github.com\n\n" \
@@ -683,6 +695,20 @@ jobs:
               for a in get store erase; do test -z "$(ask "$r" "$a" 2>&1)"; done
             done
             test "$(snap)" = "$before"'
+          # Image-default Docker exec, entered as is (no -e, no profile): the same Git gate and owner-only gh.
+          docker exec -u 1000:1000 -w /work/repos/gh-proof rent-smoke /bin/bash -euc '
+            test "$GIT_CONFIG_NOSYSTEM" = 1 && test "$GIT_CONFIG_GLOBAL" = /dev/null
+            fill() {
+              d=$1 p=$2; shift 2
+              printf "protocol=https\nhost=github.com\npath=%s\n\n" "$p" | (cd "$d" && env "$@" GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null) |
+                sed -n "s/^password=//p"
+            }
+            test -n "$(fill unbound roccho-dev/windows -u GIT_CONFIG_GLOBAL)"
+            test -z "$(fill unbound roccho-dev/windows)"
+            test "$(fill bound roccho-dev/windows)" = ci-owner-token
+            test -z "$(fill other other/windows)"
+            test "$(cd bound && gh auth token)" = ci-owner-token
+            if (cd unbound && gh auth token) > /dev/null 2>&1; then echo "unbound: gh returned a token" >&2; exit 1; fi'
 
           # Restart: same container; TERM reaches the supervisor, and home, state, and host key remain.
           before="$(docker inspect --format '{{.Id}}' rent-smoke)"

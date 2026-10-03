@@ -365,7 +365,8 @@
           # No Volumes: an image-declared volume would silently satisfy a missing mount.
           config = {
             Cmd = [ "${start}/bin/rent-start" ];
-            Env = [ "HOME=/home/dev" "PATH=/bin:/usr/bin" "SSL_CERT_FILE=${rentCert}" ];
+            # Default exec reads no global or system Git configuration, as SSH sessions (hosts/rent/nix.nix) (#8-C).
+            Env = [ "HOME=/home/dev" "PATH=/bin:/usr/bin" "SSL_CERT_FILE=${rentCert}" "GIT_CONFIG_NOSYSTEM=1" "GIT_CONFIG_GLOBAL=/dev/null" ];
             ExposedPorts."2222/tcp" = {};
             Labels."org.opencontainers.image.source" = "https://github.com/roccho-dev/windows";
           };
@@ -432,6 +433,9 @@
           case "''${start,,}" in *xpra*) echo 'own-start still names xpra' >&2; exit 1 ;; esac
           [ "$(grep -c '^wait -n ' ${own.start}/bin/own-start)" = 1 ]
           grep -qx 'wait -n "$ssh_pid" "$nd_pid"' ${own.start}/bin/own-start
+          # #8-C: SSH sessions and default exec read no global or system Git configuration (P2 tests the real image).
+          grep -qF ' NIX_REMOTE=daemon GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null' ${own.sshConfig}
+          jq -e '(.Env | index("GIT_CONFIG_NOSYSTEM=1")) and (.Env | index("GIT_CONFIG_GLOBAL=/dev/null"))' <<<"$config"
           grep -qF "$(jq -r .syntheticTrialEnv <<<"$spec")" ${own.browser}
           grep -qF "remote-debugging-port=$(jq -r .cdpPort <<<"$spec")" ${own.browser}
           touch $out
