@@ -499,7 +499,7 @@ jobs:
               out=$(seed "$1" rp-nix)
               [ "$(grep -cE "^own-nix-seed ok volume=own-smoke-rp-nix roots=.* copied=$2$" <<<"$out")" = 1 ] || fail "$3"
             }
-            rp_state() { docker exec own-smoke /bin/bash -c 'cd /home/dev && sha256sum .ssh/ssh_host_ed25519_key.pub .ssh/authorized_keys .config/gh/config.yml .config/gh/hosts.yml .codex/ci-marker rp-marker && stat -c "%n %a %u:%g %F" .ssh/authorized_keys .config/gh/config.yml .config/gh/hosts.yml .codex/ci-marker rp-marker'; }
+            rp_state() { docker exec own-smoke /bin/bash -c 'cd /home/dev && sha256sum .ssh/ssh_host_ed25519_key.pub .ssh/authorized_keys .config/gh/config.yml .config/gh/hosts.yml .codex/ci-marker rp-marker && stat -c "%n %a %u:%g %F" .ssh/ssh_host_ed25519_key.pub .ssh/authorized_keys .config/gh/config.yml .config/gh/hosts.yml .codex/ci-marker rp-marker'; }
             # Each start: strict SSH with the pinned host key, the same home state, the same work commit and daemon Nix use.
             rp_check() {
               ssh_ready
