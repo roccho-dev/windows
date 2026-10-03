@@ -3469,15 +3469,22 @@ try {
     $kid.path = Join-Path $controlDir 'elsewhere\chrome.exe'; $kid.source = 'kernel'
     B3aClassify @($browserObs, $kid, $orphan, $gone) $at $tree
     Must ($kid.class -ceq 'outside') 'A29 classes: a descendant whose image is later read outside the tree is outside'
-    # A root from its held Process object: StartTime while it runs and after it exits, ExitTime once it has, and its
-    # creation-checked kernel image both times.
-    $pingRoot = B3aRootOf (StartControl $ping).process 'control' $controlDir
-    Must ($null -ne $pingRoot.start -and $pingRoot.image -eq $ping -and $pingRoot.source -ceq 'kernel (pid, creation-checked)') 'A29 roots: a running root has its StartTime and kernel image'
+    # A root from its held Process object, in a tree holding its executable: StartTime while it runs and after it exits,
+    # ExitTime once it has, and the creation-checked kernel image captured while it ran, so it stays tree. A fresh read by
+    # PID after exit is not documented to succeed; it may be unread, but never another image.
+    $pingTree = Split-Path -Parent $ping
+    $pingRoot = B3aRootOf (StartControl $ping).process 'control' $pingTree
+    Must ($null -ne $pingRoot.start -and $pingRoot.image -eq $ping -and $pingRoot.source -ceq 'kernel (pid, creation-checked)' -and
+        $pingRoot.class -ceq 'tree') 'A29 roots: a running root has its StartTime, kernel image and class'
+    $pingBefore = $pingRoot.start
     $pingRoot.process.Kill(); $pingRoot.process.WaitForExit()
     $pingStart = $pingRoot.process.StartTime.ToUniversalTime()
-    B3aRootRefresh $pingRoot $controlDir
-    Must ($pingStart -eq $pingRoot.start -and $null -ne $pingRoot.exit -and $pingRoot.exit -gt $pingRoot.start) 'A29 roots: after exit StartTime is still readable and ExitTime is later'
-    Must ([W.ImageProbe]::Path($pingRoot.id, $pingRoot.start.Ticks) -eq $ping) 'A29 roots: an exited root held open still reads as its own executable'
+    B3aRootRefresh $pingRoot $pingTree
+    Must ($pingStart -eq $pingBefore -and $pingRoot.start -eq $pingBefore -and $null -ne $pingRoot.exit -and $pingRoot.exit -gt $pingRoot.start) 'A29 roots: after exit the held StartTime is unchanged and ExitTime is later'
+    Must ($pingRoot.image -eq $ping -and $pingRoot.source -ceq 'kernel (pid, creation-checked)' -and $pingRoot.class -ceq 'tree') 'A29 roots: an exited root keeps its cached creation-checked image and stays tree'
+    $why = ''
+    $fresh = [W.ImageProbe]::Probe($pingRoot.id, $pingRoot.start.Ticks, [ref]$why)
+    Must ($fresh -eq '' -or $fresh -eq $ping) "A29 roots: a fresh read after exit is unread or the same image, never another (got '$fresh'; $why)"
     # Pure root lineage: a root started at t0 and ended at t1, its image in the tree; an unread child at t_c.
     $t0, $t1 = $at.AddMinutes(1).Ticks, $at.AddMinutes(2).Ticks
     $utc = { param($Ticks) [DateTime]::new($Ticks, [DateTimeKind]::Utc) }
