@@ -40,6 +40,10 @@ param(
     # Migrate only: the exact pre-recorded image of the old source container.
     [ValidatePattern('^[^\s"'']+$')]
     [string] $OldImageSource,
+    # Stage only: the verified envs placement distribution (place.ps1, sops.exe, rent-receive.sh and its ciphertexts) and
+    # the rent target's own age identity file. Stage places the tunnel token from them after the kept rent stops.
+    [string] $PlacementDistribution,
+    [string] $PlacementIdentity,
     [switch] $Apply
 )
 
@@ -51,6 +55,10 @@ if ($env:COMPUTERNAME -ine $ExpectHost) {
 }
 $Wslc = 'C:\Program Files\WSL\wslc.exe'
 if ($Step -ne 'Plan' -and -not (Test-Path -LiteralPath $Wslc)) { throw "WSLC is missing: $Wslc" }
+# place.ps1 is a Windows PowerShell 5.1 script that ends with exit: it runs as its own process, so its exit can never end
+# Stage or skip a recovery decision. Only its exit code is read; the token stays inside that process and its receiver.
+$PlacementShell = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+$Placement = $PlacementShell
 
 # Migrate only: the published rent image that kept /home/dev on a volume.
 $OldImage = 'ghcr.io/roccho-dev/windows-rent@sha256:da1393586b2e847c7508038675be8701c185b77be777ef1492689d4c604185ce'
@@ -115,6 +123,28 @@ function Get-StageProblem($Old, $Existing) {
     return $null
 }
 
+# Stage placement inputs, checked before any task change or stop: why they are not usable, or $null. Paths and shapes only;
+# no secret is read. place.ps1's receiver writes only windows-rent-state, so any other state volume is refused.
+function Get-PlacementProblem {
+    if ($StateVolume -cne 'windows-rent-state') { return "Placement writes only windows-rent-state; state volume $StateVolume is refused." }
+    if (-not $PlacementDistribution -or -not $PlacementIdentity) { return 'Stage needs -PlacementDistribution and -PlacementIdentity.' }
+    $Files = [ordered]@{
+        'system PowerShell 5.1' = $PlacementShell
+        'place.ps1' = Join-Path $PlacementDistribution 'place.ps1'
+        'sops.exe' = Join-Path $PlacementDistribution 'sops.exe'
+        'rent-receive.sh' = Join-Path $PlacementDistribution 'rent-receive.sh'
+        'tunnel envelope' = Join-Path (Join-Path $PlacementDistribution 'ciphertexts') 'dev-rent-tunnel.sops.yaml'
+        'rent age identity' = $PlacementIdentity
+    }
+    foreach ($Name in $Files.Keys) {
+        $Item = Get-Item -LiteralPath $Files[$Name] -Force -ErrorAction SilentlyContinue
+        if (-not $Item -or $Item.PSIsContainer -or ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            return "Placement input '$Name' is not a plain file: $($Files[$Name])"
+        }
+    }
+    return $null
+}
+
 function Get-Container([string] $Name) {
     $Current = (& $Wslc inspect $Name) -join "`n"
     if ($LASTEXITCODE -ne 0) { return $null }
@@ -147,6 +177,11 @@ if ($Step -in @('Create', 'Stage')) {
     $Key = (Get-Content -LiteralPath $PublicKeyFile -Raw).Trim()
     if ($Key -notmatch '^ssh-ed25519 [A-Za-z0-9+/=]+(?: .*)?$') { throw 'Expected one ed25519 public key.' }
 }
+# Stage refuses unusable placement inputs here, before any WSLC call, task change or stop.
+if ($Step -eq 'Stage') {
+    $Problem = Get-PlacementProblem
+    if ($Problem) { throw "$Problem Not staging." }
+}
 
 # The tunnel token is never an argument or environment value: rent-start reads its fixed file in the state volume.
 function Get-RunArgs([string] $Name) {
@@ -163,6 +198,13 @@ $MigrateArgs = @('run', '--rm', '--volume', "${OldHomeVolume}:/old:ro", '--volum
 $ListArgs = @('container', 'list', '--all', '-q')
 # One-shot helper from exactly $Image: the nix volume at /seed, the image's own /nix beneath it; removed by --rm.
 $SeedArgs = @('run', '--rm', '--volume', "${NixVolume}:/seed", '--env', "RENT_NIX_VOLUME=$NixVolume", $Image, '/bin/rent-nix-seed')
+# Stage's token placement: envs place.ps1 decrypts with the rent identity and hands the token to its receiver in exactly
+# $Image on windows-rent-state. Paths and the image digest only.
+$PlaceDistribution = if ($PlacementDistribution) { $PlacementDistribution } else { '<placement distribution>' }
+$PlaceIdentity = if ($PlacementIdentity) { $PlacementIdentity } else { '<rent age identity>' }
+$PlaceArgs = @('-NoProfile', '-NonInteractive', '-File', (Join-Path $PlaceDistribution 'place.ps1'), '-Target', 'rent',
+    '-Identity', $PlaceIdentity, '-Ciphertext', (Join-Path (Join-Path $PlaceDistribution 'ciphertexts') 'dev-rent-tunnel.sops.yaml'),
+    '-RentImage', $Image)
 
 if ($Step -eq 'Plan') {
     # Exact argv for every live step; touches nothing.
@@ -175,16 +217,19 @@ if ($Step -eq 'Plan') {
         seed = @($Wslc) + $SeedArgs
         create = @($Wslc) + $RunArgs
         readyGate = "within 60 s: Running with log lines '$Proof' and '$Ready', then Running for 10 consecutive polls"
-        stageAccepts = "$Container exists and is Running (its images read by inspect now), $Candidate absent, every other container stopped, logon task $TaskName exactly '$Wslc start $Container'; the token file is placed in $StateVolume beforehand"
+        stageAccepts = "$Container exists and is Running (its images read by inspect now), $Candidate absent, every other container stopped, logon task $TaskName exactly '$Wslc start $Container'; placement inputs are plain files and the state volume is windows-rent-state, checked before any change"
         # Order: stageTask (while $Container still runs, so a logon can only try the not-yet-existing candidate),
-        # stageStop, seed, stageRun, readyGate. Success leaves the task on the running candidate.
+        # stageStop, stagePlace, seed, stageRun, readyGate. Success leaves the task on the running candidate.
         stageTask = @($TaskName, $Wslc, 'start', $Candidate)
         stageStop = @($Wslc, 'stop', $Container)
+        stagePlace = @($PlacementShell) + $PlaceArgs
+        stagePlaceHalt = "any placement result but exit 0 halts Stage: no seed, run, task restore or start of $Container; $Container stays stopped, the logon task targets the absent $Candidate, and the slot and writer state are UNKNOWN until separately authorized recovery"
         stageRun = @($Wslc) + $StageArgs
         readyLogs = @($Wslc, 'logs', $Candidate)
-        # Any Stage failure after stageTask, and the Revert step: revertStop if running, then the candidate provably
-        # stopped by readback whatever stop returned, revertRemove (a failed Stage's candidate only), revertTask read back,
-        # and only then revertStart and Running on its inspected images for 3 consecutive polls.
+        # A Stage failure after a placement exit 0, and the Revert step: revertStop if running, then the candidate provably
+        # stopped by readback whatever stop returned, revertRemove (a failed Stage's candidate only), every other container
+        # provably stopped, revertTask read back, and only then revertStart and Running on its inspected images for 3
+        # consecutive polls. The placed token slot is kept; nothing reverts the state volume.
         revertStop = @($Wslc, 'stop', $Candidate)
         revertRemove = @($Wslc, 'remove', $Candidate)
         revertTask = @($TaskName, $Wslc, 'start', $Container)
@@ -281,7 +326,8 @@ function Wait-OldRunning($Old) {
 }
 
 # Back to the kept rent: stop the candidate (and remove it only when it is a failed Stage's), start the old rent,
-# and prove it Running on its own images. No -f, no -v; no volume is touched. Every step is appended to $Steps.
+# and prove it Running on its own images. No -f, no -v; this function touches no volume (a token Stage placed stays).
+# Every step is appended to $Steps.
 function Invoke-Revert($Old, $Steps, [bool] $RemoveCandidate) {
     $Now = Get-Named $Candidate
     if ($Now) {
@@ -298,6 +344,10 @@ function Invoke-Revert($Old, $Steps, [bool] $RemoveCandidate) {
             if ($LASTEXITCODE -ne 0) { return $false }
         }
     }
+    # No return while another writer may run: every container but the kept rent must read back provably stopped (a
+    # snapshot, not a guarantee against later races). Otherwise nothing more happens and the task stays where it is.
+    try { Assert-NoOtherWriter $Container 'restoring' }
+    catch { $Steps.Add("$($_.Exception.Message) Not starting $Container"); return $false }
     # The logon task goes back first: the kept rent starts only once no logon can start the candidate.
     try { Set-TaskTarget $Container; $Steps.Add("task starts $Container") }
     catch { $Steps.Add("task not restored ($($_.Exception.Message)); not starting $Container"); return $false }
@@ -345,8 +395,20 @@ function Invoke-Stage($Old) {
     Complete-Stage $Old
 }
 
-# Stage after the old rent was stopped (kept, never removed): any failure reverts, and Stage still fails.
+# Stage after the old rent was stopped (kept, never removed). First the token is placed, while no rent runs. Any result
+# but a known exit 0 (another code, a timeout's -1, an exception) leaves the slot and its writer unknown, so Stage halts
+# with nothing further: no seed, no candidate, no task restore, no old start, no retry. After a placement exit 0, any later
+# failure reverts, and Stage still fails.
 function Complete-Stage($Old) {
+    try {
+        & $Placement @PlaceArgs | Out-Host
+        $Placed = if ($LASTEXITCODE -is [int] -and $LASTEXITCODE -eq 0) { $null } else { "exit $LASTEXITCODE" }
+    } catch {
+        $Placed = 'an exception'
+    }
+    if ($Placed) {
+        throw "Stage halted after placement attempt ($Placed): $Container kept stopped, logon task targets absent $Candidate, slot and writer state UNKNOWN; recovery needs separate authority."
+    }
     try {
         Invoke-Seed
         & $Wslc @StageArgs | Out-Host
