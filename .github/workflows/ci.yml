@@ -134,9 +134,15 @@ jobs:
           $Wrappers = @($Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
               $n.Left.Extent.Text -ceq '$Wslc' -and $n.Right.Extent.Text.TrimStart().StartsWith('{') }, $true))
           if ($Wrappers.Count -ne 1) { "expected one wslc wrapper, found $($Wrappers.Count)"; exit 1 }
+          # The script's own Replace precheck: container inspect, the recorded rollback file and Get-RollbackProblem.
+          $Prechecks = @($Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and
+              $n.Clauses[0].Item1.Extent.Text -ceq "`$Step -eq 'Replace'" -and $n.Extent.Text.Contains('Get-RollbackProblem $Rollback') }, $true))
+          if ($Prechecks.Count -ne 1) { "expected one Replace precheck, found $($Prechecks.Count)"; exit 1 }
+          $Precheck = [scriptblock]::Create($Prechecks[0].Extent.Text)
           foreach ($N in $Ast.FindAll({ param($n)
               ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Get-Own', 'Get-Images', 'Test-RunningProof',
-                'Wait-RunningProof', 'Get-RollbackProblem', 'Wait-OldRunning', 'Invoke-Seed', 'Complete-Replace') -or
+                'Wait-RunningProof', 'Get-RollbackProblem', 'Wait-OldRunning', 'Invoke-Seed', 'Complete-Replace', 'Test-OwnMount',
+                'ConvertFrom-JsonItems') -or
               ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in '$Volumes', '$Proof') }, $true) + $Wrappers) {
             . ([scriptblock]::Create($N.Extent.Text))
           }
@@ -194,10 +200,31 @@ jobs:
           if ($C.result -cne 'ok' -or $script:Gate -ne $false) { "C: an own-mounts line on stderr only passed the gate: $($C.result) $script:Gate"; exit 1 }
           $D = Case 'd' @{ FAKE_SEED = '3' } { Invoke-Seed }
           if ($D.result -cne 'WSLC seed failed: 3' -or $D.code -ne 3) { "D: $($D.result) exit $($D.code)"; exit 1 }
+          # E: the precheck reads a rollback file written as a flat JSON array of strings and accepts it unchanged, with the
+          # container inspect as one object or as a one-element array; a nested, typed or object file is still refused.
+          $OldMounted = '{"Name":"windows-own","State":{"Running":true},"Config":{"Image":"' + $OldImage +
+            '"},"Mounts":[{"Type":"volume","Name":"windows-own-home","Destination":"/home/dev"}]}'
+          $OldOne = Join-Path $Tmp 'old-one.json'; Set-Content -LiteralPath $OldOne -Encoding ascii -Value $OldMounted
+          $OldList = Join-Path $Tmp 'old-list.json'; Set-Content -LiteralPath $OldList -Encoding ascii -Value "[$OldMounted]"
+          $GoodJson = ConvertTo-Json -InputObject $Good -Compress
+          $Argvs = [ordered] @{ good = $GoodJson; nested = "[$GoodJson]"; typed = $GoodJson.Replace('"--detach"', '1'); object = '{"argv":' + $GoodJson + '}' }
+          foreach ($K in $Argvs.Keys) { Set-Content -LiteralPath (Join-Path $Tmp "$K.argv.json") -Encoding ascii -Value $Argvs[$K] }
+          foreach ($Inspect in $OldOne, $OldList) {
+            foreach ($K in $Argvs.Keys) {
+              $script:ArgvFile = Join-Path $Tmp "$K.argv.json"; $script:Parsed = $null
+              $E = Case "e-$K" @{ FAKE_INSPECT = $Inspect } { $Step = 'Replace'; $RollbackArgvFile = $script:ArgvFile; . $Precheck; $script:Parsed = $Rollback }
+              $Want = if ($K -ceq 'good') { 'ok' } else { 'Rollback argv must be a JSON array of strings. Not replacing.' }
+              if ($E.result -cne $Want -or ($K -ceq 'good' -and (@($script:Parsed) -join "`n") -cne ($Good -join "`n"))) {
+                "E: $K rollback file with inspect $(Split-Path -Leaf $Inspect): $($E.result)"; $E.log; exit 1
+              }
+              Remove-Item -LiteralPath (Join-Path $Tmp "e-$K.log")
+            }
+          }
           foreach ($F in 'a', 'b', 'c', 'd') { Remove-Item -LiteralPath (Join-Path $Tmp "$F.log") }
-          foreach ($F in $WslcExe, $NewUp, $OldUp) { Remove-Item -LiteralPath $F }
+          foreach ($K in $Argvs.Keys) { Remove-Item -LiteralPath (Join-Path $Tmp "$K.argv.json") }
+          foreach ($F in $WslcExe, $NewUp, $OldUp, $OldOne, $OldList) { Remove-Item -LiteralPath $F }
           [IO.Directory]::Delete($Tmp)
-          'PASS own Replace under Windows PowerShell 5.1: A success, B rollback after remove, C stderr-only gate refused, D seed exit 3'
+          'PASS own Replace under Windows PowerShell 5.1: A success, B rollback after remove, C stderr-only gate refused, D seed exit 3, E rollback file precheck'
           exit 0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:

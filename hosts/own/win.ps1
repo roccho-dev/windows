@@ -303,16 +303,24 @@ function Complete-Replace($Rollback) {
 & $Wslc volume inspect $Site.volume
 if ($LASTEXITCODE -ne 0) { throw "Named volume is missing: $($Site.volume)" }
 
+# Windows PowerShell 5.1 writes a top-level JSON array as one object, so @(... | ConvertFrom-Json) nests it; PowerShell 7
+# enumerates it unless -NoEnumerate. Both return here the top-level array's own elements (or the one value), and never
+# unwrap a nested element, so the checks below still refuse it.
+function ConvertFrom-JsonItems([string] $Text) {
+    $Value = if ($PSVersionTable.PSVersion.Major -ge 7) { ConvertFrom-Json $Text -NoEnumerate } else { ConvertFrom-Json $Text }
+    $Value
+}
+
 if ($Step -eq 'Replace') {
     # Only replace the container this Binding created: it must exist and reference the Binding's volume and state mount.
     $Current = (& $Wslc container inspect -f json $Site.container) -join "`n"
     if ($LASTEXITCODE -ne 0) { throw "Container to replace is missing: $($Site.container)" }
-    $Item = @($Current | ConvertFrom-Json)
+    $Item = @(ConvertFrom-JsonItems $Current)
     if (-not (Test-OwnMount $Item $Site.volume $Spec.stateMount)) {
         throw "Container $($Site.container) does not mount exactly volume $($Site.volume) at $($Spec.stateMount); not replacing."
     }
     if (-not $RollbackArgvFile) { throw 'Replace needs -RollbackArgvFile with the pre-recorded argv of the current container.' }
-    $Rollback = @((Get-Content -LiteralPath $RollbackArgvFile -Raw) | ConvertFrom-Json)
+    $Rollback = @(ConvertFrom-JsonItems (Get-Content -LiteralPath $RollbackArgvFile -Raw))
     $Problem = Get-RollbackProblem $Rollback $Item[0]
     if ($Problem) { throw "$Problem Not replacing." }
 }
