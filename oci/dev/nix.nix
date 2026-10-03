@@ -331,17 +331,38 @@ rec {
       };
       # Runs the exact ops Jev CLI once: the caller's stdin is its request, its single stdout line is the result, and
       # the launcher's own messages go to stderr. Only the fixed package output; no attribute, program or argument choice.
+      # R-ENTRY1.1: agreed fixed semlint finite-real target contract; live permission separate.
+      # Preserve this existing four-argument legacy Jev mode unchanged. The planned
+      # --semlint-real mode supplies only the exact pinned #jev-review Node/source
+      # tests/run.mjs --semlint-real, built and closure-verified before the existing
+      # target-owned SOPS bootstrap and its one key-bearing child. No program,
+      # module, endpoint, preload or arbitrary argument selector is accepted.
+      # Public stdin is {schema:ops.semlint.real-input.v1,cases:[{id,input}]};
+      # exact keys/unique neutral IDs, nonempty <=24 cases, stdin <=1MiB, exact
+      # semlint v1/v2 inputs and whole-plan admission before any provider POST.
+      # Each child permits <=24 attempted POSTs to the fixed official endpoint,
+      # 15s whole-response deadline, redirect:error and no retry. Missing Core
+      # context/empty checks remain no-send, not success; all failures are retained.
+      # Output projects known model/qN numeric Noul, original-wire digest (not
+      # truth), input_tokens/output_tokens safe nonnegative integers or null,
+      # and closed attempt/received-response/validation accounting. Never raw
+      # body/header/exception/key, arbitrary answer/usage fields or gold/threshold.
+      # Availability does not grant live permission, prove quality, or adopt a
+      # finite population/series spend. Existing CI launcher-only isolation applies;
+      # no own/rent/Cloudflare/profile/host effect or new CLI command is introduced.
       ops = mkLaunch {
         name = "ops-jev";
-        usage = "--envs-sha <40-hex> --ops-sha <40-hex>";
+        usage = "[--semlint-real] --envs-sha <40-hex> --ops-sha <40-hex>";
         say = "2";
         announce = "ops $ops_sha jev with PATH HOME LANG JEV_API_KEY";
         childEnv = "";
         parse = ''
           ops_remote=${q opsRemote}
           envs_sha="" ops_sha=""
+          if [ "''${1:-}" = --semlint-real ]; then formal=true; shift; fi
           [ "$#" -eq 4 ] || usage
           while [ "$#" -gt 0 ]; do
+            if [ "$formal" = true ]; then [ -n "''${2:-}" ] && [[ $2 != --* ]] || usage; fi
             case "$1" in
               --envs-sha) [ -z "$envs_sha" ] || usage; envs_sha=$2 ;;
               --ops-sha) [ -z "$ops_sha" ] || usage; ops_sha=$2 ;;
@@ -352,11 +373,37 @@ rec {
           [[ $envs_sha =~ ^[0-9a-f]{40}$ && $ops_sha =~ ^[0-9a-f]{40}$ ]] || usage
         '';
         build = ''
+          if [ "$formal" = true ]; then
+            out=$(nix_ build --no-link --print-out-paths "git+$ops_remote?rev=$ops_sha#packages.x86_64-linux.jev-review") \
+              || fail "cannot build the fixed semlint package"
+            [ "$(printf '%s\n' "$out" | "$cu/wc" -l)" -eq 1 ] || fail "the semlint package is not one output"
+            refs=$(nix_ path-info --recursive "$out") || fail "cannot inspect the semlint closure"
+            mapfile -t paths <<< "$refs"
+            for path in "''${paths[@]}"; do
+              [[ $path =~ ^/nix/store/[a-z0-9]{32}-[^/[:space:]]+$ ]] || fail "invalid semlint closure path"
+            done
+            ${pkgs.nix}/bin/nix-store --verify-path "''${paths[@]}" >/dev/null \
+              || fail "semLint closure contents differ"
+            wrapper=$out/bin/jev-review
+            { [ -f "$wrapper" ] && [ ! -L "$wrapper" ] && [ -x "$wrapper" ]; } || fail "missing fixed semlint wrapper"
+            mapfile -t exec_lines < <("$grep" '^exec ' "$wrapper")
+            [ "''${#exec_lines[@]}" -eq 1 ] || fail "ambiguous semlint wrapper"
+            exec_pattern='^exec (/nix/store/[a-z0-9]{32}-nodejs-[^/ ]+/bin/node) (/nix/store/[a-z0-9]{32}-jev-review)/bin/jev-review[.]mjs "[$]@"$'
+            [[ ''${exec_lines[0]} =~ $exec_pattern ]] || fail "unsupported semlint wrapper"
+            program=''${BASH_REMATCH[1]}
+            source=''${BASH_REMATCH[2]}
+            "$grep" -qxF "''${program%/bin/node}" <<< "$refs" || fail "Node is outside the semlint closure"
+            "$grep" -qxF "$source" <<< "$refs" || fail "source is outside the semlint closure"
+            { [ -x "$program" ] && [ -f "$source/tests/run.mjs" ] && [ ! -L "$source/tests/run.mjs" ]; } \
+              || fail "missing fixed semlint test entry"
+            program_args=("$source/tests/run.mjs" --semlint-real)
+          else
           out=$(nix_ build --no-link --print-out-paths "git+$ops_remote?rev=$ops_sha#packages.x86_64-linux.jev") \
             || fail "cannot build the ops jev package"
           [ "$(printf '%s\n' "$out" | "$cu/wc" -l)" -eq 1 ] || fail "the ops jev package is not one output"
           program=$out/bin/jev
           { [ -f "$program" ] && [ -x "$program" ]; } || fail "the ops jev package has no bin/jev"
+          fi
         '';
       };
     };
