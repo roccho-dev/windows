@@ -1,13 +1,13 @@
 # Owner GitHub routing (Issue #8-C), one definition for own, rent and dev: the gh wrapper and the owner's Git
 # credential helper, immutable outputs reached through each runtime's profile. Credentials persist only in the owner
 # root /work/repos/.auth/<owner>/gh. A repository selects it in its own common-dir config (credential.helper reset, then
-# this helper for its github.com/<owner> origin, as Tools' bind writes); everywhere else gh gets an empty read-only
-# config, so it has no credentials and no writable store. Token and target overrides never win on either path.
+# this helper for its github.com/<owner> origin, as Tools' bind writes); everywhere else gh's config directory is
+# /dev/null, which is no directory, so nothing can be read or created there, by root either (a read-only directory
+# would not stop root). Token and target overrides never win on either path.
 { pkgs, owner ? "roccho-dev" }:
 let
   root = "/work/repos/.auth/${owner}/gh";
   helperName = "git-credential-github-${owner}";
-  unselected = pkgs.runCommand "gh-unselected-config" { } "mkdir $out";
   clear = "unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_REPO GH_HOST";
 in
 {
@@ -20,7 +20,7 @@ in
       helper=$(local_git "credential.$url.helper") && [ "''${helper##*/}" = ${helperName} ]; then
       export GH_CONFIG_DIR=${root}
     else
-      export GH_CONFIG_DIR=${unselected} GH_PROMPT_DISABLED=1
+      export GH_CONFIG_DIR=/dev/null GH_PROMPT_DISABLED=1
     fi
     exec ${pkgs.gh}/bin/gh "$@"
   '';

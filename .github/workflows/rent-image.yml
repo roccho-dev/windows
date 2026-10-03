@@ -684,11 +684,13 @@ jobs:
             export XDG_CONFIG_HOME="$HOME/xdg" GH_TOKEN=ci-env-gh GITHUB_TOKEN=ci-env-github GH_ENTERPRISE_TOKEN=ci-env-ghe \
               GITHUB_ENTERPRISE_TOKEN=ci-env-ghes GH_HOST=evil.example GH_REPO=other/elsewhere GIT_TERMINAL_PROMPT=0
             gh --version | grep -q "^gh version "
+            gh help > /dev/null
             snap() { find "$HOME/.config" "$HOME/xdg" /work/repos/.auth -type f -exec sha256sum {} + | LC_ALL=C sort; }
             before=$(snap)
             if (cd "$HOME" && gh auth token) > /dev/null 2>&1; then echo "gh outside a bound repository returned a token" >&2; exit 1; fi
             if (cd "$HOME" && gh config set editor vi) > /dev/null 2>&1; then echo "gh outside a bound repository wrote a config" >&2; exit 1; fi
             test "$(snap)" = "$before"
+            test -c /dev/null
             test "$(cd bound && gh auth token)" = ci-owner-token
             for r in unbound other; do if (cd "$r" && gh auth token) > /dev/null 2>&1; then echo "$r: gh returned a token" >&2; exit 1; fi; done
             # The helper itself answers only https://github.com/roccho-dev/<repo>, for get, store and erase, and is
@@ -722,6 +724,17 @@ jobs:
             nofill other other/windows
             test "$(cd bound && gh auth token)" = ci-owner-token
             if (cd unbound && gh auth token) > /dev/null 2>&1; then echo "unbound: gh returned a token" >&2; exit 1; fi'
+          # Unselected gh as root (image-default exec, no -u): its config directory /dev/null is no directory, so root
+          # cannot create a config there either; version and help still work, and no config store changes.
+          docker exec -w /home/dev rent-smoke /bin/bash -euc '
+            snap() { find /home/dev/.config /home/dev/xdg /work/repos/.auth -type f -exec sha256sum {} + | LC_ALL=C sort; }
+            before=$(snap)
+            gh --version | grep -q "^gh version "
+            gh help > /dev/null
+            if gh auth token > /dev/null 2>&1; then echo "root gh outside a bound repository returned a token" >&2; exit 1; fi
+            if gh config set editor vi > /dev/null 2>&1; then echo "root gh outside a bound repository wrote a config" >&2; exit 1; fi
+            test "$(snap)" = "$before"
+            test -c /dev/null'
 
           # Restart: same container; TERM reaches the supervisor, and home, state, and host key remain.
           before="$(docker inspect --format '{{.Id}}' rent-smoke)"

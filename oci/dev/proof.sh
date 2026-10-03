@@ -645,7 +645,9 @@ inside '
   nofill other other/windows
   export XDG_CONFIG_HOME="$HOME/xdg" GH_TOKEN=ci-env-gh GITHUB_TOKEN=ci-env-github GH_ENTERPRISE_TOKEN=ci-env-ghe \
     GITHUB_ENTERPRISE_TOKEN=ci-env-ghes GH_HOST=evil.example GH_REPO=other/elsewhere GIT_TERMINAL_PROMPT=0
+  # This session is root: unselected gh uses /dev/null, which is no directory, so root cannot create a config there.
   case $(gh --version) in "gh version "*) ;; *) exit 1 ;; esac
+  gh help > /dev/null
   snap() {
     ls -lAR --time-style=+%s.%N "$HOME/.config" "$HOME/xdg" /work/repos/.auth
     sha256sum "$HOME/.config/gh/hosts.yml" "$HOME/xdg/gh/hosts.yml" /work/repos/.auth/roccho-dev/gh/hosts.yml
@@ -654,6 +656,7 @@ inside '
   if (cd "$HOME" && gh auth token) > /dev/null 2>&1; then echo "gh outside a bound clone returned a token" >&2; exit 1; fi
   if (cd "$HOME" && gh config set editor vi) > /dev/null 2>&1; then echo "gh outside a bound clone wrote a config" >&2; exit 1; fi
   test "$(snap)" = "$before"
+  test -c /dev/null
   test "$(cd bound && gh auth token)" = ci-owner-token
   for r in unbound other; do if (cd "$r" && gh auth token) > /dev/null 2>&1; then echo "$r: gh returned a token" >&2; exit 1; fi; done
   # The helper itself answers only https://github.com/roccho-dev/<repo>, for get, store and erase, and is silent
