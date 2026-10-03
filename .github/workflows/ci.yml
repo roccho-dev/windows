@@ -195,6 +195,13 @@ jobs:
           $B = Case 'b' @{ FAKE_INSPECT = $OldUp; FAKE_RUN = '7' } { Complete-Replace $Good }
           $WantB = 'Replace failed: WSLC run failed: 7 | rollback succeeded: stop new exit 0; remove new exit 0; recorded argv exit 0; old Running on its old image'
           if ($B.result -cne $WantB) { "B: $($B.result)"; $B.log; exit 1 }
+          # A' and B': the same success and rollback with the container inspect as a one-element JSON array.
+          $NewUpList = Join-Path $Tmp 'new-list.json'; Set-Content -LiteralPath $NewUpList -Encoding ascii -Value ('[' + [IO.File]::ReadAllText($NewUp).Trim() + ']')
+          $OldUpList = Join-Path $Tmp 'old-up-list.json'; Set-Content -LiteralPath $OldUpList -Encoding ascii -Value ('[' + [IO.File]::ReadAllText($OldUp).Trim() + ']')
+          $A2 = Case 'a2' @{ FAKE_INSPECT = $NewUpList } { Complete-Replace $Good }
+          if ($A2.result -cne 'ok' -or $A2.log -notmatch 'fake-wslc stderr') { "A': Replace did not succeed with an array inspect: $($A2.result)"; $A2.log; exit 1 }
+          $B2 = Case 'b2' @{ FAKE_INSPECT = $OldUpList; FAKE_RUN = '7' } { Complete-Replace $Good }
+          if ($B2.result -cne $WantB) { "B': $($B2.result)"; $B2.log; exit 1 }
           $script:Gate = $null
           $C = Case 'c' @{ FAKE_INSPECT = $NewUp; FAKE_GATE = 'stderr' } { $script:Gate = Wait-RunningProof }
           if ($C.result -cne 'ok' -or $script:Gate -ne $false) { "C: an own-mounts line on stderr only passed the gate: $($C.result) $script:Gate"; exit 1 }
@@ -231,11 +238,12 @@ jobs:
             }
             Remove-Item -LiteralPath (Join-Path $Tmp 'f.log')
           }
-          foreach ($F in 'a', 'b', 'c', 'd') { Remove-Item -LiteralPath (Join-Path $Tmp "$F.log") }
+          foreach ($F in 'a', 'b', 'a2', 'b2', 'c', 'd') { Remove-Item -LiteralPath (Join-Path $Tmp "$F.log") }
           foreach ($K in $Argvs.Keys) { Remove-Item -LiteralPath (Join-Path $Tmp "$K.argv.json") }
-          foreach ($F in $WslcExe, $NewUp, $OldUp, $OldOne, $OldList, $OldTwo) { Remove-Item -LiteralPath $F }
+          foreach ($F in $WslcExe, $NewUp, $OldUp, $NewUpList, $OldUpList, $OldOne, $OldList, $OldTwo) { Remove-Item -LiteralPath $F }
           [IO.Directory]::Delete($Tmp)
-          'PASS own Replace under Windows PowerShell 5.1: A success, B rollback after remove, C stderr-only gate refused, D seed exit 3, E rollback file precheck, F one container from inspect'
+          ("PASS own Replace under Windows PowerShell 5.1: A success, B rollback after remove, A' and B' with an array inspect, " +
+            'C stderr-only gate refused, D seed exit 3, E rollback file precheck, F one container from inspect')
           exit 0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
