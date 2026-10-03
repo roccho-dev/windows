@@ -145,6 +145,19 @@ if ($Step -eq 'Plan') {
     exit 0
 }
 
+# Windows PowerShell 5.1 turns native stderr into terminating errors under Stop (with 2>$null, or inside a caller's
+# *>&1). From here every wslc call runs through this block: stdout is returned unchanged, stderr goes to the
+# information stream, and $LASTEXITCODE is the native exit code (-1 if wslc could not be started).
+$WslcExe = $Wslc
+$Wslc = {
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = -1
+    & $WslcExe @args 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) { Write-Information -MessageData ([string] $_) -InformationAction Continue }
+        else { $_ }
+    }
+}
+
 Write-Host "$Step on $env:COMPUTERNAME / $($Site.container) / SSH TCP $($Site.hostPort)"
 if (-not $Apply) {
     Write-Host 'Dry run. Add -Apply for this one step.'
@@ -175,7 +188,7 @@ function Test-RunningProof($Item, $Logs) {
 function Wait-RunningProof {
     for ($Second = 0; $Second -lt 60; $Second++) {
         Start-Sleep -Seconds 1
-        if (Test-RunningProof (Get-Own) @(& $Wslc logs $Site.container 2>$null)) { return $true }
+        if (Test-RunningProof (Get-Own) @(& $Wslc logs $Site.container 2>$null 6>$null)) { return $true }
     }
     return $false
 }

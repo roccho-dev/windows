@@ -114,6 +114,91 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 35
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          path: source
+      # hosts/own/win.ps1's Replace functions and its wslc wrapper under real Windows PowerShell 5.1, Stop and the
+      # ordinary route's outer *>&1, against a fake wslc in RUNNER_TEMP that writes stderr on every call.
+      - name: Own Replace under Windows PowerShell 5.1 with native stderr
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Path = "$PWD\source\hosts\own\win.ps1"
+          $Errors = $null
+          $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref] $null, [ref] $Errors)
+          if ($Errors) { $Errors; exit 1 }
+          $Site = Get-Content source\hosts\own\bindings\G6I3.json -Raw | ConvertFrom-Json
+          $Spec = Get-Content source\hosts\own\spec.json -Raw | ConvertFrom-Json
+          $Wrappers = @($Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+              $n.Left.Extent.Text -ceq '$Wslc' -and $n.Right.Extent.Text.TrimStart().StartsWith('{') }, $true))
+          if ($Wrappers.Count -ne 1) { "expected one wslc wrapper, found $($Wrappers.Count)"; exit 1 }
+          foreach ($N in $Ast.FindAll({ param($n)
+              ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Get-Own', 'Get-Images', 'Test-RunningProof',
+                'Wait-RunningProof', 'Get-RollbackProblem', 'Wait-OldRunning', 'Invoke-Seed', 'Complete-Replace') -or
+              ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in '$Volumes', '$Proof') }, $true) + $Wrappers) {
+            . ([scriptblock]::Create($N.Extent.Text))
+          }
+          function Start-Sleep { }
+          $Tmp = Join-Path $env:RUNNER_TEMP ('own51-' + [guid]::NewGuid().ToString('N'))
+          $null = New-Item -ItemType Directory -Path $Tmp
+          $WslcExe = Join-Path $Tmp 'wslc.cmd'
+          # Every call writes stderr; the seed (run --rm) is classified before a new container's run.
+          Set-Content -LiteralPath $WslcExe -Encoding ascii -Value @'
+          @echo off
+          echo fake-wslc stderr %* 1>&2
+          echo fake-wslc stderr second line 1>&2
+          if "%1"=="container" goto inspect
+          if "%1"=="logs" goto logs
+          if "%1"=="run" goto run
+          exit /b 0
+          :inspect
+          type "%FAKE_INSPECT%"
+          exit /b 0
+          :logs
+          for /l %%i in (1,1,50) do echo fake-wslc container stderr %%i 1>&2
+          if "%FAKE_GATE%"=="stderr" (echo %FAKE_PROOF% 1>&2) else (echo %FAKE_PROOF%)
+          exit /b 0
+          :run
+          if "%2"=="--rm" exit /b %FAKE_SEED%
+          echo %* | findstr /c:"OWN_NIX_VOLUME" >nul && exit /b %FAKE_RUN%
+          exit /b 0
+          '@
+          $Image = $Site.image
+          $OldImage = 'ghcr.io/roccho-dev/windows-own@sha256:' + ('1' * 64)
+          $Pre = @('run', '--name', 'windows-own', '--detach', '--publish', '127.0.0.1:2223:2223', '--shm-size', '1G')
+          $RunArgs = $Pre + @('--volume', 'windows-own-home:/home/dev', '--volume', 'windows-own-work:/work/repos', '--volume', 'windows-own-nix:/nix',
+            '--env', 'OWN_HOME_VOLUME=windows-own-home', '--env', 'OWN_WORK_VOLUME=windows-own-work', '--env', 'OWN_NIX_VOLUME=windows-own-nix',
+            '--env', 'OWN_AUTHORIZED_KEY=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA== ci', $Image)
+          $SeedArgs = @('run', '--rm', '--volume', 'windows-own-nix:/seed', '--env', 'OWN_NIX_VOLUME=windows-own-nix', $Image, '/bin/own-nix-seed')
+          $Good = $Pre + @('--volume', 'windows-own-home:/home/dev', $OldImage)
+          $NewUp = Join-Path $Tmp 'new.json'; Set-Content -LiteralPath $NewUp -Encoding ascii -Value ('{"Name":"windows-own","State":{"Running":true},"Config":{"Image":"' + $Image + '"}}')
+          $OldUp = Join-Path $Tmp 'old.json'; Set-Content -LiteralPath $OldUp -Encoding ascii -Value ('{"Name":"windows-own","State":{"Running":true},"Config":{"Image":"' + $OldImage + '"}}')
+          $env:FAKE_PROOF = $Proof
+          function Case([string]$Name, [hashtable]$Fake, [scriptblock]$Body) {
+            foreach ($K in 'FAKE_INSPECT', 'FAKE_GATE', 'FAKE_SEED', 'FAKE_RUN') { Set-Item "env:$K" '0' }
+            $env:FAKE_GATE = 'stdout'
+            foreach ($K in $Fake.Keys) { Set-Item "env:$K" $Fake[$K] }
+            $Log = Join-Path $Tmp "$Name.log"
+            $Result = try { & $Body *>&1 | Out-File -LiteralPath $Log -Encoding utf8; 'ok' } catch { $_.Exception.Message }
+            [pscustomobject]@{ result = $Result; code = $global:LASTEXITCODE; log = [IO.File]::ReadAllText($Log) }
+          }
+          $A = Case 'a' @{ FAKE_INSPECT = $NewUp } { Complete-Replace $Good }
+          if ($A.result -cne 'ok' -or $A.log -notmatch 'fake-wslc stderr') { "A: Replace did not succeed with stderr on every call: $($A.result)"; $A.log; exit 1 }
+          $B = Case 'b' @{ FAKE_INSPECT = $OldUp; FAKE_RUN = '7' } { Complete-Replace $Good }
+          $WantB = 'Replace failed: WSLC run failed: 7 | rollback succeeded: stop new exit 0; remove new exit 0; recorded argv exit 0; old Running on its old image'
+          if ($B.result -cne $WantB) { "B: $($B.result)"; $B.log; exit 1 }
+          $script:Gate = $null
+          $C = Case 'c' @{ FAKE_INSPECT = $NewUp; FAKE_GATE = 'stderr' } { $script:Gate = Wait-RunningProof }
+          if ($C.result -cne 'ok' -or $script:Gate -ne $false) { "C: an own-mounts line on stderr only passed the gate: $($C.result) $script:Gate"; exit 1 }
+          $D = Case 'd' @{ FAKE_SEED = '3' } { Invoke-Seed }
+          if ($D.result -cne 'WSLC seed failed: 3' -or $D.code -ne 3) { "D: $($D.result) exit $($D.code)"; exit 1 }
+          foreach ($F in 'a', 'b', 'c', 'd') { Remove-Item -LiteralPath (Join-Path $Tmp "$F.log") }
+          foreach ($F in $WslcExe, $NewUp, $OldUp) { Remove-Item -LiteralPath $F }
+          [IO.Directory]::Delete($Tmp)
+          'PASS own Replace under Windows PowerShell 5.1: A success, B rollback after remove, C stderr-only gate refused, D seed exit 3'
+          exit 0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           artifact-ids: ${{ needs.build.outputs.artifact }}
