@@ -61,6 +61,10 @@ jobs:
             stateVolumeCreateOnce = @($W, 'volume', 'create', 'windows-rent-state')
             migrateSourceInspect = @($W, 'inspect', 'envs-dev-mutable')
             migrateContainerList = @($W, 'container', 'list', '--all', '-q')
+            # Stage's token placement: its own Windows PowerShell 5.1 process, paths and the image digest only.
+            stagePlace = @('C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe', '-NoProfile', '-NonInteractive', '-File',
+              (Join-Path '<placement distribution>' 'place.ps1'), '-Target', 'rent', '-Identity', '<rent age identity>',
+              '-Ciphertext', (Join-Path (Join-Path '<placement distribution>' 'ciphertexts') 'dev-rent-tunnel.sops.yaml'), '-RentImage', $Image)
           }
           foreach ($K in $Want.Keys) {
             if ((@($Plan.$K) -join "`n") -cne ($Want[$K] -join "`n")) { "$K differs: $(@($Plan.$K) -join ' ')"; exit 1 }
@@ -75,6 +79,16 @@ jobs:
           if ($Ast.Extent.Text -notmatch "(?m)^\`$TaskName = 'windows-rent-oci-logon'$") { 'logon task name is not fixed'; exit 1 }
           # No Tailscale and no token anywhere in the runbook: the token is a file in the state volume.
           if ($PlanJson -match '(?i)tailscale|TS_|TUNNEL_TOKEN|--token') { 'the plan still carries Tailscale or a token'; exit 1 }
+          if ($Plan.stagePlaceHalt -notlike '*no seed, run, task restore or start of windows-rent*UNKNOWN*') { 'stagePlaceHalt differs'; exit 1 }
+          # The placement inputs are Stage-only: no other step needs them, and Stage checks them before any change.
+          foreach ($P in @($Ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -in 'PlacementDistribution', 'PlacementIdentity' })) {
+            if (@($P.Attributes | Where-Object { $_.Extent.Text -match 'Mandatory' }).Count) { "$($P.Name) is mandatory beyond Stage"; exit 1 }
+          }
+          $Text = $Ast.Extent.Text
+          $Pre = [regex]::Match($Text, "if \(\`$Step -eq 'Stage'\) \{\s+\`$Problem = Get-PlacementProblem\s+if \(\`$Problem\) \{ throw").Index
+          if ($Pre -le 0 -or $Pre -gt $Text.IndexOf('Write-Host "$Step on') -or $Pre -gt $Text.IndexOf('function Get-TaskTarget')) {
+            'Stage placement preflight is not before every WSLC call, task change and stop'; exit 1
+          }
           # Refusals before any WSLC call.
           foreach ($Bad in @(@{ OldHomeVolume = 'repos' }, @{ OldHomeVolume = 'windows-rent-state' }, @{ OldHomeVolume = 'windows-rent-nix' },
               @{ NixVolume = 'repos' }, @{ NixVolume = 'windows-rent-state' }, @{ SessionId = 'not-a-session' }, @{ OldContainer = 'windows-rent' },
@@ -92,7 +106,7 @@ jobs:
               ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Get-Images', 'Test-Stopped', 'Test-Running',
                 'Get-OldSourceProblem', 'Get-WriterProblem', 'Test-RunningProof', 'Get-StageProblem', 'Get-Container', 'Get-Named',
                 'Assert-NoOtherWriter', 'Invoke-Seed', 'Wait-Ready', 'Wait-OldRunning', 'Invoke-Revert', 'Invoke-StageStop', 'Complete-Stage',
-                'Get-TaskTarget', 'Set-TaskTarget', 'Invoke-Stage') -or
+                'Get-TaskTarget', 'Set-TaskTarget', 'Invoke-Stage', 'Get-PlacementProblem') -or
               ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in '$OldImage', '$Mounts', '$Proof', '$Ready', '$ListArgs', '$SeedArgs', '$TaskName') }, $true)) {
             . ([scriptblock]::Create($N.Extent.Text))
           }
@@ -133,6 +147,30 @@ jobs:
               @((J ('{"Name":"windows-rent","State":{"Running":true},"Config":{"Image":"' + $Image + '"}}')), $null), @($OldUp, (J $CandDown)))) {
             if (-not (Get-StageProblem $Bad[0] $Bad[1])) { 'stage precondition allowed a bad state'; exit 1 }
           }
+          # Placement preflight: plain-file inputs and the one state volume the receiver writes; synthetic files in a fresh
+          # runner directory, nothing secret. Each refusal happens before any WSLC call, task change or stop.
+          $PD = Join-Path ([IO.Path]::GetTempPath()) "rent-placement-$([guid]::NewGuid())"
+          $null = New-Item -ItemType Directory -Path (Join-Path $PD 'ciphertexts')
+          foreach ($F in 'place.ps1', 'sops.exe', 'rent-receive.sh', 'identity', 'shell', (Join-Path 'ciphertexts' 'dev-rent-tunnel.sops.yaml')) {
+            Set-Content -LiteralPath (Join-Path $PD $F) -Value 'synthetic'
+          }
+          $PlacementShell = Join-Path $PD 'shell'; $PlacementDistribution = $PD; $PlacementIdentity = Join-Path $PD 'identity'
+          if (Get-PlacementProblem) { "placement preflight refused usable inputs: $(Get-PlacementProblem)"; exit 1 }
+          foreach ($Bad in @(@{ StateVolume = 'other-state' }, @{ PlacementDistribution = '' }, @{ PlacementIdentity = '' },
+              @{ PlacementIdentity = (Join-Path $PD 'missing') }, @{ PlacementIdentity = (Join-Path $PD 'ciphertexts') },
+              @{ PlacementShell = (Join-Path $PD 'missing') }, @{ PlacementDistribution = (Join-Path $PD 'ciphertexts') })) {
+            $Keep = @{ StateVolume = $StateVolume; PlacementDistribution = $PlacementDistribution; PlacementIdentity = $PlacementIdentity; PlacementShell = $PlacementShell }
+            foreach ($K in $Bad.Keys) { Set-Variable -Name $K -Value $Bad[$K] }
+            $Problem = Get-PlacementProblem
+            foreach ($K in $Keep.Keys) { Set-Variable -Name $K -Value $Keep[$K] }
+            if (-not $Problem) { "placement preflight allowed: $($Bad | ConvertTo-Json -Compress)"; exit 1 }
+          }
+          # Placement takes paths only: with real input paths the plan names them, never what they hold.
+          Set-Content -LiteralPath $PlacementIdentity -Value 'AGE-SECRET-KEY-1CISYNTHETICMARKER'
+          Set-Content -LiteralPath (Join-Path $PD (Join-Path 'ciphertexts' 'dev-rent-tunnel.sops.yaml')) -Value 'ci-synthetic-envelope-marker'
+          $PathPlan = (& $Path @Base -PlacementDistribution $PD -PlacementIdentity $PlacementIdentity) -join "`n"
+          if ($PathPlan -match 'CISYNTHETICMARKER|ci-synthetic-envelope-marker') { 'the plan carries placement file contents'; exit 1 }
+          if (@(($PathPlan | ConvertFrom-Json).stagePlace) -cnotcontains $PlacementIdentity) { 'stagePlace does not name the identity path'; exit 1 }
           # Ready gate: Running with both lines, nothing less.
           $Up = J $CandUp
           if (-not (Test-RunningProof $Up @('x', "$Proof`r", $Ready))) { 'ready gate refused a proven start'; exit 1 }
@@ -177,6 +215,14 @@ jobs:
           # forced and no volume is touched.
           function Start-Sleep { }
           $StageArgs = @($Plan.stageRun | Select-Object -Skip 1)
+          # place.ps1 as a fake process: recorded with its argv, then its exit code or a failure to run at all.
+          $PlaceArgs = @($Plan.stagePlace | Select-Object -Skip 1)
+          $Placement = {
+            $Calls.Add('place ' + (@($args) -join ' '))
+            if ($Case.PlaceThrow) { throw 'fake placement process failure' }
+            $global:LASTEXITCODE = if ($Case.ContainsKey('PlaceExit')) { $Case.PlaceExit } else { 0 }
+            'placement output'
+          }
           $Wslc = {
             $A = @($args) -join ' '
             $Calls.Add($A)
@@ -185,18 +231,24 @@ jobs:
               'inspect windows-rent' { $Case.OldSeen++; & $Case.Old $Case.OldSeen }
               'inspect windows-rent-cf' { $Case.CandSeen++; & $Case.Cand $Case.CandSeen }
               'logs windows-rent-cf' { if ($Case.Logs) { $Case.Logs } else { @($Proof, $Ready) } }
-              'container list --all -q' { $Case.List }
+              'container list --all -q' { $Case.ListSeen++; if ($Case.List -is [scriptblock]) { & $Case.List $Case.ListSeen } else { $Case.List } }
               'inspect other' { $Case.Other }
+              'inspect ghost' { $null }
               default { 'wslc output' }
             }
             if ($A -clike 'inspect *' -and $null -eq $Out) { $global:LASTEXITCODE = 1 } else { $Out }
           }
-          $S = $SeedArgs -join ' '; $SA = $StageArgs -join ' '
-          $Pre = @('container list --all -q', $S, $SA)
+          $S = $SeedArgs -join ' '; $SA = $StageArgs -join ' '; $Place = 'place ' + ($PlaceArgs -join ' ')
+          $List = 'container list --all -q'
+          $Pre = @($Place, $List, $S, $SA)
           $Pair = @('inspect windows-rent-cf', 'logs windows-rent-cf')
           $Wait60 = @(1..60 | ForEach-Object { $Pair })
-          $Back = @('task -> windows-rent', 'start windows-rent', 'inspect windows-rent', 'inspect windows-rent', 'inspect windows-rent')
-          $NoBack = @('task -> windows-rent', 'start windows-rent') + @(1..60 | ForEach-Object { 'inspect windows-rent' })
+          # Every return to the kept rent first proves every other container stopped, then points the task back.
+          $Back = @($List, 'task -> windows-rent', 'start windows-rent', 'inspect windows-rent', 'inspect windows-rent', 'inspect windows-rent')
+          $NoBack = @($List, 'task -> windows-rent', 'start windows-rent') + @(1..60 | ForEach-Object { 'inspect windows-rent' })
+          $Halt = { param($R) "Stage halted after placement attempt ($R): windows-rent kept stopped, logon task targets absent windows-rent-cf, slot and writer state UNKNOWN; recovery needs separate authority." }
+          $Writer = 'Container other is not provably stopped. Not restoring. Not starting windows-rent'
+          $Unreadable = 'Container  is not provably stopped. Not restoring. Not starting windows-rent'
           $Ok = 'task starts windows-rent; start old exit 0; old Running on its images'
           $NotOk = 'task starts windows-rent; start old exit 0; old not Running on its images within 60 s'
           $Stopped = 'candidate provably stopped'
@@ -205,6 +257,9 @@ jobs:
           function Assert-Case($K, $Got) {
             if ($Got -cne $Case.Want -or ($Calls -join "`n") -cne ($Case.Calls -join "`n")) { "case '$K' gave: $Got"; $Calls; exit 1 }
             if (@($Calls) -cmatch '(^| )(-f|-v|--force|--volumes)( |$)|^volume (remove|rm|prune)|^(remove|rm) windows-rent$') { "case '$K' forced, removed a volume or the kept rent"; exit 1 }
+            if (@($Calls) -match '(?i)AGE-SECRET-KEY|TUNNEL_TOKEN|--token' -or $Got -match '(?i)AGE-SECRET-KEY|TUNNEL_TOKEN') { "case '$K' carried a credential"; exit 1 }
+            # Placement runs exactly once per Stage, and only after the kept rent was stopped.
+            if (@($Calls | Where-Object { $_ -clike 'place *' }).Count -gt 1) { "case '$K' placed more than once"; exit 1 }
             # Once the candidate may exist, the kept rent starts only after the task was pointed back at it.
             $List = @($Calls); $Seen = $false; $AtOld = $true
             foreach ($C in $List) {
@@ -215,10 +270,25 @@ jobs:
           }
           $Cases = [ordered]@{
             'ready' = @{ Old = { $OldUpJson }; Cand = { $CandUp }; Want = 'ok'; Calls = $Pre + @(1..10 | ForEach-Object { $Pair }) }
+            'placement exit 2 halts' = @{ PlaceExit = 2; Old = { $OldUpJson }; Cand = { $null }; Calls = @($Place); Want = (& $Halt 'exit 2') }
+            'placement exit 1 halts' = @{ PlaceExit = 1; Old = { $OldUpJson }; Cand = { $null }; Calls = @($Place); Want = (& $Halt 'exit 1') }
+            'placement timeout -1 halts' = @{ PlaceExit = -1; Old = { $OldUpJson }; Cand = { $null }; Calls = @($Place); Want = (& $Halt 'exit -1') }
+            'placement exception halts' = @{ PlaceThrow = $true; Old = { $OldUpJson }; Cand = { $null }; Calls = @($Place); Want = (& $Halt 'an exception') }
+            # A writer that keeps running: the seed guard refuses, and so does the revert's guard; the kept rent stays stopped.
             'another container running' = @{ List = 'other'; Other = $OtherRunning | ConvertTo-Json -Compress; Old = { $OldUpJson }; Cand = { $null }
-              Calls = @('container list --all -q', 'inspect other', 'inspect windows-rent-cf') + $Back
-              Want = "Stage failed: Container other is not provably stopped. Not seeding. | revert succeeded: $Ok" }
-            'seed fails' = @{ Exit = @{ $S = 1 }; Old = { $OldUpJson }; Cand = { $null }; Calls = @('container list --all -q', $S, 'inspect windows-rent-cf') + $Back
+              Calls = @($Place, $List, 'inspect other', 'inspect windows-rent-cf', $List, 'inspect other')
+              Want = "Stage failed: Container other is not provably stopped. Not seeding. | revert FAILED: $Writer" }
+            'writer appears before the kept rent restarts' = @{ Exit = @{ $SA = 1 }; List = { param($N) if ($N -ge 2) { 'other' } }
+              Other = $OtherRunning | ConvertTo-Json -Compress; Old = { $OldUpJson }; Cand = { $null }
+              Calls = $Pre + @('inspect windows-rent-cf', $List, 'inspect other')
+              Want = "Stage failed: WSLC run of windows-rent-cf failed: 1 | revert FAILED: $Writer" }
+            'unreadable container before the kept rent restarts' = @{ Exit = @{ $SA = 1 }; List = { param($N) if ($N -ge 2) { 'ghost' } }; Old = { $OldUpJson }; Cand = { $null }
+              Calls = $Pre + @('inspect windows-rent-cf', $List, 'inspect ghost')
+              Want = "Stage failed: WSLC run of windows-rent-cf failed: 1 | revert FAILED: $Unreadable" }
+            'candidate state unknown refuses recovery' = @{ Exit = @{ $SA = 1 }; Old = { $OldUpJson }; Cand = { '{"Name":"windows-rent-cf","State":{"Running":"unknown"}}' }
+              Calls = $Pre + @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf')
+              Want = 'Stage failed: WSLC run of windows-rent-cf failed: 1 | revert FAILED: stop candidate exit 0; candidate not provably stopped' }
+            'seed fails' = @{ Exit = @{ $S = 1 }; Old = { $OldUpJson }; Cand = { $null }; Calls = @($Place, $List, $S, 'inspect windows-rent-cf') + $Back
               Want = "Stage failed: WSLC seed failed: 1 | revert succeeded: $Ok" }
             'candidate run fails' = @{ Exit = @{ $SA = 1 }; Old = { $OldUpJson }; Cand = { $null }; Calls = $Pre + @('inspect windows-rent-cf') + $Back
               Want = "Stage failed: WSLC run of windows-rent-cf failed: 1 | revert succeeded: $Ok" }
@@ -231,22 +301,22 @@ jobs:
             'stop exits 0 but the candidate keeps running' = @{ Old = { $OldUpJson }; Cand = { $CandUp }; Logs = @($Proof)
               Calls = $Pre + $Wait60 + @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf')
               Want = "Stage failed: $Rejected | revert FAILED: stop candidate exit 0; candidate not provably stopped" }
-            'kept rent does not come back' = @{ Exit = @{ $S = 1 }; Old = { $OldDownJson }; Cand = { $null }; Calls = @('container list --all -q', $S, 'inspect windows-rent-cf') + $NoBack
+            'kept rent does not come back' = @{ Exit = @{ $S = 1 }; Old = { $OldDownJson }; Cand = { $null }; Calls = @($Place, $List, $S, 'inspect windows-rent-cf') + $NoBack
               Want = "Stage failed: WSLC seed failed: 1 | revert FAILED: $NotOk" }
             'kept rent back on other image' = @{ Exit = @{ $S = 1 }; Old = { $OldUpJson.Replace($Live, $Other) }; Cand = { $null }
-              Calls = @('container list --all -q', $S, 'inspect windows-rent-cf') + $NoBack
+              Calls = @($Place, $List, $S, 'inspect windows-rent-cf') + $NoBack
               Want = "Stage failed: WSLC seed failed: 1 | revert FAILED: $NotOk" }
             'candidate readback names another container' = @{ Old = { $OldUpJson }; Cand = { $CandUp.Replace('"Name":"windows-rent-cf"', '"Name":"windows-rent"') }
               Calls = $Pre + @('inspect windows-rent-cf', 'inspect windows-rent-cf')
               Want = 'Stage failed: Inspect of windows-rent-cf returned windows-rent. | revert FAILED: error: Inspect of windows-rent-cf returned windows-rent.' }
             'kept rent readback names another container' = @{ Exit = @{ $S = 1 }; Old = { $OldUpJson.Replace('"Name":"windows-rent"', '"Name":"other"') }; Cand = { $null }
-              Calls = @('container list --all -q', $S, 'inspect windows-rent-cf', 'task -> windows-rent', 'start windows-rent', 'inspect windows-rent')
+              Calls = @($Place, $List, $S, 'inspect windows-rent-cf', $List, 'task -> windows-rent', 'start windows-rent', 'inspect windows-rent')
               Want = 'Stage failed: WSLC seed failed: 1 | revert FAILED: task starts windows-rent; start old exit 0; error: Inspect of windows-rent returned other.' }
             'failed candidate cannot be removed' = @{ Exit = @{ 'remove windows-rent-cf' = 1 }; Old = { $OldUpJson }; Cand = $Upto61; Logs = @($Proof)
               Calls = $Pre + $Wait60 + @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf', 'remove windows-rent-cf')
               Want = "Stage failed: $Rejected | revert FAILED: stop candidate exit 0; $Stopped; remove candidate exit 1" }
             'task cannot be pointed back' = @{ Exit = @{ $S = 1 }; TaskFail = @('windows-rent'); Old = { $OldUpJson }; Cand = { $null }
-              Calls = @('container list --all -q', $S, 'inspect windows-rent-cf', 'task -> windows-rent')
+              Calls = @($Place, $List, $S, 'inspect windows-rent-cf', $List, 'task -> windows-rent')
               Want = 'Stage failed: WSLC seed failed: 1 | revert FAILED: task not restored (fake task failure for windows-rent); not starting windows-rent' }
           }
           foreach ($K in $Cases.Keys) {
@@ -260,6 +330,8 @@ jobs:
           $Stages = [ordered]@{
             'task handed over before the stop' = @{ Old = { $OldUpJson }; Cand = { $CandUp }; Want = 'ok'
               Calls = @('task -> windows-rent-cf', 'stop windows-rent') + $Pre + @(1..10 | ForEach-Object { $Pair }) }
+            'placement fails after the stop: halt, task not restored' = @{ PlaceExit = 2; Old = { $OldUpJson }; Cand = { $null }
+              Calls = @('task -> windows-rent-cf', 'stop windows-rent', $Place); Want = (& $Halt 'exit 2') }
             'task handoff fails' = @{ TaskFail = @('windows-rent-cf'); Old = { $OldUpJson }; Cand = { $null }
               Calls = @('task -> windows-rent-cf', 'task -> windows-rent'); Want = "${Before}: fake task failure for windows-rent-cf | task starts windows-rent" }
             'stop fails, kept rent still Running' = @{ Exit = @{ 'stop windows-rent' = 1 }; Old = { $OldUpJson }; Cand = { $null }
@@ -290,7 +362,15 @@ jobs:
               Want = "False | stop candidate exit 0; $Stopped; $NotOk"; Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf') + $NoBack }
             'revert, task cannot be pointed back' = @{ TaskFail = @('windows-rent'); Old = { $OldUpJson }; Cand = { param($N) if ($N -eq 1) { $CandUp } else { $CandDown } }
               Want = "False | stop candidate exit 0; $Stopped; task not restored (fake task failure for windows-rent); not starting windows-rent"
-              Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf', 'task -> windows-rent') }
+              Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf', $List, 'task -> windows-rent') }
+            'revert, kept candidate listed and stopped' = @{ List = 'windows-rent-cf'; Old = { $OldUpJson }; Cand = { param($N) if ($N -eq 1) { $CandUp } else { $CandDown } }
+              Want = "True | stop candidate exit 0; $Stopped; $Ok"
+              Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf', $List, 'inspect windows-rent-cf') + @($Back | Select-Object -Skip 1) }
+            'revert, another writer running' = @{ List = 'other'; Other = $OtherRunning | ConvertTo-Json -Compress; Old = { $OldUpJson }
+              Cand = { param($N) if ($N -eq 1) { $CandUp } else { $CandDown } }
+              Want = "False | stop candidate exit 0; $Stopped; $Writer"; Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf', $List, 'inspect other') }
+            'revert, a container is unreadable' = @{ List = 'ghost'; Old = { $OldUpJson }; Cand = { param($N) if ($N -eq 1) { $CandUp } else { $CandDown } }
+              Want = "False | stop candidate exit 0; $Stopped; $Unreadable"; Calls = @('inspect windows-rent-cf', 'stop windows-rent-cf', 'inspect windows-rent-cf', $List, 'inspect ghost') }
           }
           foreach ($K in $Reverts.Keys) {
             $Case = $Reverts[$K]; $Calls = [System.Collections.Generic.List[string]]::new(); $Steps = [System.Collections.Generic.List[string]]::new()
@@ -771,6 +851,10 @@ jobs:
           # whose real cloudflared rejects the synthetic token) passes every local gate and then stops, and the kept rent
           # comes back with its state. This is not Cloudflare evidence: no connection is ever authenticated here.
           docker stop -t 30 rent-smoke
+          # The placed token slot is retained across the failed switch and the return (compared by sha256 only, never
+          # printed). A state invariant of this current image's twin, not compatibility evidence for any published rent.
+          slot_sum() { docker run --rm -v rent-smoke-state:/s:ro "$image" /bin/sha256sum /s/cloudflared/token | cut -d' ' -f1; }
+          token_sum="$(slot_sum)"
           docker run --rm -v rent-smoke-nix:/seed -e RENT_NIX_VOLUME=rent-smoke-nix "$real" /bin/rent-nix-seed
           docker run -d --name rent-cand -p 127.0.0.1:2222:2222 -v rent-smoke-repos:/work/repos -v rent-smoke-state:/var/lib/rent \
             "${nixm[@]}" "${ids[@]}" "$real" > /dev/null
@@ -793,6 +877,8 @@ jobs:
           tunnel_up
           repos_untouched
           docker stop -t 30 rent-smoke
+          test -n "$token_sum"
+          test "$(slot_sum)" = "$token_sum"
 
           # Token gate on the published image: a missing or wrong slot starts no service and prints no token.
           gate() {
