@@ -645,7 +645,9 @@ inside '
   nofill other other/windows
   export XDG_CONFIG_HOME="$HOME/xdg" GH_TOKEN=ci-env-gh GITHUB_TOKEN=ci-env-github GH_ENTERPRISE_TOKEN=ci-env-ghe \
     GITHUB_ENTERPRISE_TOKEN=ci-env-ghes GH_HOST=evil.example GH_REPO=other/elsewhere GIT_TERMINAL_PROMPT=0
-  # This session is root: unselected gh uses /dev/null, which is no directory, so root cannot create a config there.
+  # This session is root: unselected gh uses the absent procfs path /proc/gh-unselected, which root cannot create.
+  test "$(stat -f -c %T /proc)" = proc
+  test ! -e /proc/gh-unselected
   case $(gh --version) in "gh version "*) ;; *) exit 1 ;; esac
   gh help > /dev/null
   snap() {
@@ -656,7 +658,7 @@ inside '
   if (cd "$HOME" && gh auth token) > /dev/null 2>&1; then echo "gh outside a bound clone returned a token" >&2; exit 1; fi
   if (cd "$HOME" && gh config set editor vi) > /dev/null 2>&1; then echo "gh outside a bound clone wrote a config" >&2; exit 1; fi
   test "$(snap)" = "$before"
-  test -c /dev/null
+  test ! -e /proc/gh-unselected
   test "$(cd bound && gh auth token)" = ci-owner-token
   for r in unbound other; do if (cd "$r" && gh auth token) > /dev/null 2>&1; then echo "$r: gh returned a token" >&2; exit 1; fi; done
   # The helper itself answers only https://github.com/roccho-dev/<repo>, for get, store and erase, and is silent
