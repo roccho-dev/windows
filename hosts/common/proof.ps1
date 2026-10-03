@@ -3282,14 +3282,57 @@ function B3aLeft([int]$Least, [string]$Step) {
     if ($left -lt $Least) { throw "$Step skipped: $left s of the $b3aBudget s budget left, $Least s needed" }
     $left
 }
-function InTree([string]$Path) { $Path -and $Path.StartsWith($b3aTree + '\', [StringComparison]::OrdinalIgnoreCase) }
-# Every chrome.exe that appears after b3a starts, keyed by (PID, creation time) so a reused PID is never confused, in
-# four classes: tree (its path, read by CIM or retried through Get-Process, is in the tree); outside (its readable
-# path is elsewhere); descendant (its path is unreadable, as a sandboxed child's may be, and its parent is our launched
-# browser or a known descendant created no later and still seen running at or after the child's creation, so a PID the
-# parent left behind and another process reused never counts; the child itself created after the launch); unknown
-# (anything else: never counted as ours, never killed, never a pass). Returns the observations of the processes running
-# now; each carries lastSeen, the UTC time just before the poll that last saw it running.
+function InTree([string]$Path, [string]$Tree = $b3aTree) { $Path -and $Path.StartsWith($Tree + '\', [StringComparison]::OrdinalIgnoreCase) }
+# The executable image of a process, as the kernel recorded it at creation: one handle opened with
+# PROCESS_QUERY_LIMITED_INFORMATION, its creation time (GetProcessTimes) within 10 ticks of the CIM creation time the
+# caller observed, then QueryFullProcessImageNameW on that same handle, which is always closed. '' when the process
+# cannot be opened, has exited, is another process under a reused PID or its image cannot be read. Never a module list, the CIM
+# Name or ExecutablePath: those can name something other than the image (an observed chrome.exe read as ntdll.dll).
+if (-not ('W.ImageProbe' -as [type])) {
+    Add-Type -Namespace W -Name ImageProbe -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)] static extern System.IntPtr OpenProcess(uint access, bool inherit, uint id);
+[DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(System.IntPtr handle);
+[DllImport("kernel32.dll", SetLastError = true)] static extern bool GetProcessTimes(System.IntPtr handle, out long creation, out long exit, out long kernel, out long user);
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageNameW(System.IntPtr handle, uint flags, System.Text.StringBuilder name, ref uint size);
+public static string Path(int id, long createdUtcTicks) {
+    if (id <= 0) { return ""; }
+    System.IntPtr handle = OpenProcess(0x1000, false, (uint)id);
+    if (handle == System.IntPtr.Zero) { return ""; }
+    try {
+        long creation, exit, kernel, user;
+        if (!GetProcessTimes(handle, out creation, out exit, out kernel, out user) || exit != 0) { return ""; }
+        if (System.Math.Abs(System.DateTime.FromFileTimeUtc(creation).Ticks - createdUtcTicks) >= 10) { return ""; }
+        var name = new System.Text.StringBuilder(32768);
+        uint size = 32768;
+        if (!QueryFullProcessImageNameW(handle, 0, name, ref size)) { return ""; }
+        return name.ToString(0, (int)size);
+    } finally { CloseHandle(handle); }
+}
+'@
+}
+# The classes of every observation (pure): tree (its kernel image path is in $Tree); outside (its kernel image path is
+# elsewhere); descendant (no image path read yet, as a sandboxed or exiting child's may be, and its parent is our
+# launched browser or a known descendant created no later and still seen running at or after the child's creation, so a
+# PID the parent left behind and another process reused never counts; the child itself created after the launch);
+# unknown (anything else: never counted as ours, never killed, never a pass). A read path is final; an unread one is
+# re-classified on every pass, so a descendant whose image is later read outside the tree becomes outside.
+function B3aClassify($All, [DateTime]$Launched, [string]$Tree) {
+    do {  # a child listed before its parent is traced on the next pass
+        $changed = $false
+        foreach ($seen in @($All | Where-Object { $_.class -cnotin @('tree', 'outside') })) {
+            $class = if ($seen.path) { $(if (InTree $seen.path $Tree) { 'tree' } else { 'outside' }) }
+                elseif ($seen.created -ge $Launched -and @($All | Where-Object {
+                    $_.id -eq $seen.parent -and $_.class -cin @('tree', 'descendant') -and $_.created -le $seen.created -and
+                    $_.lastSeen -ge $seen.created }).Count) { 'descendant' }
+                else { 'unknown' }
+            if ($class -cne $seen.class) { $seen.class = $class; $changed = $true }
+        }
+    } while ($changed)
+}
+# Every chrome.exe that appears after b3a starts, keyed by (PID, creation time) so a reused PID is never confused. Its
+# image path is read through the kernel (source 'kernel'); while it is still unread ('unread') it is read again on every
+# poll that sees the process running. Returns the observations of the processes running now; each carries lastSeen, the
+# UTC time just before the poll that last saw it running.
 function B3aPoll {
     $live, $polled = [Collections.Generic.List[object]]::new(), [DateTime]::UtcNow
     foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'")) {
@@ -3297,27 +3340,70 @@ function B3aPoll {
         $key = "$($process.ProcessId)|$($created.Ticks)"
         if ($b3aBaseline -contains $key) { continue }
         if (-not $script:b3aSeen.ContainsKey($key)) {
-            $path = [string]$process.ExecutablePath
-            if (-not $path) { try { $path = [string](Get-Process -Id $process.ProcessId -ErrorAction Stop).Path } catch { $path = '' } }
             $type = if ($null -eq $process.CommandLine) { '?' } elseif ($process.CommandLine -match '--type=(\S+)') { $Matches[1] } else { 'browser' }
             $script:b3aSeen[$key] = [pscustomobject]@{ id = [int]$process.ProcessId; created = $created; parent = [int]$process.ParentProcessId
-                type = $type; path = $path; class = 'unknown'; lastSeen = $polled }
+                type = $type; path = ''; source = 'unread'; class = 'unknown'; lastSeen = $polled }
         }
-        $script:b3aSeen[$key].lastSeen = $polled
-        $live.Add($script:b3aSeen[$key])
+        $seen = $script:b3aSeen[$key]
+        if (-not $seen.path) {
+            $seen.path = [W.ImageProbe]::Path($seen.id, $seen.created.Ticks)
+            if ($seen.path) { $seen.source = 'kernel' }
+        }
+        $seen.lastSeen = $polled
+        $live.Add($seen)
     }
-    do {  # a child listed before its parent is traced on the next pass
-        $changed = $false
-        foreach ($seen in @($script:b3aSeen.Values | Where-Object { $_.class -ceq 'unknown' })) {
-            $class = if ($seen.path) { $(if (InTree $seen.path) { 'tree' } else { 'outside' }) }
-                elseif ($seen.created -ge $b3aLaunched -and @($script:b3aSeen.Values | Where-Object {
-                    $_.id -eq $seen.parent -and $_.class -cin @('tree', 'descendant') -and $_.created -le $seen.created -and
-                    $_.lastSeen -ge $seen.created }).Count) { 'descendant' }
-                else { 'unknown' }
-            if ($class -cne $seen.class) { $seen.class = $class; $changed = $true }
-        }
-    } while ($changed)
+    B3aClassify @($script:b3aSeen.Values) $b3aLaunched $b3aTree
     , $live
+}
+# The kernel image reader and the classes, checked here on this runner (CI only): the proof's own process, a known
+# child, a wrong creation time, an absent and an exited process, a renamed executable outside any tree, and the pure
+# classes. Only the children started here are stopped, by their own handles, and only the one copied file is removed.
+$controlDir = Join-Path $(if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }) ('image-' + [guid]::NewGuid().ToString('N'))
+$ping = Join-Path $env:SystemRoot 'System32\PING.EXE'
+$renamed = Join-Path $controlDir 'chrome.exe'
+$controlChildren = @()
+function StartControl([string]$Exe) {
+    $info = [Diagnostics.ProcessStartInfo]::new($Exe)
+    foreach ($argument in '-n', '30', '127.0.0.1') { $info.ArgumentList.Add($argument) }
+    $info.UseShellExecute, $info.CreateNoWindow, $info.RedirectStandardOutput = $false, $true, $true
+    $process = [Diagnostics.Process]::Start($info)
+    $script:controlChildren += $process
+    $created = (Get-CimInstance Win32_Process -Filter "ProcessId = $($process.Id)").CreationDate.ToUniversalTime()
+    [pscustomobject]@{ process = $process; created = $created }
+}
+try {
+    $self = (Get-CimInstance Win32_Process -Filter "ProcessId = $PID").CreationDate.ToUniversalTime()
+    Must ([W.ImageProbe]::Path($PID, $self.Ticks) -eq [Environment]::ProcessPath) 'A29 image reader: this process is its own executable'
+    Must ([W.ImageProbe]::Path($PID, $self.Ticks + 20) -eq '') 'A29 image reader: a creation time 2 microseconds off is unread'
+    Must ([W.ImageProbe]::Path([int]::MaxValue - 3, 0) -eq '') 'A29 image reader: an absent process is unread'
+    $child = StartControl $ping
+    Must ([W.ImageProbe]::Path($child.process.Id, $child.created.Ticks) -eq $ping) 'A29 image reader: a known child is its own executable'
+    $null = New-Item -ItemType Directory -Path $controlDir
+    Copy-Item -LiteralPath $ping -Destination $renamed
+    $outsider = StartControl $renamed
+    $outsidePath = [W.ImageProbe]::Path($outsider.process.Id, $outsider.created.Ticks)
+    Must ($outsidePath -eq $renamed) 'A29 image reader: a renamed executable reads as its own file'
+    $tree = Join-Path $controlDir 'tree'
+    $read = [pscustomobject]@{ id = 7; created = $outsider.created; parent = 1; type = 'browser'; path = $outsidePath; source = 'kernel'; class = 'unknown'; lastSeen = $outsider.created }
+    B3aClassify @($read) $outsider.created.AddSeconds(-1) $tree
+    Must ($read.class -ceq 'outside') 'A29 classes: a renamed executable outside the tree is outside'
+    $child.process.Kill(); $child.process.WaitForExit(); $child.process.Dispose()
+    Must ([W.ImageProbe]::Path($child.process.Id, $child.created.Ticks) -eq '') 'A29 image reader: an exited process is unread'
+    $at = [DateTime]::UtcNow
+    $obs = { param($Id, $Parent, $Path, $Class, $Seen) [pscustomobject]@{ id = $Id; created = $at.AddSeconds($Id); parent = $Parent; type = 'renderer'
+        path = $Path; source = $(if ($Path) { 'kernel' } else { 'unread' }); class = $Class; lastSeen = $at.AddSeconds($Seen) } }
+    $browserObs = & $obs 1 0 (Join-Path $tree 'chrome.exe') 'unknown' 60
+    $kid, $orphan, $gone = (& $obs 2 1 '' 'unknown' 60), (& $obs 3 99 '' 'unknown' 60), (& $obs 4 98 '' 'unknown' 4)
+    B3aClassify @($browserObs, $kid, $orphan, $gone) $at $tree
+    Must ($browserObs.class -ceq 'tree' -and $kid.class -ceq 'descendant' -and $orphan.class -ceq 'unknown' -and $gone.class -ceq 'unknown') 'A29 classes: unread with our parent is a descendant, without one unknown'
+    Must (@(@($browserObs, $kid, $orphan, $gone) | Where-Object { $_.class -ceq 'unknown' }).Count -eq 2) 'A29 classes: an exited unknown stays unknown and is counted at the end'
+    $kid.path = Join-Path $controlDir 'elsewhere\chrome.exe'; $kid.source = 'kernel'
+    B3aClassify @($browserObs, $kid, $orphan, $gone) $at $tree
+    Must ($kid.class -ceq 'outside') 'A29 classes: a descendant whose image is later read outside the tree is outside'
+} finally {
+    foreach ($process in $controlChildren) { try { if (-not $process.HasExited) { $process.Kill(); $process.WaitForExit() } } catch { }; $process.Dispose() }
+    if (Test-Path -LiteralPath $renamed -PathType Leaf) { Remove-Item -LiteralPath $renamed -Force }
+    if (Test-Path -LiteralPath $controlDir -PathType Container) { [IO.Directory]::Delete($controlDir) }
 }
 function Ours($Observations) { @($Observations | Where-Object { $_.class -cin @('tree', 'descendant') }) }
 # Waits up to $Seconds for every tree and descendant process to end (noting when $Browser, the launched process, ended);
@@ -3541,10 +3627,14 @@ try {
     # Every chrome.exe seen in any run, by class; parent and type for the ones not in the tree.
     $seenAll = @($script:b3aSeen.Values)
     $b3a.processes = (@('tree', 'descendant', 'outside', 'unknown' | ForEach-Object { $class = $_; "$class $(@($seenAll | Where-Object { $_.class -ceq $class }).Count)" }) -join ', ') +
-        "; not in the tree: $(Few @($seenAll | Where-Object { $_.class -cne 'tree' } | ForEach-Object { "$($_.class) $($_.type)[$($_.id)<$($_.parent)]$(if ($_.path) { ' ' + $_.path })" }))"
+        "; paths kernel $(@($seenAll | Where-Object { $_.source -ceq 'kernel' }).Count), unread $(@($seenAll | Where-Object { $_.source -ceq 'unread' }).Count)" +
+        "; not in the tree: $(Few @($seenAll | Where-Object { $_.class -cne 'tree' } | ForEach-Object { "$($_.class) $($_.type)[$($_.id)<$($_.parent)] $($_.source)$(if ($_.path) { ' ' + $_.path })" }))"
     if (@($seenAll | Where-Object { $_.class -ceq 'outside' }).Count -and -not $b3aStops.Contains('H3: a process started from outside the tree')) {
         $b3aStops.Add('H3: a process started from outside the tree')
     }
+    # A chrome.exe never identified, running or not, is not ours and was not proven harmless.
+    $unidentified = @($seenAll | Where-Object { $_.class -ceq 'unknown' })
+    if ($unidentified.Count) { $b3aStops.Add("unproven: a chrome.exe never identified $(Few @($unidentified | ForEach-Object { "$($_.type)[$($_.id)<$($_.parent)]" }))") }
     # C9 before any move aside, so a failed move cannot lose it: every added name where registration matters (at most 100
     # each), only the count and first names under Software\Chromium, Chromium's own state.
     $hkcuAfter = HkcuNames
