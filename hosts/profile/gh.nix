@@ -24,9 +24,26 @@ in
     fi
     exec ${pkgs.gh}/bin/gh "$@"
   '';
+  # Git's request is key=value lines up to a blank line. For every action (get, store, erase), only protocol=https,
+  # host=github.com and a path ${owner}/<repo> (Git sends the path because binding sets useHttpPath) reach the owner
+  # root; a missing, repeated or other protocol, host or path gets no answer, no output and no side effect.
   helper = pkgs.writeShellScriptBin helperName ''
     ${clear}
+    request=() protocol= host= path= seen=
+    while IFS= read -r line && [ -n "$line" ]; do
+      request+=("$line")
+      key=''${line%%=*}
+      case $key in protocol|host|path) ;; *) continue ;; esac
+      case " $seen " in *" $key "*) exit 0 ;; esac
+      seen="$seen $key"
+      printf -v "$key" '%s' "''${line#*=}"
+    done
+    repo=''${path#${owner}/}
+    if [ "$protocol" != https ] || [ "$host" != github.com ] || [ "$repo" = "$path" ] ||
+      ! [[ $repo =~ ^[A-Za-z0-9._-]+$ ]] || [ "$repo" = . ] || [ "$repo" = .. ]; then
+      exit 0
+    fi
     export GH_CONFIG_DIR=${root}
-    exec ${pkgs.gh}/bin/gh auth git-credential "$@"
+    printf '%s\n' "''${request[@]}" "" | ${pkgs.gh}/bin/gh auth git-credential "$@"
   '';
 }

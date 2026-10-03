@@ -670,7 +670,19 @@ jobs:
             for r in unbound other; do if (cd "$r" && gh auth token) > /dev/null 2>&1; then echo "$r: gh returned a token" >&2; exit 1; fi; done
             fill() { printf "protocol=https\nhost=github.com\npath=%s\n\n" "$2" | (cd "$1" && git credential fill 2>/dev/null) | sed -n "s/^password=//p"; }
             test "$(fill bound roccho-dev/windows)" = ci-owner-token
-            test "$(fill unbound roccho-dev/windows)" != ci-owner-token'
+            test "$(fill unbound roccho-dev/windows)" != ci-owner-token
+            # Another owner never gets the owner token, even through a repository bound to the owner helper; the helper
+            # itself answers only https://github.com/roccho-dev/<repo>, for get, store and erase, silently otherwise.
+            test -z "$(fill other other/windows)"
+            ask() { printf "$1" | "$h" "${2:-get}"; }
+            test "$(ask "protocol=https\nhost=github.com\npath=roccho-dev/windows\n\n" | sed -n "s/^password=//p")" = ci-owner-token
+            for r in "protocol=https\nhost=github.com\npath=other/windows\n\n" "protocol=https\nhost=github.com\n\n" \
+              "protocol=http\nhost=github.com\npath=roccho-dev/windows\n\n" "protocol=https\nhost=example.com\npath=roccho-dev/windows\n\n" \
+              "protocol=https\nhost=github.com\npath=roccho-dev/windows\npath=other/windows\n\n" \
+              "protocol=https\nhost=github.com\npath=roccho-dev/../other\n\n"; do
+              for a in get store erase; do test -z "$(ask "$r" "$a" 2>&1)"; done
+            done
+            test "$(snap)" = "$before"'
 
           # Restart: same container; TERM reaches the supervisor, and home, state, and host key remain.
           before="$(docker inspect --format '{{.Id}}' rent-smoke)"

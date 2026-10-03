@@ -642,6 +642,18 @@ inside '
   }
   test "$(fill bound roccho-dev/windows)" = ci-owner-token
   test "$(fill unbound roccho-dev/windows)" != ci-owner-token
+  # Another owner never gets the owner token, even through a clone bound to the owner helper; the helper itself answers
+  # only https://github.com/roccho-dev/<repo>, for get, store and erase, silently otherwise.
+  test -z "$(fill other other/windows)"
+  pw() { local l; while IFS= read -r l; do case $l in password=*) printf %s "${l#password=}" ;; esac; done; }
+  test "$(printf "%b" "protocol=https\nhost=github.com\npath=roccho-dev/windows\n\n" | "$h" get | pw)" = ci-owner-token
+  for r in "protocol=https\nhost=github.com\npath=other/windows\n\n" "protocol=https\nhost=github.com\n\n" \
+    "protocol=http\nhost=github.com\npath=roccho-dev/windows\n\n" "protocol=https\nhost=example.com\npath=roccho-dev/windows\n\n" \
+    "protocol=https\nhost=github.com\npath=roccho-dev/windows\npath=other/windows\n\n" \
+    "protocol=https\nhost=github.com\npath=roccho-dev/../other\n\n"; do
+    for a in get store erase; do test -z "$(printf "%b" "$r" | "$h" "$a" 2>&1)"; done
+  done
+  test "$(snap)" = "$before"
 '
 echo 'PASS owner gh routing (dev image): bind check holds; bound clone selects the owner root; unbound/other owner/outside get no token or store; overrides never win'
 
