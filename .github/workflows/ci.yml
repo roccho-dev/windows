@@ -238,12 +238,85 @@ jobs:
             }
             Remove-Item -LiteralPath (Join-Path $Tmp 'f.log')
           }
+          # G: hosts/common/win.ps1's HostTaskPolicies, loaded with its real helpers, queries this runner's actual policies
+          # through a real child Windows PowerShell, once here under 5.1 and once under pwsh 7. The logon task runs Windows
+          # PowerShell, so the reference values are this 5.1 process's own Get-ExecutionPolicy per persisted scope.
+          $GScript = Join-Path $Tmp 'g.ps1'
+          Set-Content -LiteralPath $GScript -Encoding utf8 -Value @'
+          param([string] $Root, [string] $Reference, [string] $ChildModulePath)
+          $ErrorActionPreference = 'Stop'
+          Import-Module Microsoft.PowerShell.Utility, Microsoft.PowerShell.Management
+          $Loaded = @{}
+          foreach ($Source in @(@('hosts\common\win.ps1', @('Invoke-Native', 'HostTaskPolicies')),
+              @('hosts\common\handoff-evaluate.ps1', @('Join-NativeArguments', 'Get-Field', 'Get-OwnTaskPolicyProblem')))) {
+            $Errors = $null
+            $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $Root $Source[0]), [ref] $null, [ref] $Errors)
+            if ($Errors) { throw "G: $($Source[0]) does not parse" }
+            foreach ($Name in $Source[1]) {
+              $Found = @($Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $Name }, $true))
+              if ($Found.Count -ne 1) { throw "G: expected one $Name, found $($Found.Count)" }
+              . ([scriptblock]::Create($Found[0].Extent.Text)); $Loaded[$Name] = $Found[0]
+            }
+          }
+          $Major = $PSVersionTable.PSVersion.Major
+          # Invoke-Native passes its environment on; under pwsh the child Windows PowerShell would inherit pwsh's module
+          # path and fail to load Get-ExecutionPolicy. Production starts from Windows PowerShell, so give the child that path.
+          if ($Major -ge 7) { $env:PSModulePath = $ChildModulePath; 'G diagnostic: the child gets the Windows PowerShell module path' }
+          # Regression control: the M2 expression on the same native output nests the array on 5.1 and is flat on 7.
+          $Query = @($Loaded['HostTaskPolicies'].Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $n.Left.Extent.Text -cin '$exe', '$policies' }, $true))
+          if (($Query.Left.Extent.Text -join ',') -cne '$exe,$policies') { throw "G: expected the executable and native policy query, found $($Query.Count)" }
+          foreach ($Statement in $Query) { . ([scriptblock]::Create($Statement.Extent.Text)) }
+          function OldShape { return $policies | ConvertFrom-Json }
+          $Old = @(OldShape)
+          $OldOk = if ($Major -ge 7) { $Old.Count -eq 5 } else { $Old.Count -eq 1 -and $Old[0] -is [array] -and @($Old[0]).Count -eq 5 }
+          if (-not $OldOk) { throw "G: old expression on PowerShell ${Major}: $($Old.Count) item(s)" }
+          $Rows = @(HostTaskPolicies)
+          if ($Rows.Count -ne 5) { throw "G: expected 5 policy rows, got $($Rows.Count): $(@($Rows | ForEach-Object { $_.GetType().FullName }) -join ',')" }
+          $Valid = [enum]::GetNames([Microsoft.PowerShell.ExecutionPolicy])
+          $Child = @{}
+          foreach ($Row in $Rows) {
+            if ($Row -isnot [System.Management.Automation.PSCustomObject] -or
+                ((@($Row.PSObject.Properties.Name) | Sort-Object) -join ',') -cne 'ExecutionPolicy,Scope' -or
+                $Row.Scope -isnot [string] -or $Row.ExecutionPolicy -isnot [string] -or $Valid -cnotcontains $Row.ExecutionPolicy) {
+              throw "G: malformed policy row: $($Row | ConvertTo-Json -Compress)"
+            }
+            $Child[$Row.Scope] = $Row.ExecutionPolicy
+          }
+          $Scopes = 'MachinePolicy', 'UserPolicy', 'Process', 'CurrentUser', 'LocalMachine'
+          if (((@($Rows.Scope) | Sort-Object) -join ',') -cne ((@($Scopes) | Sort-Object) -join ',')) { throw "G: scopes $(@($Rows.Scope) -join ',')" }
+          $Parent = @{}
+          foreach ($Pair in $Reference.Split(',')) { $Parent[$Pair.Split('=')[0]] = $Pair.Split('=')[1] }
+          $Persisted = 'MachinePolicy', 'UserPolicy', 'CurrentUser', 'LocalMachine'
+          foreach ($Scope in $Persisted) {
+            if ($Child[$Scope] -cne $Parent[$Scope]) { throw "G: $Scope child $($Child[$Scope]) parent $($Parent[$Scope])" }
+          }
+          # The decision, computed independently: the first persisted scope that is not Undefined; Process never counts.
+          $Expected = 'Default Restricted task execution policy blocks unsigned runtime; policy is not changed.'
+          foreach ($Scope in $Persisted) {
+            if ($Parent[$Scope] -ceq 'Undefined') { continue }
+            $Expected = if ($Parent[$Scope] -cin 'RemoteSigned', 'Unrestricted', 'Bypass') { '' } else { 'Existing task execution policy blocks unsigned runtime; policy is not changed.' }
+            break
+          }
+          $Got = [string] (Get-OwnTaskPolicyProblem $Rows)
+          if ($Got -cne $Expected) { throw "G: decision '$Got', expected '$Expected'" }
+          "G diagnostic: Process child $($Child['Process']), parent $($Parent['Process'])"
+          ('G real task policy rows on PowerShell ' + $Major)
+          '@
+          $Reference = (@('MachinePolicy', 'UserPolicy', 'Process', 'CurrentUser', 'LocalMachine') |
+            ForEach-Object { $_ + '=' + [string] (Get-ExecutionPolicy -Scope $_) }) -join ','
+          $G5 = @(& $GScript -Root "$PWD\source" -Reference $Reference -ChildModulePath $env:PSModulePath)
+          $G7 = @(& pwsh -NoProfile -NonInteractive -File $GScript -Root "$PWD\source" -Reference $Reference -ChildModulePath $env:PSModulePath)
+          if ($LASTEXITCODE -ne 0 -or $G5 -cnotcontains ('G real task policy rows on PowerShell ' + '5') -or
+              $G7 -cnotcontains ('G real task policy rows on PowerShell ' + '7')) { 'G:'; $G5; $G7; exit 1 }
+          $G5; $G7
           foreach ($F in 'a', 'b', 'a2', 'b2', 'c', 'd') { Remove-Item -LiteralPath (Join-Path $Tmp "$F.log") }
           foreach ($K in $Argvs.Keys) { Remove-Item -LiteralPath (Join-Path $Tmp "$K.argv.json") }
-          foreach ($F in $WslcExe, $NewUp, $OldUp, $NewUpList, $OldUpList, $OldOne, $OldList, $OldTwo) { Remove-Item -LiteralPath $F }
+          foreach ($F in $WslcExe, $NewUp, $OldUp, $NewUpList, $OldUpList, $OldOne, $OldList, $OldTwo, $GScript) { Remove-Item -LiteralPath $F }
           [IO.Directory]::Delete($Tmp)
           ("PASS own Replace under Windows PowerShell 5.1: A success, B rollback after remove, A' and B' with an array inspect, " +
-            'C stderr-only gate refused, D seed exit 3, E rollback file precheck, F one container from inspect')
+            'C stderr-only gate refused, D seed exit 3, E rollback file precheck, F one container from inspect, ' +
+            'G real task policy rows under 5.1 and 7')
           exit 0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
