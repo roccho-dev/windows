@@ -669,11 +669,18 @@ jobs:
               printf "protocol=https\nhost=github.com\npath=%s\n\n" "$p" | (cd "$d" && env "$@" GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null) |
                 sed -n "s/^password=//p"
             }
+            # No credential at all: Git must fail and print nothing, whatever fields a reply could carry.
+            nofill() {
+              if out=$(printf "protocol=https\nhost=github.com\npath=%s\n\n" "$2" | (cd "$1" && GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null)); then
+                echo "$1: git credential fill succeeded" >&2; return 1
+              fi
+              test -z "$out"
+            }
             test -n "$(fill unbound roccho-dev/windows -u GIT_CONFIG_GLOBAL)"
             test "$(fill unbound roccho-dev/windows -u GIT_CONFIG_NOSYSTEM)" = ci-system-token
-            test -z "$(fill unbound roccho-dev/windows)"
+            nofill unbound roccho-dev/windows
             test "$(fill bound roccho-dev/windows)" = ci-owner-token
-            test -z "$(fill other other/windows)"
+            nofill other other/windows
             export XDG_CONFIG_HOME="$HOME/xdg" GH_TOKEN=ci-env-gh GITHUB_TOKEN=ci-env-github GH_ENTERPRISE_TOKEN=ci-env-ghe \
               GITHUB_ENTERPRISE_TOKEN=ci-env-ghes GH_HOST=evil.example GH_REPO=other/elsewhere GIT_TERMINAL_PROMPT=0
             gh --version | grep -q "^gh version "
@@ -703,10 +710,16 @@ jobs:
               printf "protocol=https\nhost=github.com\npath=%s\n\n" "$p" | (cd "$d" && env "$@" GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null) |
                 sed -n "s/^password=//p"
             }
+            nofill() {
+              if out=$(printf "protocol=https\nhost=github.com\npath=%s\n\n" "$2" | (cd "$1" && GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null)); then
+                echo "$1: git credential fill succeeded" >&2; return 1
+              fi
+              test -z "$out"
+            }
             test -n "$(fill unbound roccho-dev/windows -u GIT_CONFIG_GLOBAL)"
-            test -z "$(fill unbound roccho-dev/windows)"
+            nofill unbound roccho-dev/windows
             test "$(fill bound roccho-dev/windows)" = ci-owner-token
-            test -z "$(fill other other/windows)"
+            nofill other other/windows
             test "$(cd bound && gh auth token)" = ci-owner-token
             if (cd unbound && gh auth token) > /dev/null 2>&1; then echo "unbound: gh returned a token" >&2; exit 1; fi'
 

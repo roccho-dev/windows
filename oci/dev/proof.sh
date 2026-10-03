@@ -630,11 +630,19 @@ inside '
     out=$(printf "protocol=https\nhost=github.com\npath=%s\n\n" "$p" | (cd "$d" && env "$@" GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null)) || true
     while IFS= read -r l; do case $l in password=*) printf %s "${l#password=}" ;; esac; done <<< "$out"
   }
+  # No credential at all: Git must fail and print nothing, whatever fields a reply could carry.
+  nofill() {
+    local out
+    if out=$(printf "protocol=https\nhost=github.com\npath=%s\n\n" "$2" | (cd "$1" && GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null)); then
+      echo "$1: git credential fill succeeded" >&2; return 1
+    fi
+    test -z "$out"
+  }
   test -n "$(fill unbound roccho-dev/windows -u GIT_CONFIG_GLOBAL)"
   test "$(fill unbound roccho-dev/windows -u GIT_CONFIG_NOSYSTEM)" = ci-system-token
-  test -z "$(fill unbound roccho-dev/windows)"
+  nofill unbound roccho-dev/windows
   test "$(fill bound roccho-dev/windows)" = ci-owner-token
-  test -z "$(fill other other/windows)"
+  nofill other other/windows
   export XDG_CONFIG_HOME="$HOME/xdg" GH_TOKEN=ci-env-gh GITHUB_TOKEN=ci-env-github GH_ENTERPRISE_TOKEN=ci-env-ghe \
     GITHUB_ENTERPRISE_TOKEN=ci-env-ghes GH_HOST=evil.example GH_REPO=other/elsewhere GIT_TERMINAL_PROMPT=0
   case $(gh --version) in "gh version "*) ;; *) exit 1 ;; esac
