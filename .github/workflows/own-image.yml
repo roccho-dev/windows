@@ -191,10 +191,10 @@ jobs:
           next=$(docker image inspect ghcr.io/roccho-dev/windows-own:next --format '{{.Id}}')
           d="$(mktemp -d)"
           # Every file this step writes under $d; the exit trap removes exactly these, then the empty directory.
-          d_files=(after head1 key key.pub known_hosts out key2 key2.pub mig-a mig-b mig-head mig-paths)
+          d_files=(after head1 key key.pub known_hosts out key2 key2.pub mig-a mig-b mig-head mig-paths rp-a rp-b rp-cfg rp-head)
           # Removes one of those regular files; a link or other type is kept and fails the step.
           plain() { if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then echo "kept unexpected entry $1" >&2; return 1; fi; rm -f -- "$1"; }
-          trap 'status=$?; [ "$status" -eq 0 ] || docker logs own-smoke 2>&1 | tail -n 40 || true; docker rm -f own-smoke own-hold >/dev/null 2>&1 || true; docker volume rm own-smoke-home own-smoke-work own-smoke-nix own-smoke-empty own-smoke-foreign own-smoke-mig-home own-smoke-mig-work own-smoke-mig-nix >/dev/null 2>&1 || true; for f in "${d_files[@]}"; do plain "$d/$f" || exit 1; done; rmdir -- "$d" || { echo "kept $d: unexpected entries" >&2; exit 1; }' EXIT
+          trap 'status=$?; [ "$status" -eq 0 ] || docker logs own-smoke 2>&1 | tail -n 40 || true; docker rm -f own-smoke own-hold >/dev/null 2>&1 || true; docker volume rm own-smoke-home own-smoke-work own-smoke-nix own-smoke-empty own-smoke-foreign own-smoke-mig-home own-smoke-mig-work own-smoke-mig-nix own-smoke-rp-home own-smoke-rp-work own-smoke-rp-nix >/dev/null 2>&1 || true; for f in "${d_files[@]}"; do plain "$d/$f" || exit 1; done; rmdir -- "$d" || { echo "kept $d: unexpected entries" >&2; exit 1; }' EXIT
           fail() { echo "FAIL $*" >&2; exit 1; }
           ssh-keygen -q -t ed25519 -N '' -f "$d/key"
           for v in home work nix empty foreign; do docker volume create "own-smoke-$v" >/dev/null; done
@@ -459,6 +459,189 @@ jobs:
             test "$(cat "$d/mig-b")" = "$(cat "$d/mig-head")" || fail 'work commit lost'
             printf 'own legacy migration %s -> %s, image %s\n' "$old" "$new" "$image" >> "$GITHUB_STEP_SUMMARY"
             echo 'PASS own legacy migration: legacy -> bound -> legacy -> bound with unchanged host and authorized keys, synthetic state, tool paths and work' | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Re-pin: the base binding's three-volume image -> this binding's image -> back with the three-volume argv a
+          # rollback records (no seed of the old image, as hosts/own/win.ps1 Complete-Replace rolls back) -> forward again,
+          # on one synthetic home, work and nix set. Then the owner Git/gh boundary of the new image over ordinary SSH (dev)
+          # and the image-default docker exec (root, no -u, -e or profile). It runs only when this change re-pins a
+          # three-volume binding; otherwise it reports not applicable and never prints PASS.
+          if [ "$old" = "$legacy" ] || [ "$new" = "$old" ]; then
+            echo 'own re-pin: not applicable (the binding is not re-pinned from a three-volume image)' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            docker pull -q "$old" >/dev/null
+            docker pull -q "$new" >/dev/null
+            test "$(docker image inspect "$new" --format '{{.Id}}')" = "$image" || fail 'the bound image is not the image this job built and tested'
+            ssh-keygen -q -t ed25519 -N '' -f "$d/key2"
+            for v in rp-home rp-work rp-nix; do docker volume create "own-smoke-$v" >/dev/null; done
+            rp=(-v own-smoke-rp-home:/home/dev -v own-smoke-rp-work:/work/repos --mount "$(nixm own-smoke-rp-nix)"
+              -e OWN_HOME_VOLUME=own-smoke-rp-home -e OWN_WORK_VOLUME=own-smoke-rp-work -e OWN_NIX_VOLUME=own-smoke-rp-nix)
+            rp_line='own-mounts ok home=own-smoke-rp-home work=own-smoke-rp-work nix=own-smoke-rp-nix'
+            # The three-volume form Replace runs and its rollback argv records; a later key in the environment must not
+            # replace authorized_keys.
+            rp_up() {
+              docker run -d --name own-smoke --shm-size 1g -p 127.0.0.1:2223:2223 "${rp[@]}" -e "OWN_AUTHORIZED_KEY=$(cat "$2")" \
+                -e OWN_TRIAL_UNSANDBOXED=1 "$1" >/dev/null
+              local _
+              for _ in {1..60}; do [ "$(docker logs own-smoke 2>&1 | grep -cxF "$rp_line")" = 1 ] && break; sleep 1; done
+              [ "$(docker logs own-smoke 2>&1 | grep -cxF "$rp_line")" = 1 ] || fail "$1 did not pass its gate"
+            }
+            rp_down() { docker stop -t 30 own-smoke >/dev/null; docker rm own-smoke >/dev/null; }
+            # The running container's own configuration as Docker reports it: image, sorted environment (synthetic public
+            # key only), mounts, port bindings and shm size.
+            rp_cfg() {
+              docker inspect own-smoke | jq -S '.[0] | {image: .Config.Image, env: (.Config.Env | sort),
+                mounts: ([.Mounts[] | {Type, Name, Destination, RW}] | sort_by(.Destination)),
+                ports: .HostConfig.PortBindings, shm: .HostConfig.ShmSize}'
+            }
+            rp_seed() {
+              local out
+              out=$(seed "$1" rp-nix)
+              [ "$(grep -cE "^own-nix-seed ok volume=own-smoke-rp-nix roots=.* copied=$2$" <<<"$out")" = 1 ] || fail "$3"
+            }
+            rp_state() { docker exec own-smoke /bin/bash -c 'cd /home/dev && sha256sum .ssh/ssh_host_ed25519_key.pub .ssh/authorized_keys .config/gh/config.yml .config/gh/hosts.yml .codex/ci-marker rp-marker && stat -c "%n %a %u:%g %F" .ssh/authorized_keys .config/gh/config.yml .config/gh/hosts.yml .codex/ci-marker rp-marker'; }
+            # Each start: strict SSH with the pinned host key, the same home state, the same work commit and daemon Nix use.
+            rp_check() {
+              ssh_ready
+              test "$(rp_state)" = "$(cat "$d/rp-a")" || fail "$1 changed home keys or synthetic state"
+              "${ssh_cmd[@]}" 'set -eu
+                test "$NIX_REMOTE" = daemon
+                nix build --impure --no-link --expr "derivation { name = \"own-rp\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; args = [ \"-c\" \"echo ok > \$out\" ]; }" >/dev/null
+                cd /work/repos/rp && git rev-parse HEAD' > "$d/rp-b"
+              test "$(cat "$d/rp-b")" = "$(cat "$d/rp-head")" || fail "$1 lost the work commit"
+              # Recorded, not compared: the new image's gh is the owner-routing wrapper.
+              printf 'own re-pin %s tools: %s\n' "$1" "$(docker exec own-smoke /bin/bash -c 'for t in chromium codex gh git; do readlink -e /bin/$t; done' | tr '\n' ' ')" >> "$GITHUB_STEP_SUMMARY"
+            }
+            # 1. The base image on three fresh volumes: pin its host key and write synthetic, credential-free state and work.
+            rp_seed "$old" '[1-9][0-9]*' 'base seed'
+            rp_up "$old" "$d/key.pub"
+            rp_cfg > "$d/rp-cfg"
+            for _ in {1..60}; do docker exec own-smoke /bin/test -s /home/dev/.ssh/ssh_host_ed25519_key.pub && break; sleep 1; done
+            printf '[127.0.0.1]:2223 %s\n' "$(docker exec own-smoke /bin/cut -d' ' -f1,2 /home/dev/.ssh/ssh_host_ed25519_key.pub)" > "$d/known_hosts"
+            ssh_ready
+            "${ssh_cmd[@]}" 'set -eu
+              echo rp > ~/rp-marker
+              install -d -m 700 ~/.config/gh ~/.codex
+              printf "version: \"1\"\n" > ~/.config/gh/config.yml
+              printf "github.com:\n    git_protocol: ssh\n    users:\n        ci:\n    user: ci\n" > ~/.config/gh/hosts.yml
+              chmod 600 ~/.config/gh/config.yml ~/.config/gh/hosts.yml
+              echo session > ~/.codex/ci-marker
+              git init -q /work/repos/rp && cd /work/repos/rp
+              git -c user.name=ci -c user.email=ci@example.invalid commit -q --allow-empty -m rp
+              git rev-parse HEAD' > "$d/rp-head"
+            rp_state > "$d/rp-a"
+            rp_check base
+            # 2. Forward in Replace's order: stop, seed, remove (never -v), run.
+            docker stop -t 30 own-smoke >/dev/null
+            rp_seed "$new" '[1-9][0-9]*' 'forward seed'
+            docker rm own-smoke >/dev/null
+            rp_up "$new" "$d/key2.pub"
+            rp_check forward
+            # 3. Rollback as Complete-Replace does it: stop and remove the new container, then exactly the base argv of step 1
+            # (the argv a rollback records), no seed.
+            rp_down
+            rp_up "$old" "$d/key.pub"
+            test "$(rp_cfg)" = "$(cat "$d/rp-cfg")" || fail 'the rollback container does not have the base container configuration'
+            rp_check rollback
+            # 4. Forward again: the reseed copies nothing.
+            docker stop -t 30 own-smoke >/dev/null
+            rp_seed "$new" 0 'forward reseed was not a no-op'
+            docker rm own-smoke >/dev/null
+            rp_up "$new" "$d/key2.pub"
+            rp_check 'forward again'
+            # Owner Git/gh on the new image. Synthetic hostile system, global and XDG Git helpers and HOME/XDG gh logins
+            # (fake tokens) would each answer if read; the controls show they do. The owner root holds the owner fixture.
+            docker exec own-smoke /bin/bash -euc '
+              hosts() {
+                install -d -m 700 -o 1000 -g 1000 "$1"
+                printf "github.com:\n    users:\n        ci:\n            oauth_token: %s\n    git_protocol: https\n    user: ci\n    oauth_token: %s\n" "$2" "$2" > "$1/hosts.yml"
+                chown 1000:1000 "$1/hosts.yml"; chmod 600 "$1/hosts.yml"
+              }
+              helper() { printf "[credential]\n\thelper = \"!echo username=ci; echo password=%s #\"\n" "$2" > "$1"; }
+              install -d -m 755 /work/repos/.auth
+              install -d -m 700 -o 1000 -g 1000 /work/repos/.auth/roccho-dev
+              hosts /work/repos/.auth/roccho-dev/gh ci-owner-token
+              install -d -m 755 -o 1000 -g 1000 /home/dev/xdg /home/dev/.config/git
+              hosts /home/dev/.config/gh ci-home-token
+              hosts /home/dev/xdg/gh ci-xdg-token
+              helper /etc/gitconfig ci-system-token
+              helper /home/dev/.gitconfig ci-global-token
+              helper /home/dev/.config/git/config ci-xdg-git-token
+              chown 1000:1000 /home/dev/.gitconfig /home/dev/.config/git/config'
+            # One matrix for both routes, each in its own clones owned by the user it runs as, so Git never refuses a
+            # repository for dubious ownership (checked before any credential request).
+            read -r -d '' matrix <<'EOF' || true
+          test "$GIT_CONFIG_NOSYSTEM" = 1 && test "$GIT_CONFIG_GLOBAL" = /dev/null
+          test "$(id -u)" = "$want_uid"
+          h=/nix/var/nix/profiles/own-dev/bin/git-credential-github-roccho-dev
+          test -x "$h"
+          install -d -m 700 "$r"
+          cd "$r"
+          for x in bound unbound other mismatch badhelper; do git init -q "$x"; done
+          : > "$r/empty-store"
+          bind() {
+            git -C "$1" config remote.origin.url "$2"
+            git -C "$1" config --replace-all credential.helper ""
+            git -C "$1" config --replace-all "credential.$3.helper" "${4:-$h}"
+            git -C "$1" config credential.useHttpPath true
+            git -C "$1" config http.followRedirects false
+          }
+          bind bound https://github.com/roccho-dev/windows https://github.com/roccho-dev/windows
+          git -C unbound config remote.origin.url https://github.com/roccho-dev/windows
+          bind other https://github.com/other/windows https://github.com/other/windows
+          # The owner's origin with the owner helper bound to another URL.
+          bind mismatch https://github.com/roccho-dev/windows https://github.com/other/windows
+          # The owner's origin and URL bound to a different real helper (Git's store, on an empty file).
+          bind badhelper https://github.com/roccho-dev/windows https://github.com/roccho-dev/windows "store --file=$r/empty-store"
+          for x in bound unbound other mismatch badhelper; do git -C "$x" rev-parse --git-dir > /dev/null; done
+          fill() {
+            local w=$1 p=$2; shift 2
+            printf "protocol=https\nhost=github.com\npath=%s\n\n" "$p" | (cd "$w" && env "$@" GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null) |
+              sed -n "s/^password=//p"
+          }
+          # No credential at all: Git must fail and print nothing.
+          nofill() {
+            local out
+            if out=$(printf "protocol=https\nhost=github.com\npath=%s\n\n" "$2" | (cd "$1" && GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null)); then
+              echo "$1: git credential fill succeeded" >&2; return 1
+            fi
+            test -z "$out"
+          }
+          # Controls, each changing one variable of this same environment: every hostile fixture answers on its own.
+          test "$(fill unbound roccho-dev/windows -u GIT_CONFIG_NOSYSTEM)" = ci-system-token
+          test "$(fill unbound roccho-dev/windows GIT_CONFIG_GLOBAL="$HOME/.gitconfig")" = ci-global-token
+          test "$(fill unbound roccho-dev/windows GIT_CONFIG_GLOBAL="$HOME/.config/git/config")" = ci-xdg-git-token
+          case $(fill unbound roccho-dev/windows -u GIT_CONFIG_GLOBAL) in ci-xdg-git-token|ci-global-token) ;; *) exit 1 ;; esac
+          # gh without the owner routing: the shared wrapper's own underlying gh, run directly only for these controls,
+          # returns the HOME login, the XDG login and a GH_TOKEN.
+          gh_real=$(sed -n 's|^[[:space:]]*exec \(/nix/store/[^ ]*/bin/gh\) .*|\1|p' "$(readlink -e "$(command -v gh)")")
+          test -x "$gh_real"
+          test "$(cd "$HOME" && env -u GH_CONFIG_DIR -u XDG_CONFIG_HOME "$gh_real" auth token)" = ci-home-token
+          test "$(cd "$HOME" && env -u GH_CONFIG_DIR XDG_CONFIG_HOME="$HOME/xdg" "$gh_real" auth token)" = ci-xdg-token
+          test "$(cd "$HOME" && env -u GH_CONFIG_DIR GH_TOKEN=ci-env-gh "$gh_real" auth token)" = ci-env-gh
+          test "$(fill bound roccho-dev/windows)" = ci-owner-token
+          nofill unbound roccho-dev/windows
+          nofill other other/windows
+          nofill mismatch roccho-dev/windows
+          nofill badhelper roccho-dev/windows
+          nofill "$HOME" roccho-dev/windows
+          gh --version | grep "^gh version " > /dev/null
+          test "$(cd bound && gh auth token)" = ci-owner-token
+          for x in unbound other mismatch badhelper "$HOME"; do if (cd "$x" && gh auth token) > /dev/null 2>&1; then echo "$x: gh returned a token" >&2; exit 1; fi; done
+          # Token, host and XDG overrides never win.
+          export XDG_CONFIG_HOME="$HOME/xdg" GH_TOKEN=ci-env-gh GITHUB_TOKEN=ci-env-github GH_ENTERPRISE_TOKEN=ci-env-ghe \
+            GITHUB_ENTERPRISE_TOKEN=ci-env-ghes GH_HOST=evil.example
+          test "$(cd bound && gh auth token)" = ci-owner-token
+          for x in unbound other mismatch badhelper "$HOME"; do if (cd "$x" && gh auth token) > /dev/null 2>&1; then echo "$x: gh returned a token with overrides" >&2; exit 1; fi; done
+          echo "owner git/gh ok uid=$want_uid"
+          EOF
+            [ "$("${ssh_cmd[@]}" 'bash -s' <<<"set -euo pipefail; want_uid=1000; r=/work/repos/gh-dev; $matrix")" = 'owner git/gh ok uid=1000' ] ||
+              fail 'owner Git/gh over ordinary SSH'
+            [ "$(docker exec -i own-smoke /bin/bash -s <<<"set -euo pipefail; want_uid=0; r=/work/repos/gh-root; $matrix")" = 'owner git/gh ok uid=0' ] ||
+              fail 'owner Git/gh through the image-default docker exec'
+            printf 'own re-pin %s -> %s, image %s\n' "$old" "$new" "$image" >> "$GITHUB_STEP_SUMMARY"
+            printf '%s%s\n' 'PASS own re-pin: bound -> new -> recorded bound argv -> new on three volumes with unchanged keys, state, work and Nix; ' \
+              'owner Git/gh only when bound, over SSH (dev) and default exec (root), none otherwise' | tee -a "$GITHUB_STEP_SUMMARY"
           fi
       - name: Keep the tested image for publishing
         if: inputs.publish
