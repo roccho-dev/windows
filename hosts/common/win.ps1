@@ -1198,7 +1198,10 @@ function HostTaskPolicies {
     $exe = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
     $policies = Invoke-Native $exe @('-NoProfile','-NonInteractive','-Command',
         'Get-ExecutionPolicy -List | Select-Object Scope,ExecutionPolicy | ForEach-Object { @{ Scope=[string]$_.Scope; ExecutionPolicy=[string]$_.ExecutionPolicy } } | ConvertTo-Json -Compress') 10
-    return $policies | ConvertFrom-Json
+    # Windows PowerShell 5.1 writes a top-level JSON array as one object (PowerShell 7 enumerates it unless -NoEnumerate):
+    # parse into a variable, then emit its rows, so both return one item per policy scope.
+    $rows = if ($PSVersionTable.PSVersion.Major -ge 7) { ConvertFrom-Json $policies -NoEnumerate } else { ConvertFrom-Json $policies }
+    $rows
 }
 function HostLogon([switch]$Test) {
     $sid = HostCaller
