@@ -220,11 +220,22 @@ jobs:
               Remove-Item -LiteralPath (Join-Path $Tmp "e-$K.log")
             }
           }
+          # F: Get-Own returns the one container from an inspect object or one-element array, and refuses two.
+          $OldTwo = Join-Path $Tmp 'old-two.json'; Set-Content -LiteralPath $OldTwo -Encoding ascii -Value "[$OldMounted,$OldMounted]"
+          foreach ($Inspect in $OldOne, $OldList, $OldTwo) {
+            $script:Own = $null
+            $F = Case 'f' @{ FAKE_INSPECT = $Inspect } { $script:Own = Get-Own }
+            $Want = if ($Inspect -ceq $OldTwo) { 'Expected one container named windows-own.' } else { 'ok' }
+            if ($F.result -cne $Want -or ($Want -ceq 'ok' -and ($script:Own -isnot [pscustomobject] -or $script:Own.Config.Image -cne $OldImage))) {
+              "F: Get-Own with inspect $(Split-Path -Leaf $Inspect): $($F.result)"; $F.log; exit 1
+            }
+            Remove-Item -LiteralPath (Join-Path $Tmp 'f.log')
+          }
           foreach ($F in 'a', 'b', 'c', 'd') { Remove-Item -LiteralPath (Join-Path $Tmp "$F.log") }
           foreach ($K in $Argvs.Keys) { Remove-Item -LiteralPath (Join-Path $Tmp "$K.argv.json") }
-          foreach ($F in $WslcExe, $NewUp, $OldUp, $OldOne, $OldList) { Remove-Item -LiteralPath $F }
+          foreach ($F in $WslcExe, $NewUp, $OldUp, $OldOne, $OldList, $OldTwo) { Remove-Item -LiteralPath $F }
           [IO.Directory]::Delete($Tmp)
-          'PASS own Replace under Windows PowerShell 5.1: A success, B rollback after remove, C stderr-only gate refused, D seed exit 3, E rollback file precheck'
+          'PASS own Replace under Windows PowerShell 5.1: A success, B rollback after remove, C stderr-only gate refused, D seed exit 3, E rollback file precheck, F one container from inspect'
           exit 0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:

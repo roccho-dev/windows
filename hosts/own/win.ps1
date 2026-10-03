@@ -173,7 +173,10 @@ if ($Step -eq 'Pull') {
 function Get-Own {
     $Json = (& $Wslc container inspect -f json $Site.container) -join "`n"
     if ($LASTEXITCODE -ne 0) { return $null }
-    $Items = @($Json | ConvertFrom-Json)
+    # As ConvertFrom-JsonItems below, inline because own-image.yml loads this function by name on its own: the inspect
+    # array's own elements on Windows PowerShell 5.1 and 7, so the count below is the number of containers.
+    $Items = if ($PSVersionTable.PSVersion.Major -ge 7) { ConvertFrom-Json $Json -NoEnumerate } else { ConvertFrom-Json $Json }
+    $Items = @($Items)
     if ($Items.Count -ne 1) { throw "Expected one container named $($Site.container)." }
     return $Items[0]
 }
