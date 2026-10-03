@@ -311,6 +311,27 @@ NIX
         "$names" "$home" "$(ulimit -c)" "$key" "$req" "$argv"
       case "$input" in *'"exit":3'*) exit 3 ;; esac
     '';
+    packages.x86_64-linux.jev-review = let
+      pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      source = pkgs.writeTextFile {
+        name = "jev-review"; destination = "/tests/run.mjs";
+        text = ''
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+          const input=fs.readFileSync(0);
+          const hash=(s)=>crypto.createHash('sha256').update(s).digest('hex');
+          const names=Object.keys(process.env).sort().join(' ')+' ';
+          const fds=fs.readdirSync('/proc/self/fd').filter(n=>Number(n)>2).flatMap(n=>{
+            try{return fs.readlinkSync('/proc/self/fd/'+n)==='/dev/null'?[n]:[];}catch{return [];}
+          });
+          if(process.argv.length!==3||process.argv[2]!=='--semlint-real'||fds.length)process.exit(2);
+          fs.writeFileSync('/tmp/ops-jev-proof.fds','fixed-node-child\n');
+          console.log(JSON.stringify({mode:'fixed-semlint',names,key:hash(process.env.JEV_API_KEY),request:hash(input),argv:'clean'}));
+        '';
+      };
+    in pkgs.writeShellScriptBin "jev-review" ''
+      exec ${pkgs.nodejs}/bin/node ${source}/bin/jev-review.mjs "$@"
+    '';
   };
 }
 NIX
@@ -433,6 +454,18 @@ NIX
   test "$(grep -n 'ops-jev: built ' "$ops_err" | cut -d: -f1)" -lt "$(grep -n 'ops-jev: decrypt ' "$ops_err" | cut -d: -f1)"
   ops_as pass "$request" --ops-sha "$ops_good" --envs-sha "$good"
   ops_as exit3 '{"type":"noul","exit":3}' "${ops_args[@]}"
+  # The same fixed target child, now the provided Node/source test entry, not an arbitrary program.
+  ops_as pass "$request" --semlint-real "${ops_args[@]}"
+  test "$(cat "$ops_out")" = "{\"mode\":\"fixed-semlint\",\"names\":\"HOME JEV_API_KEY LANG PATH \",\"key\":\"$digest\",\"request\":\"$(printf %s "$request" | sha256sum | cut -d' ' -f1)\",\"argv\":\"clean\"}"
+  test "$(grep -n 'ops-jev: built ' "$ops_err" | cut -d: -f1)" -lt "$(grep -n 'ops-jev: decrypt ' "$ops_err" | cut -d: -f1)"
+  for bad in --program --module --endpoint --real --semlint-real; do
+    ops_as red "$request" --semlint-real "${ops_args[@]}" "$bad" extra
+    if grep -q 'ops-jev: decrypt' "$ops_err"; then echo 'invalid finite args reached decrypt' >&2; return 1; fi
+  done
+  ops_as red "$request" --semlint-real --envs-sha '' --ops-sha "$ops_good"
+  ops_as red "$request" --semlint-real --envs-sha "$good" --ops-sha --envs-sha
+  ops_as red "$request" --semlint-real --envs-sha "$good" --ops-sha "$ops_bad"
+  if grep -q 'ops-jev: decrypt' "$ops_err"; then echo 'finite package refusal reached decrypt' >&2; return 1; fi
   # Arguments: exactly the two flags, exact SHAs; no apps flag, port, host, attribute or extra argument.
   ops_as red "$request" --envs-sha "$good"
   ops_as red "$request" "${ops_args[@]}" --port 20000
@@ -512,6 +545,7 @@ NIX
   echo 'PASS jev tools (fixtures): production profile has only the three bounded tools and exact constants; same source;'
   echo 'PASS jev launch: closed child environment, loopback unless --host 0.0.0.0 is explicit, no core, absent HOME, only stdio descriptors, no temp left after any launch, key never in argv or output, build before decrypt;'
   echo 'PASS ops-jev: caller stdin is the request, one stdout JSON line, exit status passed through, launcher messages on stderr only, PATH HOME LANG JEV_API_KEY only, only stdio descriptors, build before decrypt, RED on arguments/stale/off/unbuildable/unknown/identity;'
+  echo 'PASS fixed semlint mode (fixture only): exact supplied Node/source, whole closure contents verification before key, fixed test argv, closed environment/inherited descriptors, strict argument/build refusal before decrypt; no real provider or quality claim;'
   echo 'PASS jev scratch: removed file by file before the child, never recursively; unexpected entries and types kept and refused;'
   echo 'PASS jev fixtures: Git-verified objects and known files removed, foreign entries kept and refused; no fixture or test identity left;'
   echo 'PASS jev RED: arguments, host, stale/off/unknown envs commit, unbuildable apps, identity mode/missing/other, tamper, two recipients, extra field, absent'
