@@ -3286,7 +3286,9 @@ function InTree([string]$Path, [string]$Tree = $b3aTree) { $Path -and $Path.Star
 # The executable image of a process, as the kernel recorded it at creation: one handle opened with
 # PROCESS_QUERY_LIMITED_INFORMATION, its creation time (GetProcessTimes) within 10 ticks of the CIM creation time the
 # caller observed, then QueryFullProcessImageNameW on that same handle, which is always closed. '' when the process
-# cannot be opened, has exited, is another process under a reused PID or its image cannot be read. Never a module list, the CIM
+# cannot be opened, is another process under a reused PID or its image cannot be read. An exited process whose object
+# is still open somewhere may still be read: that is its verified image, so a quick child outside the tree is still caught
+# (the exit time is not consulted; GetProcessTimes leaves it undefined while the process runs). Never a module list, the CIM
 # Name or ExecutablePath: those can name something other than the image (an observed chrome.exe read as ntdll.dll).
 if (-not ('W.ImageProbe' -as [type])) {
     Add-Type -Namespace W -Name ImageProbe -MemberDefinition @'
@@ -3300,7 +3302,7 @@ public static string Path(int id, long createdUtcTicks) {
     if (handle == System.IntPtr.Zero) { return ""; }
     try {
         long creation, exit, kernel, user;
-        if (!GetProcessTimes(handle, out creation, out exit, out kernel, out user) || exit != 0) { return ""; }
+        if (!GetProcessTimes(handle, out creation, out exit, out kernel, out user)) { return ""; }
         if (System.Math.Abs(System.DateTime.FromFileTimeUtc(creation).Ticks - createdUtcTicks) >= 10) { return ""; }
         var name = new System.Text.StringBuilder(32768);
         uint size = 32768;
@@ -3387,8 +3389,10 @@ try {
     $read = [pscustomobject]@{ id = 7; created = $outsider.created; parent = 1; type = 'browser'; path = $outsidePath; source = 'kernel'; class = 'unknown'; lastSeen = $outsider.created }
     B3aClassify @($read) $outsider.created.AddSeconds(-1) $tree
     Must ($read.class -ceq 'outside') 'A29 classes: a renamed executable outside the tree is outside'
+    $childId = $child.process.Id
     $child.process.Kill(); $child.process.WaitForExit(); $child.process.Dispose()
-    Must ([W.ImageProbe]::Path($child.process.Id, $child.created.Ticks) -eq '') 'A29 image reader: an exited process is unread'
+    $exited = [W.ImageProbe]::Path($childId, $child.created.Ticks)
+    Must ($exited -eq '' -or $exited -eq $ping) 'A29 image reader: an exited process is unread or still its own executable, never another'
     $at = [DateTime]::UtcNow
     $obs = { param($Id, $Parent, $Path, $Class, $Seen) [pscustomobject]@{ id = $Id; created = $at.AddSeconds($Id); parent = $Parent; type = 'renderer'
         path = $Path; source = $(if ($Path) { 'kernel' } else { 'unread' }); class = $Class; lastSeen = $at.AddSeconds($Seen) } }
