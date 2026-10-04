@@ -4,7 +4,7 @@
 
 将来の適用先にも使える IaC と secret の管理・配置を明確にし、環境を再現可能にするための全体図と設計理由を記録する。G6I3 own/head と PC7337 rent は、これを実証する現在のサンプルである。関連する目的は [windows #8](https://github.com/roccho-dev/windows/issues/8) と [#14](https://github.com/roccho-dev/windows/issues/14) にある。
 
-これは説明用の正本であり、実行許可や runtime の正本ではない。役割・許可は [ADRS #525](https://github.com/roccho-dev/adrs/pull/525) の canonical `701e76e6f1ac0c87fddda01fc4167f62d6cfd726`、特に `policy/control.jsonl` の row272（本番系列 v39）と row273（state 鍵保管）に従う。製品の実装は各 repository、現在の合意と証拠は対象 PR に置く。同じ図を各 repository や PR に複写しない。
+これは説明用の正本であり、実行許可や runtime の正本ではない。役割・許可は [ADRS #528](https://github.com/roccho-dev/adrs/pull/528) の canonical `95220e6ac9fa840733f318d63c45c8f17d5981b6`、特に `policy/control.jsonl` の row272（本番系列 v41）と row273（受入済みstate鍵保管）に従う。製品の実装は各 repository、現在の合意と証拠は対象 PR に置く。同じ図を各 repository や PR に複写しない。
 
 **観測基準日は 2026-10-04。図の「完了」は下表の限定範囲だけを示す。** source の受入、Provider の適用、実機の成功、全体の受入を混同しない。ここに書いた段階を新しい実行前チェック列にしない。
 
@@ -16,7 +16,7 @@ User が 2026-10-04 に明確化した優先順位は、**将来の端末にも�
 
 そのため、共通定義・配布成果物と、適用先ごとの入力・所有者・secret・永続状態を分ける。対応環境と前提を宣言し、別の適用先へ移るとき何を入力し、どの秘密を誰が生成・保管・登録・配置・更新・復旧・終了させるかを標準経路で説明できる状態を目指す。秘密の値は文書に保存しない。CI はその定義と配布成果物を事前に実証し、サンプル実機では標準の採用・疎通と、実機でしか証明できない継続・復帰を確認する。
 
-これは目的の明確化であり、任意の端末・OSへの適用を実証済みとする記録ではない。現在の本番 root は `windows-rent-ssh` を固定名として使い、配布・policyにも現サンプルの入力と権限がある。この名前はrole名であり、同じ所有stateのもとで役割を別端末へ移すなら固定を保てる可能性がある。独立instanceの追加とは区別し、固定名だけを理由に入力を増やさない。現定義の境界は一つの論理rentと一つの論理clientで、複数instanceや別OSへの対応は実証していない。未確認部分を generic framework、helper、workflow の追加で先回りして埋めない。現 v39 の対象・作用許可はこの説明だけで拡張しない。
+これは目的の明確化であり、任意の端末・OSへの適用を実証済みとする記録ではない。現在の本番 root は `windows-rent-ssh` を固定名として使い、配布・policyにも現サンプルの入力と権限がある。この名前はrole名であり、同じ所有stateのもとで役割を別端末へ移すなら固定を保てる可能性がある。独立instanceの追加とは区別し、固定名だけを理由に入力を増やさない。現定義の境界は一つの論理rentと一つの論理clientで、複数instanceや別OSへの対応は実証していない。未確認部分を generic framework、helper、workflow の追加で先回りして埋めない。現 v41 の対象・作用許可はこの説明だけで拡張しない。
 
 ### 別の適用先へ渡すもの
 
@@ -152,16 +152,18 @@ R は W の成果と工程を独立に評価し、同じ合意の中で必要な
 
 session は固定する。現在の native W を最終 rent OCI 内の W と同一視しない。最終 OCI での実作業・認証/session 継続と役割引継ぎは runtime 受入で扱い、新 session や actor を黙示追加しない。own P2 の実機作業を remote P/R/W が重複実行しない。
 
-## 5. 本番系列 S1 → S2 → S3 → S4
+## 5. 本番系列 S1・S1B → S2 → S3 → S4
 
 ```mermaid
 flowchart TB
-  subgraph s1["S1 完了：必要な source 一行だけ"]
+  subgraph s1["S1・S1B 完了：必要な source と閉じた失敗分類"]
     fixture["synthetic fixture<br/>8760h → 既存の1h<br/>本番8760h・negative oracleは保持"]
     pr42["envs PR #42<br/>独立評価 → 通常merge"]
     ci42["canonical push CI 全8件成功<br/>42a3bc1d / run37173892878"]
+    pr43["envs PR #43<br/>既存initの閉じたhintだけ追加<br/>独立評価 → 通常merge"]
+    ci43["現canonical push CI 全8件成功<br/>ff290b66 / run37190955405"]
     artifact["同SHAの唯一・未失効 effect/placement<br/>実bytes・SOURCE・ENTRYはS3 consumerで通過"]
-    fixture --> pr42 --> ci42 --> artifact
+    fixture --> pr42 --> ci42 --> pr43 --> ci43 --> artifact
   end
   subgraph s2["S2 準備完了：入力・権限・保管を確定"]
     bucket["新 private R2 bucket<br/>windows-rent-iac<br/>空・Standard・public無効"]
@@ -175,8 +177,9 @@ flowchart TB
     inventory --> s2ready
   end
   go["P の別段階 S3 GO"]
-  subgraph s3["S3 run37179580956：artifact通過 / init失敗・apply未到達"]
-    dispatch["R が current proposals へdispatch<br/>帰属するrunを確定してから監視"]
+  previous["以前のrun37179580956はinit失敗<br/>原因・state・lockはUNKNOWNのまま"]
+  subgraph s3["S3 未実証：現sourceで標準reconcileを一回"]
+    dispatch["R が固定proposalsへdispatch<br/>帰属するrunを確定してから監視"]
     consume["提供済みtoolchainを直接照合<br/>再build・local installなし"]
     apply["rent-root<br/>暗号化state / lock / Cloudflare資源"]
     envelopes["秘密outputはmemory内<br/>SOPSで2targetへseal"]
@@ -191,15 +194,18 @@ flowchart TB
   end
   artifact --> go
   s2ready --> go
+  previous -. "Pが同じ所有rootへの一回を選択" .-> go
   go --> dispatch
   artifact --> consume
   handoff --> rw
   merge --> later["後続の実機配送・Stage・SSH・継続・復帰<br/>#8/#14 → G1"]
 ```
 
-S1 の fixture 是正は合成検査の不足を埋める最小変更で、実入力や gate を緩める変更ではない。S3 は既存 [project-dev-rent-tunnel.yml](https://github.com/roccho-dev/envs/blob/42a3bc1d3192f0d5049a8c7b962d00e8eb0c66e4/.github/workflows/project-dev-rent-tunnel.yml) を使う。S4 の PR を docs の保存用に拡張しない。
+S1 の fixture 是正は合成検査の不足を埋める最小変更で、実入力や gate を緩める変更ではない。S1B の [envs #43](https://github.com/roccho-dev/envs/pull/43#issuecomment-5978462562) は既存initの失敗時に閉じた未検証hintを返す2ファイルだけの変更で、原因を確定するprobeや別workflowを足していない。現配布元は canonical `ff290b66`／[run37190955405](https://github.com/roccho-dev/envs/actions/runs/37190955405) の全8件成功と同sourceのeffect/placementで、以前の成果物を新sourceへ読み替えない。既存consumerが取得元のidentity・digest・実bytes・`SOURCE`を直接照合し、policyや文書へhashを転記して別gateを作らない。S3 は既存 [project-dev-rent-tunnel.yml](https://github.com/roccho-dev/envs/blob/ff290b66a5cb88373ad7eb401ca568876a69fa29/.github/workflows/project-dev-rent-tunnel.yml) を使う。S4 の PR を docs の保存用に拡張しない。
 
 今回の既存 CI が返した閉じた失敗分類は `RENT_ROOT=RED: envs at init`。固定 source の [rent_root](https://github.com/roccho-dev/envs/blob/42a3bc1d3192f0d5049a8c7b962d00e8eb0c66e4/adapters/jev_api.py#L1050) は `init` が成功してから `apply` へ進むため、この run は適用処理に到達していない。ただし、初期化の根本原因や backend への全作用まで判明したことにはならない。失敗後の bucket 一覧は空だったが、それだけで state/lock を含む作用全体をゼロとは断定しない。
+
+v41はこのUNKNOWNを残し、Pの可視inventoryで衝突が観測されていないことを根拠に、同じ所有bucket/key・宣言rootで標準reconcileを一回選ぶ。native applyはcreate-onlyではない。新しいstate・resource・lock・競合をdispatch前に観測すればPへ戻り、adopt・reset・unlock・cleanupは行わない。Pはpreflightからhandoff PR読戻しまでenvs proposalsへのmergeを止めるが、外部writeがない証明にはしない。S3の一つのworkflowには3ファイルのverify・owner commit・non-force push・PR生成も含め、ローカルの手順を増やさない。S4は実際のCI状態を見て別GOで承認・監視・受入を選び、runが0件の場合だけ既存fallbackを一回使う。承認とfallbackを重ねない。
 
 Provider の run 失敗や runner 消失では、PR が作られなくても資源・state・lock が残り得る。自動再実行、import、destroy、rollback、資格情報削除、force-unlock を行わず、非秘密の実際の段階・資源を読んで P が回復境界を判断する。
 
@@ -343,7 +349,7 @@ flowchart TB
 | 適用先を変えられる | 共通定義を保ち、端末ごとの入力・owner・secret・永続状態だけを明示して採用する | 特定PCだけの手修正や隠れた前提を残さず、実際に必要な不足だけを既存定義・CIへ戻す |
 | 同じ成果物を使う | 検証したsource/image/artifactをそのままconsumerへ渡す | ローカル再build・都度install・手で転記したhashをgateにしない |
 | 一つの責務に一つの標準経路 | Providerはrent-root、秘密はSOPS/placement、Windows作用はnative adapter | 新workflow・転送helper・scanner・receipt frameworkを追加しない |
-| 変更が目的に直接寄与 | fixture一行と既存production/3-file handoffで閉じる | 意味のないscaffold PR、枝を整えるだけのrebase、完了済み試験の再実行を避ける |
+| 変更が目的に直接寄与 | fixture一行、既存initの閉じたhint、既存production/3-file handoffで閉じる | 意味のないscaffold PR、枝を整えるだけのrebase、完了済み試験の再実行を避ける |
 | 状態が明確 | state/work/nixを分け、同じ永続対象のwriterを一つにする | HOME全体の移植、host間の認証共有、rootfsとvolumeの混同をしない |
 | 独立性が保たれる | Wが作成・是正、Rが直接評価、Pが境界と合成を評価 | Rを報告役にせず、Pの要約だけでR/Wの読戻しを代用しない |
 | 成功と不明を区別 | source / metadata / Provider / runtime / G1 を別の証拠で示す | CI successやSecret名presenceから実認証・SSH・復旧を推定しない |
@@ -356,15 +362,17 @@ Provider運用にはstateの保管、lock、期限更新、target側のprivate i
 | 系列・境界 | 担当 | 2026-10-04の現在地 | 残件 |
 |---|---|---|---|
 | 基盤・単一CI・own/rent/dev/Windows source | 各既存系列、remote P合成 | 統合済み | 実機の完了とは別 |
-| 別端末への再現契約 | remote P・固定rent R/W、own P2の関連証拠 | 目的理解と最小のA〜D系列をP/R/Wが相互反証・原文readbackして合意。現サンプルの受入は保持 | 本文のlifecycle追記は独立レビュー待ち。再現・交換・復旧の実証は未完了。PC7337の成功だけで完了にしない |
+| 別端末への再現契約 | remote P・固定rent R/W、own P2の関連証拠 | 目的理解と最小のA〜D系列、Aのlifecycle説明をP/R/Wが相互反証・原文readbackして受入。現サンプルの受入は保持 | 再現・交換・復旧の実証は未完了。PC7337の成功だけで完了にしない |
 | B2 表示限定 | own、User受入 | 完了 | IME/wheel等は別scope |
 | VM退役・age key保存 | 既存担当、User受入 | 完了 | 再実施しない |
 | own image/復帰 source | own P2固定R/W | source/CI受入済み | 実機採用・再起動・ログオン復帰は別受入 |
 | S1 本番 fixture/source | rent固定R/W、remote P | PR #42／canonical `42a3bc1d`／push CI全8件で完了 | S3の既存consumerで実bytes照合通過 |
+| S1B init失敗の閉じたhint | rent固定R/W、remote P | PR #43／canonical `ff290b66`／push CI全8件と同source配布物をP/R/W受入済み | hintは原因・認証・実Providerの精度の証明ではない |
 | target age bootstrap | rent固定R/W・own P2固定R/W | 配布元一致・ACL・public recipient一致で完了 | private鍵での本番配置は後続 |
 | state passphrase custody | own P2固定R/W、remote P | owner-only fileと同Environment登録を受入済み | 本番使用・実復旧は未証明 |
 | S2 入力・backend準備 | remote P、User、rent固定R/W | 9公開入力、4 Secret名、branch制約、権限/有限期限、空backendの準備合意が完了 | 認証実使用、旧tokenの独立失効確認は未証明 |
-| S3 本番Provider・暗号handoff生成 | rent R、固定W、remote P | [run37179580956](https://github.com/roccho-dev/envs/actions/runs/37179580956)を一回実行。artifact照合・toolchain通過後、閉じた分類 `envs at init` で失敗。apply未到達、暗号PR作成はskipped | 初期化の原因と最小是正の独立確認。state/lock・資源への全作用はUNKNOWN。再実行・削除・unlockは未実行 |
+| v41 本番境界 | remote P・固定rent R/W | ADRS #528通常merge、P/R/Wのcanonical読戻し異論0、同版S3 GO済み | 固定R/Wの実preflightと一回の本番実行。S4は別GO |
+| S3 本番Provider・暗号handoff生成 | rent R、固定W、remote P | 以前の[run37179580956](https://github.com/roccho-dev/envs/actions/runs/37179580956)はartifact/toolchain通過後にinit失敗。v41の新しい実行は未実施 | 同じ所有rootへの一回の標準reconcile・暗号PR生成は未実証。以前の原因・state/lock・全作用はUNKNOWNを保持 |
 | S4 暗号PR受入・配布 | rent固定R/W、remote P | 未完了 | 同head CI、必要owner承認、通常merge、canonical配布 |
 | rent 実機の配置・切替・開発継続 | rent host R、固定W | 未実証 | 標準slot、単一writer、認可/拒否、strict SSH/Codex、継続、復帰 |
 | 旧OCI整理・work側容量支援 | rent側の既存担当、remote P合成 | 未完了 | 移行実証、完全Diff、利用者0、container本体だけの削除とvolume存続 |
@@ -378,10 +386,10 @@ S3以後のrunや受入が成立したら、この表と該当図の状態だけ
 
 - [windows #8](https://github.com/roccho-dev/windows/issues/8)：開発継続、状態、writer、旧container整理、G1の目的。
 - [windows #14](https://github.com/roccho-dev/windows/issues/14)：Cloudflare接続・認可/拒否・復帰の目的。
-- [ADRS #525](https://github.com/roccho-dev/adrs/pull/525)：v39／row272・273の合意と段階別作用境界。
+- [ADRS #528](https://github.com/roccho-dev/adrs/pull/528)：v41／row272・受入済みrow273の合意と段階別作用境界。
 - [envs #40](https://github.com/roccho-dev/envs/pull/40)、[#41](https://github.com/roccho-dev/envs/pull/41)、[#42](https://github.com/roccho-dev/envs/pull/42)：production接続、標準bootstrap、fixture是正とsource証拠。
-- [envs canonical check](https://github.com/roccho-dev/envs/actions/runs/37173892878)：`42a3bc1d`の配布元。
-- [Provider root](https://github.com/roccho-dev/envs/blob/42a3bc1d3192f0d5049a8c7b962d00e8eb0c66e4/providers/dev-rent-cloudflare/main.tf)、[既存production workflow](https://github.com/roccho-dev/envs/blob/42a3bc1d3192f0d5049a8c7b962d00e8eb0c66e4/.github/workflows/project-dev-rent-tunnel.yml)：資源・native backend・暗号化・3-file handoff。
+- [envs #43](https://github.com/roccho-dev/envs/pull/43#issuecomment-5978462562)、[canonical check](https://github.com/roccho-dev/envs/actions/runs/37190955405)：`ff290b66`の閉じたhint・全8件成功・同source配布元。
+- [Provider root](https://github.com/roccho-dev/envs/blob/ff290b66a5cb88373ad7eb401ca568876a69fa29/providers/dev-rent-cloudflare/main.tf)、[既存production workflow](https://github.com/roccho-dev/envs/blob/ff290b66a5cb88373ad7eb401ca568876a69fa29/.github/workflows/project-dev-rent-tunnel.yml)：資源・native backend・暗号化・3-file handoff。
 - [windows #45](https://github.com/roccho-dev/windows/pull/45)、[#47](https://github.com/roccho-dev/windows/pull/47)：own配布とrentの標準Stage。現在の関連実装は [flake.nix](../flake.nix)、[rent Windows entry](../hosts/rent/win.ps1)、[client ProxyCommand](../hosts/common/rent-access.ps1)、[owner gh binding](../hosts/profile/gh.nix)。
 
 この文書の追加は docs 一件だけで、上記source、credential、Provider、host/OCIの作用を変更しない。
