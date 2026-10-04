@@ -2,13 +2,21 @@
 
 ## この文書の位置づけ
 
-G6I3 を own/head として、PC7337 の rent をこの端末から開発・制御するための全体図と設計理由を記録する。関連する目的は [windows #8](https://github.com/roccho-dev/windows/issues/8) と [#14](https://github.com/roccho-dev/windows/issues/14) にある。
+将来の適用先にも使える IaC と secret の管理・配置を明確にし、環境を再現可能にするための全体図と設計理由を記録する。G6I3 own/head と PC7337 rent は、これを実証する現在のサンプルである。関連する目的は [windows #8](https://github.com/roccho-dev/windows/issues/8) と [#14](https://github.com/roccho-dev/windows/issues/14) にある。
 
 これは説明用の正本であり、実行許可や runtime の正本ではない。役割・許可は [ADRS #525](https://github.com/roccho-dev/adrs/pull/525) の canonical `701e76e6f1ac0c87fddda01fc4167f62d6cfd726`、特に `policy/control.jsonl` の row272（本番系列 v39）と row273（state 鍵保管）に従う。製品の実装は各 repository、現在の合意と証拠は対象 PR に置く。同じ図を各 repository や PR に複写しない。
 
 **観測基準日は 2026-10-04。図の「完了」は下表の限定範囲だけを示す。** source の受入、Provider の適用、実機の成功、全体の受入を混同しない。ここに書いた段階を新しい実行前チェック列にしない。
 
 ## 1. 目的と完成形
+
+### 目的の優先順位
+
+User が 2026-10-04 に明確化した優先順位は、**将来の端末にも適用できる IaC と secret を明確にすること、再現可能にすることが上位で、PC7337 の実機完成はそのサンプル実証**である。PC7337 だけが動く手修正では上位目的を達成しない。
+
+そのため、共通定義・配布成果物と、適用先ごとの入力・所有者・secret・永続状態を分ける。対応環境と前提を宣言し、別の適用先へ移るとき何を入力し、どの秘密を誰が生成・保管・登録・配置・更新・復旧・終了させるかを標準経路で説明できる状態を目指す。秘密の値は文書に保存しない。CI はその定義と配布成果物を事前に実証し、サンプル実機では標準の採用・疎通と、実機でしか証明できない継続・復帰を確認する。
+
+これは目的の明確化であり、任意の端末・OSへの適用を実証済みとする記録ではない。現在の本番 root は `windows-rent-ssh` を固定名として使い、配布・policyにも現サンプルの入力と権限がある。別端末へ適用する入力と secret の管理方法に不足がないか、固定 P/R/W の主張・相互反証で確認する。未確認部分を generic framework、helper、workflow の追加で先回りして埋めない。現 v39 の対象・作用許可はこの説明だけで拡張しない。
 
 ユーザーが求める状態は次のとおり。
 
@@ -22,11 +30,13 @@ G6I3 を own/head として、PC7337 の rent をこの端末から開発・制�
 ```mermaid
 flowchart TB
   subgraph authority["目的・権限・設計"]
-    user["User の目的・許可・最終受入"]
+    user["User の上位目的<br/>再利用できるIaC・secret / 再現可能性"]
+    samples["G6I3 own / PC7337 rent<br/>現在のサンプル実証"]
     issues["windows #8 / #14<br/>完成条件"]
     policy["ADRS<br/>固定組織・主張反復・作用境界"]
     user --> issues
     user --> policy
+    issues --> samples
   end
   subgraph distribution["CI で先に配布可能にする"]
     win["windows<br/>Nix OCI + Windows 配布定義"]
@@ -310,6 +320,7 @@ flowchart TB
 | 評価基準 | この構成で達成すること | 膨らませないための制約 |
 |---|---|---|
 | 正本が一つ | packageはNix、作用は既存entrypoint、目的は#8/#14、role/許可はADRS | 図はこのfileへ集約。独自runtime台帳・並列した設定正本を増やさない |
+| 適用先を変えられる | 共通定義を保ち、端末ごとの入力・owner・secret・永続状態だけを明示して採用する | 特定PCだけの手修正や隠れた前提を残さず、実際に必要な不足だけを既存定義・CIへ戻す |
 | 同じ成果物を使う | 検証したsource/image/artifactをそのままconsumerへ渡す | ローカル再build・都度install・手で転記したhashをgateにしない |
 | 一つの責務に一つの標準経路 | Providerはrent-root、秘密はSOPS/placement、Windows作用はnative adapter | 新workflow・転送helper・scanner・receipt frameworkを追加しない |
 | 変更が目的に直接寄与 | fixture一行と既存production/3-file handoffで閉じる | 意味のないscaffold PR、枝を整えるだけのrebase、完了済み試験の再実行を避ける |
@@ -325,6 +336,7 @@ Provider運用にはstateの保管、lock、期限更新、target側のprivate i
 | 系列・境界 | 担当 | 2026-10-04の現在地 | 残件 |
 |---|---|---|---|
 | 基盤・単一CI・own/rent/dev/Windows source | 各既存系列、remote P合成 | 統合済み | 実機の完了とは別 |
+| 別端末への再現契約 | remote P・固定rent R/W、own P2の関連証拠 | Userの目的順位を明確化。現サンプルの受入は保持 | 共通定義と端末固有入力、secret管理・更新・復旧・終了、名前と所有状態の分離を独立に評価。PC7337の成功だけで完了にしない |
 | B2 表示限定 | own、User受入 | 完了 | IME/wheel等は別scope |
 | VM退役・age key保存 | 既存担当、User受入 | 完了 | 再実施しない |
 | own image/復帰 source | own P2固定R/W | source/CI受入済み | 実機採用・再起動・ログオン復帰は別受入 |
