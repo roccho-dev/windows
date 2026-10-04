@@ -16,7 +16,18 @@ User が 2026-10-04 に明確化した優先順位は、**将来の端末にも�
 
 そのため、共通定義・配布成果物と、適用先ごとの入力・所有者・secret・永続状態を分ける。対応環境と前提を宣言し、別の適用先へ移るとき何を入力し、どの秘密を誰が生成・保管・登録・配置・更新・復旧・終了させるかを標準経路で説明できる状態を目指す。秘密の値は文書に保存しない。CI はその定義と配布成果物を事前に実証し、サンプル実機では標準の採用・疎通と、実機でしか証明できない継続・復帰を確認する。
 
-これは目的の明確化であり、任意の端末・OSへの適用を実証済みとする記録ではない。現在の本番 root は `windows-rent-ssh` を固定名として使い、配布・policyにも現サンプルの入力と権限がある。別端末へ適用する入力と secret の管理方法に不足がないか、固定 P/R/W の主張・相互反証で確認する。未確認部分を generic framework、helper、workflow の追加で先回りして埋めない。現 v39 の対象・作用許可はこの説明だけで拡張しない。
+これは目的の明確化であり、任意の端末・OSへの適用を実証済みとする記録ではない。現在の本番 root は `windows-rent-ssh` を固定名として使い、配布・policyにも現サンプルの入力と権限がある。この名前はrole名であり、同じ所有stateのもとで役割を別端末へ移すなら固定を保てる可能性がある。独立instanceの追加とは区別し、固定名だけを理由に入力を増やさない。現定義の境界は一つの論理rentと一つの論理clientで、複数instanceや別OSへの対応は実証していない。未確認部分を generic framework、helper、workflow の追加で先回りして埋めない。現 v39 の対象・作用許可はこの説明だけで拡張しない。
+
+### 別の適用先へ渡すもの
+
+| 分類 | 現在の定義・入力 | 別端末へ移る際の境界 |
+|---|---|---|
+| 共通成果物 | 固定sourceからCIが検証・配布するown/rent image、Windows client、effect/placement | 同じconsumerが成果物を照合する。端末で再build・都度installしない |
+| Providerと所有state | account、zone、hostname、origin、duration、専用bucketとstate key | host名とstateの所有単位を混同しない。同じroleの継承と新しい独立instanceを区別する |
+| targetの入力 | 適用先owner、対応環境・WSLC、role別volumeとwriter、rent/client public age recipient、各private identityの保管 | 同じ標準bootstrap・配置経路へ渡す。private identityを別hostへ共有しない。現サンプルの受入を別端末の成功へ読み替えない |
+| secrets | 下記7分類と、#8が担当する開発認証・SSH状態 | 各正本・保管・配送・更新・復旧・終了の責務を選ぶ。recipient変更だけで旧端末の権限を終了したことにしない |
+
+別端末での再現は、新規作成、保持したstateからの再作成、端末交換後の継続・復旧を区別して評価する。入力だけで表現できるか、既存CIのsynthetic入力と実機でしか確認できない証拠を分ける。台数や新しい試験基盤を増やすこと自体を受入条件にしない。
 
 ユーザーが求める状態は次のとおり。
 
@@ -227,14 +238,23 @@ flowchart LR
   clientIdentity --> clientSlot
 ```
 
-| 保管対象 | 正規の場所・利用者 | 確認の範囲 |
-|---|---|---|
-| state passphrase の控え | G6I3 `C:\Users\resta\AppData\Local\envs\identity\rent-state.passphrase` | 作成時の本人専用ACL、単一生成→本人file→同Environment登録、独立metadata受入済み。実復旧は未証明 |
-| state passphrase の CI 入力 | Environment `dev-rent-tunnel` の `RENT_STATE_PASSPHRASE` | GitHub は値を読戻せない。登録の単一process経路と独立metadataを根拠とする |
-| rent private age identity | PC7337 の本人領域 `AppData/Local/envs/identity/rent.agekey` | 標準bootstrapの配布元・ACL・public recipient一致を受入済み |
-| client private age identity | G6I3 の本人領域 `AppData/Local/envs/identity/client.agekey` | 同上。rent private identityとは共有しない |
-| Provider state | account `3d17cd263c27a0ea241f0a8fc09ac2bb` の `windows-rent-iac`、key `cloudflare/windows-rent.tfstate` | 空backendの準備完了。本番暗号化state/lockの作成はS3の実証対象 |
-| tunnel/client credential | targetごとのSOPS暗号文から標準slotへ配置 | plaintextをmodel・Issue・PR・argv・log・独自receiptへ出さない |
+### 本番配布・接続系列のsecret 7分類
+
+| 分類 | 生成・権限・正本／保管 | 登録・配布・配置 | 更新・復旧・終了の責務 | 根拠と未証明 |
+|---|---|---|---|---|
+| Cloudflare API token | User/ownerが対象account・zoneの必要scopeと有限期限で発行 | `dev-rent-tunnel` の `CLOUDFLARE_API_TOKEN`へUserが直接登録。CIのProvider childだけで使用 | ownerが同権限の再発行・Secret更新・旧token失効を担当。値をagentへ渡さない | scope・期限・登録metadataを受入。本番認証、旧tokenの独立失効確認は未証明 |
+| R2 S3 key pair | User/ownerが専用bucket限定Object Read/Writeで発行 | 同Environmentの `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`。native S3 backendのstate/lock用 | ownerが期限更新・必要な再発行と登録を担当。再発行時はpairを揃える。実復旧・終了は別証拠 | bucket/private/入力準備を受入。S3実使用と旧試験の資格情報終了は未証明 |
+| state passphrase | P2の固定Wが32 random bytesを64 lowercase hexへ変換。G6I3の本人専用 `C:\Users\resta\AppData\Local\envs\identity\rent-state.passphrase` が復旧控え | 同じfile bytesを一回だけ `RENT_STATE_PASSPHRASE`へ登録。OpenTofu state/plan encryptionに使用 | ownerが現keyと復旧控えを保持。本番rootの標準rotation・旧key移行は未定義／未実証で、盲目的な値変更をしない | 単一生成・file読戻し・送信・ACLと登録metadataを受入。本番使用・fileからの復旧は未証明 |
+| rent private age identity | PC7337 target ownerの本人領域 `AppData/Local/envs/identity/rent.agekey`。private identityはそのtargetが保管 | public recipientだけを `RENT_AGE_RECIPIENT`へ登録。rent ciphertextを標準placementで復号 | 新targetは自身のidentityを持つ。recipient更新・再sealの候補経路はあるが、旧identityや旧targetの権限終了とは別 | bootstrap配布元・ACL・public `-y`一致を受入。本番配置・交換後継続・秘密復旧は未証明 |
+| client private age identity | G6I3 target ownerの本人領域 `AppData/Local/envs/identity/client.agekey`。rent identityとは別 | public recipientだけを `RENT_CLIENT_AGE_RECIPIENT`へ登録。client ciphertextを標準placementで復号 | 新clientは自身のidentityを持つ。現定義はclient recipient一つ。複数clientや旧clientの失効を実証したとは扱わない | bootstrap限定受入済み。実Access利用・交換・復旧は未証明 |
+| Tunnel token | Cloudflareが論理rentに発行。Provider outputと暗号化stateが管理し、CIがmemory内でseal | `dev-rent-tunnel.sops.yaml` → rent identity → 標準receiverの固定state slot | Provider-issued credentialの更新・失効はrole ownerの責務。新recipientへ同じoutputを再sealしても旧targetのtokenは失効しない | source/CIのseal・receiverを受入。実発行・配置・continuity・旧新overlap・終了は未証明 |
+| Access service token pair | Cloudflareが論理clientにClient ID/Secretを発行。Service Auth policyはそのtokenだけを許可 | `dev-rent-client.sops.yaml` → client identity → `win.ps1 -Mode RentAccess` → ownerの `%USERPROFILE%\.ssh\windows-rent\access` | ownerが期限・更新・失効を管理。現rootに強制rotationの標準entryはない。新recipientへの再sealだけで旧clientを排除しない | source/CIの暗号配布・owner slotを受入。本番認可／拒否・更新・旧権限終了は未証明 |
+
+Provider stateの現在のbindingは account `3d17cd263c27a0ea241f0a8fc09ac2bb`、bucket `windows-rent-iac`、key `cloudflare/windows-rent.tfstate`。これはサンプルの所有stateであり、hostの置換だけで新しいstate keyを勝手に作らない。暗号化state/lockの実作成はS3の未完了実証である。
+
+この7分類は本番Provider・暗号配布・外部接続の範囲。gh、Codex、Claudeのログイン状態とSSH private状態は#8の型付きruntime state／owner bindingが担当する。Nix package配布だけでログイン・資格情報移行・session継続を完了にせず、実機交換の既存系列で配置・保全・継続・旧所有者の扱いを確認する。
+
+Provider-issuedの論理role credentialは、sourceの再seal時に同じoutputを引き継ぐ可能性がある。private age identityを共有しない設計と、role credentialの継続・重複・失効の実証を区別する。現在の `rent_root` はapply後にoutputを再sealする候補経路を持つが、再apply・旧targetの排除・復旧はまだ実証していない。
 
 User の provider credential は Environment へ直接入力する。秘密値・値の hash・断片を agent に渡す経路を設けない。R/W は GitHub の Secret名・更新時刻だけを独立に読む。P の Cloudflare UI観測は P に帰属させ、R/W 自身の直接観測とは記録しない。
 
@@ -336,7 +356,7 @@ Provider運用にはstateの保管、lock、期限更新、target側のprivate i
 | 系列・境界 | 担当 | 2026-10-04の現在地 | 残件 |
 |---|---|---|---|
 | 基盤・単一CI・own/rent/dev/Windows source | 各既存系列、remote P合成 | 統合済み | 実機の完了とは別 |
-| 別端末への再現契約 | remote P・固定rent R/W、own P2の関連証拠 | Userの目的順位を明確化。現サンプルの受入は保持 | 共通定義と端末固有入力、secret管理・更新・復旧・終了、名前と所有状態の分離を独立に評価。PC7337の成功だけで完了にしない |
+| 別端末への再現契約 | remote P・固定rent R/W、own P2の関連証拠 | 目的理解と最小のA〜D系列をP/R/Wが相互反証・原文readbackして合意。現サンプルの受入は保持 | 本文のlifecycle追記は独立レビュー待ち。再現・交換・復旧の実証は未完了。PC7337の成功だけで完了にしない |
 | B2 表示限定 | own、User受入 | 完了 | IME/wheel等は別scope |
 | VM退役・age key保存 | 既存担当、User受入 | 完了 | 再実施しない |
 | own image/復帰 source | own P2固定R/W | source/CI受入済み | 実機採用・再起動・ログオン復帰は別受入 |
