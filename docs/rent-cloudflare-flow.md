@@ -162,14 +162,14 @@ flowchart TB
     ci42["canonical push CI 全8件成功<br/>42a3bc1d / run37173892878"]
     pr43["envs PR #43<br/>既存initの閉じたhintだけ追加<br/>独立評価 → 通常merge"]
     ci43["現canonical push CI 全8件成功<br/>ff290b66 / run37190955405"]
-    artifact["同SHAの唯一・未失効 effect/placement<br/>実bytes・SOURCE・ENTRYはS3 consumerで通過"]
+    artifact["同SHAの唯一・未失効 effect/placement<br/>S3はeffectだけ取得・照合済み<br/>placementの実対象使用は後続"]
     fixture --> pr42 --> ci42 --> pr43 --> ci43 --> artifact
   end
   subgraph s2["S2 準備完了：入力・権限・保管を確定"]
     bucket["新 private R2 bucket<br/>windows-rent-iac<br/>空・Standard・public無効"]
     environment["dev-rent-tunnel<br/>proposals限定 / reviewerなし<br/>9公開入力 / 4 Secret名"]
     custody["G6I3 本人専用の復旧控え<br/>同Environmentのpassphrase<br/>P2固定R/WとPが受入"]
-    inventory["current scope / 有限期限<br/>対象名が不在のfresh inventory<br/>Cloudflare観測はP帰属"]
+    inventory["scope / 有限期限のP帰属inventory<br/>対象名は可視一覧に不在<br/>全作用0の証明ではない"]
     s2ready["P/R/W 準備合意<br/>認証実使用・旧token失効・復旧は未証明"]
     bucket --> s2ready
     environment --> s2ready
@@ -181,14 +181,14 @@ flowchart TB
   subgraph s3["S3 run37194605140：init失敗 / hint401は未検証"]
     dispatch["R が固定proposalsへdispatch<br/>帰属するrunを確定してから監視"]
     consume["提供済みtoolchainを直接照合<br/>再build・local installなし"]
-    apply["rent-root<br/>暗号化state / lock / Cloudflare資源"]
-    envelopes["秘密outputはmemory内<br/>SOPSで2targetへseal"]
-    handoff["ciphertexts 2件 + environments.jsonl<br/>3ファイルだけのhandoff PR"]
+    apply["rent-root：init失敗 / apply未到達<br/>state / lockの全作用はUNKNOWN"]
+    envelopes["未実行の予定経路<br/>秘密outputはmemory内で2targetへseal"]
+    handoff["未実行の予定経路<br/>ciphertexts 2件 + environments.jsonl<br/>3ファイルだけのhandoff PR"]
     dispatch --> consume --> apply --> envelopes --> handoff
   end
   subgraph s4["S4 未完了：同じ暗号成果を受入・配布"]
     rw["同headを固定R/Wが独立確認"]
-    approval["既存 approval-required run を先に照合<br/>owner承認 / 無い場合だけ既存check発火"]
+    approval["実run状態から承認 / 監視 / 受入 / 保全<br/>run 0件だけ既存fallbackを一回<br/>承認とfallbackは重ねない"]
     merge["同head CI → Pの通常merge<br/>canonical CI / 同source配布"]
     rw --> approval --> merge
   end
@@ -201,13 +201,13 @@ flowchart TB
   merge --> later["後続の実機配送・Stage・SSH・継続・復帰<br/>#8/#14 → G1"]
 ```
 
-S1 の fixture 是正は合成検査の不足を埋める最小変更で、実入力や gate を緩める変更ではない。S1B の [envs #43](https://github.com/roccho-dev/envs/pull/43#issuecomment-5978462562) は既存initの失敗時に閉じた未検証hintを返す2ファイルだけの変更で、原因を確定するprobeや別workflowを足していない。現配布元は canonical `ff290b66`／[run37190955405](https://github.com/roccho-dev/envs/actions/runs/37190955405) の全8件成功と同sourceのeffect/placementで、以前の成果物を新sourceへ読み替えない。既存consumerが取得元のidentity・digest・実bytes・`SOURCE`を直接照合し、policyや文書へhashを転記して別gateを作らない。S3 は既存 [project-dev-rent-tunnel.yml](https://github.com/roccho-dev/envs/blob/ff290b66a5cb88373ad7eb401ca568876a69fa29/.github/workflows/project-dev-rent-tunnel.yml) を使う。S4 の PR を docs の保存用に拡張しない。
+S1 の fixture 是正は合成検査の不足を埋める最小変更で、実入力や gate を緩める変更ではない。S1B の [envs #43](https://github.com/roccho-dev/envs/pull/43#issuecomment-5978462562) は既存initの失敗時に閉じた未検証hintを返す2ファイルだけの変更で、原因を確定するprobeや別workflowを足していない。現配布元は canonical `ff290b66`／[run37190955405](https://github.com/roccho-dev/envs/actions/runs/37190955405) の全8件成功と同sourceのeffect/placementで、以前の成果物を新sourceへ読み替えない。S3 は既存 [project-dev-rent-tunnel.yml](https://github.com/roccho-dev/envs/blob/ff290b66a5cb88373ad7eb401ca568876a69fa29/.github/workflows/project-dev-rent-tunnel.yml) を使い、effectだけを取得してidentity・digest・実bytes・`SOURCE`・entryを照合する。placementは同sourceのCI検査・配布受入までで、S3で取得したとは記載しない。実対象の配置は後続consumerの別受入である。policyや文書へhashを転記して別gateを作らず、S4のPRをdocsの保存用に拡張しない。
 
-今回の既存 CI が返した閉じた失敗分類は `RENT_ROOT=RED: envs at init`。固定 source の [rent_root](https://github.com/roccho-dev/envs/blob/42a3bc1d3192f0d5049a8c7b962d00e8eb0c66e4/adapters/jev_api.py#L1050) は `init` が成功してから `apply` へ進むため、この run は適用処理に到達していない。ただし、初期化の根本原因や backend への全作用まで判明したことにはならない。失敗後の bucket 一覧は空だったが、それだけで state/lock を含む作用全体をゼロとは断定しない。
+以前のrun `37179580956`（source `42a3bc1d`）でPが観測した閉じた失敗分類は `RENT_ROOT=RED: envs at init`。その固定sourceの [rent_root](https://github.com/roccho-dev/envs/blob/42a3bc1d3192f0d5049a8c7b962d00e8eb0c66e4/adapters/jev_api.py#L1050) は `init` が成功してから `apply` へ進むため、このrunは適用処理に到達していない。ただし、初期化の根本原因やbackendへの全作用まで判明したことにはならない。失敗後にPが見たbucket一覧は空だったが、それだけでstate/lockを含む作用全体をゼロとは断定しない。
 
 v41はこのUNKNOWNを残し、Pの可視inventoryで衝突が観測されていないことを根拠に、同じ所有bucket/key・宣言rootで標準reconcileを一回選ぶ。native applyはcreate-onlyではない。新しいstate・resource・lock・競合をdispatch前に観測すればPへ戻り、adopt・reset・unlock・cleanupは行わない。Pはpreflightからhandoff PR読戻しまでenvs proposalsへのmergeを止めるが、外部writeがない証明にはしない。S3の一つのworkflowには3ファイルのverify・owner commit・non-force push・PR生成も含め、ローカルの手順を増やさない。S4は実際のCI状態を見て別GOで承認・監視・受入を選び、runが0件の場合だけ既存fallbackを一回使う。承認とfallbackを重ねない。
 
-v41の[run37194605140](https://github.com/roccho-dev/envs/actions/runs/37194605140)は固定`ff290b66`・proposals・attempt1に帰属し、artifact/toolchain通過後、root stepで失敗した。Pはその名指しstepの閉じた2行だけを既存UIで観測した：`RENT_ROOT=RED: envs at init`、`RENT_ROOT_INIT_HINT_UNVERIFIED=status=401 access_denied=false transient=false`。raw child、state/plan、secret値やhashは読んでいない。verifyとhandoffはskippedで、S3の一回は消費済み。401は未検証の文字パターンであり、R2や特定の資格情報への原因帰属、作用ゼロの証拠にはしない。固定P/R/Wは追加コードに進む前に、既存のS3資格情報入力の本人照合で足りるかを反証する。
+v41の[run37194605140](https://github.com/roccho-dev/envs/actions/runs/37194605140)は固定`ff290b66`・proposals・attempt1に帰属し、artifact/toolchain通過後、root stepで失敗した。Pはその名指しstepの閉じた2行だけを既存UIで観測した：`RENT_ROOT=RED: envs at init`、`RENT_ROOT_INIT_HINT_UNVERIFIED=status=401 access_denied=false transient=false`。raw child、state/plan、secret値やhashは読んでいない。verifyとhandoffはskippedで、S3の一回は消費済み。401は未検証の文字パターンであり、R2や特定の資格情報への原因帰属、作用ゼロの証拠にはしない。Pは固定R/Wの最小入力確認案を受入済みで、値を尋ねないUser回答を待つ。v41は設定変更や再実行を許さず、訂正は新しい限定契約で扱う。
 
 Provider の run 失敗や runner 消失では、PR が作られなくても資源・state・lock が残り得る。自動再実行、import、destroy、rollback、資格情報削除、force-unlock を行わず、非秘密の実際の段階・資源を読んで P が回復境界を判断する。
 
@@ -251,14 +251,14 @@ flowchart LR
 | 分類 | 生成・権限・正本／保管 | 登録・配布・配置 | 更新・復旧・終了の責務 | 根拠と未証明 |
 |---|---|---|---|---|
 | Cloudflare API token | User/ownerが対象account・zoneの必要scopeと有限期限で発行 | `dev-rent-tunnel` の `CLOUDFLARE_API_TOKEN`へUserが直接登録。CIのProvider childだけで使用 | ownerが同権限の再発行・Secret更新・旧token失効を担当。値をagentへ渡さない | scope・期限・登録metadataを受入。本番認証、旧tokenの独立失効確認は未証明 |
-| R2 S3 key pair | User/ownerが専用bucket限定Object Read/Writeで発行 | 同Environmentの `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`。native S3 backendのstate/lock用 | ownerが期限更新・必要な再発行と登録を担当。再発行時はpairを揃える。実復旧・終了は別証拠 | bucket/private/入力準備を受入。S3実使用と旧試験の資格情報終了は未証明 |
+| R2 S3 key pair | User/ownerが専用bucket限定Object Read/Writeで発行 | 同Environmentの `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`。native S3 backendのstate/lock用 | ownerが期限更新・必要な再発行と登録を担当。再発行時はpairを揃える。Secret Access Keyは作成後再表示できず、本人の保管組の照合と新規発行を区別する。実復旧・終了は別証拠 | bucket/private/入力準備を受入。S3実使用と旧試験の資格情報終了は未証明 |
 | state passphrase | P2の固定Wが32 random bytesを64 lowercase hexへ変換。G6I3の本人専用 `C:\Users\resta\AppData\Local\envs\identity\rent-state.passphrase` が復旧控え | 同じfile bytesを一回だけ `RENT_STATE_PASSPHRASE`へ登録。OpenTofu state/plan encryptionに使用 | ownerが現keyと復旧控えを保持。本番rootの標準rotation・旧key移行は未定義／未実証で、盲目的な値変更をしない | 単一生成・file読戻し・送信・ACLと登録metadataを受入。本番使用・fileからの復旧は未証明 |
 | rent private age identity | PC7337 target ownerの本人領域 `AppData/Local/envs/identity/rent.agekey`。private identityはそのtargetが保管 | public recipientだけを `RENT_AGE_RECIPIENT`へ登録。rent ciphertextを標準placementで復号 | 新targetは自身のidentityを持つ。recipient更新・再sealの候補経路はあるが、旧identityや旧targetの権限終了とは別 | bootstrap配布元・ACL・public `-y`一致を受入。本番配置・交換後継続・秘密復旧は未証明 |
 | client private age identity | G6I3 target ownerの本人領域 `AppData/Local/envs/identity/client.agekey`。rent identityとは別 | public recipientだけを `RENT_CLIENT_AGE_RECIPIENT`へ登録。client ciphertextを標準placementで復号 | 新clientは自身のidentityを持つ。現定義はclient recipient一つ。複数clientや旧clientの失効を実証したとは扱わない | bootstrap限定受入済み。実Access利用・交換・復旧は未証明 |
 | Tunnel token | Cloudflareが論理rentに発行。Provider outputと暗号化stateが管理し、CIがmemory内でseal | `dev-rent-tunnel.sops.yaml` → rent identity → 標準receiverの固定state slot | Provider-issued credentialの更新・失効はrole ownerの責務。新recipientへ同じoutputを再sealしても旧targetのtokenは失効しない | source/CIのseal・receiverを受入。実発行・配置・continuity・旧新overlap・終了は未証明 |
 | Access service token pair | Cloudflareが論理clientにClient ID/Secretを発行。Service Auth policyはそのtokenだけを許可 | `dev-rent-client.sops.yaml` → client identity → `win.ps1 -Mode RentAccess` → ownerの `%USERPROFILE%\.ssh\windows-rent\access` | ownerが期限・更新・失効を管理。現rootに強制rotationの標準entryはない。新recipientへの再sealだけで旧clientを排除しない | source/CIの暗号配布・owner slotを受入。本番認可／拒否・更新・旧権限終了は未証明 |
 
-Provider stateの現在のbindingは account `3d17cd263c27a0ea241f0a8fc09ac2bb`、bucket `windows-rent-iac`、key `cloudflare/windows-rent.tfstate`。これはサンプルの所有stateであり、hostの置換だけで新しいstate keyを勝手に作らない。暗号化state/lockの実作成はS3の未完了実証である。
+Provider stateの現在のbindingは account `3d17cd263c27a0ea241f0a8fc09ac2bb`、bucket `windows-rent-iac`、key `cloudflare/windows-rent.tfstate`。sourceはdefault jurisdictionの `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` を使い、他jurisdictionへ適用済みとはしない。これはサンプルの所有stateであり、hostの置換だけで新しいstate keyを勝手に作らない。暗号化state/lockの実作成はS3の未完了実証である。[R2公式仕様](https://developers.cloudflare.com/r2/api/tokens/)
 
 この7分類は本番Provider・暗号配布・外部接続の範囲。gh、Codex、Claudeのログイン状態とSSH private状態は#8の型付きruntime state／owner bindingが担当する。Nix package配布だけでログイン・資格情報移行・session継続を完了にせず、実機交換の既存系列で配置・保全・継続・旧所有者の扱いを確認する。
 
@@ -368,13 +368,13 @@ Provider運用にはstateの保管、lock、期限更新、target側のprivate i
 | B2 表示限定 | own、User受入 | 完了 | IME/wheel等は別scope |
 | VM退役・age key保存 | 既存担当、User受入 | 完了 | 再実施しない |
 | own image/復帰 source | own P2固定R/W | source/CI受入済み | 実機採用・再起動・ログオン復帰は別受入 |
-| S1 本番 fixture/source | rent固定R/W、remote P | PR #42／canonical `42a3bc1d`／push CI全8件で完了 | S3の既存consumerで実bytes照合通過 |
+| S1 本番 fixture/source | rent固定R/W、remote P | PR #42／canonical `42a3bc1d`／push CI全8件で完了 | 旧S3のeffect取得・照合は通過。現配布元はS1Bの同source成果物 |
 | S1B init失敗の閉じたhint | rent固定R/W、remote P | PR #43／canonical `ff290b66`／push CI全8件と同source配布物をP/R/W受入済み | hintは原因・認証・実Providerの精度の証明ではない |
 | target age bootstrap | rent固定R/W・own P2固定R/W | 配布元一致・ACL・public recipient一致で完了 | private鍵での本番配置は後続 |
 | state passphrase custody | own P2固定R/W、remote P | owner-only fileと同Environment登録を受入済み | 本番使用・実復旧は未証明 |
 | S2 入力・backend準備 | remote P、User、rent固定R/W | 9公開入力、4 Secret名、branch制約、権限/有限期限、空backendの準備合意が完了 | 認証実使用、旧tokenの独立失効確認は未証明 |
 | v41 本番境界 | remote P・固定rent R/W | ADRS #528通常merge、P/R/Wのcanonical読戻し異論0、実preflight合意、一回のS3発火まで完了 | one-shot消費済み。次の作用は実結果を踏まえた別のP判断。S4は別GO |
-| S3 本番Provider・暗号handoff生成 | rent R、固定W、remote P | [run37194605140](https://github.com/roccho-dev/envs/actions/runs/37194605140)はartifact/toolchain通過後にinit失敗。P観測の閉じたhintは未検証401。verify/handoffはskipped | 本番適用・暗号PR生成は未実証。両失敗runの原因・state/lock・全作用はUNKNOWNを保持。最小の入力確認案を反証中 |
+| S3 本番Provider・暗号handoff生成 | rent R、固定W、remote P | [run37194605140](https://github.com/roccho-dev/envs/actions/runs/37194605140)はartifact/toolchain通過後にinit失敗。P観測の閉じたhintは未検証401。verify/handoffはskipped | 本番適用・暗号PR生成は未実証。両失敗runの原因・state/lock・全作用はUNKNOWN。最小入力確認案はP/R/W合意、Userの値なし回答待ち。訂正は新しい限定契約 |
 | S4 暗号PR受入・配布 | rent固定R/W、remote P | 未完了 | 同head CI、必要owner承認、通常merge、canonical配布 |
 | rent 実機の配置・切替・開発継続 | rent host R、固定W | 未実証 | 標準slot、単一writer、認可/拒否、strict SSH/Codex、継続、復帰 |
 | 旧OCI整理・work側容量支援 | rent側の既存担当、remote P合成 | 未完了 | 移行実証、完全Diff、利用者0、container本体だけの削除とvolume存続 |
