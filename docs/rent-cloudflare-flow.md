@@ -178,7 +178,7 @@ flowchart TB
   end
   go["P の別段階 S3 GO"]
   previous["以前のrun37179580956はinit失敗<br/>原因・state・lockはUNKNOWNのまま"]
-  subgraph s3["S3 未実証：現sourceで標準reconcileを一回"]
+  subgraph s3["S3 run37194605140：init失敗 / hint401は未検証"]
     dispatch["R が固定proposalsへdispatch<br/>帰属するrunを確定してから監視"]
     consume["提供済みtoolchainを直接照合<br/>再build・local installなし"]
     apply["rent-root<br/>暗号化state / lock / Cloudflare資源"]
@@ -206,6 +206,8 @@ S1 の fixture 是正は合成検査の不足を埋める最小変更で、実�
 今回の既存 CI が返した閉じた失敗分類は `RENT_ROOT=RED: envs at init`。固定 source の [rent_root](https://github.com/roccho-dev/envs/blob/42a3bc1d3192f0d5049a8c7b962d00e8eb0c66e4/adapters/jev_api.py#L1050) は `init` が成功してから `apply` へ進むため、この run は適用処理に到達していない。ただし、初期化の根本原因や backend への全作用まで判明したことにはならない。失敗後の bucket 一覧は空だったが、それだけで state/lock を含む作用全体をゼロとは断定しない。
 
 v41はこのUNKNOWNを残し、Pの可視inventoryで衝突が観測されていないことを根拠に、同じ所有bucket/key・宣言rootで標準reconcileを一回選ぶ。native applyはcreate-onlyではない。新しいstate・resource・lock・競合をdispatch前に観測すればPへ戻り、adopt・reset・unlock・cleanupは行わない。Pはpreflightからhandoff PR読戻しまでenvs proposalsへのmergeを止めるが、外部writeがない証明にはしない。S3の一つのworkflowには3ファイルのverify・owner commit・non-force push・PR生成も含め、ローカルの手順を増やさない。S4は実際のCI状態を見て別GOで承認・監視・受入を選び、runが0件の場合だけ既存fallbackを一回使う。承認とfallbackを重ねない。
+
+v41の[run37194605140](https://github.com/roccho-dev/envs/actions/runs/37194605140)は固定`ff290b66`・proposals・attempt1に帰属し、artifact/toolchain通過後、root stepで失敗した。Pはその名指しstepの閉じた2行だけを既存UIで観測した：`RENT_ROOT=RED: envs at init`、`RENT_ROOT_INIT_HINT_UNVERIFIED=status=401 access_denied=false transient=false`。raw child、state/plan、secret値やhashは読んでいない。verifyとhandoffはskippedで、S3の一回は消費済み。401は未検証の文字パターンであり、R2や特定の資格情報への原因帰属、作用ゼロの証拠にはしない。固定P/R/Wは追加コードに進む前に、既存のS3資格情報入力の本人照合で足りるかを反証する。
 
 Provider の run 失敗や runner 消失では、PR が作られなくても資源・state・lock が残り得る。自動再実行、import、destroy、rollback、資格情報削除、force-unlock を行わず、非秘密の実際の段階・資源を読んで P が回復境界を判断する。
 
@@ -371,8 +373,8 @@ Provider運用にはstateの保管、lock、期限更新、target側のprivate i
 | target age bootstrap | rent固定R/W・own P2固定R/W | 配布元一致・ACL・public recipient一致で完了 | private鍵での本番配置は後続 |
 | state passphrase custody | own P2固定R/W、remote P | owner-only fileと同Environment登録を受入済み | 本番使用・実復旧は未証明 |
 | S2 入力・backend準備 | remote P、User、rent固定R/W | 9公開入力、4 Secret名、branch制約、権限/有限期限、空backendの準備合意が完了 | 認証実使用、旧tokenの独立失効確認は未証明 |
-| v41 本番境界 | remote P・固定rent R/W | ADRS #528通常merge、P/R/Wのcanonical読戻し異論0、同版S3 GO済み | 固定R/Wの実preflightと一回の本番実行。S4は別GO |
-| S3 本番Provider・暗号handoff生成 | rent R、固定W、remote P | 以前の[run37179580956](https://github.com/roccho-dev/envs/actions/runs/37179580956)はartifact/toolchain通過後にinit失敗。v41の新しい実行は未実施 | 同じ所有rootへの一回の標準reconcile・暗号PR生成は未実証。以前の原因・state/lock・全作用はUNKNOWNを保持 |
+| v41 本番境界 | remote P・固定rent R/W | ADRS #528通常merge、P/R/Wのcanonical読戻し異論0、実preflight合意、一回のS3発火まで完了 | one-shot消費済み。次の作用は実結果を踏まえた別のP判断。S4は別GO |
+| S3 本番Provider・暗号handoff生成 | rent R、固定W、remote P | [run37194605140](https://github.com/roccho-dev/envs/actions/runs/37194605140)はartifact/toolchain通過後にinit失敗。P観測の閉じたhintは未検証401。verify/handoffはskipped | 本番適用・暗号PR生成は未実証。両失敗runの原因・state/lock・全作用はUNKNOWNを保持。最小の入力確認案を反証中 |
 | S4 暗号PR受入・配布 | rent固定R/W、remote P | 未完了 | 同head CI、必要owner承認、通常merge、canonical配布 |
 | rent 実機の配置・切替・開発継続 | rent host R、固定W | 未実証 | 標準slot、単一writer、認可/拒否、strict SSH/Codex、継続、復帰 |
 | 旧OCI整理・work側容量支援 | rent側の既存担当、remote P合成 | 未完了 | 移行実証、完全Diff、利用者0、container本体だけの削除とvolume存続 |
