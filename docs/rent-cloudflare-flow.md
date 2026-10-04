@@ -154,7 +154,7 @@ flowchart TB
     inventory --> s2ready
   end
   go["P の別段階 S3 GO"]
-  subgraph s3["S3 run37179580956：artifact通過 / rent-root失敗"]
+  subgraph s3["S3 run37179580956：artifact通過 / init失敗・apply未到達"]
     dispatch["R が current proposals へdispatch<br/>帰属するrunを確定してから監視"]
     consume["提供済みtoolchainを直接照合<br/>再build・local installなし"]
     apply["rent-root<br/>暗号化state / lock / Cloudflare資源"]
@@ -177,6 +177,8 @@ flowchart TB
 ```
 
 S1 の fixture 是正は合成検査の不足を埋める最小変更で、実入力や gate を緩める変更ではない。S3 は既存 [project-dev-rent-tunnel.yml](https://github.com/roccho-dev/envs/blob/42a3bc1d3192f0d5049a8c7b962d00e8eb0c66e4/.github/workflows/project-dev-rent-tunnel.yml) を使う。S4 の PR を docs の保存用に拡張しない。
+
+今回の既存 CI が返した閉じた失敗分類は `RENT_ROOT=RED: envs at init`。固定 source の [rent_root](https://github.com/roccho-dev/envs/blob/42a3bc1d3192f0d5049a8c7b962d00e8eb0c66e4/adapters/jev_api.py#L1050) は `init` が成功してから `apply` へ進むため、この run は適用処理に到達していない。ただし、初期化の根本原因や backend への全作用まで判明したことにはならない。失敗後の bucket 一覧は空だったが、それだけで state/lock を含む作用全体をゼロとは断定しない。
 
 Provider の run 失敗や runner 消失では、PR が作られなくても資源・state・lock が残り得る。自動再実行、import、destroy、rollback、資格情報削除、force-unlock を行わず、非秘密の実際の段階・資源を読んで P が回復境界を判断する。
 
@@ -330,7 +332,7 @@ Provider運用にはstateの保管、lock、期限更新、target側のprivate i
 | target age bootstrap | rent固定R/W・own P2固定R/W | 配布元一致・ACL・public recipient一致で完了 | private鍵での本番配置は後続 |
 | state passphrase custody | own P2固定R/W、remote P | owner-only fileと同Environment登録を受入済み | 本番使用・実復旧は未証明 |
 | S2 入力・backend準備 | remote P、User、rent固定R/W | 9公開入力、4 Secret名、branch制約、権限/有限期限、空backendの準備合意が完了 | 認証実使用、旧tokenの独立失効確認は未証明 |
-| S3 本番Provider・暗号handoff生成 | rent R、固定W、remote P | [run37179580956](https://github.com/roccho-dev/envs/actions/runs/37179580956)を一回実行。artifact照合・toolchain通過後、rent-rootで失敗。暗号PR作成はskipped | 閉じたkind/stageと最小是正の特定。state/lock・資源への作用はUNKNOWN。再実行・削除・unlockは未実行 |
+| S3 本番Provider・暗号handoff生成 | rent R、固定W、remote P | [run37179580956](https://github.com/roccho-dev/envs/actions/runs/37179580956)を一回実行。artifact照合・toolchain通過後、閉じた分類 `envs at init` で失敗。apply未到達、暗号PR作成はskipped | 初期化の原因と最小是正の独立確認。state/lock・資源への全作用はUNKNOWN。再実行・削除・unlockは未実行 |
 | S4 暗号PR受入・配布 | rent固定R/W、remote P | 未完了 | 同head CI、必要owner承認、通常merge、canonical配布 |
 | rent 実機の配置・切替・開発継続 | rent host R、固定W | 未実証 | 標準slot、単一writer、認可/拒否、strict SSH/Codex、継続、復帰 |
 | 旧OCI整理・work側容量支援 | rent側の既存担当、remote P合成 | 未完了 | 移行実証、完全Diff、利用者0、container本体だけの削除とvolume存続 |
