@@ -102,15 +102,18 @@ let
       p=$pr root=/work/repos/.auth/$pr/gh
       [ -d "$root" ] && [ ! -L "$root" ] || return 1
       for k in config.yml hosts.yml; do [ -f "$root/$k" ] && [ ! -L "$root/$k" ] || return 1; done
-      # gh 2.96.0 reads the top-level version as a string and migrates, rewriting the slot, unless it is "1". Only the
-      # two lines native gh is shown to write are accepted, as the one top-level version key: version: 1 (its default
-      # template) and version: "1" (its own write after a migration). Any other or repeated plain version key (any
-      # whitespace before the colon) is refused, and so is every other root-level line that is not blank, a comment,
-      # indented (nested) or a plain key: quoted or escaped keys, document markers, directives, flow collections,
-      # anchors, aliases, tags, complex and merge keys. A refused slot is never read by gh (the wrapper still runs gh
-      # unselected). This is a bounded check of native gh's own output, not a YAML parser.
+      # gh 2.96.0 reads the top-level version as a string and skips its migration only when it is "1"; with no version it
+      # migrates, rewriting the slot, and with another (such as 0) it refuses to start. Only the two lines native gh is
+      # shown to write are accepted, as the one top-level version key: version: 1 (its default template) and
+      # version: "1" (its own write after a migration). Native files break lines with LF only, so a carriage return
+      # anywhere is refused first. Any other or repeated plain version key (any whitespace before the colon) is refused,
+      # and so is every other root-level line that is not blank, a comment, indented (nested) or a plain key: quoted or
+      # escaped keys, document markers, directives, flow collections, anchors, aliases, tags, complex and merge keys. A
+      # refused slot is never read by gh (the wrapper still runs gh unselected). This is a bounded check of native
+      # gh's own output, not a YAML parser.
       while IFS= read -r l || [ -n "$l" ]; do
         case $l in
+          *$'\r'*) return 1 ;;
           'version: 1'|'version: "1"') n=$((n + 1)) ;;
           version|version[[:space:]:]*) return 1 ;;
           ""|'#'*|[[:space:]]*|[[:alnum:]_]*) ;;

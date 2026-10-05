@@ -739,9 +739,9 @@ jobs:
             chown -R 1000:1000 /work/repos/.auth/ci-wrong /work/repos/.auth/ci-noactive /work/repos/.auth/ci-keyring /work/repos/.auth/ci-old
             # Version-format slots, one declared principal each: the default-template plain form with nested lines, the
             # slot the pinned native gh writes itself (single-account hosts and no config, which gh migrates), and refused
-            # forms: another value, repeated or conflicting keys (a tab before the colon, an escaped quoted key), other
-            # spellings, and root-level YAML structure.
-            for x in plain v0 dup conflict tab esc squote space comment qkey doc merge flow tag native; do
+            # forms: another value, repeated or conflicting keys (a tab before the colon, an escaped quoted key before the
+            # plain one, a version hidden after a carriage return in a comment), other spellings and root-level structure.
+            for x in plain v0 dup conflict tab esc cr squote space comment qkey doc merge flow tag native; do
               install -d -m 700 -o 1000 -g 1000 /work/repos/.auth/ci-$x
               hosts /work/repos/.auth/ci-$x/gh ci-$x-token ci-$x
             done
@@ -751,7 +751,10 @@ jobs:
             vc dup "version: 1\nversion: 1\n"
             vc conflict "version: 1\n\"version\": 0\n"
             vc tab "version: 1\nversion\t: 0\n"
-            vc esc "version: 1\n\"\\\\u0076ersion\": 0\n"
+            # The escaped key stays literal in the file: its first line is 16 bytes, not the 13 of a decoded "version".
+            vc esc "\"\\\\x76ersion\": 0\nversion: 1\n"
+            test "$(head -n 1 /work/repos/.auth/ci-esc/gh/config.yml | wc -c)" = 16
+            vc cr "# c\rversion: 0\nversion: 1\n"
             vc squote "version: \x271\x27\n"
             vc space "version : 1\n"
             vc comment "version: 1 # c\n"
@@ -793,7 +796,7 @@ jobs:
             pbind bound https://github.com/roccho-dev/windows roccho-dev
             pbind mieru https://github.com/hc-consul-pj/mierundesu-generate-report mti-takasawa
             for x in wrong noactive keyring old; do pbind "$x" https://github.com/roccho-dev/windows "ci-$x"; done
-            for x in plain v0 dup conflict tab esc squote space comment qkey doc merge flow tag native; do
+            for x in plain v0 dup conflict tab esc cr squote space comment qkey doc merge flow tag native; do
               git init -q "f-$x"; pbind "f-$x" https://github.com/roccho-dev/windows "ci-$x"
             done
             git -C unbound config remote.origin.url https://github.com/roccho-dev/windows
@@ -843,10 +846,14 @@ jobs:
             # Any other or repeated top-level version key, and root-level structure, is refused with no slot-backed gh answer
             # or config read (an unselected wrapper still runs gh without a slot). Native gh reads four of these as version
             # 1 itself (shown directly), so their refusal is the guard alone.
-            for x in v0 dup conflict tab esc squote space comment qkey doc merge flow tag; do nofill "f-$x" roccho-dev/windows; done
+            for x in v0 dup conflict tab esc cr squote space comment qkey doc merge flow tag; do nofill "f-$x" roccho-dev/windows; done
             for x in squote space comment qkey; do
               test "$(GH_CONFIG_DIR=/work/repos/.auth/ci-$x/gh DBUS_SESSION_BUS_ADDRESS=unix:path=/proc/gh-unselected "$gh_real" config get version)" = 1
             done
+            # What native gh itself makes of the escaped key before the plain version is observed, not assumed: its exit and
+            # the version it reports or refuses are recorded, and the slot snapshot below shows it wrote nothing.
+            e=$(GH_CONFIG_DIR=/work/repos/.auth/ci-esc/gh DBUS_SESSION_BUS_ADDRESS=unix:path=/proc/gh-unselected "$gh_real" config get version 2>&1) && r=0 || r=$?
+            echo "native gh on the escaped key: exit $r; $(printf "%s\n" "$e" | grep -oE "(config version \"[^\"]*\"|^[0-9]+$)" | head -n 1)"
             # Repeating each production bind is a no-op.
             for x in "bound https://github.com/roccho-dev/windows roccho-dev" \
               "mieru https://github.com/hc-consul-pj/mierundesu-generate-report mti-takasawa"; do
