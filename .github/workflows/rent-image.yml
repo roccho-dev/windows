@@ -739,8 +739,9 @@ jobs:
             chown -R 1000:1000 /work/repos/.auth/ci-wrong /work/repos/.auth/ci-noactive /work/repos/.auth/ci-keyring /work/repos/.auth/ci-old
             # Version-format slots, one declared principal each: the default-template plain form with nested lines, the
             # slot the pinned native gh writes itself (single-account hosts and no config, which gh migrates), and refused
-            # forms: another value, repeated or conflicting keys, other spellings, and root-level YAML structure.
-            for x in plain v0 dup conflict squote space comment qkey doc merge flow tag native; do
+            # forms: another value, repeated or conflicting keys (a tab before the colon, an escaped quoted key), other
+            # spellings, and root-level YAML structure.
+            for x in plain v0 dup conflict tab esc squote space comment qkey doc merge flow tag native; do
               install -d -m 700 -o 1000 -g 1000 /work/repos/.auth/ci-$x
               hosts /work/repos/.auth/ci-$x/gh ci-$x-token ci-$x
             done
@@ -749,6 +750,8 @@ jobs:
             vc v0 "version: 0\n"
             vc dup "version: 1\nversion: 1\n"
             vc conflict "version: 1\n\"version\": 0\n"
+            vc tab "version: 1\nversion\t: 0\n"
+            vc esc "version: 1\n\"\\\\u0076ersion\": 0\n"
             vc squote "version: \x271\x27\n"
             vc space "version : 1\n"
             vc comment "version: 1 # c\n"
@@ -790,7 +793,7 @@ jobs:
             pbind bound https://github.com/roccho-dev/windows roccho-dev
             pbind mieru https://github.com/hc-consul-pj/mierundesu-generate-report mti-takasawa
             for x in wrong noactive keyring old; do pbind "$x" https://github.com/roccho-dev/windows "ci-$x"; done
-            for x in plain v0 dup conflict squote space comment qkey doc merge flow tag native; do
+            for x in plain v0 dup conflict tab esc squote space comment qkey doc merge flow tag native; do
               git init -q "f-$x"; pbind "f-$x" https://github.com/roccho-dev/windows "ci-$x"
             done
             git -C unbound config remote.origin.url https://github.com/roccho-dev/windows
@@ -813,8 +816,9 @@ jobs:
             test -x "$gh_real"
             nat=/work/repos/.auth/ci-native/gh
             GH_CONFIG_DIR=$nat DBUS_SESSION_BUS_ADDRESS=unix:path=/proc/gh-unselected "$gh_real" config get git_protocol > /dev/null 2>&1 || true
+            v=$(grep -xE "version: (1|\"1\")" "$nat/config.yml")
             test "$(grep -c "^version" "$nat/config.yml")" = 1
-            echo "native gh wrote: $(grep -xE "version: (1|\"1\")" "$nat/config.yml")"
+            echo "native gh wrote: $v"
             # Every slot (paths, types, owners, modes, sizes, times and contents) is unchanged by all of the reads below.
             snap() { find "$HOME/.config" "$HOME/xdg" /work/repos/.auth -printf "%p %y %U %G %m %s %T@\n" | LC_ALL=C sort
               find "$HOME/.config" "$HOME/xdg" /work/repos/.auth -type f -exec sha256sum {} + | LC_ALL=C sort; }
@@ -836,9 +840,10 @@ jobs:
             test "$(fill f-native roccho-dev/windows)" = ci-native-token
             test "$(fill f-plain roccho-dev/windows)" = ci-plain-token
             test "$(GH_CONFIG_DIR=/work/repos/.auth/ci-plain/gh DBUS_SESSION_BUS_ADDRESS=unix:path=/proc/gh-unselected "$gh_real" config get version)" = 1
-            # Any other or repeated top-level version key, and root-level structure, is refused before gh runs. Native gh
-            # reads four of these as version 1 itself (shown directly), so their refusal is the guard alone.
-            for x in v0 dup conflict squote space comment qkey doc merge flow tag; do nofill "f-$x" roccho-dev/windows; done
+            # Any other or repeated top-level version key, and root-level structure, is refused with no slot-backed gh answer
+            # or config read (an unselected wrapper still runs gh without a slot). Native gh reads four of these as version
+            # 1 itself (shown directly), so their refusal is the guard alone.
+            for x in v0 dup conflict tab esc squote space comment qkey doc merge flow tag; do nofill "f-$x" roccho-dev/windows; done
             for x in squote space comment qkey; do
               test "$(GH_CONFIG_DIR=/work/repos/.auth/ci-$x/gh DBUS_SESSION_BUS_ADDRESS=unix:path=/proc/gh-unselected "$gh_real" config get version)" = 1
             done
