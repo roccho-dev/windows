@@ -38,8 +38,8 @@ jobs:
           printf 'source %s\ndrvPath %s\nworkflow blob %s\n' "$sha" "$drv" "$(git rev-parse HEAD:.github/workflows/own-image.yml)" >> "$GITHUB_STEP_SUMMARY"
       - name: Evaluate flake checks
         run: nix flake check --no-write-lock-file --print-build-logs
-      # The same production gh outputs for another declared credential owner, without an image, on this disposable
-      # runner: its bind and routing reach only that owner's root (synthetic token), and it refuses another owner's URL.
+      # The same production gh outputs under another target's helper name, without an image, on this disposable runner:
+      # bind and routing reach only the declared principal's slot (synthetic token), whatever the repository namespace.
       - name: Alternate credential owner through the production gh outputs (CI only, synthetic token)
         run: |
           set -euo pipefail
@@ -54,24 +54,30 @@ jobs:
           sudo install -d -m 700 -o "$(id -u)" -g "$(id -g)" /work/repos/.auth/alt-owner
           root=/work/repos/.auth/alt-owner/gh
           install -d -m 700 "$root"
-          printf 'github.com:\n    users:\n        ci:\n            oauth_token: ci-alt-token\n    git_protocol: https\n    user: ci\n    oauth_token: ci-alt-token\n' > "$root/hosts.yml"
-          chmod 600 "$root/hosts.yml"
+          printf 'github.com:\n    users:\n        alt-owner:\n            oauth_token: ci-alt-token\n    git_protocol: https\n    user: alt-owner\n    oauth_token: ci-alt-token\n' > "$root/hosts.yml"
+          printf 'version: "1"\n' > "$root/config.yml"
+          chmod 600 "$root/hosts.yml" "$root/config.yml"
           r=$(mktemp -d)
           git init -q "$r/a"
           git -C "$r/a" config remote.origin.url "$u"
-          test "$("$h" bind "$r/a" "$u")" = "bind result=ok reason=- repo=$r/a url=$u prior=AAAAAPA writes=6 restored=0 retained=0"
+          test "$("$h" bind "$r/a" "$u" alt-owner)" = "bind result=ok reason=- repo=$r/a url=$u prior=AAAAAAAPA writes=8 restored=0 retained=0"
           fill() { printf 'protocol=https\nhost=github.com\npath=%s\n\n' "$2" | (cd "$1" && git credential fill 2>/dev/null) | sed -n 's/^password=//p'; }
           test "$(fill "$r/a" alt-owner/windows)" = ci-alt-token
           test "$(cd "$r/a" && "$p/bin/gh" auth token)" = ci-alt-token
-          # Not this owner's URL: refused with nothing written; the helper answers no other owner's path; no token outside.
+          # The namespace is not the principal: a roccho-dev repository declared for alt-owner reaches alt-owner's slot.
           git init -q "$r/b"
           git -C "$r/b" config remote.origin.url https://github.com/roccho-dev/windows
-          rc=0; "$h" bind "$r/b" https://github.com/roccho-dev/windows > /dev/null || rc=$?
-          test "$rc" = 2
-          test "$({ git -C "$r/b" config --local --get-all credential.helper || true; } | wc -l)" = 0
-          test -z "$(printf 'protocol=https\nhost=github.com\npath=roccho-dev/windows\n\n' | "$h" get)"
+          test "$("$h" bind "$r/b" https://github.com/roccho-dev/windows alt-owner)" = "bind result=ok reason=- repo=$r/b url=https://github.com/roccho-dev/windows prior=AAAAAAAPA writes=8 restored=0 retained=0"
+          test "$(fill "$r/b" roccho-dev/windows)" = ci-alt-token
+          # A principal without a slot gets nothing; no token outside a bound clone.
+          git init -q "$r/c"
+          git -C "$r/c" config remote.origin.url https://github.com/roccho-dev/windows
+          case $("$h" bind "$r/c" https://github.com/roccho-dev/windows roccho-dev) in "bind result=ok "*) ;; *) exit 1 ;; esac
+          test -z "$(fill "$r/c" roccho-dev/windows)"
+          if (cd "$r/c" && "$p/bin/gh" auth token) > /dev/null 2>&1; then echo 'gh returned a token for a principal without a slot' >&2; exit 1; fi
+          test -z "$(printf 'protocol=https\nhost=github.com\npath=roccho-dev/windows\nusername=alt-owner\n\n' | "$h" get)"
           if (cd "$r" && "$p/bin/gh" auth token) > /dev/null 2>&1; then echo 'alt-owner gh outside a bound clone returned a token' >&2; exit 1; fi
-          echo 'PASS alternate credential owner: production bind and routing reach only alt-owner; another owner is refused' | tee -a "$GITHUB_STEP_SUMMARY"
+          echo 'PASS alternate helper name: production bind and routing reach only the declared principal, whatever the namespace' | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Plan and fake-WSLC Replace of the own Windows script (no WSLC, no live effect)
         shell: pwsh
         run: |
@@ -330,15 +336,17 @@ jobs:
           # fixture. The owner clone is bound by the production bind; the other clones are hostile raw edits.
           owner_proof() {
             docker exec own-smoke /bin/bash -euc '
+              # hosts DIR TOKEN [USER]: one synthetic account in a current-format gh file store.
               hosts() {
                 install -d -m 700 -o 1000 -g 1000 "$1"
-                printf "github.com:\n    users:\n        ci:\n            oauth_token: %s\n    git_protocol: https\n    user: ci\n    oauth_token: %s\n" "$2" "$2" > "$1/hosts.yml"
-                chown 1000:1000 "$1/hosts.yml"; chmod 600 "$1/hosts.yml"
+                printf "github.com:\n    users:\n        %s:\n            oauth_token: %s\n    git_protocol: https\n    user: %s\n    oauth_token: %s\n" "${3:-ci}" "$2" "${3:-ci}" "$2" > "$1/hosts.yml"
+                printf "version: \"1\"\n" > "$1/config.yml"
+                chown 1000:1000 "$1/hosts.yml" "$1/config.yml"; chmod 600 "$1/hosts.yml" "$1/config.yml"
               }
               helper() { printf "[credential]\n\thelper = \"!echo username=ci; echo password=%s #\"\n" "$2" > "$1"; }
               install -d -m 755 /work/repos/.auth
               install -d -m 700 -o 1000 -g 1000 /work/repos/.auth/roccho-dev
-              hosts /work/repos/.auth/roccho-dev/gh ci-owner-token
+              hosts /work/repos/.auth/roccho-dev/gh ci-owner-token roccho-dev
               install -d -m 755 -o 1000 -g 1000 /home/dev/xdg /home/dev/.config/git
               hosts /home/dev/.config/gh ci-home-token
               hosts /home/dev/xdg/gh ci-xdg-token
@@ -366,7 +374,7 @@ jobs:
             git -C "$1" config http.followRedirects false
           }
           git -C bound config remote.origin.url https://github.com/roccho-dev/windows
-          case $("$h" bind "$r/bound" https://github.com/roccho-dev/windows) in "bind result=ok "*) ;; *) exit 1 ;; esac
+          case $("$h" bind "$r/bound" https://github.com/roccho-dev/windows roccho-dev) in "bind result=ok "*) ;; *) exit 1 ;; esac
           git -C unbound config remote.origin.url https://github.com/roccho-dev/windows
           bind other https://github.com/other/windows https://github.com/other/windows
           # The owner's origin with the owner helper bound to another URL.
@@ -421,8 +429,9 @@ jobs:
               fail 'owner Git/gh through the image-default docker exec'
           }
           # The production bind of the own profile helper, over the strict SSH route as dev, on synthetic clones only:
-          # the observed form binds all seven settings and a repeat is a no-op; a wrong invocation, an unowned clone,
-          # every conflicting, repeated or unexpected local setting and a worktree config are refused with nothing
+          # the observed form binds all nine settings and a repeat is a no-op; a clone bound by the earlier seven
+          # settings gains only the two usernames; a wrong invocation, an unowned clone, every conflicting (another
+          # principal included), repeated or unexpected local setting and a worktree config are refused with nothing
           # written; a write failure part way (a file-size limit) restores this invocation's write and nothing else.
           bind_proof() {
             docker exec own-smoke /bin/bash -euc 'install -d -m 700 -o 1000 -g 1000 /work/repos/bind-proof
@@ -441,42 +450,58 @@ jobs:
               { echo "bind $*: exit $rc, not $want: $out" >&2; exit 1; }
             printf '%s\n' "$out"
           }
+          a=roccho-dev
           fresh() { git init -q "$r/$1"; git -C "$r/$1" config remote.origin.url "$2"; }
           cfg() { git -C "$r/$1" config --local --list; }
-          seven() {
+          nine() {
             local k v
-            for k in "credential.helper=" "credential.$u.helper=$h" "credential.$u.git.helper=$h" credential.useHttpPath=true \
-              http.followRedirects=false "remote.origin.url=$u" "remote.origin.pushurl=$u"; do
+            for k in "credential.helper=" "credential.$u.helper=$h" "credential.$u.git.helper=$h" "credential.$u.username=$a" \
+              "credential.$u.git.username=$a" credential.useHttpPath=true http.followRedirects=false "remote.origin.url=$u" \
+              "remote.origin.pushurl=$u"; do
               v=${k#*=}; k=${k%%=*}
               [ "$(git -C "$r/$1" config --local --get-all "$k" | wc -l)" = 1 ] && [ "$(git -C "$r/$1" config --local --get "$k")" = "$v" ] ||
                 { echo "$1: $k is not bound" >&2; exit 1; }
             done
           }
           fresh p "$u.git"
-          [ "$(expect 0 ok - "$h" bind "$r/p" "$u")" = "bind result=ok reason=- repo=$r/p url=$u prior=AAAAAGA writes=7 restored=0 retained=0" ]
-          seven p
+          [ "$(expect 0 ok - "$h" bind "$r/p" "$u" "$a")" = "bind result=ok reason=- repo=$r/p url=$u prior=AAAAAAAGA writes=9 restored=0 retained=0" ]
+          nine p
           before=$(cfg p)
-          [ "$(expect 0 ok - "$h" bind "$r/p" "$u")" = "bind result=ok reason=- repo=$r/p url=$u prior=PPPPPPP writes=0 restored=0 retained=0" ]
+          [ "$(expect 0 ok - "$h" bind "$r/p" "$u" "$a")" = "bind result=ok reason=- repo=$r/p url=$u prior=PPPPPPPPP writes=0 restored=0 retained=0" ]
           [ "$(cfg p)" = "$before" ]
-          # Wrong invocations, including an action Git appends to a helper value carrying bind, and a store-path helper.
-          expect 2 usage argc "$h" bind "$r/p" > /dev/null
-          expect 2 usage argc "$h" bind "$r/p" "$u" get > /dev/null
-          expect 2 usage url "$h" bind "$r/p" https://github.com/other/windows > /dev/null
-          expect 2 usage url "$h" bind "$r/p" "$u.git" > /dev/null
-          expect 2 usage repo "$h" bind relative "$u" > /dev/null
-          expect 2 usage helper "$(readlink -f "$h")" bind "$r/p" "$u" > /dev/null
+          # The earlier seven settings, exactly: only the two usernames are added, and the same bind then repeats as a no-op.
+          fresh old "$u"
+          for k in "credential.helper=" "credential.$u.helper=$h" "credential.$u.git.helper=$h" credential.useHttpPath=true \
+            http.followRedirects=false "remote.origin.pushurl=$u"; do git -C "$r/old" config "${k%%=*}" "${k#*=}"; done
+          [ "$(expect 0 ok - "$h" bind "$r/old" "$u" "$a")" = "bind result=ok reason=- repo=$r/old url=$u prior=PPPAAPPPP writes=2 restored=0 retained=0" ]
+          nine old
+          [[ $(expect 0 ok - "$h" bind "$r/old" "$u" "$a") == *" prior=PPPPPPPPP writes=0 "* ]]
+          # Wrong invocations, including an action Git appends to a helper value carrying bind, the earlier three-argument
+          # form, invalid URLs and principals, and a store-path helper.
+          expect 2 usage argc "$h" bind "$r/p" "$u" > /dev/null
+          expect 2 usage argc "$h" bind "$r/p" "$u" "$a" get > /dev/null
+          expect 2 usage url "$h" bind "$r/p" https://github.com/other "$a" > /dev/null
+          expect 2 usage url "$h" bind "$r/p" "$u.git" "$a" > /dev/null
+          expect 2 usage url "$h" bind "$r/p" http://github.com/roccho-dev/windows "$a" > /dev/null
+          expect 2 usage principal "$h" bind "$r/p" "$u" x-access-token > /dev/null
+          expect 2 usage principal "$h" bind "$r/p" "$u" -bad > /dev/null
+          expect 2 usage principal "$h" bind "$r/p" "$u" "" > /dev/null
+          expect 2 usage repo "$h" bind relative "$u" "$a" > /dev/null
+          expect 2 usage helper "$(readlink -f "$h")" bind "$r/p" "$u" "$a" > /dev/null
           [ "$(cfg p)" = "$before" ]
           # Another user's clone: Git itself refuses it, and nothing is written.
-          expect 6 refused repo "$h" bind "$r/rootowned" "$u" > /dev/null
+          expect 6 refused repo "$h" bind "$r/rootowned" "$u" "$a" > /dev/null
           # conflict NAME REASON [git config ARGS]: one change to a fresh owner clone; refused and unchanged.
           conflict() {
             local n=$1 why=$2 b; shift 2
             fresh "$n" "$u"
             [ "$#" = 0 ] || git -C "$r/$n" config "$@"
             b=$(cfg "$n")
-            expect 6 refused "$why" "$h" bind "$r/$n" "$u" > /dev/null
+            expect 6 refused "$why" "$h" bind "$r/$n" "$u" "$a" > /dev/null
             [ "$(cfg "$n")" = "$b" ] || { echo "$n changed" >&2; exit 1; }
           }
+          conflict principal conflict "credential.$u.username" mti-takasawa
+          conflict principal-git conflict "credential.$u.git.username" mti-takasawa
           conflict no-origin conflict --unset remote.origin.url
           conflict foreign-origin conflict remote.origin.url https://github.com/other/windows
           conflict two-origins conflict --add remote.origin.url "$u"
@@ -496,8 +521,8 @@ jobs:
           git -C "$r/limit" config proof.pad "$(head -c $((1989 - s)) /dev/zero | tr '\0' x)"
           [ "$(stat -c %s "$r/limit/.git/config")" = 1988 ]
           before=$(cfg limit)
-          out=$( (trap '' XFSZ; ulimit -f 2; expect 7 restored write "$h" bind "$r/limit" "$u") )
-          [ "$out" = "bind result=restored reason=write repo=$r/limit url=$u prior=AAAAAGA writes=1 restored=1 retained=0" ]
+          out=$( (trap '' XFSZ; ulimit -f 2; expect 7 restored write "$h" bind "$r/limit" "$u" "$a") )
+          [ "$out" = "bind result=restored reason=write repo=$r/limit url=$u prior=AAAAAAAGA writes=1 restored=1 retained=0" ]
           [ "$(cfg limit)" = "$before" ]
           echo "own bind ok"
           EOF
@@ -591,7 +616,7 @@ jobs:
           echo 'PASS own seed, lock, gate, restart and recreation with SSH/Nix/CDP and no Xpra' | tee -a "$GITHUB_STEP_SUMMARY"
           bind_proof
           owner_proof
-          echo 'PASS own production bind: seven settings, repeat no-op, invocation/owner/conflict/unexpected/worktree refusals, same-invocation restore; owner Git/gh only in the bound clone over SSH (dev) and default exec (root)' | tee -a "$GITHUB_STEP_SUMMARY"
+          echo 'PASS own production bind: nine settings with the declared principal, seven-setting upgrade, repeat no-op, invocation/principal/owner/conflict/unexpected/worktree refusals, same-invocation restore; declared principal Git/gh only in the bound clone over SSH (dev) and default exec (root)' | tee -a "$GITHUB_STEP_SUMMARY"
 
           # Legacy migration: the legacy home-only image -> the bound image -> back -> forward again on one synthetic
           # home, in the order hosts/own/win.ps1 Replace and its recorded rollback argv use. It runs only when this change

@@ -36,7 +36,7 @@ function Assert-Match([string] $Name, $Value, [string] $Pattern) {
 }
 
 $Spec = Read-Exact (Join-Path $PSScriptRoot 'spec.json') @(
-    'role', 'image', 'labelKey', 'nixMount', 'workMount', 'repoPath', 'cloneUrl')
+    'role', 'image', 'labelKey', 'nixMount', 'workMount', 'repoPath', 'cloneUrl', 'githubPrincipal')
 $Site = Read-Exact $Binding @(
     'role', 'site', 'expectHost', 'nixVolume', 'workVolume', 'baseSha', 'gitNixpkgs', 'toolsRev')
 
@@ -47,8 +47,10 @@ Assert-Match 'labelKey' $Spec.labelKey '^[a-z0-9.-]+/[a-z0-9-]+$'
 Assert-Match 'nixMount' $Spec.nixMount '^/nix$'
 Assert-Match 'workMount' $Spec.workMount '^/[a-z0-9/_-]+$'
 Assert-Match 'repoPath' $Spec.repoPath ('^' + [regex]::Escape($Spec.workMount) + '/[a-z0-9_-]+$')
-# cloneUrl is the exact canonical https://github.com/<owner>/<repo> (no .git, no trailing slash); Tools derives the owner from it.
+# cloneUrl is the exact canonical https://github.com/<namespace>/<repo> (no .git, no trailing slash); its namespace only
+# names the profile's stable helper. githubPrincipal is the declared GitHub account Tools binds, never derived from it.
 Assert-Match 'cloneUrl' $Spec.cloneUrl '^https://github\.com/[A-Za-z0-9-]+/(?!.*\.git$)[A-Za-z0-9._-]+$'
+Assert-Match 'githubPrincipal' $Spec.githubPrincipal '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$'
 foreach ($Name in 'nixVolume', 'workVolume') { Assert-Match $Name $Site.$Name '^[a-z0-9][a-z0-9-]+$' }
 if ($Site.nixVolume -ceq $Site.workVolume) { throw 'nixVolume and workVolume must differ.' }
 foreach ($Name in 'baseSha', 'gitNixpkgs', 'toolsRev') { Assert-Match $Name $Site.$Name '^[a-f0-9]{40}$' }
@@ -74,21 +76,23 @@ $Verify = 'read v < /nix/var/windows-seed-image && echo $v && test $v = $1 && ni
 $Clone = $Seeded + 'p=$1 u=$2 r=$3 b=$4; ' + $Git +
     'test ! -e $r || exit 3; g clone $u $r && g -C $r checkout --detach $b && test $(g -C $r rev-parse HEAD) = $b && g -C $r remote get-url origin'
 # Tools builds the flake's dev-profile at the committed toolsRev into $DevProfile, which is also its GC root,
-# then creates the owner credential root (mode 0700) and binds only the Spec clone (repoPath, cloneUrl), never
-# a PREPARE support clone, through the profile helper's own bind (hosts/profile/gh.nix): helper reset, <repo> and
-# <repo>.git keys naming the profile's owner helper, useHttpPath, no redirects, canonical origin and pushurl.
-# Success needs both bind's one result line and an independent read of all seven settings: a helper without bind
-# (an older toolsRev) exits 0 with no effect, and that is refused. No network and no credential content. Exit 6:
-# the profile's helper or gh root does not match the cloneUrl owner, or the bind is refused, fails or unconfirmed.
+# then creates the principal's credential slot directory (mode 0700) and binds only the Spec clone (repoPath, cloneUrl,
+# githubPrincipal), never a PREPARE support clone, through the profile helper's own four-argument bind
+# (hosts/profile/gh.nix): helper reset, <repo> and <repo>.git keys naming the profile's helper and the principal as
+# username, useHttpPath, no redirects, canonical origin and pushurl. Success needs both bind's one result line and an
+# independent read of all nine settings: a helper without bind, or with the earlier three-argument bind (an older
+# toolsRev), is refused. No network, no login and no credential content. Exit 6: the profile lacks its helper or the
+# principal-routing gh, or the bind is refused, fails or unconfirmed.
 # set -f keeps ? literal in the flake URL.
 $DevProfile = '/nix/var/nix/profiles/windows-dev'
 $ImagePath = '/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/nix/var/nix/profiles/default/sbin'
-$Bind = 'u=$1; o=${u#https://github.com/}; o=${o%%/*}; a=/work/repos/.auth; h=$d/bin/git-credential-github-$o; G=$d/bin/git; ' +
-    'test -x $h && test -x $G || exit 6; case $(cat $d/bin/gh) in *GH_CONFIG_DIR=$a/$o/gh*) ;; *) exit 6;; esac; ' +
-    'install -d -m 700 $a $a/$o $a/$o/gh || exit 1; ' +
-    'res=$($h bind $r $u < /dev/null); b=$?; echo $res; test $b = 0 || exit 6; ' +
+$Bind = 'u=$1 P=$2; o=${u#https://github.com/}; o=${o%%/*}; a=/work/repos/.auth; h=$d/bin/git-credential-github-$o; G=$d/bin/git; ' +
+    'test -x $h && test -x $G || exit 6; case $(cat $d/bin/gh) in *credential.*.username*GH_CONFIG_DIR=/proc/gh-unselected*) ;; *) exit 6;; esac;' +
+    'install -d -m 700 $a $a/$P $a/$P/gh || exit 1; ' +
+    'res=$($h bind $r $u $P < /dev/null); b=$?; echo $res; test $b = 0 || exit 6; ' +
     'set -- $res; test $# = 9 && test $1 = bind && test $2 = result=ok && test $4 = repo=$r && test $5 = url=$u || exit 6; ' +
-    'for k in credential.helper= credential.$u.helper=$h credential.$u.git.helper=$h credential.useHttpPath=true ' +
+    'for k in credential.helper= credential.$u.helper=$h credential.$u.git.helper=$h credential.$u.username=$P ' +
+    'credential.$u.git.username=$P credential.useHttpPath=true ' +
     'http.followRedirects=false remote.origin.url=$u remote.origin.pushurl=$u; do n=${k%%=*}; v=${k#*=}; ' +
     'test $($G -C $r config --local --get-all $n | wc -l) = 1 && test x$($G -C $r config --local --get $n) = x$v || exit 6; done; ' +
     'echo bound $r $u'
@@ -117,7 +121,8 @@ $Plan = [ordered]@{
         verify = New-Run @($NixAt) $Verify @($Spec.image)
     }
     Clone = New-Run @($NixAt, $WorkAt) $Clone @($Spec.image, $Site.gitNixpkgs, $Spec.cloneUrl, $Spec.repoPath, $Site.baseSha)
-    Tools = New-Run @($NixAt, $WorkAt) $Tools @($Spec.image, $Site.toolsRev, $Spec.repoPath, $DevProfile, $Spec.cloneUrl)
+    Tools = New-Run @($NixAt, $WorkAt) $Tools @($Spec.image, $Site.toolsRev, $Spec.repoPath, $DevProfile, $Spec.cloneUrl,
+        $Spec.githubPrincipal)
     # Run: the profile's tools first on PATH, then the image's own PATH; Git reads no system or global
     # config and never prompts; no ports and no /repo.
     Run = @('run', '--rm', '--pull', 'never') + @(if ($Interactive) { '--interactive'; '--tty' }) +
