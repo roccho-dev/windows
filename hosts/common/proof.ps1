@@ -3317,10 +3317,21 @@ public static string Probe(int id, long createdUtcTicks, out string reason) {
     } finally { CloseHandle(handle); }
 }
 public static string Path(int id, long createdUtcTicks) { string reason; return Probe(id, createdUtcTicks, out reason); }
+// The exit time (UTC ticks) of the process behind a handle this proof holds, from the kernel; 0 with a reason unless it
+// is after the creation time (GetProcessTimes leaves it zero or undefined while the process runs).
+public static long ExitTicks(System.IntPtr handle, out string reason) {
+    reason = "";
+    long creation, exit, kernel, user;
+    if (!GetProcessTimes(handle, out creation, out exit, out kernel, out user)) { reason = "exit times failed (Win32 " + Marshal.GetLastWin32Error() + ")"; return 0; }
+    if (exit <= creation) { reason = "no exit time after creation (exit " + exit + ")"; return 0; }
+    return System.DateTime.FromFileTimeUtc(exit).Ticks;
+}
 '@
 }
 # A browser A29 launches itself (a root), identified from the Process object it holds until b3a ends: Id, StartTime
-# (readable after exit while the object holds the process), ExitTime only once HasExited. Its image is read by the kernel
+# (readable after exit while the object holds the process), and once HasExited the kernel exit time of the held handle,
+# accepted only when after the creation; otherwise it stays unread and is read again on the next refresh (a cached
+# ExitTime of 1601, a zero FILETIME, once ended every child's lineage). Its image is read by the kernel
 # reader above, which opens its own handle by PID and checks the creation time against StartTime. A root is tree (image
 # in $Tree), outside (image elsewhere: H3) or unknown (StartTime, the image or, once exited, ExitTime unreadable: fails).
 function B3aRootOf([Diagnostics.Process]$Process, [string]$Phase, [string]$Tree) {
@@ -3337,7 +3348,10 @@ function B3aRootRefresh($Root, [string]$Tree) {
         if ($Root.image) { $Root.source, $Root.reason = 'kernel (pid, creation-checked)', '' } else { $Root.reason = $why }
     }
     if ($null -ne $Root.process -and $null -eq $Root.exit -and $Root.process.HasExited) {
-        try { $Root.exit = $Root.process.ExitTime.ToUniversalTime() } catch { $Root.reason = "exit time unreadable: $($_.Exception.Message)" }
+        $why = ''
+        $ticks = try { [W.ImageProbe]::ExitTicks($Root.process.Handle, [ref]$why) } catch { $why = "exit time unreadable: $($_.Exception.Message)"; 0 }
+        if ($ticks -gt 0 -and $null -ne $Root.start -and $ticks -gt $Root.start.Ticks) { $Root.exit = [DateTime]::new($ticks, [DateTimeKind]::Utc) }
+        else { $Root.reason = $(if ($why) { $why } else { 'exit time not after the start' }) }
     }
     $Root.class = if ($null -eq $Root.start -or -not $Root.image) { 'unknown' }
         elseif (-not (InTree $Root.image $Tree)) { 'outside' }
@@ -3489,6 +3503,16 @@ try {
     $why = ''
     $fresh = [W.ImageProbe]::Probe($pingRoot.id, $pingRoot.start.Ticks, [ref]$why)
     Must ($fresh -eq '' -or $fresh -eq $ping) "A29 roots: a fresh read after exit is unread or the same image, never another (got '$fresh'; $why)"
+    # A root whose object says it has exited while the kernel has no exit time after its creation (here: still running)
+    # stays unread and unknown, never ended at 1601; read again once it has really exited, it is later and tree.
+    $held = StartControl $ping
+    $early = B3aRootOf $held.process 'control' $pingTree
+    $early.process = [pscustomobject]@{ HasExited = $true; Handle = $held.process.Handle }
+    B3aRootRefresh $early $pingTree
+    Must ($null -eq $early.exit -and $early.class -ceq 'unknown' -and $early.reason -like 'no exit time after creation*') "A29 roots: no kernel exit time after creation is unread and unknown (got $($early.exit); $($early.reason))"
+    $held.process.Kill(); $held.process.WaitForExit()
+    B3aRootRefresh $early $pingTree
+    Must ($null -ne $early.exit -and $early.exit -gt $early.start -and $early.class -ceq 'tree') 'A29 roots: read again after a real exit, the kernel exit time is later and the root is tree'
     # Pure root lineage: a root started at t0 and ended at t1, its image in the tree; an unread child at t_c.
     $t0, $t1 = $at.AddMinutes(1).Ticks, $at.AddMinutes(2).Ticks
     $utc = { param($Ticks) [DateTime]::new($Ticks, [DateTimeKind]::Utc) }
