@@ -680,7 +680,7 @@ echo 'PASS owner gh/Git routing (dev image): bind check holds; real Git gives no
 # Production dev Tools bind: the exact fragment win.ps1 plans for Tools, run in this image. Through the profile helper
 # it binds a clone and confirms all seven settings, and repeating is a no-op. A helper without bind (as an older
 # toolsRev builds) exits 0 with no effect; Tools refuses that (exit 6) and nothing is bound.
-tools=$(COMPUTERNAME=G6I3 pwsh -NoProfile -NonInteractive -File oci/dev/win.ps1 -Step Plan -Binding oci/dev/bindings/G6I3.json |
+tools=$(ProgramFiles="$evidence" COMPUTERNAME=G6I3 pwsh -NoProfile -NonInteractive -File oci/dev/win.ps1 -Step Plan -Binding oci/dev/bindings/G6I3.json |
   jq -er '.Tools as $a | $a[([range(0; $a | length)] | map(select($a[.] == "-c")) | first) + 1]')
 frag=${tools#*'readlink $d || exit 1; '}
 [ "$frag" != "$tools" ] && [[ $frag == 'u=$1; '* ]] || { echo 'Tools bind fragment not found in the planned argv' >&2; exit 1; }
