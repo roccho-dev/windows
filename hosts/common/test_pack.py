@@ -45,14 +45,27 @@ class CompilerTests(unittest.TestCase):
            "ssh": {"alias": "g6i3-own", "identity": ".ssh/id_ed25519_windows_own",
                    "knownHosts": ".ssh/known_hosts_windows_own"}}
 
+    # Another declared own target: every site value differs from the G6I3 sample.
+    ALT = dict(OWN, expectHost="ALTHOST", container="alt-own", hostPort=2224, session="wslc-cli-alt",
+               ssh={"alias": "alt-own", "identity": ".ssh/id_alt", "knownHosts": ".ssh/known_hosts_alt"})
+
     def test_resume_projection_and_installed_subset(self):
         launch = {"session": "wslc-cli-resta", "container": "windows-own"}
         self.assertEqual(pack.own_resume(self.OWN, launch), self.OWN)
-        for change in ({"expectHost": "PC7337"}, {"hostPort": True}, {"image": "latest"},
-                       {"volumes": self.OWN["volumes"][:1]}, {"session": "other"},
-                       {"ssh": {"identity": "/work/repos/private"}}):
+        ssh = self.OWN["ssh"]
+        for change in ({"expectHost": "bad host"}, {"expectHost": ""}, {"hostPort": True}, {"hostPort": 80},
+                       {"image": "latest"}, {"image": "ghcr.io/other/windows-own@sha256:" + "6" * 64},
+                       {"volumes": self.OWN["volumes"][:1]}, {"session": "other"}, {"container": "other-own"},
+                       {"ssh": {"identity": "/work/repos/private"}}, {"ssh": dict(ssh, alias="Bad Alias")},
+                       {"ssh": dict(ssh, identity="/work/repos/private")}, {"ssh": dict(ssh, knownHosts=".ssh/..")},
+                       {"ssh": dict(ssh, identity=ssh["knownHosts"])}, {"ssh": dict(ssh, extra="x")}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 pack.own_resume(dict(self.OWN, **change), launch)
+        # The alternate target is accepted on its own launch, and refused on the sample's.
+        alt_launch = {"session": "wslc-cli-alt", "container": "alt-own"}
+        self.assertEqual(pack.own_resume(self.ALT, alt_launch), self.ALT)
+        with self.assertRaises(ValueError):
+            pack.own_resume(self.ALT, launch)
         fonts = self.payload()
         noctty, cloudflared, choices, scripts = self.inputs()
         selected = json.loads(choices.read_text())
@@ -72,6 +85,19 @@ class CompilerTests(unittest.TestCase):
         # A later accepted image is projected; the old image is not a permanent authority.
         next_binding = dict(self.OWN, image=self.OWN["image"].replace("6" * 64, "7" * 64))
         self.assertEqual(pack.own_resume(next_binding, launch)["image"], next_binding["image"])
+        # The whole distribution for the alternate target carries its values only, with no sample fallback.
+        selected["ownResume"] = self.ALT
+        selected["noctty"]["launch"] = dict(selected["noctty"]["launch"], session="wslc-cli-alt", container="alt-own")
+        choices.write_text(json.dumps(selected))
+        pack.distribution(fonts, noctty, cloudflared, choices, scripts, "a" * 40, self.root / "alt")
+        with zipfile.ZipFile(self.root / "alt/windows-dist.zip") as z:
+            manifest = json.loads(z.read("manifest.json"))
+            runtime = json.loads(z.read("host-runtime/manifest.json"))
+        self.assertEqual(runtime["contract"], self.ALT)
+        projected = json.dumps([runtime["contract"], manifest["noctty"]["launch"],
+                                {k: v for k, v in manifest["ownResume"].items() if k != "files"}])
+        for sample in ("G6I3", "wslc-cli-resta", "g6i3-own", "windows_own"):
+            self.assertNotIn(sample, projected)
 
     def test_noctty_existing_session_selection(self):
         launch = {"session": "wslc-cli-resta", "container": "windows-own", "shell": "/bin/sh", "windowSaveState": "never"}

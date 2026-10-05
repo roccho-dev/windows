@@ -1802,19 +1802,23 @@ function Get-BootstrapAction($Found, $Expected, [bool]$AliasPresent, [switch]$Ap
 }
 
 # Same release-lock shape as pack.py; actual archive manifests/signatures are checked by win.ps1.
-# ---- G6I3 host-only startup and native task predicates ----------------------
+# ---- Declared own target host-only startup and native task predicates -------
+# Site values come from the target's Binding (pack.py own_resume); the image publisher is the own role's invariant.
 function Get-OwnResumeProblem($Contract) {
-    if ((Get-Field $Contract 'expectHost') -cne 'G6I3' -or (Get-Field $Contract 'container') -cne 'windows-own' -or
+    $port = Get-Field $Contract 'hostPort'
+    if ([string](Get-Field $Contract 'expectHost') -cnotmatch '^[A-Za-z0-9]([A-Za-z0-9-]{0,13}[A-Za-z0-9])?\z' -or
+        [string](Get-Field $Contract 'container') -cnotmatch '^[a-z0-9][a-z0-9-]+\z' -or
         [string](Get-Field $Contract 'session') -cnotmatch '^wslc-cli-[a-z0-9][a-z0-9-]*\z' -or
-        (Get-Field $Contract 'hostPort') -ne 2223 -or
-        [string](Get-Field $Contract 'image') -cnotmatch '^ghcr\.io/roccho-dev/windows-own@sha256:[a-f0-9]{64}\z') { return 'Invalid G6I3 own binding.' }
+        -not ($port -is [int] -or $port -is [long]) -or $port -lt 1024 -or $port -gt 65535 -or
+        [string](Get-Field $Contract 'image') -cnotmatch '^ghcr\.io/roccho-dev/windows-own@sha256:[a-f0-9]{64}\z') { return 'Invalid declared own target binding.' }
     $volumes = @(Get-Field $Contract 'volumes')
     if ($volumes.Count -ne 3 -or (@($volumes | ForEach-Object { Get-Field $_ 'destination' }) -join ',') -cne '/home/dev,/work/repos,/nix' -or
         @($volumes | ForEach-Object { Get-Field $_ 'name' } | Sort-Object -Unique -CaseSensitive).Count -ne 3 -or
         @($volumes | Where-Object { [string](Get-Field $_ 'name') -cnotmatch '^[a-z0-9][a-z0-9-]*\z' }).Count) { return 'Invalid three-volume binding.' }
     $ssh = Get-Field $Contract 'ssh'
-    if ((Get-Field $ssh 'alias') -cne 'g6i3-own' -or (Get-Field $ssh 'identity') -cne '.ssh/id_ed25519_windows_own' -or
-        (Get-Field $ssh 'knownHosts') -cne '.ssh/known_hosts_windows_own') { return 'Invalid Windows SSH binding.' }
+    $identity = [string](Get-Field $ssh 'identity'); $knownHosts = [string](Get-Field $ssh 'knownHosts')
+    if ([string](Get-Field $ssh 'alias') -cnotmatch '^[a-z0-9][a-z0-9-]+\z' -or $identity -ceq $knownHosts -or
+        @($identity, $knownHosts | Where-Object { $_ -cnotmatch '^\.ssh/(?!\.\.?\z)[A-Za-z0-9._-]+\z' }).Count) { return 'Invalid Windows SSH binding.' }
     return $null
 }
 
@@ -1834,7 +1838,7 @@ function Get-OwnContainerAction($Contract, $Container) {
     }
     $ports = @(Get-Field (Get-Field $Container 'Ports') '2223/tcp')
     if ($ports.Count -ne 1 -or (Get-Field $ports[0] 'HostIp') -cne '127.0.0.1' -or
-        (Get-Field $ports[0] 'HostPort') -cne '2223') { throw 'Own SSH port is not the declared loopback binding.' }
+        (Get-Field $ports[0] 'HostPort') -cne [string]$Contract.hostPort) { throw 'Own SSH port is not the declared loopback binding.' }
     $state = Get-Field $Container 'State'
     if ((Get-Field $state 'Running') -eq $true -and (Get-Field $state 'Status') -ceq 'running') { return 'running' }
     if ((Get-Field $state 'Running') -eq $false -and (Get-Field $state 'Status') -cin @('exited','created')) { return 'start' }

@@ -333,7 +333,8 @@ Must ((Get-AppAction @() $app) -ceq 'install' -and (Get-AppAction @(@{ name = 'O
 $bootstrap = $manifest.wingetBootstrap
 $manualText = Get-NocttyConfigText $manifest.noctty 'C:\Program Files\WSL\wslc.exe'
 Must ($manualText -ceq ('font-family = ' + $manifest.noctty.fontFamily + "`n" +
-    'command = direct:"C:\Program Files\WSL\wslc.exe" --session wslc-cli-resta exec --interactive --tty windows-own /bin/sh -i' + "`nwindow-save-state = never`n")) 'Noctty direct existing OCI shell and fresh manual window, quoted native path'
+    'command = direct:"C:\Program Files\WSL\wslc.exe" --session ' + $manifest.noctty.launch.session + ' exec --interactive --tty ' +
+    $manifest.noctty.launch.container + ' /bin/sh -i' + "`nwindow-save-state = never`n")) 'Noctty direct existing OCI shell of the declared target and fresh manual window, quoted native path'
 foreach ($change in @(@{ session = '' }, @{ session = "name`ncommand = cmd" }, @{ container = 'other name' }, @{ shell = '/bin/sh -c cmd' }, @{ windowSaveState = 'always' }, @{ fallback = 'create' })) {
     $case = @{ session = 'wslc-cli-resta'; container = 'windows-own'; shell = '/bin/sh'; windowSaveState = 'never' }
     foreach ($key in $change.Keys) { $case[$key] = $change[$key] }
@@ -839,7 +840,7 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
         'ConvergeAppPath', 'CollectAppPathGarbage', 'ConvergeEffect', 'Classify', 'UndoOwned', 'SharedKey', 'ObserveKeyContent',
         'ConvergeNocttyConfig','ApplyNocttyConfigOnly','PlatformDirectory','SharedDirectory'
     $names += 'AppxEffect', 'ObserveAppx', 'IntroduceAppx', 'ConvergeApps', 'FetchBootstrap', 'AssertAppxManifest', 'AssertMicrosoftSignature'
-    $names += 'PlatformEffect','ObservePlatformEffect','IntroducePlatform','IsPlatformEffect','IsHostEffect','HostProfile'
+    $names += 'PlatformEffect','ObservePlatformEffect','IntroducePlatform','IsPlatformEffect','IsHostEffect','OwnDeclared','HostProfile'
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'win.ps1'), [ref]$null, [ref]$null)
     foreach ($definition in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cin $names }, $false)) {
         . ([scriptblock]::Create($definition.Extent.Text))
@@ -1524,7 +1525,7 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
     $ErrorActionPreference = 'Stop'
     . (Join-Path $Root 'handoff-evaluate.ps1')
     $names = 'WriteRecord','IndexRecord','NewLedgerIndex','AttemptOf','RecordsOf','LedgerIds','ReadLedger','OpenAttempt',
-        'IntentTemp','CleanStaging','ResolveAttempt','RecoverId','Recovering','IsPlatformEffect','IsHostEffect','Observe',
+        'IntentTemp','CleanStaging','ResolveAttempt','RecoverId','Recovering','IsPlatformEffect','IsHostEffect','OwnDeclared','Observe',
         'ObserveFile','ObserveTree','ObserveHostEffect','ObserveOwnTask','ResolveOwnTaskTriggerUser','OwnTaskName','OwnTaskEffect','OwnTaskXml','RegisterOwnTask','ConvergeOwnTask',
         'HostTreeEffect','InstallHostTree','Classify','HostHash','WriteHostTemp','HostFileState','ConvergeHostBytes','HostPrefix','FileEffect','CreateOwnedFile',
         'HostUndoPlan','UndoHostEffect','HostRemove','HostLogon','AssertPlainPath','HostProfile','AssertHostRuntimeStreams',
@@ -1572,9 +1573,9 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
 
     # The production observer uses actual 3.0.1 Ports/ReadWrite schema, not Docker HostConfig.PortBindings/RW.
     $contract = $manifest.ownResume.contract
-    $container = @{ Id = 'a' * 64; Name = '/windows-own'; Config = @{ Image = $contract.image }
+    $container = @{ Id = 'a' * 64; Name = '/' + $contract.container; Config = @{ Image = $contract.image }
         Mounts = @($contract.volumes | ForEach-Object { @{ Type='volume'; Name=$_.name; Destination=$_.destination; ReadWrite=$true } })
-        Ports = @{ '2223/tcp' = @(@{HostIp='127.0.0.1';HostPort='2223'}) }; State = @{Running=$false;Status='exited'} }
+        Ports = @{ '2223/tcp' = @(@{HostIp='127.0.0.1';HostPort=[string]$contract.hostPort}) }; State = @{Running=$false;Status='exited'} }
     Must ((Get-OwnContainerAction $contract $container) -ceq 'start') 'actual native inspect shape'
     $container.Mounts = @($container.Mounts[0]); Refused { Get-OwnContainerAction $contract $container } '*accepted three volumes*'
     $container.Mounts = @($contract.volumes | ForEach-Object { @{Type='volume';Name=$_.name;Destination=$_.destination;ReadWrite=$true} })
@@ -1619,7 +1620,7 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
     Must ($starts.Count -eq 1 -and ($starts[0] -join '|') -ceq ('--session|' + $contract.session + '|container|start|' + ('a'*64))) 'only exact observed ID is started once'
     $container.State=@{Running=$false;Status='exited'}; $script:calls=@(); $script:inspects=0; $script:defaults=0; $script:sessionRunning=$false
     $null=OwnResume
-    Must ($script:defaults -eq 1 -and ($script:calls[0] -join '|') -ceq 'container|inspect|windows-own|--format|json' -and
+    Must ($script:defaults -eq 1 -and ($script:calls[0] -join '|') -ceq ('container|inspect|' + $contract.container + '|--format|json') -and
         @($script:calls | Where-Object { $_ -contains 'start' }).Count -eq 1) 'cold Apply default-opens once, observes known name, then only bound own start'
     foreach ($outcome in 'missing','wrong') {
         $container.State=@{Running=$false;Status='exited'}; $script:calls=@(); $script:inspects=0; $script:defaults=0; $script:sessionRunning=$false
@@ -1630,9 +1631,12 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
 
     # Existing local alias compatibility: absent optional IdentitiesOnly/UpdateHostKeys
     # is not conflict; the actual key/endpoint/strict binding is preserved.
-    $values=@{hostname=@('127.0.0.1');user=@('dev');stricthostkeychecking=@('true');port=@('2223')
-        identityfile=@('~/.ssh/id_ed25519_windows_own');userknownhostsfile=@('~/.ssh/known_hosts_windows_own')}
-    AssertSshEffective $values 'g6i3-own' '127.0.0.1' (Join-Path $profile '.ssh\id_ed25519_windows_own') (Join-Path $profile '.ssh\known_hosts_windows_own') '' $profile
+    $ownSsh=$contract.ssh
+    $values=@{hostname=@('127.0.0.1');user=@('dev');stricthostkeychecking=@('true');port=@([string]$contract.hostPort)
+        identityfile=@('~/' + $ownSsh.identity);userknownhostsfile=@('~/' + $ownSsh.knownHosts)}
+    AssertSshEffective $values $ownSsh.alias '127.0.0.1' (Join-Path $profile $ownSsh.identity) (Join-Path $profile $ownSsh.knownHosts) '' $profile ([string]$contract.hostPort)
+    $values.port=@('2299'); Refused { AssertSshEffective $values $ownSsh.alias '127.0.0.1' (Join-Path $profile $ownSsh.identity) (Join-Path $profile $ownSsh.knownHosts) '' $profile ([string]$contract.hostPort) } '*different port/proxy*'
+    $values.port=@([string]$contract.hostPort)
     $master=Join-Path $profile '.ssh\config'; $backup=Join-Path $profile '.ssh\config.before-windows-rent'
     $include='Include windows-rent/config windows-own/config'
     HostPrefix $master $backup $include
@@ -3313,10 +3317,21 @@ public static string Probe(int id, long createdUtcTicks, out string reason) {
     } finally { CloseHandle(handle); }
 }
 public static string Path(int id, long createdUtcTicks) { string reason; return Probe(id, createdUtcTicks, out reason); }
+// The exit time (UTC ticks) of the process behind a handle this proof holds, from the kernel; 0 with a reason unless it
+// is after the creation time (GetProcessTimes leaves it zero or undefined while the process runs).
+public static long ExitTicks(System.IntPtr handle, out string reason) {
+    reason = "";
+    long creation, exit, kernel, user;
+    if (!GetProcessTimes(handle, out creation, out exit, out kernel, out user)) { reason = "exit times failed (Win32 " + Marshal.GetLastWin32Error() + ")"; return 0; }
+    if (exit <= creation) { reason = "no exit time after creation (exit " + exit + ")"; return 0; }
+    return System.DateTime.FromFileTimeUtc(exit).Ticks;
+}
 '@
 }
 # A browser A29 launches itself (a root), identified from the Process object it holds until b3a ends: Id, StartTime
-# (readable after exit while the object holds the process), ExitTime only once HasExited. Its image is read by the kernel
+# (readable after exit while the object holds the process), and once HasExited the kernel exit time of the held handle,
+# accepted only when after the creation; otherwise it stays unread and is read again on the next refresh (a cached
+# ExitTime of 1601, a zero FILETIME, once ended every child's lineage). Its image is read by the kernel
 # reader above, which opens its own handle by PID and checks the creation time against StartTime. A root is tree (image
 # in $Tree), outside (image elsewhere: H3) or unknown (StartTime, the image or, once exited, ExitTime unreadable: fails).
 function B3aRootOf([Diagnostics.Process]$Process, [string]$Phase, [string]$Tree) {
@@ -3333,7 +3348,10 @@ function B3aRootRefresh($Root, [string]$Tree) {
         if ($Root.image) { $Root.source, $Root.reason = 'kernel (pid, creation-checked)', '' } else { $Root.reason = $why }
     }
     if ($null -ne $Root.process -and $null -eq $Root.exit -and $Root.process.HasExited) {
-        try { $Root.exit = $Root.process.ExitTime.ToUniversalTime() } catch { $Root.reason = "exit time unreadable: $($_.Exception.Message)" }
+        $why = ''
+        $ticks = try { [W.ImageProbe]::ExitTicks($Root.process.Handle, [ref]$why) } catch { $why = "exit time unreadable: $($_.Exception.Message)"; 0 }
+        if ($ticks -gt 0 -and $null -ne $Root.start -and $ticks -gt $Root.start.Ticks) { $Root.exit = [DateTime]::new($ticks, [DateTimeKind]::Utc) }
+        else { $Root.reason = $(if ($why) { $why } else { 'exit time not after the start' }) }
     }
     $Root.class = if ($null -eq $Root.start -or -not $Root.image) { 'unknown' }
         elseif (-not (InTree $Root.image $Tree)) { 'outside' }
@@ -3485,6 +3503,16 @@ try {
     $why = ''
     $fresh = [W.ImageProbe]::Probe($pingRoot.id, $pingRoot.start.Ticks, [ref]$why)
     Must ($fresh -eq '' -or $fresh -eq $ping) "A29 roots: a fresh read after exit is unread or the same image, never another (got '$fresh'; $why)"
+    # A root whose object says it has exited while the kernel has no exit time after its creation (here: still running)
+    # stays unread and unknown, never ended at 1601; read again once it has really exited, it is later and tree.
+    $held = StartControl $ping
+    $early = B3aRootOf $held.process 'control' $pingTree
+    $early.process = [pscustomobject]@{ HasExited = $true; Handle = $held.process.Handle }
+    B3aRootRefresh $early $pingTree
+    Must ($null -eq $early.exit -and $early.class -ceq 'unknown' -and $early.reason -like 'no exit time after creation*') "A29 roots: no kernel exit time after creation is unread and unknown (got $($early.exit); $($early.reason))"
+    $held.process.Kill(); $held.process.WaitForExit()
+    B3aRootRefresh $early $pingTree
+    Must ($null -ne $early.exit -and $early.exit -gt $early.start -and $early.class -ceq 'tree') 'A29 roots: read again after a real exit, the kernel exit time is later and the root is tree'
     # Pure root lineage: a root started at t0 and ended at t1, its image in the tree; an unread child at t_c.
     $t0, $t1 = $at.AddMinutes(1).Ticks, $at.AddMinutes(2).Ticks
     $utc = { param($Ticks) [DateTime]::new($Ticks, [DateTimeKind]::Utc) }

@@ -615,16 +615,18 @@ inside '
   helper "$HOME/.config/git/config" ci-xdg-git-token
   cd /work/repos/gh-proof
   for r in bound unbound other; do git init -q "$r"; done
-  bind() {
-    git -C "$1" config remote.origin.url "$2"
-    git -C "$1" config --replace-all credential.helper ""
-    git -C "$1" config --replace-all "credential.$2.helper" "$h"
-    git -C "$1" config credential.useHttpPath true
-    git -C "$1" config http.followRedirects false
-  }
-  bind bound https://github.com/roccho-dev/windows
+  # The owner clone is bound by the production bind of the profile helper; the other-owner clone is a hostile raw edit
+  # (the owner bind refuses another owner).
+  git -C bound config remote.origin.url https://github.com/roccho-dev/windows
+  case $(/nix/var/nix/profiles/windows-dev/bin/git-credential-github-roccho-dev bind /work/repos/gh-proof/bound https://github.com/roccho-dev/windows) in
+    "bind result=ok "*) ;; *) echo "production bind failed" >&2; exit 1 ;;
+  esac
   git -C unbound config remote.origin.url https://github.com/roccho-dev/windows
-  bind other https://github.com/other/windows
+  git -C other config remote.origin.url https://github.com/other/windows
+  git -C other config --replace-all credential.helper ""
+  git -C other config --replace-all credential.https://github.com/other/windows.helper "$h"
+  git -C other config credential.useHttpPath true
+  git -C other config http.followRedirects false
   fill() {
     local d=$1 p=$2 out l; shift 2
     out=$(printf "protocol=https\nhost=github.com\npath=%s\n\n" "$p" | (cd "$d" && env "$@" GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null)) || true
@@ -674,6 +676,41 @@ inside '
   test "$(snap)" = "$before"
 '
 echo 'PASS owner gh/Git routing (dev image): bind check holds; real Git gives no credential outside a bound clone despite global/system helper files; bound clone selects the owner only; other owner/outside get nothing; overrides never win'
+
+# Production dev Tools bind: the exact fragment win.ps1 plans for Tools, run in this image. Through the profile helper
+# it binds a clone and confirms all seven settings, and repeating is a no-op. A helper without bind (as an older
+# toolsRev builds) exits 0 with no effect; Tools refuses that (exit 6) and nothing is bound.
+tools=$(ProgramFiles="$evidence" COMPUTERNAME=G6I3 pwsh -NoProfile -NonInteractive -File oci/dev/win.ps1 -Step Plan -Binding oci/dev/bindings/G6I3.json |
+  jq -er '.Tools as $a | $a[([range(0; $a | length)] | map(select($a[.] == "-c")) | first) + 1]')
+frag=${tools#*'readlink $d || exit 1; '}
+[ "$frag" != "$tools" ] && [[ $frag == 'u=$1; '* ]] || { echo 'Tools bind fragment not found in the planned argv' >&2; exit 1; }
+inside '
+  u=https://github.com/roccho-dev/windows
+  frag=$1
+  run() { R=$1 D=$2 bash -c "r=\$R d=\$D; set -f; $frag" sh "$u"; }
+  install -d -m 700 /work/repos/tools-proof
+  cd /work/repos/tools-proof
+  for x in new old; do git init -q "$x"; git -C "$x" config remote.origin.url "$u.git"; done
+  install -d -m 755 /tmp/old-dev /tmp/old-dev/bin
+  printf "#!/bin/bash\nwhile IFS= read -r l && [ -n \"\$l\" ]; do :; done\nexit 0\n" > /tmp/old-dev/bin/git-credential-github-roccho-dev
+  chmod 755 /tmp/old-dev/bin/git-credential-github-roccho-dev
+  ln -s /nix/var/nix/profiles/windows-dev/bin/git /tmp/old-dev/bin/git
+  ln -s /nix/var/nix/profiles/windows-dev/bin/gh /tmp/old-dev/bin/gh
+  before=$(git -C old config --local --list)
+  rc=0; out=$(run /work/repos/tools-proof/old /tmp/old-dev) || rc=$?
+  test "$rc" = 6 || { echo "old helper: Tools bind exit $rc, not 6: $out" >&2; exit 1; }
+  test "$(git -C old config --local --list)" = "$before" || { echo "old helper: config changed" >&2; exit 1; }
+  rc=0; out=$(run /work/repos/tools-proof/new /nix/var/nix/profiles/windows-dev) || rc=$?
+  test "$rc" = 0 || { echo "Tools bind exit $rc: $out" >&2; exit 1; }
+  test "$out" = "bind result=ok reason=- repo=/work/repos/tools-proof/new url=$u prior=AAAAAGA writes=7 restored=0 retained=0
+bound /work/repos/tools-proof/new $u" || { echo "Tools bind output: $out" >&2; exit 1; }
+  before=$(git -C new config --local --list)
+  rc=0; out=$(run /work/repos/tools-proof/new /nix/var/nix/profiles/windows-dev) || rc=$?
+  test "$rc" = 0 && [[ $out == "bind result=ok reason=- repo=/work/repos/tools-proof/new url=$u prior=PPPPPPP writes=0 "* ]] ||
+    { echo "Tools bind repeat exit $rc: $out" >&2; exit 1; }
+  test "$(git -C new config --local --list)" = "$before"
+' tools-bind "$frag"
+echo 'PASS dev Tools bind (planned fragment): production bind and seven-setting readback; repeat is a no-op; an old helper without bind exits 0 and is refused with nothing bound'
 
 docker rm -f "$core" >/dev/null
 # No network on the successor: neither the old HOME nor a silent re-download can rescue it.

@@ -1,10 +1,14 @@
-{ pkgs, source }:
+# ownBinding is the declared own target; CI passes an alternate one to prove the projection.
+{ pkgs, source, ownBinding ? builtins.fromJSON (builtins.readFile ../own/bindings/G6I3.json) }:
 let
   # Read-only projection: the remote owner changes the accepted image/mount binding.
   # Windows never writes that source or depends on the retired Xpra fields.
-  ownBinding = builtins.fromJSON (builtins.readFile ../own/bindings/G6I3.json);
   ownSpec = builtins.fromJSON (builtins.readFile ../own/spec.json);
-  nocttyLaunch = { session = "wslc-cli-resta"; container = "windows-own";
+  # A Binding Windows SSH path (%USERPROFILE%\.ssh\<name>) as the profile-relative form the runtime joins.
+  profileRelative = path: let m = builtins.match ''%USERPROFILE%\\\.ssh\\([A-Za-z0-9._-]+)'' path; in
+    assert m != null; ".ssh/${builtins.head m}";
+  # The declared target's session and container; nothing here names a site.
+  nocttyLaunch = { inherit (ownBinding) session container;
     shell = "/bin/sh"; windowSaveState = "never"; };
   # One selection, reused by Linux and the Windows compiler. The existing
   # nixpkgs lock owns font versions and upstream content hashes.
@@ -181,6 +185,17 @@ let
     7zz x -y -otree ${archive} > /dev/null
     python ${./pack.py} inventory ${pkgs.writeText "${lock.name}-lock.json" (builtins.toJSON upstream)} ${archive} listing.txt tree "$out"
   '';
+  ownResume = {
+    inherit (ownBinding) expectHost container hostPort image;
+    session = nocttyLaunch.session;
+    volumes = [
+      { name = ownBinding.volume; destination = ownSpec.stateMount; }
+      { name = ownBinding.workVolume; destination = ownSpec.workMount; }
+      { name = ownBinding.nixVolume; destination = ownSpec.nixMount; }
+    ];
+    ssh = { alias = ownBinding.sshAlias; identity = profileRelative ownBinding.windowsIdentityFile;
+      knownHosts = profileRelative ownBinding.knownHostsFile; };
+  };
   windowsChoices = pkgs.writeText "windows-restore-selection.json" (builtins.toJSON {
     noctty = {
       version = nocttyVersion;
@@ -202,18 +217,7 @@ let
       ];
     };
     cloudflared.version = cloudflaredVersion;
-    ownResume = {
-      inherit (ownBinding) expectHost container hostPort image;
-      session = nocttyLaunch.session;
-      volumes = [
-        { name = ownBinding.volume; destination = ownSpec.stateMount; }
-        { name = ownBinding.workVolume; destination = ownSpec.workMount; }
-        { name = ownBinding.nixVolume; destination = ownSpec.nixMount; }
-      ];
-      ssh = { alias = "g6i3-own"; identity = ".ssh/id_ed25519_windows_own";
-        knownHosts = ".ssh/known_hosts_windows_own"; };
-    };
-    inherit wingetBootstrap wslPlatform;
+    inherit ownResume wingetBootstrap wslPlatform;
     packages = map (lock: lock // { inventory = "${inventory lock}"; }) packageLocks;
     # The desktop UI font face: the family of this role, set face-only in the six Win32 UI font slots
     # in HKCU WindowMetrics; ui-font.ahk reads the live faces only (no setter or compiler).
@@ -255,7 +259,9 @@ let
     python ${./pack.py} dist ${fonts} ${noctty} ${cloudflared} ${windowsChoices} ${./.} ${pkgs.lib.escapeShellArg source} "$out"
   '';
 in {
-  inherit fonts dist;
+  inherit fonts dist python;
+  # The production projection of ownBinding, exactly as windowsChoices carries it.
+  ownProjection = { launch = nocttyLaunch; inherit ownResume; };
   check = pkgs.runCommand "windows-dist-check" {
     nativeBuildInputs = [ python pkgs.unzip ];
   } ''

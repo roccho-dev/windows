@@ -165,7 +165,7 @@ function OwnContext($Contract) {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
     if ($identity.IsSystem -or $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) -or
-        [Environment]::MachineName -cne $Contract.expectHost) { throw 'Own startup requires this G6I3 normal-user Limited context.' }
+        [Environment]::MachineName -cne $Contract.expectHost) { throw 'Own startup requires the declared target host normal-user Limited context.' }
     $username = $identity.Name.Split('\')[-1]
     if ($Contract.session -cne ('wslc-cli-' + $username)) { throw 'The artifact is not bound to this normal-user default session.' }
     $profile = HostProfile
@@ -661,6 +661,15 @@ function WriteRecord([string]$Phase, $Effect, $Observed, [string]$Temp, [string]
     $script:recordsWritten++
 }
 
+# This artifact's declared own target (generated from its Binding), or $null when it declares none or none valid.
+function OwnDeclared {
+    $artifact = Get-Variable -Name manifest -ValueOnly -ErrorAction Ignore
+    $own = Get-Field (Get-Field $artifact 'ownResume') 'contract'
+    if ($null -eq $own) { $own = Get-Field $artifact 'contract' }
+    if ($null -eq $own -or (Get-OwnResumeProblem $own)) { return $null }
+    return $own
+}
+
 # Host effects have fixed paths and only explicit host modes recover or remove them.
 function IsHostEffect($Effect) {
     $kind, $target = [string](Get-Field $Effect 'kind'), [string](Get-Field $Effect 'target')
@@ -672,8 +681,11 @@ function IsHostEffect($Effect) {
         [IO.Path]::GetFileName($target) -cmatch '^(windows-host-[a-f0-9]{40}|cloudflared-[0-9.]+)\z') { return $true }
     $ssh = Join-Path (HostProfile) '.ssh'
     if ($kind -cnotin @('file-created','prefix-inserted')) { return $false }
-    return @(@('config','config.before-windows-rent','config.before-g6i3-own','windows-rent\config','windows-rent\known_hosts',
-        'windows-rent\access','windows-own\config','known_hosts_windows_own') | Where-Object { (Join-Path $ssh $_) -eq $target }).Count -gt 0
+    # The declared own target's known hosts file and the backup name of its alias.
+    $own = Get-Field (OwnDeclared) 'ssh'
+    $ownFiles = if ($own) { @(('config.before-' + $own.alias), ([string]$own.knownHosts -replace '^\.ssh/', '')) } else { @() }
+    return @(@('config','config.before-windows-rent','windows-rent\config','windows-rent\known_hosts',
+        'windows-rent\access','windows-own\config') + $ownFiles | Where-Object { (Join-Path $ssh $_) -eq $target }).Count -gt 0
 }
 
 function OwnTaskName([string]$Target) { 'windows-own-logon-' + $Target.Substring('task:windows-own-logon:'.Length) }
@@ -925,13 +937,14 @@ function SshPath([string]$Path, [string]$Profile) {
     if ($path.StartsWith('~\')) { $path = Join-Path $Profile $path.Substring(2) }
     return [IO.Path]::GetFullPath($path)
 }
-function AssertSshEffective($Values, [string]$Name, [string]$HostName, [string]$IdentityPath, [string]$KnownHosts, [string]$Proxy, [string]$Profile) {
+# LocalPort is the declared own target's loopback port for its local alias; empty for the rent Access alias.
+function AssertSshEffective($Values, [string]$Name, [string]$HostName, [string]$IdentityPath, [string]$KnownHosts, [string]$Proxy, [string]$Profile, [string]$LocalPort) {
     if (@($Values.hostname).Count -ne 1 -or $Values.hostname[0] -cne $HostName -or @($Values.user).Count -ne 1 -or $Values.user[0] -cne 'dev' -or
-        $Values.stricthostkeychecking[0] -cne 'true' -or ($Name -cne 'g6i3-own' -and $Values.identitiesonly[0] -cne 'yes') -or @($Values.identityfile).Count -ne 1 -or
+        $Values.stricthostkeychecking[0] -cne 'true' -or (-not $LocalPort -and $Values.identitiesonly[0] -cne 'yes') -or @($Values.identityfile).Count -ne 1 -or
         (SshPath $Values.identityfile[0] $Profile) -ne $IdentityPath -or @($Values.userknownhostsfile).Count -ne 1 -or
         (SshPath $Values.userknownhostsfile[0] $Profile) -ne $KnownHosts) { throw 'Existing SSH alias authentication/host binding differs; preserved.' }
-    if ($Name -ceq 'g6i3-own') {
-        if ($Values.port[0] -cne '2223' -or ($Values.ContainsKey('proxycommand') -and $Values.proxycommand[0] -cne 'none')) { throw 'Local own alias has a different port/proxy.' }
+    if ($LocalPort) {
+        if ($Values.port[0] -cne $LocalPort -or ($Values.ContainsKey('proxycommand') -and $Values.proxycommand[0] -cne 'none')) { throw 'Local own alias has a different port/proxy.' }
     } elseif (-not $Values.ContainsKey('hostkeyalias') -or $Values.hostkeyalias[0] -cne $Name -or
         -not $Values.ContainsKey('proxycommand') -or $Values.proxycommand[0] -cne $Proxy) { throw 'Rent Access ProxyCommand/host key alias differs.' }
 }
@@ -945,8 +958,9 @@ function HostCaller {
     $problem = PackageContextProblem
     if ($problem) { throw "Scoped host mode refuses: $problem" }
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $expectHost = Get-Field (OwnDeclared) 'expectHost'
     if ($identity.IsSystem -or [Security.Principal.WindowsPrincipal]::new($identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) -or
-        [Environment]::MachineName -cne 'G6I3') { throw 'Scoped host mode requires G6I3 normal-user context.' }
+        -not $expectHost -or [Environment]::MachineName -cne $expectHost) { throw 'Scoped host mode requires the declared target host normal-user context.' }
     return $identity.User.Value
 }
 function AssertOwnedSsh([string[]]$Paths, [switch]$Test) {
@@ -969,12 +983,12 @@ function HostSsh([switch]$Test, [switch]$Local) {
     AssertPlainPath $ssh -Required
     $files = @(SshConfigFiles $directory)
     if ($Local) {
-        $contract = OwnContract; $name = $contract.ssh.alias; $hostName = '127.0.0.1'
+        $contract = OwnContract; $name = $contract.ssh.alias; $hostName = '127.0.0.1'; $localPort = [string]$contract.hostPort
         $identityPath = Join-Path $profile $contract.ssh.identity; $knownHosts = Join-Path $profile $contract.ssh.knownHosts
         $fragment = Join-Path $directory 'windows-own\config'; $clientExe = $null; $proxy = $null
     } else {
         if ($Alias -cne 'windows-rent' -or $Hostname -cnotmatch '^(?=.{1,253}$)[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+\z') { throw 'Explicit windows-rent Access hostname is required.' }
-        $name = $Alias; $hostName = $Hostname; $identityPath = [IO.Path]::GetFullPath($Identity)
+        $name = $Alias; $hostName = $Hostname; $identityPath = [IO.Path]::GetFullPath($Identity); $localPort = ''
         $knownHosts = Join-Path $directory 'windows-rent\known_hosts'; $fragment = Join-Path $directory 'windows-rent\config'
         $clientDirectory = Join-Path $localAppData ('Programs\cloudflared-' + $manifest.cloudflared.version)
         $clientExe = Join-Path $clientDirectory 'cloudflared.exe'
@@ -988,13 +1002,13 @@ function HostSsh([switch]$Test, [switch]$Local) {
     if ($count -gt 1) { throw 'SSH alias is declared more than once; preserved.' }
     if ($count -eq 1) {
         AssertPlainPath $knownHosts -Required
-        AssertSshEffective (SshEffective $ssh $name) $name $hostName $identityPath $knownHosts $proxy $profile
+        AssertSshEffective (SshEffective $ssh $name) $name $hostName $identityPath $knownHosts $proxy $profile $localPort
         if ($Local) { return [ordered]@{ alias = $name; configured = $true; ownership = 'existing'; authenticationProof = 'unproven' } }
     } elseif ($Test) { throw 'SSH alias is absent.' }
     if ($count -eq 0) { $null = SshDeclaredCount $files $name -Creating }
     if ($HostKey -cnotmatch '^ssh-ed25519 [A-Za-z0-9+/]+={0,2}\z') { throw 'An explicitly authorized public SSH host key is required; never discovered as trust.' }
     $text = "Host $name`n  HostName $hostName`n  User dev`n"
-    if ($Local) { $text += "  Port 2223`n"; $known = "[127.0.0.1]:2223 $HostKey`n" }
+    if ($Local) { $text += "  Port $localPort`n"; $known = "[127.0.0.1]:$localPort $HostKey`n" }
     else { $text += "  ProxyCommand $proxy`n  HostKeyAlias $name`n"; $known = "$name $HostKey`n" }
     if ($identityPath -match '["\r\n]' -or $knownHosts -match '["\r\n]') { throw 'Unsupported SSH path quoting.' }
     $text += "  IdentityFile `"$identityPath`"`n  IdentitiesOnly yes`n  StrictHostKeyChecking yes`n  UserKnownHostsFile `"$knownHosts`"`n  UpdateHostKeys no`n"
@@ -1022,7 +1036,7 @@ function HostSsh([switch]$Test, [switch]$Local) {
         if ($count -eq 0) { HostPrefix $config (Join-Path $directory 'config.before-windows-rent') $include }
     }
     $null = SshConfigFiles $directory
-    AssertSshEffective (SshEffective $ssh $name) $name $hostName $identityPath $knownHosts $proxy $profile
+    AssertSshEffective (SshEffective $ssh $name) $name $hostName $identityPath $knownHosts $proxy $profile $localPort
     if (-not $Local -and -not (Test-EffectStateEqual 'tree-extracted' (HostTreeEffect $clientDirectory $clientFiles).desired (ObserveTree $clientDirectory))) { throw 'Pinned cloudflared client or rent launcher differs.' }
     [ordered]@{ alias = $name; configured = $true; client = $clientExe; launcher = (Join-Path $clientDirectory 'rent-access.ps1')
         credential = 'RentAccess stdin slot; never written here'; authenticationProof = 'unproven'; rebootProof = 'unproven' }

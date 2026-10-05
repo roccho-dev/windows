@@ -8,13 +8,27 @@
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
       ownSpec = builtins.fromJSON (builtins.readFile ./hosts/own/spec.json);
+      # The target's declared credential owner selects own's gh routing and bind (rent keeps the default).
+      ownOwner = (builtins.fromJSON (builtins.readFile ./hosts/own/bindings/G6I3.json)).owner;
+      # CI only, never published or applied: another declared own target. Every site value, the credential owner
+      # included, differs from the G6I3 sample; the role and the image publisher are the own role's invariants.
+      ciAltBinding = {
+        role = "own"; site = "ALTSITE"; expectHost = "ALTHOST"; owner = "alt-owner"; session = "wslc-cli-alt";
+        sshAlias = "alt-own"; container = "alt-own"; hostPort = 2224;
+        volume = "alt-own-home"; workVolume = "alt-own-work"; nixVolume = "alt-own-nix";
+        publicKeyFile = "%USERPROFILE%\\.ssh\\id_alt_wslc.pub"; privateKeyFile = "/work/repos/.auth/ssh/alt-own/id_ed25519";
+        knownHostsFile = "%USERPROFILE%\\.ssh\\known_hosts_alt"; windowsIdentityFile = "%USERPROFILE%\\.ssh\\id_alt";
+        image = "ghcr.io/roccho-dev/windows-own@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        imageFrom = "CI-only alternate target fixture";
+      };
+      ciAlt = import ./hosts/common/nix.nix { inherit pkgs; source = "uncommitted"; ownBinding = ciAltBinding; };
       # own on the same common dev profile as rent; the generic mountLib and multi-user nix.conf are shared, unchanged.
       ownFor = { profile, tag }: import ./hosts/own/nix.nix {
         inherit pkgs profile tag mountLib;
         spec = ownSpec;
         nixConf = rentNixConf;
       };
-      own = ownFor { profile = import ./hosts/profile/nix.nix { inherit pkgs; }; tag = "nix"; };
+      own = ownFor { profile = import ./hosts/profile/nix.nix { inherit pkgs; owner = ownOwner; }; tag = "nix"; };
       dev = import ./oci/dev/nix.nix { inherit pkgs; };
       common = import ./hosts/common/nix.nix {
         inherit pkgs;
@@ -387,7 +401,7 @@
         own-image = own.image;
         # CI only, never published: the same own definition plus one profile package, to prove seed-on-upgrade.
         own-image-next = (ownFor {
-          profile = import ./hosts/profile/nix.nix { inherit pkgs; extra = [ pkgs.hello ]; };
+          profile = import ./hosts/profile/nix.nix { inherit pkgs; owner = ownOwner; extra = [ pkgs.hello ]; };
           tag = "next";
         }).image;
         rent-image = mkRent { profile = rentProfile; tag = "nix"; };
@@ -399,6 +413,11 @@
           tag = "next";
           tunnel = rentTunnelStub;
         };
+        # CI only, never published: the same owner routing and bind for the alternate target's credential owner,
+        # without an image; and that target's Binding as JSON for the own Windows script's strict reader.
+        ci-alt-owner-gh = let alt = import ./hosts/profile/gh.nix { inherit pkgs; inherit (ciAltBinding) owner; }; in
+          pkgs.buildEnv { name = "ci-alt-owner-gh"; paths = [ alt.wrapper alt.helper ]; pathsToLink = [ "/bin" ]; };
+        ci-alt-own-binding = pkgs.writeText "ci-alt-own-binding.json" (builtins.toJSON ciAltBinding);
         dev-profile = dev.profile;
         dev-image = dev.image;
         common-fonts = common.fonts;
@@ -406,6 +425,33 @@
       };
       checks.${system} = {
         windows-dist = common.check;
+        # The alternate Binding through the production projection (hosts/common/nix.nix) and the existing pack.py
+        # validators: its own values only, none of the sample's, and no distribution or image is built.
+        own-alt-binding = pkgs.runCommand "own-alt-binding-check" {
+          nativeBuildInputs = [ ciAlt.python ];
+          projection = builtins.toJSON ciAlt.ownProjection;
+          binding = builtins.toJSON ciAltBinding;
+        } ''
+          set -eu
+          export PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=${./hosts/common}
+          python - <<'EOF'
+          import json, os, pack
+          p, b = json.loads(os.environ["projection"]), json.loads(os.environ["binding"])
+          launch = pack.noctty_launch(p["launch"])
+          own = pack.own_resume(p["ownResume"], launch)
+          assert (launch["session"], launch["container"]) == (b["session"], b["container"]), launch
+          assert own == {"expectHost": b["expectHost"], "container": b["container"], "hostPort": b["hostPort"],
+                         "image": b["image"], "session": b["session"],
+                         "volumes": [{"name": b["volume"], "destination": "/home/dev"},
+                                     {"name": b["workVolume"], "destination": "/work/repos"},
+                                     {"name": b["nixVolume"], "destination": "/nix"}],
+                         "ssh": {"alias": b["sshAlias"], "identity": ".ssh/id_alt", "knownHosts": ".ssh/known_hosts_alt"}}, own
+          text = json.dumps(p)
+          for sample in ("G6I3", "wslc-cli-resta", "g6i3-own", "windows_own", "windows-own-"):
+              assert sample not in text, sample
+          EOF
+          touch $out
+        '';
         # Fails when the own image or its scripts disagree with hosts/own/spec.json.
         own-spec = pkgs.runCommand "own-spec-check" {
           nativeBuildInputs = [ pkgs.jq ];

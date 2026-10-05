@@ -741,7 +741,9 @@ jobs:
               git -C "$1" config credential.useHttpPath true
               git -C "$1" config http.followRedirects false
             }
-            bind bound https://github.com/roccho-dev/windows
+            # The owner clone through the production bind of the shared helper; the other-owner clone stays a hostile edit.
+            git -C bound config remote.origin.url https://github.com/roccho-dev/windows
+            case $("$h" bind /work/repos/gh-proof/bound https://github.com/roccho-dev/windows) in "bind result=ok "*) ;; *) exit 1 ;; esac
             git -C unbound config remote.origin.url https://github.com/roccho-dev/windows
             bind other https://github.com/other/windows
             fill() {

@@ -51,8 +51,8 @@ $Spec = Read-Exact (Join-Path $PSScriptRoot 'spec.json') @(
     'role', 'imageRepository', 'sshPort', 'cdpPort', 'publishAddress',
     'stateMount', 'workMount', 'nixMount', 'shmSize', 'authorizedKeyEnv', 'syntheticTrialEnv')
 $Site = Read-Exact $Binding @(
-    'role', 'site', 'expectHost', 'container', 'hostPort', 'volume', 'workVolume', 'nixVolume',
-    'publicKeyFile', 'privateKeyFile', 'knownHostsFile', 'image', 'imageFrom')
+    'role', 'site', 'expectHost', 'owner', 'session', 'sshAlias', 'container', 'hostPort', 'volume', 'workVolume', 'nixVolume',
+    'publicKeyFile', 'privateKeyFile', 'knownHostsFile', 'windowsIdentityFile', 'image', 'imageFrom')
 
 if ($Site.role -cne $Spec.role) { throw "Binding role $($Site.role) does not match Spec role $($Spec.role)" }
 foreach ($Name in 'sshPort', 'cdpPort') { Assert-Port $Name $Spec.$Name 1 }
@@ -63,7 +63,14 @@ foreach ($Name in 'stateMount', 'workMount') {
 if ($Spec.nixMount -cne '/nix') { throw 'Spec nixMount must be /nix.' }
 Assert-Port 'hostPort' $Site.hostPort 1024
 Assert-Name 'container' $Site.container
-foreach ($Name in 'volume', 'workVolume', 'nixVolume') { Assert-Name $Name $Site.$Name }
+foreach ($Name in 'volume', 'workVolume', 'nixVolume', 'sshAlias') { Assert-Name $Name $Site.$Name }
+# Read here only so a malformed target fails early; the Windows distribution (hosts/common) consumes these.
+if ($Site.owner -cnotmatch '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$') { throw "Invalid owner: $($Site.owner)" }
+if ($Site.session -cnotmatch '^wslc-cli-[a-z0-9][a-z0-9-]*$') { throw "Invalid session: $($Site.session)" }
+foreach ($Name in 'knownHostsFile', 'windowsIdentityFile') {
+    if ($Site.$Name -cnotmatch '^%USERPROFILE%\\\.ssh\\[A-Za-z0-9._-]+$') { throw "Invalid ${Name}: $($Site.$Name)" }
+}
+if ($Site.knownHostsFile -ceq $Site.windowsIdentityFile) { throw 'knownHostsFile and windowsIdentityFile must differ.' }
 # home state, work and the own /nix: three distinct named volumes, never deleted by this script.
 $Volumes = [ordered]@{ $Spec.stateMount = $Site.volume; $Spec.workMount = $Site.workVolume; $Spec.nixMount = $Site.nixVolume }
 if (@($Volumes.Values | Sort-Object -Unique -CaseSensitive).Count -ne 3) { throw 'The home, work and nix volumes must be distinct.' }

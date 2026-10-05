@@ -4,7 +4,7 @@
 
 将来の適用先にも使える IaC と secret の管理・配置を明確にし、環境を再現可能にするための全体図と設計理由を記録する。G6I3 own/head と PC7337 rent は、これを実証する現在のサンプルである。関連する目的は [windows #8](https://github.com/roccho-dev/windows/issues/8) と [#14](https://github.com/roccho-dev/windows/issues/14) にある。
 
-これは説明用の正本であり、実行許可や runtime の正本ではない。役割・許可は [ADRS #528](https://github.com/roccho-dev/adrs/pull/528) の canonical `95220e6ac9fa840733f318d63c45c8f17d5981b6`、特に `policy/control.jsonl` の row272（本番系列 v41）と row273（受入済みstate鍵保管）に従う。製品の実装は各 repository、現在の合意と証拠は対象 PR に置く。同じ図を各 repository や PR に複写しない。
+これは説明用の正本であり、実行許可や runtime の正本ではない。役割・許可は [ADRS #528](https://github.com/roccho-dev/adrs/pull/528) の canonical `95220e6ac9fa840733f318d63c45c8f17d5981b6`、特に `policy/control.jsonl` の row272（本番系列 v41）と row273（受入済みstate鍵保管）に従う。own の再利用可能な Binding と repository 束縛の source 品質系列（§7a）は ADRS canonical `1aa313608bf1043049fc019268e2936b20e6121b` の row274（v44）に従う。製品の実装は各 repository、現在の合意と証拠は対象 PR に置く。同じ図を各 repository や PR に複写しない。
 
 **観測基準日は 2026-10-04。図の「完了」は下表の限定範囲だけを示す。** source の受入、Provider の適用、実機の成功、全体の受入を混同しない。ここに書いた段階を新しい実行前チェック列にしない。
 
@@ -280,10 +280,12 @@ G6I3 (own/head)
 │  └─ rent-state.passphrase          private / owner-only / 復旧控え
 └─ windows-own
    ├─ windows-own-home → /home/dev
+   │  ├─ repos/{adrs.git,envs.git,windows}   現在の作業repository（移動しない）
+   │  ├─ .config/gh/hosts.yml        元のHOME gh資格情報（保持）
+   │  └─ .ssh/                       host秘密鍵（secret）/ authorized_keys（public）
    ├─ windows-own-work → /work/repos
-   │  ├─ <bare>/.worktrees/*         作業directory
-   │  └─ .auth/<github-owner>/gh     owner別のgh資格情報
-   └─ windows-own-nix → /nix
+   │  └─ .auth/<github-owner>/gh     owner別のgh資格情報（0600）
+   └─ windows-own-nix → /nix          store / DB / own-dev profile / GC roots
 
 PC7337 (rent)
 ├─ 既存 host R / 固定 native Opus W
@@ -304,6 +306,26 @@ PC7337 (rent)
 `dev-home` は移行元を読む既存 Migrate の入力としてだけ残り、最終 rent に mount しない。package は HOME に都度 installせず、Nix の固定定義から配布する。Codex/Claude は公式 release を hash固定、gh等は固定nixpkgsを使う。host間で資格情報・session・work・`/nix` を共有しない。
 
 `.auth/<github-owner>/gh` は資格情報の保管rootであり、repositoryのlocal bindingがowner helperを選ぶ。裸repo・worktreeの配置やPATHだけで、別ownerの認証を自動選択したことにしない。[共通 gh 定義](../hosts/profile/gh.nix) と ADRS の Git/authority規則へ従う。
+
+## 7a. own の再利用可能な Binding と repository 束縛
+
+**目的。** 適用先ごとの値を own の Binding（現在のサンプルは [`hosts/own/bindings/G6I3.json`](../hosts/own/bindings/G6I3.json)）だけに宣言し、Windows 配布の manifest、pack/evaluator の検証、runtime guard、SSH alias と gh owner の選択がすべて同じ宣言を読む。G6I3・`wslc-cli-resta`・`g6i3-own` は宣言値の一例であり、共通 source の前提ではない。対応範囲は native x64 Windows で、対応外の owner・形式は拒否する。
+
+| 区分 | 置き場所 | 例 |
+|---|---|---|
+| 適用先の値（Binding） | `expectHost`、credential `owner`、`session`、`sshAlias`、`container`、`hostPort`、3 volume、`windowsIdentityFile`、`knownHostsFile`、OCI/dev→own の鍵 file、`image` | G6I3 の現在値 |
+| role の不変条件（Spec・profile） | image publisher（`imageRepository`）、container 内の SSH/CDP port、3 mount 先、共通 dev profile | own role 共通 |
+| secret | Windows SSH 秘密鍵、own host 秘密鍵、owner root の gh 資格情報 | 文書・Binding・image に値を置かない |
+
+credential owner と image publisher は別の値である。Windows→own の SSH identity と、OCI/dev→own の鍵は別 field として扱い、統合・再生成しない。known_hosts は公開の pin である。
+
+**標準の repository 束縛。** 追加の executable は作らず、既存の owner credential helper の `bind REPO URL` を使う。native Git が local の7設定（credential.helper の reset、URL と URL.git の owner helper、useHttpPath、redirect 無効、origin と push URL）を書く。所有者の異なる clone、worktree config、include、想定外の credential/http/url 設定、異なる値・重複値、URL/URL.git 以外の origin は書く前に拒否する。既に束縛済みなら何もしない。既知の失敗は、同じ呼び出しの中で、その呼び出しが書いてまだ変わっていない値だけを戻す。不明な結果は保持して報告し、後から任意の過去設定を戻す汎用 Unbind は持たない。dev Tools は結果行と7設定の独立な読戻しを両方要求し、`bind` を持たない古い helper の exit 0（効果なし）を成功にしない。
+
+**最小の証明。** CI では own image job が毎回、production `bind` の正常・再実行・誤った呼び出し・競合・想定外設定・同一呼び出し内の復元と、束縛 clone だけで owner 資格情報を選ぶ routing oracle を実行する。CI 専用の別 owner の gh 出力で routing と他 owner の拒否、test_pack の別 Binding で G6I3 値へ fallback しないこと、dev proof で計画どおりの Tools 断片と古い helper の拒否を示す。実際の SID・ACL・WSLC・実認証の principal と push 権限・Git read・default exec・logon・再起動は CI では証明できず、別に許可された実機採用で確認する。
+
+**短い手順。** 初期配置は、許可された保管済み資格情報の配置か、選択された owner root での native `gh auth login` を一度だけ行う。更新は要求時・期限切れ時の `gh auth refresh`、復旧は保管からの復元か再認証で、毎回の適用では認証し直さない。`gh auth logout` は local の削除だけで provider 側の失効ではない。束縛は、既存の厳格 SSH 経路で `/nix/var/nix/profiles/own-dev/bin/git-credential-github-<owner> bind <repo> <url>` を repository ごとに一度実行し、再実行は no-op となる。dev の `toolsRev` は、公開後に実際に `bind` を含む commit へ同じ PR の中で合わせる。
+
+この source 系列は own v10 の保留中の実機作用を再開しない。実機の image・Release 採用、束縛、検証、再起動はそれぞれ別の許可で行う。
 
 ## 8. 実機に残す最小作用と失敗時の境界
 
@@ -368,6 +390,7 @@ Provider運用にはstateの保管、lock、期限更新、target側のprivate i
 | B2 表示限定 | own、User受入 | 完了 | IME/wheel等は別scope |
 | VM退役・age key保存 | 既存担当、User受入 | 完了 | 再実施しない |
 | own image/復帰 source | own P2固定R/W | source/CI受入済み | 実機採用・再起動・ログオン復帰は別受入 |
+| own 再利用 Binding・production bind（§7a） | own P2固定R/W、remote P | v44 の source 系列で作成中。CI・受入は未確認 | dev `toolsRev` の実commitへの整合、実機の束縛・検証・再起動は別許可 |
 | S1 本番 fixture/source | rent固定R/W、remote P | PR #42／canonical `42a3bc1d`／push CI全8件で完了 | 旧S3のeffect取得・照合は通過。現配布元はS1Bの同source成果物 |
 | S1B init失敗の閉じたhint | rent固定R/W、remote P | PR #43／canonical `ff290b66`／push CI全8件と同source配布物をP/R/W受入済み | hintは原因・認証・実Providerの精度の証明ではない |
 | target age bootstrap | rent固定R/W・own P2固定R/W | 配布元一致・ACL・public recipient一致で完了 | private鍵での本番配置は後続 |
@@ -394,4 +417,4 @@ S3以後のrunや受入が成立したら、この表と該当図の状態だけ
 - [Provider root](https://github.com/roccho-dev/envs/blob/ff290b66a5cb88373ad7eb401ca568876a69fa29/providers/dev-rent-cloudflare/main.tf)、[既存production workflow](https://github.com/roccho-dev/envs/blob/ff290b66a5cb88373ad7eb401ca568876a69fa29/.github/workflows/project-dev-rent-tunnel.yml)：資源・native backend・暗号化・3-file handoff。
 - [windows #45](https://github.com/roccho-dev/windows/pull/45)、[#47](https://github.com/roccho-dev/windows/pull/47)：own配布とrentの標準Stage。現在の関連実装は [flake.nix](../flake.nix)、[rent Windows entry](../hosts/rent/win.ps1)、[client ProxyCommand](../hosts/common/rent-access.ps1)、[owner gh binding](../hosts/profile/gh.nix)。
 
-この文書の追加は docs 一件だけで、上記source、credential、Provider、host/OCIの作用を変更しない。
+この文書の最初の追加（[windows #48](https://github.com/roccho-dev/windows/pull/48)）は docs 一件だけで、上記source、credential、Provider、host/OCIの作用を変更しない。§7a は同じPRの source 変更の説明であり、credential、Provider、host/OCIの作用を変更しない。
