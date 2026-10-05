@@ -838,6 +838,36 @@ jobs:
               for a in get store erase; do test -z "$(ask bound "$r" "$a" 2>&1)"; done
             done
             for d in "$HOME" unbound; do test -z "$(ask "$d" "protocol=https\nhost=github.com\npath=roccho-dev/windows\nusername=roccho-dev\n\n" 2>&1)"; done
+            # Selection reads the whole declaration as bind checks it and never repairs it: after any one drift from the
+            # nine settings (a repeated empty value included), an extra local key, an include or a worktree config, get and
+            # gh stay unselected and the clone config is left exactly as found.
+            q="protocol=https\nhost=github.com\npath=roccho-dev/windows\nusername=roccho-dev\n\n"
+            w=https://github.com/roccho-dev/windows
+            ln -s "$(readlink -f "$h")" /tmp/git-credential-github-roccho-dev
+            for m in reset push path redirect include worktree extra helper origin user; do
+              d=drift-$m
+              git init -q "$d"
+              pbind "$d" "$w" roccho-dev
+              test "$(ask "$d" "$q" | sed -n "s/^password=//p")" = ci-owner-token
+              c() { git -C "$d" config "$@"; }
+              case $m in
+                reset) c --unset-all credential.helper ;;
+                push) c remote.origin.pushurl https://github.com/other/repo ;;
+                path) c credential.useHttpPath false ;;
+                redirect) c http.followRedirects true ;;
+                include) c include.path /dev/null ;;
+                worktree) c core.repositoryformatversion 1 && c extensions.worktreeConfig true ;;
+                extra) c http.extraHeader "X-CI: 1" ;;
+                helper) c --replace-all "credential.$w.helper" /tmp/git-credential-github-roccho-dev &&
+                  c --replace-all "credential.$w.git.helper" /tmp/git-credential-github-roccho-dev ;;
+                origin) c --add remote.origin.url "" ;;
+                user) c --add "credential.$w.username" "" ;;
+              esac
+              k=$(sha256sum "$d/.git/config")
+              test -z "$(ask "$d" "$q" 2>&1)"
+              if (cd "$d" && gh auth token) > /dev/null 2>&1; then echo "$d: gh returned a token" >&2; exit 1; fi
+              test "$(sha256sum "$d/.git/config")" = "$k"
+            done
             test "$(snap)" = "$before"'
           # Image-default Docker exec, entered as is (no -e, no profile): the same Git gate and bound-principal gh.
           docker exec -u 1000:1000 -w /work/repos/gh-proof rent-smoke /bin/bash -euc '
