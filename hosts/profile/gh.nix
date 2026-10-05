@@ -10,8 +10,9 @@
 #
 # What a selection proves: the exact declaration above, read as bind checks it (the repository's common-dir config is
 # the caller's own and holds the nine settings bind writes, each exactly once, this helper at a stable profile path, no
-# other local credential, http, url or include key and no worktree config), a slot that is a current-format
-# (version "1") gh file store (a real directory of regular files), and that the pinned native gh answers for the
+# other local credential, http, url or include key and no worktree config), a slot that is a current-format gh file
+# store (one top-level version 1 as native gh writes it; a real directory of regular files), and that the pinned native
+# gh answers for the
 # declared principal as its configured active user. Selection only reads; it never writes, repairs or rebinds a
 # repository. It does not prove the token's provider principal: an account added, copied or swapped into a slot is not
 # detected. A slot is accepted only through separately authorized custody (first login, refresh, loss recovery, any copy, import or added
@@ -101,8 +102,19 @@ let
       p=$pr root=/work/repos/.auth/$pr/gh
       [ -d "$root" ] && [ ! -L "$root" ] || return 1
       for k in config.yml hosts.yml; do [ -f "$root/$k" ] && [ ! -L "$root/$k" ] || return 1; done
-      # gh 2.96.0 migrates and rewrites any config without version "1" as it starts: such a slot is refused first.
-      while IFS= read -r l; do [ "$l" = 'version: "1"' ] && n=$((n + 1)); done < "$root/config.yml"
+      # gh 2.96.0 reads the top-level version as a string and migrates, rewriting the slot, unless it is "1". Only the
+      # two lines native gh is shown to write are accepted, as the one top-level version key: version: 1 (its default
+      # template) and version: "1" (its own write after a migration). Any other or repeated top-level version key, and
+      # any root-level YAML structure that could change what gh reads (document marker, directive, flow collection,
+      # anchor, alias, tag, complex or merge key), is refused before gh runs. This is a bounded check of native gh's own
+      # output, not a YAML parser; comments and indented (nested) lines are left alone.
+      while IFS= read -r l || [ -n "$l" ]; do
+        case $l in
+          'version: 1'|'version: "1"') n=$((n + 1)) ;;
+          version|version[\ :]*|\"version\"*|\'version\'*) return 1 ;;
+          ---*|...*|%*|'{'*|'['*|'&'*|'*'*|'!'*|'?'*|'<<'*) return 1 ;;
+        esac
+      done < "$root/config.yml"
       [ "$n" = 1 ]
     }
     answer() {
