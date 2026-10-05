@@ -2,10 +2,11 @@
 # owner-auth helper) remain open; this profile is the bounded CI0 bootstrap, not F1 acceptance.
 { pkgs }:
 rec {
-  # One-owner GitHub routing per execution.md, the same outputs own and rent use (hosts/profile/gh.nix): the gh wrapper
-  # selects the owner root only in a clone bound in its own config, and the owner's git credential helper. Tools binds
-  # each clone through the helper's own bind; Run excludes system and global Git configuration and prompts. The owner
-  # is the one in the Spec's canonical cloneUrl.
+  # GitHub routing by declared principal, the same outputs own and rent use (hosts/profile/gh.nix): the gh wrapper
+  # selects a principal's slot only in a clone bound in its own config, and the profile's git credential helper. Tools
+  # binds the Spec clone through the helper's own bind with the Spec's explicit githubPrincipal; Run excludes system and
+  # global Git configuration and prompts. The cloneUrl namespace here only names the profile's stable helper; it is not
+  # the principal.
   github = import ../../hosts/profile/gh.nix {
     inherit pkgs;
     owner = builtins.head (builtins.match "https://github\\.com/([^/]+)/[^/]+"

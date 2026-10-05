@@ -596,18 +596,20 @@ inside '
   # This image ships no grep, sed or find: bash builtins and coreutils only.
   test "$GIT_CONFIG_NOSYSTEM" = 1 && test "$GIT_CONFIG_GLOBAL" = /dev/null
   gh_text=$(cat /bin/gh)
-  case $gh_text in *GH_CONFIG_DIR=/work/repos/.auth/roccho-dev/gh*) ;; *) echo "Tools bind would refuse this gh" >&2; exit 1 ;; esac
+  case $gh_text in *credential.*.username*GH_CONFIG_DIR=/proc/gh-unselected*) ;; *) echo "Tools bind would refuse this gh" >&2; exit 1 ;; esac
   case $gh_text in *"unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_REPO GH_HOST"*) ;; *) exit 1 ;; esac
   h=/bin/git-credential-github-roccho-dev
   test -x "$h"
+  # hosts DIR TOKEN [USER]: a gh file store of one synthetic account; a principal slot also carries the current config.
   hosts() {
     install -d -m 700 "$1"
-    printf "github.com:\n    users:\n        ci:\n            oauth_token: %s\n    git_protocol: https\n    user: ci\n    oauth_token: %s\n" "$2" "$2" > "$1/hosts.yml"
-    chmod 600 "$1/hosts.yml"
+    printf "github.com:\n    users:\n        %s:\n            oauth_token: %s\n    git_protocol: https\n    user: %s\n    oauth_token: %s\n" "${3:-ci}" "$2" "${3:-ci}" "$2" > "$1/hosts.yml"
+    printf "version: \"1\"\n" > "$1/config.yml"
+    chmod 600 "$1/hosts.yml" "$1/config.yml"
   }
   helper() { printf "[credential]\n\thelper = \"!echo username=ci; echo password=%s #\"\n" "$2" > "$1"; }
   install -d -m 700 /work/repos/.auth /work/repos/.auth/roccho-dev /work/repos/gh-proof "$HOME/.config/git"
-  hosts /work/repos/.auth/roccho-dev/gh ci-owner-token
+  hosts /work/repos/.auth/roccho-dev/gh ci-owner-token roccho-dev
   hosts "$HOME/.config/gh" ci-home-token
   hosts "$HOME/xdg/gh" ci-xdg-token
   helper /etc/gitconfig ci-system-token
@@ -615,10 +617,10 @@ inside '
   helper "$HOME/.config/git/config" ci-xdg-git-token
   cd /work/repos/gh-proof
   for r in bound unbound other; do git init -q "$r"; done
-  # The owner clone is bound by the production bind of the profile helper; the other-owner clone is a hostile raw edit
-  # (the owner bind refuses another owner).
+  # The clone is bound by the production bind of the profile helper with its declared principal; the other clone is a
+  # hostile raw edit that names the helper without a principal.
   git -C bound config remote.origin.url https://github.com/roccho-dev/windows
-  case $(/nix/var/nix/profiles/windows-dev/bin/git-credential-github-roccho-dev bind /work/repos/gh-proof/bound https://github.com/roccho-dev/windows) in
+  case $(/nix/var/nix/profiles/windows-dev/bin/git-credential-github-roccho-dev bind /work/repos/gh-proof/bound https://github.com/roccho-dev/windows roccho-dev) in
     "bind result=ok "*) ;; *) echo "production bind failed" >&2; exit 1 ;;
   esac
   git -C unbound config remote.origin.url https://github.com/roccho-dev/windows
@@ -654,7 +656,8 @@ inside '
   gh help > /dev/null
   snap() {
     ls -lAR --time-style=+%s.%N "$HOME/.config" "$HOME/xdg" /work/repos/.auth
-    sha256sum "$HOME/.config/gh/hosts.yml" "$HOME/xdg/gh/hosts.yml" /work/repos/.auth/roccho-dev/gh/hosts.yml
+    sha256sum "$HOME/.config/gh/hosts.yml" "$HOME/xdg/gh/hosts.yml" /work/repos/.auth/roccho-dev/gh/hosts.yml \
+      /work/repos/.auth/roccho-dev/gh/config.yml
   }
   before=$(snap)
   if (cd "$HOME" && gh auth token) > /dev/null 2>&1; then echo "gh outside a bound clone returned a token" >&2; exit 1; fi
@@ -663,31 +666,41 @@ inside '
   test ! -e /proc/gh-unselected
   test "$(cd bound && gh auth token)" = ci-owner-token
   for r in unbound other; do if (cd "$r" && gh auth token) > /dev/null 2>&1; then echo "$r: gh returned a token" >&2; exit 1; fi; done
-  # The helper itself answers only https://github.com/roccho-dev/<repo>, for get, store and erase, and is silent
-  # otherwise, even when a clone of another owner is bound to it.
+  # The helper itself answers get only in the bound clone, for its exact origin path and declared principal; store and
+  # erase never answer; every other request, and any request outside a bound clone, gets nothing.
   pw() { local l; while IFS= read -r l; do case $l in password=*) printf %s "${l#password=}" ;; esac; done; }
-  test "$(printf "%b" "protocol=https\nhost=github.com\npath=roccho-dev/windows\n\n" | "$h" get | pw)" = ci-owner-token
-  for r in "protocol=https\nhost=github.com\npath=other/windows\n\n" "protocol=https\nhost=github.com\n\n" \
-    "protocol=http\nhost=github.com\npath=roccho-dev/windows\n\n" "protocol=https\nhost=example.com\npath=roccho-dev/windows\n\n" \
-    "protocol=https\nhost=github.com\npath=roccho-dev/windows\npath=other/windows\n\n" \
-    "protocol=https\nhost=github.com\npath=roccho-dev/../other\n\n"; do
-    for a in get store erase; do test -z "$(printf "%b" "$r" | "$h" "$a" 2>&1)"; done
+  ok="protocol=https\nhost=github.com\npath=roccho-dev/windows\nusername=roccho-dev\n\n"
+  test "$(cd bound && printf "%b" "$ok" | "$h" get | pw)" = ci-owner-token
+  test "$(cd bound && printf "%b" "url=https://github.com/other/x\n$ok" | "$h" get | pw)" = ci-owner-token
+  for a in get store erase; do test -z "$(cd "$HOME" && printf "%b" "$ok" | "$h" "$a" 2>&1)"; test -z "$(cd other && printf "%b" "$ok" | "$h" "$a" 2>&1)"; done
+  for r in "protocol=https\nhost=github.com\npath=other/windows\nusername=roccho-dev\n\n" "protocol=https\nhost=github.com\nusername=roccho-dev\n\n" \
+    "protocol=https\nhost=github.com\npath=roccho-dev/windows\n\n" "protocol=https\nhost=github.com\npath=roccho-dev/windows\nusername=other\n\n" \
+    "protocol=http\nhost=github.com\npath=roccho-dev/windows\nusername=roccho-dev\n\n" "protocol=https\nhost=example.com\npath=roccho-dev/windows\nusername=roccho-dev\n\n" \
+    "protocol=https\nhost=github.com\npath=roccho-dev/windows\npath=other/windows\nusername=roccho-dev\n\n" \
+    "protocol=https\nhost=github.com\npath=roccho-dev/windows/extra\nusername=roccho-dev\n\n" \
+    "protocol=https\nhost=github.com\npath=roccho-dev/windowsx\nusername=roccho-dev\n\n" \
+    "protocol=https\nhost=github.com\npath=roccho-dev/../other\nusername=roccho-dev\n\n" "$ok"; do
+    for a in store erase; do test -z "$(cd bound && printf "%b" "$r" | "$h" "$a" 2>&1)"; done
+    [ "$r" = "$ok" ] || test -z "$(cd bound && printf "%b" "$r" | "$h" get 2>&1)"
   done
   test "$(snap)" = "$before"
 '
 echo 'PASS owner gh/Git routing (dev image): bind check holds; real Git gives no credential outside a bound clone despite global/system helper files; bound clone selects the owner only; other owner/outside get nothing; overrides never win'
 
 # Production dev Tools bind: the exact fragment win.ps1 plans for Tools, run in this image. Through the profile helper
-# it binds a clone and confirms all seven settings, and repeating is a no-op. A helper without bind (as an older
-# toolsRev builds) exits 0 with no effect; Tools refuses that (exit 6) and nothing is bound.
+# it binds a clone with the Spec's githubPrincipal and confirms all nine settings, and repeating is a no-op. A helper
+# without bind (as an older toolsRev builds) exits 0 with no effect; Tools refuses that (exit 6) and nothing is bound.
 tools=$(ProgramFiles="$evidence" COMPUTERNAME=G6I3 pwsh -NoProfile -NonInteractive -File oci/dev/win.ps1 -Step Plan -Binding oci/dev/bindings/G6I3.json |
   jq -er '.Tools as $a | $a[([range(0; $a | length)] | map(select($a[.] == "-c")) | first) + 1]')
+principal=$(ProgramFiles="$evidence" COMPUTERNAME=G6I3 pwsh -NoProfile -NonInteractive -File oci/dev/win.ps1 -Step Plan -Binding oci/dev/bindings/G6I3.json |
+  jq -er '.Tools[-1]')
+[ "$principal" = "$(jq -er .githubPrincipal oci/dev/spec.json)" ] || { echo 'Tools does not pass the Spec githubPrincipal' >&2; exit 1; }
 frag=${tools#*'readlink $d || exit 1; '}
-[ "$frag" != "$tools" ] && [[ $frag == 'u=$1; '* ]] || { echo 'Tools bind fragment not found in the planned argv' >&2; exit 1; }
+[ "$frag" != "$tools" ] && [[ $frag == 'u=$1 P=$2; '* ]] || { echo 'Tools bind fragment not found in the planned argv' >&2; exit 1; }
 inside '
   u=https://github.com/roccho-dev/windows
   frag=$1
-  run() { R=$1 D=$2 bash -c "r=\$R d=\$D; set -f; $frag" sh "$u"; }
+  run() { R=$1 D=$2 bash -c "r=\$R d=\$D; set -f; $frag" sh "$u" roccho-dev; }
   install -d -m 700 /work/repos/tools-proof
   cd /work/repos/tools-proof
   for x in new old; do git init -q "$x"; git -C "$x" config remote.origin.url "$u.git"; done
@@ -702,15 +715,15 @@ inside '
   test "$(git -C old config --local --list)" = "$before" || { echo "old helper: config changed" >&2; exit 1; }
   rc=0; out=$(run /work/repos/tools-proof/new /nix/var/nix/profiles/windows-dev) || rc=$?
   test "$rc" = 0 || { echo "Tools bind exit $rc: $out" >&2; exit 1; }
-  test "$out" = "bind result=ok reason=- repo=/work/repos/tools-proof/new url=$u prior=AAAAAGA writes=7 restored=0 retained=0
+  test "$out" = "bind result=ok reason=- repo=/work/repos/tools-proof/new url=$u prior=AAAAAAAGA writes=9 restored=0 retained=0
 bound /work/repos/tools-proof/new $u" || { echo "Tools bind output: $out" >&2; exit 1; }
   before=$(git -C new config --local --list)
   rc=0; out=$(run /work/repos/tools-proof/new /nix/var/nix/profiles/windows-dev) || rc=$?
-  test "$rc" = 0 && [[ $out == "bind result=ok reason=- repo=/work/repos/tools-proof/new url=$u prior=PPPPPPP writes=0 "* ]] ||
+  test "$rc" = 0 && [[ $out == "bind result=ok reason=- repo=/work/repos/tools-proof/new url=$u prior=PPPPPPPPP writes=0 "* ]] ||
     { echo "Tools bind repeat exit $rc: $out" >&2; exit 1; }
   test "$(git -C new config --local --list)" = "$before"
 ' tools-bind "$frag"
-echo 'PASS dev Tools bind (planned fragment): production bind and seven-setting readback; repeat is a no-op; an old helper without bind exits 0 and is refused with nothing bound'
+echo 'PASS dev Tools bind (planned fragment): production bind with the Spec principal and nine-setting readback; repeat is a no-op; an old helper without bind exits 0 and is refused with nothing bound'
 
 docker rm -f "$core" >/dev/null
 # No network on the successor: neither the old HOME nor a silent re-download can rescue it.

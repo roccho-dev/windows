@@ -23,6 +23,9 @@ jobs:
       image: ${{ steps.publish.outputs.image }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - name: Parse and dry-plan the Windows script (no WSLC, no live effect)
         shell: pwsh
         run: |
@@ -711,15 +714,29 @@ jobs:
           # the four token variables, GH_HOST, HOME, XDG and the old rent root never win. GH_REPO is checked statically.
           docker run --rm "$image" /bin/grep -qF 'unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_REPO GH_HOST' /bin/gh
           docker exec rent-smoke /bin/bash -euc '
+            # hosts DIR TOKEN [USER]: one synthetic account in a current-format gh file store.
             hosts() {
               install -d -m 700 -o 1000 -g 1000 "$1"
-              printf "github.com:\n    users:\n        ci:\n            oauth_token: %s\n    git_protocol: https\n    user: ci\n    oauth_token: %s\n" "$2" "$2" > "$1/hosts.yml"
-              chown 1000:1000 "$1/hosts.yml"; chmod 600 "$1/hosts.yml"
+              printf "github.com:\n    users:\n        %s:\n            oauth_token: %s\n    git_protocol: https\n    user: %s\n    oauth_token: %s\n" "${3:-ci}" "$2" "${3:-ci}" "$2" > "$1/hosts.yml"
+              printf "version: \"1\"\n" > "$1/config.yml"
+              chown 1000:1000 "$1/hosts.yml" "$1/config.yml"; chmod 600 "$1/hosts.yml" "$1/config.yml"
             }
             helper() { printf "[credential]\n\thelper = \"!echo username=ci; echo password=%s #\"\n" "$2" > "$1"; }
             install -d -m 755 /work/repos/.auth
-            install -d -m 700 -o 1000 -g 1000 /work/repos/.auth/roccho-dev /work/repos/gh-proof
-            hosts /work/repos/.auth/roccho-dev/gh ci-owner-token
+            install -d -m 700 -o 1000 -g 1000 /work/repos/.auth/roccho-dev /work/repos/.auth/mti-takasawa /work/repos/gh-proof
+            hosts /work/repos/.auth/roccho-dev/gh ci-owner-token roccho-dev
+            hosts /work/repos/.auth/mti-takasawa/gh ci-mti-token mti-takasawa
+            # Refused slots: another active account, no active account (x-access-token), a configured account whose token
+            # is not in the file (keyring only), and the earlier version-less format gh would migrate.
+            for x in wrong noactive keyring old; do install -d -m 700 -o 1000 -g 1000 /work/repos/.auth/ci-$x; done
+            hosts /work/repos/.auth/ci-wrong/gh ci-wrong-token ci-other
+            hosts /work/repos/.auth/ci-noactive/gh ci-noactive-token ci-noactive
+            printf "github.com:\n    oauth_token: ci-noactive-token\n    git_protocol: https\n" > /work/repos/.auth/ci-noactive/gh/hosts.yml
+            hosts /work/repos/.auth/ci-keyring/gh unused ci-keyring
+            printf "github.com:\n    users:\n        ci-keyring:\n    git_protocol: https\n    user: ci-keyring\n" > /work/repos/.auth/ci-keyring/gh/hosts.yml
+            hosts /work/repos/.auth/ci-old/gh ci-old-token ci-old
+            rm -f /work/repos/.auth/ci-old/gh/config.yml
+            chown -R 1000:1000 /work/repos/.auth/ci-wrong /work/repos/.auth/ci-noactive /work/repos/.auth/ci-keyring /work/repos/.auth/ci-old
             hosts /var/lib/rent/dev/gh ci-legacy-token
             install -d -m 755 -o 1000 -g 1000 /home/dev/xdg /home/dev/.config/git
             hosts /home/dev/.config/gh ci-home-token
@@ -733,7 +750,7 @@ jobs:
             h=/nix/var/nix/profiles/rent-dev/bin/git-credential-github-roccho-dev
             test -x "$h"
             cd /work/repos/gh-proof
-            for r in bound unbound other; do git init -q "$r"; done
+            for r in bound mieru unbound other wrong noactive keyring old; do git init -q "$r"; done
             bind() {
               git -C "$1" config remote.origin.url "$2"
               git -C "$1" config --replace-all credential.helper ""
@@ -741,9 +758,16 @@ jobs:
               git -C "$1" config credential.useHttpPath true
               git -C "$1" config http.followRedirects false
             }
-            # The owner clone through the production bind of the shared helper; the other-owner clone stays a hostile edit.
-            git -C bound config remote.origin.url https://github.com/roccho-dev/windows
-            case $("$h" bind /work/repos/gh-proof/bound https://github.com/roccho-dev/windows) in "bind result=ok "*) ;; *) exit 1 ;; esac
+            # pbind DIR URL PRINCIPAL: the production bind of the shared helper.
+            pbind() {
+              git -C "$1" config remote.origin.url "$2"
+              case $("$h" bind "/work/repos/gh-proof/$1" "$2" "$3") in "bind result=ok "*) ;; *) echo "bind $1 failed" >&2; exit 1 ;; esac
+            }
+            # One profile, two declared principals at once: the namespace never selects the principal. The other clone
+            # stays a hostile edit naming the helper without a principal.
+            pbind bound https://github.com/roccho-dev/windows roccho-dev
+            pbind mieru https://github.com/hc-consul-pj/mierundesu-generate-report mti-takasawa
+            for x in wrong noactive keyring old; do pbind "$x" https://github.com/roccho-dev/windows "ci-$x"; done
             git -C unbound config remote.origin.url https://github.com/roccho-dev/windows
             bind other https://github.com/other/windows
             fill() {
@@ -758,11 +782,36 @@ jobs:
               fi
               test -z "$out"
             }
+            # Every slot (paths, types, sizes, times and contents) is unchanged by all of the reads below.
+            snap() { find "$HOME/.config" "$HOME/xdg" /work/repos/.auth -printf "%p %y %s %T@\n" | LC_ALL=C sort
+              find "$HOME/.config" "$HOME/xdg" /work/repos/.auth -type f -exec sha256sum {} + | LC_ALL=C sort; }
+            slots=$(snap)
             test -n "$(fill unbound roccho-dev/windows -u GIT_CONFIG_GLOBAL)"
             test "$(fill unbound roccho-dev/windows -u GIT_CONFIG_NOSYSTEM)" = ci-system-token
             nofill unbound roccho-dev/windows
             test "$(fill bound roccho-dev/windows)" = ci-owner-token
+            test "$(fill mieru hc-consul-pj/mierundesu-generate-report)" = ci-mti-token
+            test "$(fill bound roccho-dev/windows)" = ci-owner-token
+            nofill mieru roccho-dev/windows
+            nofill mieru hc-consul-pj/mierundesu-generate-report-x
             nofill other other/windows
+            for x in wrong noactive keyring old; do nofill "$x" roccho-dev/windows; done
+            # A parent D-Bus session does not reach gh: the keyring-only slot stays refused under it as well.
+            ( export DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/ci-session-bus; nofill keyring roccho-dev/windows )
+            # Repeating each production bind is a no-op.
+            for x in "bound https://github.com/roccho-dev/windows roccho-dev" \
+              "mieru https://github.com/hc-consul-pj/mierundesu-generate-report mti-takasawa"; do
+              set -- $x
+              case $("$h" bind "/work/repos/gh-proof/$1" "$2" "$3") in *" prior=PPPPPPPPP writes=0 "*) ;; *) echo "$1: repeat bind changed" >&2; exit 1 ;; esac
+            done
+            test "$(snap)" = "$slots"
+            # The native gh of this closure writes version "1" in the form the guard accepts, on a disposable copy only.
+            gh_real=$(sed -n "s|^[[:space:]]*exec \(/nix/store/[^ ]*/bin/gh\) .*|\1|p" "$(readlink -e /bin/gh)")
+            test -x "$gh_real"
+            m=$(mktemp -d)
+            printf "github.com:\n    oauth_token: ci-mig-token\n    user: ci-mig\n    git_protocol: https\n" > "$m/hosts.yml"
+            GH_CONFIG_DIR=$m DBUS_SESSION_BUS_ADDRESS=unix:path=/proc/gh-unselected "$gh_real" config get git_protocol > /dev/null 2>&1 || true
+            grep -qxF "version: \"1\"" "$m/config.yml"
             export XDG_CONFIG_HOME="$HOME/xdg" GH_TOKEN=ci-env-gh GITHUB_TOKEN=ci-env-github GH_ENTERPRISE_TOKEN=ci-env-ghe \
               GITHUB_ENTERPRISE_TOKEN=ci-env-ghes GH_HOST=evil.example GH_REPO=other/elsewhere GIT_TERMINAL_PROMPT=0
             # Unselected gh uses the absent procfs path /proc/gh-unselected: no config to read, none can be created.
@@ -770,26 +819,60 @@ jobs:
             test ! -e /proc/gh-unselected
             gh --version | grep -q "^gh version "
             gh help > /dev/null
-            snap() { find "$HOME/.config" "$HOME/xdg" /work/repos/.auth -type f -exec sha256sum {} + | LC_ALL=C sort; }
             before=$(snap)
             if (cd "$HOME" && gh auth token) > /dev/null 2>&1; then echo "gh outside a bound repository returned a token" >&2; exit 1; fi
             if (cd "$HOME" && gh config set editor vi) > /dev/null 2>&1; then echo "gh outside a bound repository wrote a config" >&2; exit 1; fi
             test "$(snap)" = "$before"
             test ! -e /proc/gh-unselected
             test "$(cd bound && gh auth token)" = ci-owner-token
-            for r in unbound other; do if (cd "$r" && gh auth token) > /dev/null 2>&1; then echo "$r: gh returned a token" >&2; exit 1; fi; done
-            # The helper itself answers only https://github.com/roccho-dev/<repo>, for get, store and erase, and is
-            # silent otherwise, even when a repository of another owner is bound to it.
-            ask() { printf "$1" | "$h" "${2:-get}"; }
-            test "$(ask "protocol=https\nhost=github.com\npath=roccho-dev/windows\n\n" | sed -n "s/^password=//p")" = ci-owner-token
-            for r in "protocol=https\nhost=github.com\npath=other/windows\n\n" "protocol=https\nhost=github.com\n\n" \
-              "protocol=http\nhost=github.com\npath=roccho-dev/windows\n\n" "protocol=https\nhost=example.com\npath=roccho-dev/windows\n\n" \
-              "protocol=https\nhost=github.com\npath=roccho-dev/windows\npath=other/windows\n\n" \
-              "protocol=https\nhost=github.com\npath=roccho-dev/../other\n\n"; do
-              for a in get store erase; do test -z "$(ask "$r" "$a" 2>&1)"; done
+            test "$(cd mieru && gh auth token)" = ci-mti-token
+            for r in unbound other wrong noactive keyring old; do if (cd "$r" && gh auth token) > /dev/null 2>&1; then echo "$r: gh returned a token" >&2; exit 1; fi; done
+            # The helper itself answers only get, inside a bound repository, for exactly its origin and declared
+            # principal, and is silent otherwise (store and erase never touch a slot).
+            ask() { printf "$2" | (cd "$1" && "$h" "${3:-get}"); }
+            test "$(ask bound "protocol=https\nhost=github.com\npath=roccho-dev/windows\nusername=roccho-dev\n\n" | sed -n "s/^password=//p")" = ci-owner-token
+            test "$(ask mieru "protocol=https\nhost=github.com\npath=hc-consul-pj/mierundesu-generate-report.git\nusername=mti-takasawa\n\n" | sed -n "s/^password=//p")" = ci-mti-token
+            for a in store erase; do test -z "$(ask bound "protocol=https\nhost=github.com\npath=roccho-dev/windows\nusername=roccho-dev\n\n" "$a" 2>&1)"; done
+            for r in "protocol=https\nhost=github.com\npath=other/windows\nusername=roccho-dev\n\n" "protocol=https\nhost=github.com\nusername=roccho-dev\n\n" \
+              "protocol=https\nhost=github.com\npath=roccho-dev/windows\n\n" "protocol=https\nhost=github.com\npath=roccho-dev/windows\nusername=mti-takasawa\n\n" \
+              "protocol=http\nhost=github.com\npath=roccho-dev/windows\nusername=roccho-dev\n\n" "protocol=https\nhost=example.com\npath=roccho-dev/windows\nusername=roccho-dev\n\n" \
+              "protocol=https\nhost=github.com\npath=roccho-dev/windows\npath=other/windows\nusername=roccho-dev\n\n" \
+              "protocol=https\nhost=github.com\npath=roccho-dev/../other\nusername=roccho-dev\n\n"; do
+              for a in get store erase; do test -z "$(ask bound "$r" "$a" 2>&1)"; done
+            done
+            for d in "$HOME" unbound; do test -z "$(ask "$d" "protocol=https\nhost=github.com\npath=roccho-dev/windows\nusername=roccho-dev\n\n" 2>&1)"; done
+            # Selection reads the whole declaration as bind checks it and never repairs it: after any one drift from the
+            # nine settings (a repeated empty value included), an extra local key, an include or a worktree config, get and
+            # gh stay unselected and the clone config is left exactly as found.
+            q="protocol=https\nhost=github.com\npath=roccho-dev/windows\nusername=roccho-dev\n\n"
+            w=https://github.com/roccho-dev/windows
+            ln -s "$(readlink -f "$h")" /tmp/git-credential-github-roccho-dev
+            for m in reset push path redirect include worktree extra helper origin user; do
+              d=drift-$m
+              git init -q "$d"
+              pbind "$d" "$w" roccho-dev
+              test "$(ask "$d" "$q" | sed -n "s/^password=//p")" = ci-owner-token
+              c() { git -C "$d" config "$@"; }
+              case $m in
+                reset) c --unset-all credential.helper ;;
+                push) c remote.origin.pushurl https://github.com/other/repo ;;
+                path) c credential.useHttpPath false ;;
+                redirect) c http.followRedirects true ;;
+                include) c include.path /dev/null ;;
+                worktree) c core.repositoryformatversion 1 && c extensions.worktreeConfig true ;;
+                extra) c http.extraHeader "X-CI: 1" ;;
+                helper) c --replace-all "credential.$w.helper" /tmp/git-credential-github-roccho-dev &&
+                  c --replace-all "credential.$w.git.helper" /tmp/git-credential-github-roccho-dev ;;
+                origin) c --add remote.origin.url "" ;;
+                user) c --add "credential.$w.username" "" ;;
+              esac
+              k=$(sha256sum "$d/.git/config")
+              test -z "$(ask "$d" "$q" 2>&1)"
+              if (cd "$d" && gh auth token) > /dev/null 2>&1; then echo "$d: gh returned a token" >&2; exit 1; fi
+              test "$(sha256sum "$d/.git/config")" = "$k"
             done
             test "$(snap)" = "$before"'
-          # Image-default Docker exec, entered as is (no -e, no profile): the same Git gate and owner-only gh.
+          # Image-default Docker exec, entered as is (no -e, no profile): the same Git gate and bound-principal gh.
           docker exec -u 1000:1000 -w /work/repos/gh-proof rent-smoke /bin/bash -euc '
             test "$GIT_CONFIG_NOSYSTEM" = 1 && test "$GIT_CONFIG_GLOBAL" = /dev/null
             fill() {

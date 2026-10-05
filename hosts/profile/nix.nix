@@ -1,7 +1,8 @@
 # The one small development profile for own and rent (Issue #8). Codex and Claude Code are official releases pinned
 # by hash; every other package comes from the locked nixpkgs. Adding a package is a change here, CI, and a new image;
-# nothing is installed into a host by hand. `extra` exists only for the CI upgrade proof. `owner` is the role's or
-# target's declared credential owner (own: its Binding); rent keeps the default.
+# nothing is installed into a host by hand. `extra` exists only for the CI upgrade proof. `owner` only names the
+# profile's stable Git credential helper (own: its Binding; rent keeps the default); each repository's principal is
+# declared by its own binding (hosts/profile/gh.nix), never derived from owner or the URL namespace.
 { pkgs, extra ? [], owner ? "roccho-dev" }:
 let
   codex = import ../own/codex.nix { inherit pkgs; };
@@ -17,7 +18,7 @@ let
     export DISABLE_AUTOUPDATER=1
     exec ${pkgs.glibc}/lib/ld-linux-x86-64.so.2 --library-path ${pkgs.glibc}/lib ${claudeBin} "$@"
   '';
-  # gh is the shared owner-routing wrapper, with the owner's Git credential helper (#8-C).
+  # gh is the shared principal-routing wrapper, with the profile's Git credential helper (#8-C).
   github = import ./gh.nix { inherit pkgs owner; };
 in
 pkgs.buildEnv {

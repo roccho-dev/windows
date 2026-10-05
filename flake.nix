@@ -8,7 +8,8 @@
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
       ownSpec = builtins.fromJSON (builtins.readFile ./hosts/own/spec.json);
-      # The target's declared credential owner selects own's gh routing and bind (rent keeps the default).
+      # The target's declared owner names own's stable gh helper (rent keeps the default); each repository's principal
+      # is the one its own binding declares (hosts/profile/gh.nix).
       ownOwner = (builtins.fromJSON (builtins.readFile ./hosts/own/bindings/G6I3.json)).owner;
       # CI only, never published or applied: another declared own target. Every site value, the credential owner
       # included, differs from the G6I3 sample; the role and the image publisher are the own role's invariants.
@@ -413,7 +414,7 @@
           tag = "next";
           tunnel = rentTunnelStub;
         };
-        # CI only, never published: the same owner routing and bind for the alternate target's credential owner,
+        # CI only, never published: the same principal routing and bind under the alternate target's helper name,
         # without an image; and that target's Binding as JSON for the own Windows script's strict reader.
         ci-alt-owner-gh = let alt = import ./hosts/profile/gh.nix { inherit pkgs; inherit (ciAltBinding) owner; }; in
           pkgs.buildEnv { name = "ci-alt-owner-gh"; paths = [ alt.wrapper alt.helper ]; pathsToLink = [ "/bin" ]; };
