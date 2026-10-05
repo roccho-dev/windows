@@ -14,6 +14,6 @@
   "privateKeyFile": "/work/repos/.auth/ssh/windows-own/id_ed25519",
   "knownHostsFile": "%USERPROFILE%\\.ssh\\known_hosts_windows_own",
   "windowsIdentityFile": "%USERPROFILE%\\.ssh\\id_ed25519_windows_own",
-  "image": "ghcr.io/roccho-dev/windows-own@sha256:35ac544837bf5c743af46179a96fa79bb5be8721c6cf6b396ddaf6cf850d478b",
-  "imageFrom": "roccho-dev/windows run 37097223405 at c45f7a72fdfddab7790d7e5f4fe2175b016f7c23"
+  "image": "ghcr.io/roccho-dev/windows-own@sha256:7446d6c9876cec44c56c1b2be08f2e03d8de0ebfc1683d48fa9d123b30c47e93",
+  "imageFrom": "roccho-dev/windows run 37321127124 at 1ac04d78a820177b5ff9c6608affa97b54c80697"
 }
