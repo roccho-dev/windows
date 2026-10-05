@@ -588,18 +588,22 @@ def noctty_launch(value: object) -> dict:
 
 
 def own_resume(value, launch):
-    """A generated G6I3 projection, not a second authored OCI binding."""
+    """A projection generated from the declared own target's Binding, not a second authored OCI binding."""
     if value is None:
         return None
     if (not isinstance(value, dict) or set(value) !=
             {"expectHost", "container", "hostPort", "image", "session", "volumes", "ssh"}):
         raise ValueError("Invalid own resume projection")
-    if (value["expectHost"] != "G6I3" or value["container"] != "windows-own" or
+    # Site values come from the Binding; the image publisher is the own role's Spec invariant.
+    if (not isinstance(value["expectHost"], str) or
+            not re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9-]{0,13}[A-Za-z0-9])?", value["expectHost"]) or
+            not isinstance(value["container"], str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]+", value["container"]) or
+            not isinstance(value["session"], str) or not re.fullmatch(r"wslc-cli-[a-z0-9][a-z0-9-]*", value["session"]) or
             value["session"] != launch["session"] or value["container"] != launch["container"] or
-            type(value["hostPort"]) is not int or value["hostPort"] != 2223 or
+            type(value["hostPort"]) is not int or not 1024 <= value["hostPort"] <= 65535 or
             not isinstance(value["image"], str) or not re.fullmatch(
                 r"ghcr\.io/roccho-dev/windows-own@sha256:[a-f0-9]{64}", value["image"])):
-        raise ValueError("Own resume requires the explicit G6I3 binding")
+        raise ValueError("Own resume requires an explicit declared own target binding")
     volumes = value["volumes"]
     if (not isinstance(volumes, list) or len(volumes) != 3 or
             any(not isinstance(v, dict) or set(v) != {"name", "destination"} for v in volumes) or
@@ -607,9 +611,12 @@ def own_resume(value, launch):
             any(not isinstance(v["name"], str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", v["name"])
                 for v in volumes) or len({v["name"] for v in volumes}) != 3):
         raise ValueError("Own resume requires three distinct existing named volumes")
-    if value["ssh"] != {"alias": "g6i3-own", "identity": ".ssh/id_ed25519_windows_own",
-                         "knownHosts": ".ssh/known_hosts_windows_own"}:
-        raise ValueError("Own resume must preserve the Windows SSH binding")
+    ssh = value["ssh"]
+    if (not isinstance(ssh, dict) or set(ssh) != {"alias", "identity", "knownHosts"} or
+            any(not isinstance(ssh[k], str) for k in ssh) or not re.fullmatch(r"[a-z0-9][a-z0-9-]+", ssh["alias"]) or
+            any(not re.fullmatch(r"\.ssh/(?!\.\.?$)[A-Za-z0-9._-]+", ssh[k]) for k in ("identity", "knownHosts")) or
+            ssh["identity"] == ssh["knownHosts"]):
+        raise ValueError("Own resume must declare its Windows SSH alias, identity and known hosts")
     return value
 
 

@@ -75,20 +75,23 @@ $Clone = $Seeded + 'p=$1 u=$2 r=$3 b=$4; ' + $Git +
     'test ! -e $r || exit 3; g clone $u $r && g -C $r checkout --detach $b && test $(g -C $r rev-parse HEAD) = $b && g -C $r remote get-url origin'
 # Tools builds the flake's dev-profile at the committed toolsRev into $DevProfile, which is also its GC root,
 # then creates the owner credential root (mode 0700) and binds only the Spec clone (repoPath, cloneUrl), never
-# a PREPARE support clone: helper reset, <repo> and <repo>.git keys naming the profile's owner helper,
-# useHttpPath, no redirects, canonical origin and pushurl. No network and no credential content. Exit 6: the
-# profile's helper or gh root does not match the cloneUrl owner, or the clone's origin is not cloneUrl.
+# a PREPARE support clone, through the profile helper's own bind (hosts/profile/gh.nix): helper reset, <repo> and
+# <repo>.git keys naming the profile's owner helper, useHttpPath, no redirects, canonical origin and pushurl.
+# Success needs both bind's one result line and an independent read of all seven settings: a helper without bind
+# (an older toolsRev) exits 0 with no effect, and that is refused. No network and no credential content. Exit 6:
+# the profile's helper or gh root does not match the cloneUrl owner, or the bind is refused, fails or unconfirmed.
 # set -f keeps ? literal in the flake URL.
 $DevProfile = '/nix/var/nix/profiles/windows-dev'
 $ImagePath = '/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/nix/var/nix/profiles/default/sbin'
 $Bind = 'u=$1; o=${u#https://github.com/}; o=${o%%/*}; a=/work/repos/.auth; h=$d/bin/git-credential-github-$o; G=$d/bin/git; ' +
     'test -x $h && test -x $G || exit 6; case $(cat $d/bin/gh) in *GH_CONFIG_DIR=$a/$o/gh*) ;; *) exit 6;; esac; ' +
-    'case $($G -C $r config --get remote.origin.url) in $u|$u.git) ;; *) exit 6;; esac; ' +
     'install -d -m 700 $a $a/$o $a/$o/gh || exit 1; ' +
-    '$G -C $r config --replace-all credential.helper '''' || exit 1; ' +
-    'for k in $u $u.git; do $G -C $r config --replace-all credential.$k.helper $h || exit 1; done; ' +
-    '$G -C $r config credential.useHttpPath true && $G -C $r config http.followRedirects false && ' +
-    '$G -C $r config remote.origin.url $u && $G -C $r config --replace-all remote.origin.pushurl $u || exit 1; echo bound $r $u'
+    'res=$($h bind $r $u < /dev/null); b=$?; echo $res; test $b = 0 || exit 6; ' +
+    'set -- $res; test $# = 9 && test $1 = bind && test $2 = result=ok && test $4 = repo=$r && test $5 = url=$u || exit 6; ' +
+    'for k in credential.helper= credential.$u.helper=$h credential.$u.git.helper=$h credential.useHttpPath=true ' +
+    'http.followRedirects=false remote.origin.url=$u remote.origin.pushurl=$u; do n=${k%%=*}; v=${k#*=}; ' +
+    'test $($G -C $r config --local --get-all $n | wc -l) = 1 && test x$($G -C $r config --local --get $n) = x$v || exit 6; done; ' +
+    'echo bound $r $u'
 $Tools = $Seeded + 'set -f; p=$1 r=$2 d=$3; shift 3; ' +
     'nix --extra-experimental-features ''nix-command flakes'' build --profile $d git+file://$r?rev=$p#dev-profile && readlink $d || exit 1; ' + $Bind
 # Run checks the seed marker, then execs the command. With IFS empty and globbing off,

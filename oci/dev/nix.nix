@@ -4,8 +4,13 @@
 rec {
   # One-owner GitHub routing per execution.md, the same outputs own and rent use (hosts/profile/gh.nix): the gh wrapper
   # selects the owner root only in a clone bound in its own config, and the owner's git credential helper. Tools binds
-  # each clone to the helper; Run excludes system and global Git configuration and prompts.
-  github = import ../../hosts/profile/gh.nix { inherit pkgs; };
+  # each clone through the helper's own bind; Run excludes system and global Git configuration and prompts. The owner
+  # is the one in the Spec's canonical cloneUrl.
+  github = import ../../hosts/profile/gh.nix {
+    inherit pkgs;
+    owner = builtins.head (builtins.match "https://github\\.com/([^/]+)/[^/]+"
+      (builtins.fromJSON (builtins.readFile ./spec.json)).cloneUrl);
+  };
   ghWrapper = github.wrapper;
   ghCredential = github.helper;
 

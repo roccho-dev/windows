@@ -333,7 +333,8 @@ Must ((Get-AppAction @() $app) -ceq 'install' -and (Get-AppAction @(@{ name = 'O
 $bootstrap = $manifest.wingetBootstrap
 $manualText = Get-NocttyConfigText $manifest.noctty 'C:\Program Files\WSL\wslc.exe'
 Must ($manualText -ceq ('font-family = ' + $manifest.noctty.fontFamily + "`n" +
-    'command = direct:"C:\Program Files\WSL\wslc.exe" --session wslc-cli-resta exec --interactive --tty windows-own /bin/sh -i' + "`nwindow-save-state = never`n")) 'Noctty direct existing OCI shell and fresh manual window, quoted native path'
+    'command = direct:"C:\Program Files\WSL\wslc.exe" --session ' + $manifest.noctty.launch.session + ' exec --interactive --tty ' +
+    $manifest.noctty.launch.container + ' /bin/sh -i' + "`nwindow-save-state = never`n")) 'Noctty direct existing OCI shell of the declared target and fresh manual window, quoted native path'
 foreach ($change in @(@{ session = '' }, @{ session = "name`ncommand = cmd" }, @{ container = 'other name' }, @{ shell = '/bin/sh -c cmd' }, @{ windowSaveState = 'always' }, @{ fallback = 'create' })) {
     $case = @{ session = 'wslc-cli-resta'; container = 'windows-own'; shell = '/bin/sh'; windowSaveState = 'never' }
     foreach ($key in $change.Keys) { $case[$key] = $change[$key] }
@@ -839,7 +840,7 @@ function PrimitiveProof([string]$Root, [string]$Scratch, [switch]$Real) {
         'ConvergeAppPath', 'CollectAppPathGarbage', 'ConvergeEffect', 'Classify', 'UndoOwned', 'SharedKey', 'ObserveKeyContent',
         'ConvergeNocttyConfig','ApplyNocttyConfigOnly','PlatformDirectory','SharedDirectory'
     $names += 'AppxEffect', 'ObserveAppx', 'IntroduceAppx', 'ConvergeApps', 'FetchBootstrap', 'AssertAppxManifest', 'AssertMicrosoftSignature'
-    $names += 'PlatformEffect','ObservePlatformEffect','IntroducePlatform','IsPlatformEffect','IsHostEffect','HostProfile'
+    $names += 'PlatformEffect','ObservePlatformEffect','IntroducePlatform','IsPlatformEffect','IsHostEffect','OwnDeclared','HostProfile'
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'win.ps1'), [ref]$null, [ref]$null)
     foreach ($definition in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cin $names }, $false)) {
         . ([scriptblock]::Create($definition.Extent.Text))
@@ -1524,7 +1525,7 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
     $ErrorActionPreference = 'Stop'
     . (Join-Path $Root 'handoff-evaluate.ps1')
     $names = 'WriteRecord','IndexRecord','NewLedgerIndex','AttemptOf','RecordsOf','LedgerIds','ReadLedger','OpenAttempt',
-        'IntentTemp','CleanStaging','ResolveAttempt','RecoverId','Recovering','IsPlatformEffect','IsHostEffect','Observe',
+        'IntentTemp','CleanStaging','ResolveAttempt','RecoverId','Recovering','IsPlatformEffect','IsHostEffect','OwnDeclared','Observe',
         'ObserveFile','ObserveTree','ObserveHostEffect','ObserveOwnTask','ResolveOwnTaskTriggerUser','OwnTaskName','OwnTaskEffect','OwnTaskXml','RegisterOwnTask','ConvergeOwnTask',
         'HostTreeEffect','InstallHostTree','Classify','HostHash','WriteHostTemp','HostFileState','ConvergeHostBytes','HostPrefix','FileEffect','CreateOwnedFile',
         'HostUndoPlan','UndoHostEffect','HostRemove','HostLogon','AssertPlainPath','HostProfile','AssertHostRuntimeStreams',
@@ -1572,9 +1573,9 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
 
     # The production observer uses actual 3.0.1 Ports/ReadWrite schema, not Docker HostConfig.PortBindings/RW.
     $contract = $manifest.ownResume.contract
-    $container = @{ Id = 'a' * 64; Name = '/windows-own'; Config = @{ Image = $contract.image }
+    $container = @{ Id = 'a' * 64; Name = '/' + $contract.container; Config = @{ Image = $contract.image }
         Mounts = @($contract.volumes | ForEach-Object { @{ Type='volume'; Name=$_.name; Destination=$_.destination; ReadWrite=$true } })
-        Ports = @{ '2223/tcp' = @(@{HostIp='127.0.0.1';HostPort='2223'}) }; State = @{Running=$false;Status='exited'} }
+        Ports = @{ '2223/tcp' = @(@{HostIp='127.0.0.1';HostPort=[string]$contract.hostPort}) }; State = @{Running=$false;Status='exited'} }
     Must ((Get-OwnContainerAction $contract $container) -ceq 'start') 'actual native inspect shape'
     $container.Mounts = @($container.Mounts[0]); Refused { Get-OwnContainerAction $contract $container } '*accepted three volumes*'
     $container.Mounts = @($contract.volumes | ForEach-Object { @{Type='volume';Name=$_.name;Destination=$_.destination;ReadWrite=$true} })
@@ -1619,7 +1620,7 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
     Must ($starts.Count -eq 1 -and ($starts[0] -join '|') -ceq ('--session|' + $contract.session + '|container|start|' + ('a'*64))) 'only exact observed ID is started once'
     $container.State=@{Running=$false;Status='exited'}; $script:calls=@(); $script:inspects=0; $script:defaults=0; $script:sessionRunning=$false
     $null=OwnResume
-    Must ($script:defaults -eq 1 -and ($script:calls[0] -join '|') -ceq 'container|inspect|windows-own|--format|json' -and
+    Must ($script:defaults -eq 1 -and ($script:calls[0] -join '|') -ceq ('container|inspect|' + $contract.container + '|--format|json') -and
         @($script:calls | Where-Object { $_ -contains 'start' }).Count -eq 1) 'cold Apply default-opens once, observes known name, then only bound own start'
     foreach ($outcome in 'missing','wrong') {
         $container.State=@{Running=$false;Status='exited'}; $script:calls=@(); $script:inspects=0; $script:defaults=0; $script:sessionRunning=$false
@@ -1630,9 +1631,12 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
 
     # Existing local alias compatibility: absent optional IdentitiesOnly/UpdateHostKeys
     # is not conflict; the actual key/endpoint/strict binding is preserved.
-    $values=@{hostname=@('127.0.0.1');user=@('dev');stricthostkeychecking=@('true');port=@('2223')
-        identityfile=@('~/.ssh/id_ed25519_windows_own');userknownhostsfile=@('~/.ssh/known_hosts_windows_own')}
-    AssertSshEffective $values 'g6i3-own' '127.0.0.1' (Join-Path $profile '.ssh\id_ed25519_windows_own') (Join-Path $profile '.ssh\known_hosts_windows_own') '' $profile
+    $ownSsh=$contract.ssh
+    $values=@{hostname=@('127.0.0.1');user=@('dev');stricthostkeychecking=@('true');port=@([string]$contract.hostPort)
+        identityfile=@('~/' + $ownSsh.identity);userknownhostsfile=@('~/' + $ownSsh.knownHosts)}
+    AssertSshEffective $values $ownSsh.alias '127.0.0.1' (Join-Path $profile $ownSsh.identity) (Join-Path $profile $ownSsh.knownHosts) '' $profile ([string]$contract.hostPort)
+    $values.port=@('2299'); Refused { AssertSshEffective $values $ownSsh.alias '127.0.0.1' (Join-Path $profile $ownSsh.identity) (Join-Path $profile $ownSsh.knownHosts) '' $profile ([string]$contract.hostPort) } '*different port/proxy*'
+    $values.port=@([string]$contract.hostPort)
     $master=Join-Path $profile '.ssh\config'; $backup=Join-Path $profile '.ssh\config.before-windows-rent'
     $include='Include windows-rent/config windows-own/config'
     HostPrefix $master $backup $include
