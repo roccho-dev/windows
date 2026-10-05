@@ -38,12 +38,13 @@ let
   decl = ''
     g() { GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null ${pkgs.git}/bin/git -C "$r" "$@"; }
     # count:value of one local key, counting every record Git returns (an added empty value included); U when Git
-    # cannot tell.
+    # cannot tell, either read failing (the key gone between them included).
     st() {
-      local v rc
+      local v rc n
       v=$(g config --local --get-all "$1" 2>/dev/null) && rc=0 || rc=$?
       case $rc in
-        0) printf '%s:%s' "$(g config --local --get-all "$1" 2>/dev/null | ${bin}/wc -l)" "$v" ;;
+        0) n=$(set -o pipefail; g config --local --get-all "$1" 2>/dev/null | ${bin}/wc -l) || { printf 'U:'; return; }
+           printf '%s:%s' "$n" "$v" ;;
         1) printf '0:' ;;
         *) printf 'U:' ;;
       esac
