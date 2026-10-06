@@ -330,7 +330,8 @@ jobs:
           # Every return to the kept rent first passes the writer check for every other container, then points the task back.
           $Back = @($List, 'task -> windows-rent', 'start windows-rent', 'inspect windows-rent', 'inspect windows-rent', 'inspect windows-rent')
           $NoBack = @($List, 'task -> windows-rent', 'start windows-rent') + @(1..60 | ForEach-Object { 'inspect windows-rent' })
-          $Halt = { param($R) "Stage halted after placement attempt ($R): windows-rent kept stopped, logon task targets absent windows-rent-cf, slot and writer state UNKNOWN; recovery needs separate authority." }
+          # Not $Halt: the dot-sourced production functions share this scope and set $script:Halt.
+          $PlaceHaltWant = { param($R) "Stage halted after placement attempt ($R): windows-rent kept stopped, logon task targets absent windows-rent-cf, slot and writer state UNKNOWN; recovery needs separate authority." }
           $Held = { param($F, $W) "Stage halted: $F | $W; windows-rent kept stopped, windows-rent-cf left as found, logon task not restored, state UNKNOWN; recovery needs separate authority." }
           # The typed import, its selected items appended to the Plan's migrate argv; seeding with an expected backing.
           $Imp = @($Plan.migrate | Select-Object -Skip 1) + 'session' + 'codex'; $I = $Imp -join ' '; $Ipre = @($Place, $List, $S, 'inspect envs-dev-mutable', $List, $I)
@@ -358,10 +359,10 @@ jobs:
           }
           $Cases = [ordered]@{
             'ready' = @{ Old = { $OldUpJson }; Cand = { $CandUp }; Want = 'ok'; Calls = $Pre + @(1..10 | ForEach-Object { $Pair }) }
-            'placement exit 2 halts' = @{ PlaceExit = 2; Old = { $OldUpJson }; Cand = { $null }; Calls = @($Place); Want = (& $Halt 'exit 2') }
-            'placement exit 1 halts' = @{ PlaceExit = 1; Old = { $OldUpJson }; Cand = { $null }; Calls = @($Place); Want = (& $Halt 'exit 1') }
-            'placement timeout -1 halts' = @{ PlaceExit = -1; Old = { $OldUpJson }; Cand = { $null }; Calls = @($Place); Want = (& $Halt 'exit -1') }
-            'placement exception halts' = @{ PlaceThrow = $true; Old = { $OldUpJson }; Cand = { $null }; Calls = @($Place); Want = (& $Halt 'an exception') }
+            'placement exit 2 halts' = @{ PlaceExit = 2; Old = { $OldUpJson }; Cand = { $null }; Calls = @($Place); Want = (& $PlaceHaltWant 'exit 2') }
+            'placement exit 1 halts' = @{ PlaceExit = 1; Old = { $OldUpJson }; Cand = { $null }; Calls = @($Place); Want = (& $PlaceHaltWant 'exit 1') }
+            'placement timeout -1 halts' = @{ PlaceExit = -1; Old = { $OldUpJson }; Cand = { $null }; Calls = @($Place); Want = (& $PlaceHaltWant 'exit -1') }
+            'placement exception halts' = @{ PlaceThrow = $true; Old = { $OldUpJson }; Cand = { $null }; Calls = @($Place); Want = (& $PlaceHaltWant 'an exception') }
             # A writer that keeps running: the seed guard refuses, and so does the revert's guard; the kept rent stays stopped.
             'another container running' = @{ List = 'other'; Other = $OtherRunning | ConvertTo-Json -Compress; Old = { $OldUpJson }; Cand = { $null }
               Calls = @($Place, $List, 'inspect other', 'inspect windows-rent-cf', $List, 'inspect other')
@@ -444,7 +445,7 @@ jobs:
             'task handed over before the stop' = @{ Old = { $OldUpJson }; Cand = { $CandUp }; Want = 'ok'
               Calls = @('task -> windows-rent-cf', 'stop windows-rent') + $Pre + @(1..10 | ForEach-Object { $Pair }) }
             'placement fails after the stop: halt, task not restored' = @{ PlaceExit = 2; Old = { $OldUpJson }; Cand = { $null }
-              Calls = @('task -> windows-rent-cf', 'stop windows-rent', $Place); Want = (& $Halt 'exit 2') }
+              Calls = @('task -> windows-rent-cf', 'stop windows-rent', $Place); Want = (& $PlaceHaltWant 'exit 2') }
             'task handoff fails' = @{ TaskFail = @('windows-rent-cf'); Old = { $OldUpJson }; Cand = { $null }
               Calls = @('task -> windows-rent-cf', 'task -> windows-rent'); Want = "${Before}: fake task failure for windows-rent-cf | task starts windows-rent" }
             'stop fails, kept rent still Running' = @{ Exit = @{ 'stop windows-rent' = 1 }; Old = { $OldUpJson }; Cand = { $null }
