@@ -177,7 +177,14 @@ function Get-VolumeKind([string] $Name) {
     if ($LASTEXITCODE -ne 0) {
         $Rows = @(& $Wslc volume list 2>$null)
         if ($LASTEXITCODE -ne 0 -or $Rows.Count -lt 1 -or ([string] $Rows[0]).Trim() -cnotmatch '^DRIVER\s+VOLUME NAME$') { return 'unknown' }
-        $Names = @($Rows | Select-Object -Skip 1 | ForEach-Object { if (([string] $_).Trim() -cmatch '^\S+\s+(\S.*)$') { $Matches[1].Trim() } })
+        # Every non-blank row must read as 'driver name'; one that does not leaves the list, and so the absence, unknown.
+        $Names = @()
+        foreach ($Row in @($Rows | Select-Object -Skip 1)) {
+            $Text = ([string] $Row).Trim()
+            if (-not $Text) { continue }
+            if ($Text -cnotmatch '^\S+\s+(\S.*)$') { return 'unknown' }
+            $Names += $Matches[1].Trim()
+        }
         return $(if ($Names -ccontains $Name) { 'unknown' } else { 'absent' })
     }
     $V = try { @($Text | ConvertFrom-Json) } catch { @() }

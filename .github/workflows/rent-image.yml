@@ -197,10 +197,10 @@ jobs:
             elseif ($A -ceq 'inspect h1') { $HolderJson }
             elseif ($A -ceq 'volume inspect windows-rent-nix') { $global:LASTEXITCODE = 1 }
             elseif ($A -clike 'volume inspect *') { '[{"Name":"' + $args[2] + '","Driver":"' + $Driver + '","DriverOpts":' + $Opts + '}]' }
-            elseif ($A -ceq 'volume list') { if ($ListExit) { $global:LASTEXITCODE = $ListExit } else { @('DRIVER   VOLUME NAME', 'guest    repos', 'guest    windows-rent-state', 'guest    dev-home') + $ListMore } }
+            elseif ($A -ceq 'volume list') { if ($ListExit) { $global:LASTEXITCODE = $ListExit } else { @('DRIVER   VOLUME NAME') + $ListRows + $ListMore } }
             else { $global:LASTEXITCODE = 1 }
           }
-          $ListExit = 0; $ListMore = @()
+          $ListExit = 0; $ListMore = @(); $ListRows = @('guest    repos', 'guest    windows-rent-state', 'guest    dev-home')
           $Got = Get-Anchors (J $HolderJson)
           if (-not $Got -or $Got['windows-rent-nix'].Dev -cne '8:32' -or $Got['windows-rent-nix'].Root -cne '/volumes/windows-rent-nix/_data' -or
               $Got['dev-home'].Root -cne '/volumes/dev-home/_data' -or $Got['repos'].Root -cne '/volumes/repos/_data') { 'anchors not taken from the actual state mount'; exit 1 }
@@ -212,7 +212,9 @@ jobs:
           if ((Get-VolumeKind 'windows-rent-nix') -cne 'absent') { 'an unlisted failed volume was not absent'; exit 1 }
           $ListMore = @('guest    windows-rent-nix'); if ((Get-VolumeKind 'windows-rent-nix') -cne 'unknown') { 'a listed failed volume read as absent'; exit 1 }
           $ListMore = @(); $ListExit = 1; if ((Get-VolumeKind 'windows-rent-nix') -cne 'unknown') { 'an unreadable list read as absent'; exit 1 }
-          $ListExit = 0
+          $ListExit = 0; $ListMore = @('malformed-row'); if ((Get-VolumeKind 'windows-rent-nix') -cne 'unknown') { 'a list with an unreadable row read as absent'; exit 1 }
+          $ListMore = @(); $Kept = $ListRows; $ListRows = @(); if ((Get-VolumeKind 'windows-rent-nix') -cne 'absent') { 'an empty inventory did not read as absent'; exit 1 }
+          $ListRows = $Kept
           $script:Anchors = $null
           # Stage preconditions: the kept rent Running on images read now (never a recorded digest), no candidate yet.
           $OldUpJson = '{"Name":"windows-rent","State":{"Running":true,"Status":"running"},"Image":"sha256:' + ('3' * 64) + '","Config":{"Image":"' + $Live + '"},"Mounts":[]}'
@@ -532,11 +534,11 @@ jobs:
           docker load < result-1
           key_dir="$(mktemp -d)"
           # Every file this step writes under $key_dir; the exit trap removes exactly these, then the empty directory.
-          key_files=(answer busy cand cand-visible cf-help cf-version closure cmdlines gate gh host.pub import imported key key.pub
-            known_hosts logs modes mountinfo mountlib.sh procs refuse start-real start-stub visible)
+          key_files=(answer auth-original busy cand cand-visible cf-help cf-version closure cmdlines gate gh host.pub import imported journal key
+            key.pub known_hosts logs modes mountinfo mountlib.sh procs refuse seed start-real start-stub visible)
           # Removes one of those regular files; a link or other type is kept and fails the step.
           plain() { if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then echo "kept unexpected entry $1" >&2; return 1; fi; rm -f -- "$1"; }
-          trap 'status=$?; [ "$status" -eq 0 ] || { docker logs rent-smoke 2>&1 | tail -n 40; docker logs rent-cand 2>&1 | tail -n 40; } || true; docker rm -f rent-smoke rent-refuse rent-cand >/dev/null 2>&1 || true; docker volume rm rent-smoke-repos rent-smoke-state rent-smoke-nix rent-smoke-home rent-smoke-old rent-smoke-import >/dev/null 2>&1 || true; for f in "${key_files[@]}"; do plain "$key_dir/$f" || exit 1; done; rmdir -- "$key_dir" || { echo "kept $key_dir: unexpected entries" >&2; exit 1; }' EXIT
+          trap 'status=$?; [ "$status" -eq 0 ] || { docker logs rent-smoke 2>&1 | tail -n 40; docker logs rent-cand 2>&1 | tail -n 40; } || true; docker rm -f rent-smoke rent-refuse rent-cand >/dev/null 2>&1 || true; docker volume rm rent-smoke-repos rent-smoke-state rent-smoke-nix rent-smoke-home rent-smoke-old rent-smoke-import rent-smoke-unknown >/dev/null 2>&1 || true; for f in "${key_files[@]}"; do plain "$key_dir/$f" || exit 1; done; rmdir -- "$key_dir" || { echo "kept $key_dir: unexpected entries" >&2; exit 1; }' EXIT
           test "$(docker image inspect --format '{{json .Config.Volumes}}' "$image")" = null
           test "$(docker image inspect --format '{{json .Config.Volumes}}' "$real")" = null
           # The stub image differs from the published one only in the cloudflared store path rent-start runs.
@@ -754,6 +756,26 @@ jobs:
           expect_import 20 :ro rent-smoke-old "$sid" codex
           grep -qF '/var/lib/rent/dev/codex is not a real directory' "$key_dir/import"
           test "$(import_listing)" = "$before"
+          # The same failure after the first rename, now with the prior's evidence unreadable: a synthetic test fault (an
+          # exported Bash function shadowing find, failing only inside the directory's prior and saying so) reaches the real
+          # helper. Without it this fixture restores (21, above); with it the outcome is UNKNOWN (30): the prior is kept,
+          # the target left absent and the staging copy kept. Not a real drift or provider failure.
+          docker volume create rent-smoke-unknown
+          unk=(-v rent-smoke-old:/old:ro -v rent-smoke-unknown:/var/lib/rent -e RENT_OLD_VOLUME=rent-smoke-old -e RENT_STATE_VOLUME=rent-smoke-unknown)
+          rc=0
+          docker run --rm "${unk[@]}" "$image" /bin/rent-state-import "$sid" session > "$key_dir/import" 2>&1 || rc=$?
+          test "$rc" = 10 || { cat "$key_dir/import" >&2; exit 1; }
+          docker run --rm -v rent-smoke-old:/o "$image" /bin/bash -c "echo again > /o/.claude/projects/-home-dev/$sid/subagents/c.jsonl && chown 1000:1000 /o/.claude/projects/-home-dev/$sid/subagents/c.jsonl"
+          rc=0
+          docker run --rm "${unk[@]}" -v "$key_dir/journal:/var/lib/rent/dev/claude/projects/-home-dev/$sid.jsonl:ro" "$image" /bin/bash -c "
+            find() { case \$PWD in */$sid.prior) echo 'synthetic test fault: find in the prior' >&2; return 1 ;; esac; command find \"\$@\"; }
+            export -f find
+            exec /bin/rent-state-import $sid session" > "$key_dir/import" 2>&1 || rc=$?
+          test "$rc" = 30 || { cat "$key_dir/import" >&2; exit 1; }
+          grep -qF 'synthetic test fault: find in the prior' "$key_dir/import"
+          grep -qF 'restore incomplete, state UNKNOWN' "$key_dir/import"
+          docker run --rm -v rent-smoke-unknown:/s "$image" /bin/bash -c \
+            "d=/s/dev/claude/projects/-home-dev; [ ! -e \$d/$sid ] && [ -d \$d/$sid.prior ] && compgen -G \"\$d/.import-$sid.*\" > /dev/null"
 
           run() {
             docker run -d --name rent-smoke -p 127.0.0.1:2222:2222 \
