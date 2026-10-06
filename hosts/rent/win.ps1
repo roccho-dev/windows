@@ -153,7 +153,9 @@ function Get-Anchors($Holder) {
     $Names = @(@($Mounts.Values) + $OldHomeVolume)
     $Found = @{}
     foreach ($Name in $Names) {
-        if ((Get-VolumeKind $Name) -ceq 'other') { return $null }
+        # repos and state exist as guest volumes; nix and the old home may also be truly absent; nothing else is supported.
+        $Kind = Get-VolumeKind $Name
+        if ($Kind -cne 'guest' -and -not ($Kind -ceq 'absent' -and $Name -cin @($NixVolume, $OldHomeVolume))) { return $null }
         $M = @($Table | Where-Object { $_.Type -cne 'overlay' -and $_.Root.EndsWith("/$Name/_data", [StringComparison]::Ordinal) })
         if ($M.Count -gt 1) { return $null }
         if ($M.Count -eq 1) { $Found[$Name] = @{ Dev = $M[0].Dev; Root = $M[0].Root } }
@@ -168,14 +170,33 @@ function Get-Anchors($Holder) {
     return $Found
 }
 
-# 'guest' for a named volume of the guest driver with empty options, 'absent', or 'other' (unsupported or unreadable).
+# One named volume, read now: 'guest' (the guest driver with empty options, the supported layout), 'other' (another
+# driver, options or identity), 'absent' (inspect fails and a readable volume list does not name it) or 'unknown'.
 function Get-VolumeKind([string] $Name) {
     $Text = (& $Wslc volume inspect $Name 2>$null) -join "`n"
-    if ($LASTEXITCODE -ne 0) { return 'absent' }
+    if ($LASTEXITCODE -ne 0) {
+        $Rows = @(& $Wslc volume list 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $Rows.Count -lt 1 -or ([string] $Rows[0]).Trim() -cnotmatch '^DRIVER\s+VOLUME NAME$') { return 'unknown' }
+        $Names = @($Rows | Select-Object -Skip 1 | ForEach-Object { if (([string] $_).Trim() -cmatch '^\S+\s+(\S.*)$') { $Matches[1].Trim() } })
+        return $(if ($Names -ccontains $Name) { 'unknown' } else { 'absent' })
+    }
     $V = try { @($Text | ConvertFrom-Json) } catch { @() }
-    if ($V.Count -ne 1 -or [string] $V[0].Name -cne $Name -or [string] $V[0].Driver -cne 'guest' -or -not $V[0].DriverOpts -or
+    if ($V.Count -ne 1) { return 'unknown' }
+    if ([string] $V[0].Name -cne $Name -or [string] $V[0].Driver -cne 'guest' -or -not $V[0].DriverOpts -or
         @($V[0].DriverOpts.PSObject.Properties).Count) { return 'other' }
     return 'guest'
+}
+
+# This invocation's readback of a written volume: it must be the supported guest volume; when it is truly absent and
+# -Create is given, it is created and read back as one.
+function Assert-Volume([string] $Name, [switch] $Create) {
+    $Kind = Get-VolumeKind $Name
+    if ($Kind -ceq 'absent' -and $Create) {
+        & $Wslc volume create $Name
+        if ($LASTEXITCODE -ne 0) { throw "WSLC volume create failed: $LASTEXITCODE" }
+        $Kind = Get-VolumeKind $Name
+    }
+    if ($Kind -cne 'guest') { throw "Volume $Name is $Kind, not a guest-driver volume with empty options (the supported layout)." }
 }
 
 function Get-SharingProblem($Item, [string[]] $Write, [string[]] $NoReader) {
@@ -184,10 +205,17 @@ function Get-SharingProblem($Item, [string[]] $Write, [string[]] $NoReader) {
     if (-not $Table) { return 'has an unreadable or changing mount table.' }
     foreach ($M in $Table) {
         if ($M.Type -ceq 'overlay') {
+            # Every layer of a supported overlay is an engine layer directory: lower layers are read, upper and work written.
             foreach ($Option in ($M.Super -split ',')) {
-                if ($Option -match '^(upperdir|workdir)=(.*)$' -and $Matches[2] -cnotmatch '^/var/lib/docker/overlay2/[0-9a-f]+/(diff|work)$') {
+                if ($Option -cmatch '^(upperdir|workdir)=(.*)$' -and $Matches[2] -cnotmatch '^/var/lib/docker/overlay2/[0-9a-f]+/(diff|work)$') {
                     return 'has an overlay writing outside the engine layers.'
                 }
+                if ($Option -cmatch '^lowerdir=(.*)$') {
+                    foreach ($Lower in ($Matches[1] -split ':')) {
+                        if ($Lower -cnotmatch '^/var/lib/docker/overlay2/(l/[A-Za-z0-9]+|[0-9a-f]+/diff)$') { return 'has an overlay reading outside the engine layers.' }
+                    }
+                }
+                if ($Option -cmatch '^(lowerdir|datadir)\+=') { return 'has an overlay layer form outside the supported layout.' }
             }
             continue
         }
@@ -284,6 +312,7 @@ if ($Step -eq 'Stage') {
     if ($Problem) { throw "$Problem Not staging." }
 }
 if ($Step -eq 'Migrate' -and -not $ImportItems.Count) { throw 'Migrate needs -ImportItems, the selected items to import.' }
+if (@($ImportItems | Sort-Object -Unique).Count -ne $ImportItems.Count) { throw 'Each import item may be named only once.' }
 if ($ImportItems.Count -and -not $OldImageSource) { throw 'An import needs -OldImageSource, the pre-recorded image of the old home holder.' }
 
 # The tunnel token is never an argument or environment value: rent-start reads its fixed file in the state volume.
@@ -430,6 +459,7 @@ function Invoke-Import {
     switch ($LASTEXITCODE) {
         0 { return 'unchanged' }
         10 { return 'updated' }
+        11 { return 'updated' }
         20 { throw 'WSLC import refused with no target changed' }
         21 { throw 'WSLC import failed and restored every changed item' }
         default { $script:Halt = "the import outcome is unknown (exit $LASTEXITCODE)"; throw "WSLC import: $($script:Halt)." }
@@ -588,12 +618,10 @@ if ($Step -eq 'Migrate') {
     $Kept = Get-Container $Container
     if ($Kept -and -not (Test-Stopped $Kept)) { throw "Container $Container is not provably stopped; not migrating." }
     Assert-NoOtherWriter $Container 'migrating' @($StateVolume, $OldHomeVolume) @($StateVolume)
-    & $Wslc volume inspect $OldHomeVolume | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Old home volume is missing: $OldHomeVolume" }
+    Assert-Volume $OldHomeVolume
 } else {
     # Create and Stage: repos must already exist (never create an empty one).
-    & $Wslc volume inspect $ReposVolume | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Repos volume is missing: $ReposVolume" }
+    Assert-Volume $ReposVolume
     if ($Step -eq 'Stage') {
         # The kept rent and its images come from inspect now; nothing is taken from a recorded digest.
         $Old = Get-Named $Container
@@ -602,31 +630,18 @@ if ($Step -eq 'Migrate') {
         $Target = Get-TaskTarget
         if ($Target -cne $Container) { throw "Logon task $TaskName must start exactly $Container before staging; it starts '$Target'. Nothing changed." }
         Assert-NoOtherWriter $Container 'staging'
-        & $Wslc volume inspect $StateVolume | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "State volume is missing: $StateVolume" }
+        Assert-Volume $StateVolume
     }
 }
 
-& $Wslc volume inspect $StateVolume | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    & $Wslc volume create $StateVolume
-    if ($LASTEXITCODE -ne 0) { throw "WSLC volume create failed: $LASTEXITCODE" }
-}
-if ($Step -ne 'Migrate') {
-    & $Wslc volume inspect $NixVolume | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        & $Wslc volume create $NixVolume
-        if ($LASTEXITCODE -ne 0) { throw "WSLC volume create failed: $LASTEXITCODE" }
-        # Created in this invocation: it must read back as the guest driver's with empty options, the layout the anchors assume.
-        if ($script:Anchors -and (Get-VolumeKind $NixVolume) -cne 'guest') { throw "Created $NixVolume is not a guest-driver volume with empty options." }
-    }
-}
+# Every written volume is read back in this invocation; only a truly absent state or nix volume is created, then read back.
+Assert-Volume $StateVolume -Create:($Step -ne 'Stage')
+if ($Step -ne 'Migrate') { Assert-Volume $NixVolume -Create }
 
 if ($Step -eq 'Migrate') {
     # Recheck right before the helper; one-shot helper removed by --rm; nothing is deleted from the old home.
     # The helper itself proves /old and the state mount from its own mountinfo before importing.
-    & $Wslc volume inspect $StateVolume | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "State volume is missing: $StateVolume" }
+    Assert-Volume $StateVolume
     Assert-OldSourceStopped
     $Now = Get-Container $Container
     if ([bool] $Now -ne [bool] $Kept -or ($Now -and ([string] $Now.Id -cne [string] $Kept.Id -or "$(Get-Images $Now)" -cne "$(Get-Images $Kept)" -or
@@ -635,7 +650,7 @@ if ($Step -eq 'Migrate') {
     & $Wslc @MigrateArgs
     switch ($LASTEXITCODE) {
         0 { Write-Output 'Migrate: every selected item already equal; nothing written.' }
-        10 { Write-Output 'Migrate: selected differing items updated; each original kept as its .prior.' }
+        { $_ -in 10, 11 } { Write-Output "Migrate: selected differing items updated; each original kept as its .prior (exit $LASTEXITCODE)." }
         default { throw "WSLC migrate helper exit $LASTEXITCODE (20 refused with no target changed, 21 restored, else UNKNOWN)." }
     }
     exit 0

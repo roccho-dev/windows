@@ -106,13 +106,16 @@
       '';
       # Typed import of exactly the selected items from an old home mounted read-only at /old into the state volume:
       # credentials (Claude .credentials.json), session (the one session's journal and its directory, a related pair) and
-      # codex (Codex auth.json). Content, type, owner and mode, symlinks not followed, are compared before anything is
-      # written: every selected item equal is a success with no write, and --compare only reports. Each differing item is
-      # copied beside its target and checked, then the original is renamed to <target>.prior (never overwritten) and the
-      # copy renamed into place. The originals' exact evidence lives only in this process's memory: on a failure after the
-      # first rename, each changed item is put back only from a prior that still matches it, and verified. Exit 0
-      # unchanged, 10 updated, 20 refused with no target changed (a staging copy may remain), 21 failed and restored;
-      # anything else (a crash, drift or an unverified restore) is UNKNOWN. Never run by rent-start; prints item paths only.
+      # codex (Codex auth.json), each named at most once. The fixed parents on both sides must be real directories.
+      # Content, type, owner and mode, symlinks not followed, are compared before anything is written, and any read
+      # failure is a refusal: every selected item equal is a success with no write, and --compare only reports. Each
+      # differing item is copied beside its target and checked against the source evidence taken once; the source must
+      # still match it; then the original is renamed to <target>.prior (never overwritten) and the copy renamed into place.
+      # That evidence, and the originals', lives only in this process's memory: on a failure after the first rename, each
+      # changed item is put back only from a prior that still matches its original, and verified. Exit 0 unchanged, 10
+      # updated, 11 updated with an empty staging directory left, 20 refused with no target changed (a staging copy may
+      # remain), 21 failed and restored; anything else (a crash, drift, unreadable evidence or an unverified restore) is
+      # UNKNOWN. Never run by rent-start; prints item paths only.
       stateImport = pkgs.writeShellScriptBin "rent-state-import" ''
         set -eu
         export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.diffutils pkgs.findutils pkgs.util-linux ]}
@@ -134,8 +137,10 @@
         flock -x -n 9 || fail "${rentState} is in use by a running rent or another writer"
         s=${rentState}/dev
         p=projects/-home-dev
-        items=()
+        items=() seen=
         for item in "$@"; do
+          case " $seen " in *" $item "*) fail "item $item is named twice" ;; esac
+          seen="$seen $item"
           case $item in
             credentials) items+=("/old/.claude/.credentials.json|$s/claude/.credentials.json|f") ;;
             session) items+=("/old/.claude/$p/$id|$s/claude/$p/$id|d" "/old/.claude/$p/$id.jsonl|$s/claude/$p/$id.jsonl|f") ;;
@@ -143,15 +148,24 @@
             *) fail "unknown item $item" ;;
           esac
         done
-        # Content, type, owner and mode of one file or tree, symlinks not followed: held in memory, never printed.
+        # The fixed parents on both sides, where they exist, are real directories: nothing is followed out of the paths.
+        for d in /old/.claude /old/.claude/projects "/old/.claude/$p" /old/.codex "$s" "$s/claude" "$s/claude/projects" "$s/claude/$p" "$s/codex"; do
+          if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then fail "$d is not a real directory"; fi
+        done
+        # Content, type, owner and mode of one file or tree, symlinks not followed, or 'absent'; any read failure fails.
+        # Held only in this process's memory, never printed.
         state() {
-          if [ -d "$1" ] && [ ! -L "$1" ]; then
-            (cd "$1" && find . -printf '%p|%y|%U|%G|%m|%l\n' | LC_ALL=C sort && find . -type f -exec sha256sum {} + | LC_ALL=C sort)
-          elif [ -e "$1" ] || [ -L "$1" ]; then
-            stat -c '%F|%u|%g|%a' "$1"; if [ -f "$1" ] && [ ! -L "$1" ]; then sha256sum < "$1"; fi
-          fi
+          local out
+          if [ -L "$1" ] || { [ -e "$1" ] && [ ! -d "$1" ]; }; then
+            out=$(stat -c '%F|%u|%g|%a' "$1") || return 1
+            if [ -f "$1" ] && [ ! -L "$1" ]; then out="$out|$(sha256sum < "$1")" || return 1; fi
+          elif [ -d "$1" ]; then
+            out=$(set -o pipefail; cd "$1" && find . -printf '%p|%y|%U|%G|%m|%l\n' | LC_ALL=C sort &&
+              find . -type f -exec sha256sum {} + | LC_ALL=C sort) || return 1
+          else out=absent; fi
+          printf '%s\n' "$out"
         }
-        changed=()
+        changed=() srcs=()
         for e in "''${items[@]}"; do
           IFS='|' read -r src dst kind <<< "$e"
           [ ! -L "$src" ] || fail "$src is a symlink"
@@ -159,8 +173,10 @@
             f) [ -f "$src" ] && [ "$(stat -c '%u %a' "$src")" = '1000 600' ] || fail "$src must be a UID 1000 mode 600 file" ;;
             d) [ -d "$src" ] && [ "$(stat -c %u "$src")" = 1000 ] || fail "$src must be a UID 1000 directory" ;;
           esac
-          if [ -n "$(state "$dst")" ] && [ "$(state "$dst")" = "$(state "$src")" ]; then echo "equal $dst"
-          else echo "differs $dst"; changed+=("$e"); fi
+          ss=$(state "$src") || fail "cannot read $src"
+          ds=$(state "$dst") || fail "cannot read $dst"
+          if [ "$ds" = "$ss" ]; then echo "equal $dst"
+          else echo "differs $dst"; changed+=("$e"); srcs+=("$ss"); fi
         done
         [ "$compare" = 0 ] || exit 0
         if [ "''${#changed[@]}" = 0 ]; then echo 'rent-state-import unchanged'; exit 0; fi
@@ -175,30 +191,38 @@
         for d in "$s/codex" "$s/claude" "$s/claude/projects" "$s/claude/$p"; do
           [ -d "$d" ] || install -d -m 700 -o 1000 -g 1000 "$d" || fail "cannot create $d"
         done
-        # Stage every changed item complete beside its target first; any failure here changed no target.
+        # Stage every changed item complete beside its target first, checked against the source evidence taken once, and
+        # take each original's evidence; any failure here changed no target.
         held=() staged=() step=()
-        for e in "''${changed[@]}"; do
-          IFS='|' read -r src dst kind <<< "$e"
+        for i in "''${!changed[@]}"; do
+          IFS='|' read -r src dst kind <<< "''${changed[i]}"
           tmp=$(mktemp -d "''${dst%/*}/.import-''${dst##*/}.XXXXXXXX") || fail "cannot stage $dst"
           new=$tmp/''${dst##*/}
           cp -a --no-dereference "$src" "$new" || fail "cannot copy $src"
-          [ "$(state "$new")" = "$(state "$src")" ] || fail "$new differs from its source"
-          staged+=("$new"); held+=("$(state "$dst")"); step+=(0)
+          ns=$(state "$new") || fail "cannot read $new"
+          [ "$ns" = "''${srcs[i]}" ] || fail "$new differs from its source"
+          hs=$(state "$dst") || fail "cannot read $dst"
+          staged+=("$new"); held+=("$hs"); step+=(0)
         done
-        # Put each changed item back to the original this process saw, only where its prior still matches it.
+        # The source holder is quiesced: a source that no longer matches what was compared and copied refuses here.
+        for i in "''${!changed[@]}"; do
+          IFS='|' read -r src dst kind <<< "''${changed[i]}"
+          ss=$(state "$src") && [ "$ss" = "''${srcs[i]}" ] || fail "$src changed while importing"
+        done
+        # Put each changed item back to the original this process saw, only where the copy and the prior still match
+        # their evidence; anything unreadable or drifted leaves the outcome UNKNOWN.
         restore() {
-          local i ok=1
+          local i ok=1 now
           for ((i = ''${#changed[@]} - 1; i >= 0; i--)); do
             IFS='|' read -r src dst kind <<< "''${changed[i]}"
             if [ "''${step[i]}" = 2 ]; then
-              if [ "$(state "$dst")" = "$(state "$src")" ] && mv -T "$dst" "''${staged[i]}"; then step[i]=1; else ok=0; continue; fi
+              if now=$(state "$dst") && [ "$now" = "''${srcs[i]}" ] && mv -T "$dst" "''${staged[i]}"; then step[i]=1; else ok=0; continue; fi
             fi
-            if [ "''${step[i]}" = 1 ] && [ -n "''${held[i]}" ]; then
-              if [ "$(state "$dst.prior")" = "''${held[i]}" ] && mv -T "$dst.prior" "$dst" && [ "$(state "$dst")" = "''${held[i]}" ]; then
-                step[i]=0
-              else ok=0; fi
+            if [ "''${step[i]}" = 1 ] && [ "''${held[i]}" != absent ]; then
+              if now=$(state "$dst.prior") && [ "$now" = "''${held[i]}" ] && mv -T "$dst.prior" "$dst" &&
+                now=$(state "$dst") && [ "$now" = "''${held[i]}" ]; then step[i]=0; else ok=0; fi
             elif [ "''${step[i]}" = 1 ]; then
-              if [ -z "$(state "$dst")" ]; then step[i]=0; else ok=0; fi
+              if now=$(state "$dst") && [ "$now" = absent ]; then step[i]=0; else ok=0; fi
             fi
           done
           if [ "$ok" = 1 ]; then echo 'rent-state-import: failed; every changed item restored' >&2; exit 21; fi
@@ -207,14 +231,17 @@
         # The session's directory goes before its journal; each original becomes its prior, then the copy takes its place.
         for i in "''${!changed[@]}"; do
           IFS='|' read -r src dst kind <<< "''${changed[i]}"
-          if [ -n "''${held[i]}" ]; then mv -T "$dst" "$dst.prior" || restore; step[i]=1; fi
+          if [ "''${held[i]}" != absent ]; then mv -T "$dst" "$dst.prior" || restore; step[i]=1; fi
           mv -T "''${staged[i]}" "$dst" || restore
           step[i]=2
-          [ "$(state "$dst")" = "$(state "$src")" ] || restore
+          now=$(state "$dst") && [ "$now" = "''${srcs[i]}" ] || restore
           echo "updated $dst"
         done
-        # Each staging directory stays until every item is in place, so a restore can always move a copy back.
-        for n in "''${staged[@]}"; do rmdir "''${n%/*}" || restore; done
+        # Every item is in place and verified, and every staging copy was moved; an empty staging directory that cannot be
+        # removed is reported (11), not undone.
+        left=0
+        for n in "''${staged[@]}"; do rmdir "''${n%/*}" || left=1; done
+        if [ "$left" = 1 ]; then echo 'rent-state-import updated; an empty staging directory was left' >&2; exit 11; fi
         echo 'rent-state-import updated'
         exit 10
       '';

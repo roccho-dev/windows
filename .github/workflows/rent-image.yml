@@ -95,7 +95,8 @@ jobs:
           # Refusals before any WSLC call.
           foreach ($Bad in @(@{ OldHomeVolume = 'repos' }, @{ OldHomeVolume = 'windows-rent-state' }, @{ OldHomeVolume = 'windows-rent-nix' },
               @{ NixVolume = 'repos' }, @{ NixVolume = 'windows-rent-state' }, @{ SessionId = 'not-a-session' }, @{ OldContainer = 'windows-rent' },
-              @{ Candidate = 'windows-rent' }, @{ Candidate = 'envs-dev-mutable' }, @{ Image = 'ghcr.io/roccho-dev/windows-rent:latest' })) {
+              @{ Candidate = 'windows-rent' }, @{ Candidate = 'envs-dev-mutable' }, @{ Image = 'ghcr.io/roccho-dev/windows-rent:latest' },
+              @{ ImportItems = @('codex') }, @{ ImportItems = @('codex', 'codex'); OldImageSource = 'ghcr.io/roccho-dev/envs-dev@sha256:' + ('1' * 64) })) {
             $Refused = $false
             $Args2 = $Base.Clone(); foreach ($K in $Bad.Keys) { $Args2[$K] = $Bad[$K] }
             try { & $Path @Args2 | Out-Null } catch { $Refused = $true }
@@ -153,7 +154,9 @@ jobs:
             'same path on another device' = @{ Ok = $true; Lines = @($RootFs, (Vol '8:48' '/volumes/repos/_data' 'rw')) }
             'repos read-only' = @{ Ok = $true; Lines = @($RootFs, (Vol '8:32' '/volumes/repos/_data' 'ro')) }
             'sibling volume name' = @{ Ok = $true; Lines = @($RootFs, (Vol '8:32' '/volumes/reposx/_data' 'rw')) }
-            'overlay lower on a volume' = @{ Ok = $true; Lines = @($RootFs.Replace('lowerdir=/var/lib/docker/overlay2/l/A', 'lowerdir=/volumes/repos/_data')) }
+            'engine lower layers' = @{ Ok = $true; Lines = @($RootFs.Replace('lowerdir=/var/lib/docker/overlay2/l/A', "lowerdir=/var/lib/docker/overlay2/l/A:$Layer/diff")) }
+            'overlay lower on a volume' = @{ Ok = $false; Lines = @($RootFs.Replace('lowerdir=/var/lib/docker/overlay2/l/A', 'lowerdir=/var/lib/docker/volumes/windows-rent-state/_data')) }
+            'overlay appended lower layer' = @{ Ok = $false; Lines = @($RootFs.Replace('lowerdir=/var/lib/docker/overlay2/l/A', 'lowerdir+=/var/lib/docker/overlay2/l/A')) }
             'repos writable' = @{ Ok = $false; Lines = @($RootFs, (Vol '8:32' '/volumes/repos/_data' 'rw')) }
             'below repos writable' = @{ Ok = $false; Lines = @($RootFs, (Vol '8:32' '/volumes/repos/_data/sub' 'rw')) }
             'store exposed read-only' = @{ Ok = $false; Lines = @($RootFs, (Vol '8:32' '/volumes' 'ro')) }
@@ -179,6 +182,9 @@ jobs:
           $T = @{ Lines = @($RootFs, (Vol '8:32' '/volumes/windows-rent-state/_data' 'ro')) }
           if (Get-WriterProblem @((J $Up)) '' @('windows-rent-state')) { 'a read-only state holder counted as a writer'; exit 1 }
           if (-not (Get-WriterProblem @((J $Up)) '' @('windows-rent-state') @('windows-rent-state'))) { 'the import allowed a state reader'; exit 1 }
+          # Nor through an overlay lower layer on the state volume's engine path (not an engine layer: unsupported).
+          $T = @{ Lines = @($RootFs.Replace('lowerdir=/var/lib/docker/overlay2/l/A', 'lowerdir=/var/lib/docker/volumes/windows-rent-state/_data')) }
+          if (-not (Get-WriterProblem @((J $Up)) '' @('windows-rent-state') @('windows-rent-state'))) { 'the import allowed a state overlay lower'; exit 1 }
           # Anchors from the holder's actual state mount; an unmounted volume takes its sibling root on that device; only the
           # guest driver with empty options, and one device for every volume.
           $HolderJson = '{"Id":"h1","Name":"/windows-rent","State":{"Running":true,"Status":"running","StartedAt":"h"}}'
@@ -191,8 +197,10 @@ jobs:
             elseif ($A -ceq 'inspect h1') { $HolderJson }
             elseif ($A -ceq 'volume inspect windows-rent-nix') { $global:LASTEXITCODE = 1 }
             elseif ($A -clike 'volume inspect *') { '[{"Name":"' + $args[2] + '","Driver":"' + $Driver + '","DriverOpts":' + $Opts + '}]' }
+            elseif ($A -ceq 'volume list') { if ($ListExit) { $global:LASTEXITCODE = $ListExit } else { @('DRIVER   VOLUME NAME', 'guest    repos', 'guest    windows-rent-state', 'guest    dev-home') + $ListMore } }
             else { $global:LASTEXITCODE = 1 }
           }
+          $ListExit = 0; $ListMore = @()
           $Got = Get-Anchors (J $HolderJson)
           if (-not $Got -or $Got['windows-rent-nix'].Dev -cne '8:32' -or $Got['windows-rent-nix'].Root -cne '/volumes/windows-rent-nix/_data' -or
               $Got['dev-home'].Root -cne '/volumes/dev-home/_data' -or $Got['repos'].Root -cne '/volumes/repos/_data') { 'anchors not taken from the actual state mount'; exit 1 }
@@ -200,6 +208,11 @@ jobs:
           $Driver = 'local'; if (Get-Anchors (J $HolderJson)) { 'anchors accepted another driver'; exit 1 }; $Driver = 'guest'
           $HLines = @($RootFs, '3 1 8:48 /volumes/repos/_data /work/repos rw - ext4 /dev/sdd rw', '4 1 8:32 /volumes/windows-rent-state/_data /var/lib/rent rw - ext4 /dev/sdc rw')
           if (Get-Anchors (J $HolderJson)) { 'anchors accepted volumes on two devices'; exit 1 }
+          # A failed inspect is 'absent' only when a readable volume list does not name the volume.
+          if ((Get-VolumeKind 'windows-rent-nix') -cne 'absent') { 'an unlisted failed volume was not absent'; exit 1 }
+          $ListMore = @('guest    windows-rent-nix'); if ((Get-VolumeKind 'windows-rent-nix') -cne 'unknown') { 'a listed failed volume read as absent'; exit 1 }
+          $ListMore = @(); $ListExit = 1; if ((Get-VolumeKind 'windows-rent-nix') -cne 'unknown') { 'an unreadable list read as absent'; exit 1 }
+          $ListExit = 0
           $script:Anchors = $null
           # Stage preconditions: the kept rent Running on images read now (never a recorded digest), no candidate yet.
           $OldUpJson = '{"Name":"windows-rent","State":{"Running":true,"Status":"running"},"Image":"sha256:' + ('3' * 64) + '","Config":{"Image":"' + $Live + '"},"Mounts":[]}'
@@ -398,6 +411,9 @@ jobs:
             # target changed or every item restored reverts; an unknown outcome, or any failure after an update, halts.
             'import unchanged' = @{ Items = $true; Old = { $OldUpJson }; Cand = { $CandUp }; Want = 'ok'; Calls = $Ipre + @($SA) + @(1..10 | ForEach-Object { $Pair }) }
             'import updated' = @{ Items = $true; Exit = @{ $I = 10 }; Old = { $OldUpJson }; Cand = { $CandUp }; Want = 'ok'; Calls = $Ipre + @($SA) + @(1..10 | ForEach-Object { $Pair }) }
+            'import updated, staging left' = @{ Items = $true; Exit = @{ $I = 11 }; Old = { $OldUpJson }; Cand = { $CandUp }; Want = 'ok'; Calls = $Ipre + @($SA) + @(1..10 | ForEach-Object { $Pair }) }
+            'run fails after an import with staging left: halt' = @{ Items = $true; Exit = @{ $I = 11; $SA = 1 }; Old = { $OldUpJson }; Cand = { $null }; Calls = $Ipre + @($SA)
+              Want = (& $Held 'WSLC run of windows-rent-cf failed: 1' 'the import updated the state') }
             'run fails after an updated import: halt' = @{ Items = $true; Exit = @{ $I = 10; $SA = 1 }; Old = { $OldUpJson }; Cand = { $null }; Calls = $Ipre + @($SA)
               Want = (& $Held 'WSLC run of windows-rent-cf failed: 1' 'the import updated the state') }
             'run fails after an unchanged import: revert' = @{ Items = $true; Exit = @{ $SA = 1 }; Old = { $OldUpJson }; Cand = { $null }
@@ -694,6 +710,19 @@ jobs:
           test "$(import_listing)" = "$leftover"
           docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c \
             'f=/s/dev/codex/.import-auth.json.interrupt/auth.json; [ -f $f ] && [ ! -L $f ] && [ "$(cat $f)" = foreign ] && rm -- $f && rmdir -- ${f%/*}'
+          # The same item named twice is refused before any write, so one original can never become another's prior.
+          before=$(import_listing)
+          expect_import 20 :ro rent-smoke-old "$sid" codex codex
+          grep -qF 'item codex is named twice' "$key_dir/import"
+          test "$(import_listing)" = "$before"
+          # Evidence that cannot be read is a refusal, never 'equal' or 'differs': root without its read override cannot
+          # read the UID 1000 mode 600 source, and nothing is written.
+          rc=0
+          docker run --rm --cap-drop DAC_OVERRIDE --cap-drop DAC_READ_SEARCH -v rent-smoke-old:/old:ro -v rent-smoke-import:/var/lib/rent \
+            -e RENT_OLD_VOLUME=rent-smoke-old -e RENT_STATE_VOLUME=rent-smoke-import "$image" /bin/rent-state-import "$sid" codex > "$key_dir/import" 2>&1 || rc=$?
+          test "$rc" = 20 || { cat "$key_dir/import" >&2; exit 1; }
+          grep -qF 'cannot read /old/.codex/auth.json' "$key_dir/import"
+          test "$(import_listing)" = "$before"
           # The selected differing item is updated; its original stays beside it as its prior, byte for byte.
           docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c 'sha256sum < /s/dev/codex/auth.json' > "$key_dir/auth-original"
           expect_import 10 :ro rent-smoke-old "$sid" codex
@@ -719,6 +748,12 @@ jobs:
           test "$rc" = 21 || { cat "$key_dir/import" >&2; exit 1; }
           grep -qF 'failed; every changed item restored' "$key_dir/import"
           test "$(sessions)" = "$session_before"
+          # A fixed parent that is a symlink is refused before any write: nothing is followed outside the declared paths.
+          docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c 'mv -T /s/dev/codex /s/dev/codex-real && ln -s codex-real /s/dev/codex'
+          before=$(import_listing)
+          expect_import 20 :ro rent-smoke-old "$sid" codex
+          grep -qF '/var/lib/rent/dev/codex is not a real directory' "$key_dir/import"
+          test "$(import_listing)" = "$before"
 
           run() {
             docker run -d --name rent-smoke -p 127.0.0.1:2222:2222 \
