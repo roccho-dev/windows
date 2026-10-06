@@ -737,6 +737,34 @@ jobs:
             hosts /work/repos/.auth/ci-old/gh ci-old-token ci-old
             rm -f /work/repos/.auth/ci-old/gh/config.yml
             chown -R 1000:1000 /work/repos/.auth/ci-wrong /work/repos/.auth/ci-noactive /work/repos/.auth/ci-keyring /work/repos/.auth/ci-old
+            # Version-format slots, one declared principal each: the default-template plain form with nested lines, the
+            # slot the pinned native gh writes itself (single-account hosts and no config, which gh migrates), and refused
+            # forms: another value, repeated or conflicting keys (a tab before the colon, an escaped quoted key before the
+            # plain one, a version hidden after a carriage return in a comment), other spellings and root-level structure.
+            for x in plain v0 dup conflict tab esc cr squote space comment qkey doc merge flow tag native; do
+              install -d -m 700 -o 1000 -g 1000 /work/repos/.auth/ci-$x
+              hosts /work/repos/.auth/ci-$x/gh ci-$x-token ci-$x
+            done
+            vc() { printf "%b" "$2" > /work/repos/.auth/ci-$1/gh/config.yml; }
+            vc plain "# What protocol to use when performing git operations. Supported values: ssh, https\ngit_protocol: https\naliases:\n    co: pr checkout\nversion: 1\n"
+            vc v0 "version: 0\n"
+            vc dup "version: 1\nversion: 1\n"
+            vc conflict "version: 1\n\"version\": 0\n"
+            vc tab "version: 1\nversion\t: 0\n"
+            # The escaped key stays literal in the file: its first line is 16 bytes, not the 13 of a decoded "version".
+            vc esc "\"\\\\x76ersion\": 0\nversion: 1\n"
+            test "$(head -n 1 /work/repos/.auth/ci-esc/gh/config.yml | wc -c)" = 16
+            vc cr "# c\rversion: 0\nversion: 1\n"
+            vc squote "version: \x271\x27\n"
+            vc space "version : 1\n"
+            vc comment "version: 1 # c\n"
+            vc qkey "\"version\": \"1\"\n"
+            vc doc "---\nversion: 1\n"
+            vc merge "base: &b\n    editor: vi\nversion: 1\n<<: *b\n"
+            vc flow "{version: 1}\n"
+            vc tag "!!map\nversion: 1\n"
+            printf "github.com:\n    oauth_token: ci-native-token\n    user: ci-native\n    git_protocol: https\n" > /work/repos/.auth/ci-native/gh/hosts.yml
+            rm -f /work/repos/.auth/ci-native/gh/config.yml
             hosts /var/lib/rent/dev/gh ci-legacy-token
             install -d -m 755 -o 1000 -g 1000 /home/dev/xdg /home/dev/.config/git
             hosts /home/dev/.config/gh ci-home-token
@@ -768,6 +796,9 @@ jobs:
             pbind bound https://github.com/roccho-dev/windows roccho-dev
             pbind mieru https://github.com/hc-consul-pj/mierundesu-generate-report mti-takasawa
             for x in wrong noactive keyring old; do pbind "$x" https://github.com/roccho-dev/windows "ci-$x"; done
+            for x in plain v0 dup conflict tab esc cr squote space comment qkey doc merge flow tag native; do
+              git init -q "f-$x"; pbind "f-$x" https://github.com/roccho-dev/windows "ci-$x"
+            done
             git -C unbound config remote.origin.url https://github.com/roccho-dev/windows
             bind other https://github.com/other/windows
             fill() {
@@ -782,8 +813,17 @@ jobs:
               fi
               test -z "$out"
             }
-            # Every slot (paths, types, sizes, times and contents) is unchanged by all of the reads below.
-            snap() { find "$HOME/.config" "$HOME/xdg" /work/repos/.auth -printf "%p %y %s %T@\n" | LC_ALL=C sort
+            # The pinned native gh writes the native slot itself (it migrates single-account hosts, as on first use). Its
+            # exact bytes are consumed unchanged by the selection below; which accepted form it wrote is only recorded.
+            gh_real=$(sed -n "s|^[[:space:]]*exec \(/nix/store/[^ ]*/bin/gh\) .*|\1|p" "$(readlink -e /bin/gh)")
+            test -x "$gh_real"
+            nat=/work/repos/.auth/ci-native/gh
+            GH_CONFIG_DIR=$nat DBUS_SESSION_BUS_ADDRESS=unix:path=/proc/gh-unselected "$gh_real" config get git_protocol > /dev/null 2>&1 || true
+            v=$(grep -xE "version: (1|\"1\")" "$nat/config.yml")
+            test "$(grep -c "^version" "$nat/config.yml")" = 1
+            echo "native gh wrote: $v"
+            # Every slot (paths, types, owners, modes, sizes, times and contents) is unchanged by all of the reads below.
+            snap() { find "$HOME/.config" "$HOME/xdg" /work/repos/.auth -printf "%p %y %U %G %m %s %T@\n" | LC_ALL=C sort
               find "$HOME/.config" "$HOME/xdg" /work/repos/.auth -type f -exec sha256sum {} + | LC_ALL=C sort; }
             slots=$(snap)
             test -n "$(fill unbound roccho-dev/windows -u GIT_CONFIG_GLOBAL)"
@@ -798,6 +838,22 @@ jobs:
             for x in wrong noactive keyring old; do nofill "$x" roccho-dev/windows; done
             # A parent D-Bus session does not reach gh: the keyring-only slot stays refused under it as well.
             ( export DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/ci-session-bus; nofill keyring roccho-dev/windows )
+            # Native formats: the bytes the pinned native gh wrote and the default-template plain form with nested lines are
+            # each selected for their declared principal, with no fallback; native gh reads the plain form as version 1.
+            test "$(fill f-native roccho-dev/windows)" = ci-native-token
+            test "$(fill f-plain roccho-dev/windows)" = ci-plain-token
+            test "$(GH_CONFIG_DIR=/work/repos/.auth/ci-plain/gh DBUS_SESSION_BUS_ADDRESS=unix:path=/proc/gh-unselected "$gh_real" config get version)" = 1
+            # Any other or repeated top-level version key, and root-level structure, is refused with no slot-backed gh answer
+            # or config read (an unselected wrapper still runs gh without a slot). Native gh reads four of these as version
+            # 1 itself (shown directly), so their refusal is the guard alone.
+            for x in v0 dup conflict tab esc cr squote space comment qkey doc merge flow tag; do nofill "f-$x" roccho-dev/windows; done
+            for x in squote space comment qkey; do
+              test "$(GH_CONFIG_DIR=/work/repos/.auth/ci-$x/gh DBUS_SESSION_BUS_ADDRESS=unix:path=/proc/gh-unselected "$gh_real" config get version)" = 1
+            done
+            # What native gh itself makes of the escaped key before the plain version is observed, not assumed: its exit and
+            # the version it reports or refuses are recorded, and the slot snapshot below shows it wrote nothing.
+            e=$(GH_CONFIG_DIR=/work/repos/.auth/ci-esc/gh DBUS_SESSION_BUS_ADDRESS=unix:path=/proc/gh-unselected "$gh_real" config get version 2>&1) && r=0 || r=$?
+            echo "native gh on the escaped key: exit $r; $(printf "%s\n" "$e" | grep -oE "(config version \"[^\"]*\"|^[0-9]+$)" | head -n 1)"
             # Repeating each production bind is a no-op.
             for x in "bound https://github.com/roccho-dev/windows roccho-dev" \
               "mieru https://github.com/hc-consul-pj/mierundesu-generate-report mti-takasawa"; do
@@ -805,13 +861,6 @@ jobs:
               case $("$h" bind "/work/repos/gh-proof/$1" "$2" "$3") in *" prior=PPPPPPPPP writes=0 "*) ;; *) echo "$1: repeat bind changed" >&2; exit 1 ;; esac
             done
             test "$(snap)" = "$slots"
-            # The native gh of this closure writes version "1" in the form the guard accepts, on a disposable copy only.
-            gh_real=$(sed -n "s|^[[:space:]]*exec \(/nix/store/[^ ]*/bin/gh\) .*|\1|p" "$(readlink -e /bin/gh)")
-            test -x "$gh_real"
-            m=$(mktemp -d)
-            printf "github.com:\n    oauth_token: ci-mig-token\n    user: ci-mig\n    git_protocol: https\n" > "$m/hosts.yml"
-            GH_CONFIG_DIR=$m DBUS_SESSION_BUS_ADDRESS=unix:path=/proc/gh-unselected "$gh_real" config get git_protocol > /dev/null 2>&1 || true
-            grep -qxF "version: \"1\"" "$m/config.yml"
             export XDG_CONFIG_HOME="$HOME/xdg" GH_TOKEN=ci-env-gh GITHUB_TOKEN=ci-env-github GH_ENTERPRISE_TOKEN=ci-env-ghe \
               GITHUB_ENTERPRISE_TOKEN=ci-env-ghes GH_HOST=evil.example GH_REPO=other/elsewhere GIT_TERMINAL_PROMPT=0
             # Unselected gh uses the absent procfs path /proc/gh-unselected: no config to read, none can be created.
