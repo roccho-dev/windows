@@ -351,24 +351,27 @@ if ($Step -eq 'Plan') {
         pull = @($Wslc, 'pull', $Image)
         stateVolumeCreateOnce = @($Wslc, 'volume', 'create', $StateVolume)
         nixVolumeCreateOnce = @($Wslc, 'volume', 'create', $NixVolume)
-        seedAccepts = "every container, $Container included, provably stopped (WSLC shows no mounts), right before each seed"
+        seedAccepts = "right before each seed, every container is provably stopped or, judged by its own PID 1 mounts against volume anchors read in this invocation from a running $Container, Running without mounting $NixVolume writable or exposing its store (with no anchors, any Running container refuses); with anchors the seed gets the expected backing and exits 3, writing nothing, when /seed differs, which halts Stage"
         seedContainerList = @($Wslc) + $ListArgs
         seed = @($Wslc) + $SeedArgs
         create = @($Wslc) + $RunArgs
         readyGate = "within 60 s: Running with log lines '$Proof' and '$Ready', then Running for 10 consecutive polls"
-        stageAccepts = "$Container exists and is Running (its images read by inspect now), $Candidate absent, every other container stopped, logon task $TaskName exactly '$Wslc start $Container'; placement inputs are plain files and the state volume is windows-rent-state, checked before any change"
+        stageAccepts = "$Container exists and is Running (its images read by inspect now), $Candidate absent, every other container provably stopped or Running without mounting a rent volume writable or exposing its store (judged by its own PID 1 mounts against volume anchors read from $Container now; unreadable anchors or mounts refuse), logon task $TaskName exactly '$Wslc start $Container'; placement inputs are plain files and the state volume is windows-rent-state, checked before any change"
         # Order: stageTask (while $Container still runs, so a logon can only try the not-yet-existing candidate),
-        # stageStop, stagePlace, seed, stageRun, readyGate. Success leaves the task on the running candidate.
+        # stageStop, stagePlace, seed, the migrate argv for the selected import items (only when given), stageRun,
+        # readyGate. Success leaves the task on the running candidate.
         stageTask = @($TaskName, $Wslc, 'start', $Candidate)
         stageStop = @($Wslc, 'stop', $Container)
         stagePlace = @($PlacementShell) + $PlaceArgs
         stagePlaceHalt = "any placement result but exit 0 halts Stage: no seed, run, task restore or start of $Container; $Container stays stopped, the logon task targets the absent $Candidate, and the slot and writer state are UNKNOWN until separately authorized recovery"
         stageRun = @($Wslc) + $StageArgs
         readyLogs = @($Wslc, 'logs', $Candidate)
-        # A Stage failure after a placement exit 0, and the Revert step: revertStop if running, then the candidate provably
-        # stopped by readback whatever stop returned, revertRemove (a failed Stage's candidate only), every other container
-        # provably stopped, revertTask read back, and only then revertStart and Running on its inspected images for 3
-        # consecutive polls. The placed token slot is kept; nothing reverts the state volume.
+        # After a placement exit 0, a Stage failure halts instead (no revert, task not restored, $Container stopped) on seed
+        # exit 3, an import outcome other than 0/10/11/20/21, or any failure after an import that updated the state; any
+        # other failure, and the Revert step, run: revertStop if running, then the candidate provably stopped by readback
+        # whatever stop returned, revertRemove (a failed Stage's candidate only), the writer check passing for every other
+        # container, revertTask read back, and only then revertStart and Running on its inspected images for 3 consecutive
+        # polls. This returns the runtime and logon task only: the placed token and any imported state stay as they are.
         revertStop = @($Wslc, 'stop', $Candidate)
         revertRemove = @($Wslc, 'remove', $Candidate)
         revertTask = @($TaskName, $Wslc, 'start', $Container)
@@ -516,8 +519,8 @@ function Invoke-Revert($Old, $Steps, [bool] $RemoveCandidate) {
             if ($LASTEXITCODE -ne 0) { return $false }
         }
     }
-    # No return while another writer may run: every container but the kept rent must read back provably stopped (a
-    # snapshot, not a guarantee against later races). Otherwise nothing more happens and the task stays where it is.
+    # No return while another writer may run: every container but the kept rent must pass the writer check (a snapshot,
+    # not a guarantee against later races). Otherwise nothing more happens and the task stays where it is.
     try { Assert-NoOtherWriter $Container 'restoring' }
     catch { $Steps.Add("$($_.Exception.Message) Not starting $Container"); return $false }
     # The logon task goes back first: the kept rent starts only once no logon can start the candidate.
@@ -569,8 +572,9 @@ function Invoke-Stage($Old) {
 
 # Stage after the old rent was stopped (kept, never removed). First the token is placed, while no rent runs. Any result
 # but a known exit 0 (another code, a timeout's -1, an exception) leaves the slot and its writer unknown, so Stage halts
-# with nothing further: no seed, no candidate, no task restore, no old start, no retry. After a placement exit 0, any later
-# failure reverts, and Stage still fails.
+# with nothing further: no seed, no candidate, no task restore, no old start, no retry. After a placement exit 0, Stage
+# likewise halts on seed exit 3 (the store is not the one checked), an unknown import outcome, or any failure after an
+# import that updated the state; any other later failure reverts the runtime and task, and Stage still fails.
 function Complete-Stage($Old) {
     try {
         & $Placement @PlaceArgs | Out-Host
@@ -610,7 +614,7 @@ if ($Step -eq 'Revert') {
     if (-not (Get-Named $Candidate)) { throw "Candidate $Candidate is missing; nothing to revert." }
     $Target = Get-TaskTarget
     if ($Target -cne $Candidate -and $Target -cne $Container) { throw "Logon task $TaskName starts '$Target', neither $Candidate nor $Container; not reverting." }
-    # The kept rent must be stopped: only the candidate may be running.
+    # Every container but the candidate must pass the writer check, so the kept rent, which mounts every rent volume, must be stopped.
     Assert-NoOtherWriter $Candidate 'reverting'
     $Steps = [System.Collections.Generic.List[string]]::new()
     try { $Ok = Invoke-Revert $Old $Steps $false } catch { $Ok = $false; $Steps.Add("error: $($_.Exception.Message)") }
@@ -665,7 +669,7 @@ if ($Step -eq 'Migrate') {
 
 if ($Step -eq 'Stage') {
     Invoke-Stage $Old
-    Write-Output "Stage succeeded: $Candidate ready and the logon task starts it; $Container kept stopped. Revert restores $Container."
+    Write-Output "Stage succeeded: $Candidate ready and the logon task starts it; $Container kept stopped. Revert returns only the runtime and logon task to $Container, not the placed token or imported state; whether $Container suits the current state is not established here."
 } else {
     Invoke-Seed
     & $Wslc @RunArgs

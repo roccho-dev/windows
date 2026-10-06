@@ -325,7 +325,7 @@ jobs:
           $Pre = @($Place, $List, $S, $SA)
           $Pair = @('inspect windows-rent-cf', 'logs windows-rent-cf')
           $Wait60 = @(1..60 | ForEach-Object { $Pair })
-          # Every return to the kept rent first proves every other container stopped, then points the task back.
+          # Every return to the kept rent first passes the writer check for every other container, then points the task back.
           $Back = @($List, 'task -> windows-rent', 'start windows-rent', 'inspect windows-rent', 'inspect windows-rent', 'inspect windows-rent')
           $NoBack = @($List, 'task -> windows-rent', 'start windows-rent') + @(1..60 | ForEach-Object { 'inspect windows-rent' })
           $Halt = { param($R) "Stage halted after placement attempt ($R): windows-rent kept stopped, logon task targets absent windows-rent-cf, slot and writer state UNKNOWN; recovery needs separate authority." }
