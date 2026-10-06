@@ -37,6 +37,10 @@ param(
     [string] $OldContainer = 'envs-dev-mutable',
     [ValidatePattern('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')]
     [string] $SessionId = '4eba321e-6ade-4815-930d-dfa58b6fc960',
+    # Migrate, and Stage with an old home: the typed items selected for import where they differ (credentials: Claude
+    # .credentials.json; session: that session's journal and directory; codex: Codex auth.json). None means no import.
+    [ValidateSet('credentials', 'session', 'codex')]
+    [string[]] $ImportItems = @(),
     # Migrate only: the exact pre-recorded image of the old source container.
     [ValidatePattern('^[^\s"'']+$')]
     [string] $OldImageSource,
@@ -60,8 +64,6 @@ if ($Step -ne 'Plan' -and -not (Test-Path -LiteralPath $Wslc)) { throw "WSLC is 
 $PlacementShell = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
 $Placement = $PlacementShell
 
-# Migrate only: the published rent image that kept /home/dev on a volume.
-$OldImage = 'ghcr.io/roccho-dev/windows-rent@sha256:da1393586b2e847c7508038675be8701c185b77be777ef1492689d4c604185ce'
 # Exactly these three distinct named volumes; never the old home volume.
 $Mounts = [ordered]@{ '/work/repos' = $ReposVolume; '/var/lib/rent' = $StateVolume; '/nix' = $NixVolume }
 if (@($Mounts.Values) -ccontains $OldHomeVolume) { throw "The old home volume $OldHomeVolume must not be repos, state or nix." }
@@ -92,13 +94,112 @@ function Get-OldSourceProblem($Item) {
     return $null
 }
 
-# Possible concurrent writers: any container other than $Except that is not provably stopped. WSLC shows no mounts,
-# so every container counts: for the old home all but $Container, for the nix volume all ($Except '').
-function Get-WriterProblem($Items, [string] $Except = $Container) {
+# Concurrent writers, for the supported environment only: WSLC 2.9.3 named volumes of the guest driver with empty
+# options, as the Docker-managed engine stores them apart from its own container layers. WSLC shows no mounts, so a
+# running container other than $Except is judged by its own PID 1 mount table against where each written volume
+# actually lives (its anchor: device and filesystem root, read within this invocation). It shares a volume when a mount
+# on that device has a root equal to, above or below the anchor's, compared component by component; an overlay writes
+# only to its upper and work directories, which must be the engine's own layer directories. A volume in $Write may not
+# be mounted writable, one in $NoReader not at all, and no mount may expose the store above a volume. Unreadable,
+# changing or unexplained mounts count as sharing. This is a snapshot of cooperating containers, not a guard against a
+# privileged remount or a hidden host alias.
+$script:Anchors = $null
+function Get-WriterProblem($Items, [string] $Except = $Container, [string[]] $Write = @($Mounts.Values), [string[]] $NoReader = @()) {
     foreach ($Item in @($Items)) {
         $Name = ([string] $Item.Name).TrimStart('/')
         if ($Except -and $Name -ceq $Except) { continue }
-        if (-not (Test-Stopped $Item)) { return "Container $Name is not provably stopped." }
+        if (Test-Stopped $Item) { continue }
+        $Problem = if (Test-Running $Item) { Get-SharingProblem $Item $Write $NoReader } else { 'is not provably stopped.' }
+        if ($Problem) { return "Container $Name $Problem" }
+    }
+    return $null
+}
+
+# A running container's own PID 1 mounts, read through WSLC between two inspects that must show the same start; $null
+# when unreadable, malformed or changed meanwhile.
+function Get-MountTable($Item) {
+    $Id = [string] $Item.Id
+    if (-not $Id) { return $null }
+    $Lines = @(& $Wslc exec $Id cat /proc/1/mountinfo 2>$null)
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $Again = Get-Container $Id
+    if (-not (Test-Running $Again) -or [string] $Again.Id -cne $Id -or [string] $Again.State.StartedAt -cne [string] $Item.State.StartedAt) { return $null }
+    $Table = [System.Collections.Generic.List[object]]::new()
+    foreach ($Line in $Lines) {
+        $F = ([string] $Line).TrimEnd() -split ' '
+        $Sep = [array]::IndexOf($F, '-')
+        if ($Sep -lt 6 -or $F.Count -lt $Sep + 4) { return $null }
+        $Table.Add([pscustomobject] @{ Dev = $F[2]; Root = $F[3]; Point = $F[4]; Options = $F[5]; Type = $F[$Sep + 1]; Super = $F[$Sep + 3] })
+    }
+    if (-not @($Table | Where-Object { $_.Point -ceq '/' }).Count) { return $null }
+    return $Table.ToArray()
+}
+
+function Get-RootRelation([string] $Root, [string] $Anchor) {
+    if ($Root -ceq $Anchor) { return 'equal' }
+    $Above = $Root.TrimEnd('/')
+    if ($Anchor.StartsWith("$Above/", [StringComparison]::Ordinal)) { return 'above' }
+    if ($Root.StartsWith("$Anchor/", [StringComparison]::Ordinal)) { return 'below' }
+    return $null
+}
+
+# Where each rent volume and the old home live, from a container that mounts the state volume now: its device and
+# filesystem root. A volume that holder does not mount takes the state volume's device and sibling root, the guest
+# driver's layout; the seed checks that expectation against its own mount before any write. Every existing volume must
+# be the guest driver's with empty options. $null when any of this is unsupported or unreadable.
+function Get-Anchors($Holder) {
+    $Table = Get-MountTable $Holder
+    if (-not $Table) { return $null }
+    $Names = @(@($Mounts.Values) + $OldHomeVolume)
+    $Found = @{}
+    foreach ($Name in $Names) {
+        if ((Get-VolumeKind $Name) -ceq 'other') { return $null }
+        $M = @($Table | Where-Object { $_.Type -cne 'overlay' -and $_.Root.EndsWith("/$Name/_data", [StringComparison]::Ordinal) })
+        if ($M.Count -gt 1) { return $null }
+        if ($M.Count -eq 1) { $Found[$Name] = @{ Dev = $M[0].Dev; Root = $M[0].Root } }
+    }
+    $State = $Found[$StateVolume]
+    if (-not $State -or -not $State.Root.EndsWith("/volumes/$StateVolume/_data", [StringComparison]::Ordinal)) { return $null }
+    $Store = $State.Root.Substring(0, $State.Root.Length - "/$StateVolume/_data".Length)
+    foreach ($Name in $Names) {
+        if (-not $Found[$Name]) { $Found[$Name] = @{ Dev = $State.Dev; Root = "$Store/$Name/_data" } }
+        elseif ($Found[$Name].Dev -cne $State.Dev -or $Found[$Name].Root -cne "$Store/$Name/_data") { return $null }
+    }
+    return $Found
+}
+
+# 'guest' for a named volume of the guest driver with empty options, 'absent', or 'other' (unsupported or unreadable).
+function Get-VolumeKind([string] $Name) {
+    $Text = (& $Wslc volume inspect $Name 2>$null) -join "`n"
+    if ($LASTEXITCODE -ne 0) { return 'absent' }
+    $V = try { @($Text | ConvertFrom-Json) } catch { @() }
+    if ($V.Count -ne 1 -or [string] $V[0].Name -cne $Name -or [string] $V[0].Driver -cne 'guest' -or -not $V[0].DriverOpts -or
+        @($V[0].DriverOpts.PSObject.Properties).Count) { return 'other' }
+    return 'guest'
+}
+
+function Get-SharingProblem($Item, [string[]] $Write, [string[]] $NoReader) {
+    if (-not $script:Anchors) { return 'is running and no volume anchor was read in this invocation.' }
+    $Table = Get-MountTable $Item
+    if (-not $Table) { return 'has an unreadable or changing mount table.' }
+    foreach ($M in $Table) {
+        if ($M.Type -ceq 'overlay') {
+            foreach ($Option in ($M.Super -split ',')) {
+                if ($Option -match '^(upperdir|workdir)=(.*)$' -and $Matches[2] -cnotmatch '^/var/lib/docker/overlay2/[0-9a-f]+/(diff|work)$') {
+                    return 'has an overlay writing outside the engine layers.'
+                }
+            }
+            continue
+        }
+        foreach ($Name in @(@($Write) + @($NoReader) | Sort-Object -Unique)) {
+            $A = $script:Anchors[$Name]
+            if ($M.Dev -cne $A.Dev) { continue }
+            $Relation = Get-RootRelation $M.Root $A.Root
+            if (-not $Relation) { continue }
+            if ($Relation -ceq 'above') { return "exposes the volume store above $Name." }
+            if ($NoReader -ccontains $Name) { return "mounts volume $Name." }
+            if ($Write -ccontains $Name -and ",$($M.Options)," -clike '*,rw,*') { return "mounts volume $Name writable." }
+        }
     }
     return $null
 }
@@ -182,6 +283,8 @@ if ($Step -eq 'Stage') {
     $Problem = Get-PlacementProblem
     if ($Problem) { throw "$Problem Not staging." }
 }
+if ($Step -eq 'Migrate' -and -not $ImportItems.Count) { throw 'Migrate needs -ImportItems, the selected items to import.' }
+if ($ImportItems.Count -and -not $OldImageSource) { throw 'An import needs -OldImageSource, the pre-recorded image of the old home holder.' }
 
 # The tunnel token is never an argument or environment value: rent-start reads its fixed file in the state volume.
 function Get-RunArgs([string] $Name) {
@@ -194,7 +297,7 @@ $RunArgs = Get-RunArgs $Container
 $StageArgs = Get-RunArgs $Candidate
 $MigrateArgs = @('run', '--rm', '--volume', "${OldHomeVolume}:/old:ro", '--volume', "${StateVolume}:/var/lib/rent",
     '--env', "RENT_OLD_VOLUME=$OldHomeVolume", '--env', "RENT_STATE_VOLUME=$StateVolume",
-    $Image, '/bin/rent-state-import', $SessionId)
+    $Image, '/bin/rent-state-import', $SessionId) + $ImportItems
 $ListArgs = @('container', 'list', '--all', '-q')
 # One-shot helper from exactly $Image: the nix volume at /seed, the image's own /nix beneath it; removed by --rm.
 $SeedArgs = @('run', '--rm', '--volume', "${NixVolume}:/seed", '--env', "RENT_NIX_VOLUME=$NixVolume", $Image, '/bin/rent-nix-seed')
@@ -235,7 +338,7 @@ if ($Step -eq 'Plan') {
         revertTask = @($TaskName, $Wslc, 'start', $Container)
         revertStart = @($Wslc, 'start', $Container)
         logonTask = @($TaskName, $Wslc, 'start', $Container)
-        migrateAccepts = "$OldContainer exists, is stopped, and is exactly $OldImageSource (checked before and right before the helper); every other container except $Container is stopped; $Container absent or exactly $OldImage"
+        migrateAccepts = "$OldContainer exists, is stopped, and is exactly $OldImageSource (checked before and right before the helper); $Container absent, or provably stopped with the same Id and images right before the helper; no other running container holds the state volume or writes the old home; only the selected items ($($ImportItems -join ', ')) that differ are written"
         migrateSourceInspect = @($Wslc, 'inspect', $OldContainer)
         migrateContainerList = @($Wslc) + $ListArgs
         migrate = @($Wslc) + $MigrateArgs
@@ -287,18 +390,50 @@ if ($Step -eq 'LogonTask') {
     exit 0
 }
 
-function Assert-NoOtherWriter([string] $Except = $Container, [string] $Action = 'migrating') {
+# Only when another container runs are anchors needed: read once in this invocation from the running $Except holder.
+function Assert-NoOtherWriter([string] $Except = $Container, [string] $Action = 'migrating', [string[]] $Write = @($Mounts.Values),
+    [string[]] $NoReader = @()) {
     $Ids = @(& $Wslc @ListArgs | Where-Object { $_ })
     if ($LASTEXITCODE -ne 0 -or $Ids.Count -gt 64) { throw "Container list is unreadable; not $Action." }
-    $Problem = Get-WriterProblem @($Ids | ForEach-Object { Get-Container $_ }) $Except
+    $Items = @($Ids | ForEach-Object { Get-Container $_ })
+    $Named = { param($I) ([string] $I.Name).TrimStart('/') }
+    if (-not $script:Anchors -and @($Items | Where-Object { $_ -and (& $Named $_) -cne $Except -and (Test-Running $_) }).Count) {
+        $Holder = @($Items | Where-Object { $_ -and $Except -and (& $Named $_) -ceq $Except -and (Test-Running $_) })
+        if ($Holder.Count -eq 1) { $script:Anchors = Get-Anchors $Holder[0] }
+    }
+    $Problem = Get-WriterProblem $Items $Except $Write $NoReader
     if ($Problem) { throw "$Problem Not $Action." }
 }
 
-# Seed the nix volume from exactly $Image while no container at all can write it; rent-nix-seed proves its own mounts.
+# Seed the nix volume from exactly $Image while no other container can write it; rent-nix-seed proves its own mounts.
+# With anchors, the seed is given the expected backing and refuses before any write when its actual mount differs: the
+# store is then unknown, so that halts rather than restarting anything.
 function Invoke-Seed {
-    Assert-NoOtherWriter '' 'seeding'
-    & $Wslc @SeedArgs | Out-Host
+    Assert-NoOtherWriter '' 'seeding' @($NixVolume)
+    $Argv = $SeedArgs
+    if ($script:Anchors) {
+        $Expect = "RENT_NIX_EXPECT=$($script:Anchors[$NixVolume].Dev) $($script:Anchors[$NixVolume].Root)"
+        $Argv = @($SeedArgs[0..5]) + @('--env', $Expect) + @($SeedArgs[6..($SeedArgs.Count - 1)])
+    }
+    & $Wslc @Argv | Out-Host
+    if ($LASTEXITCODE -eq 3) { $script:Halt = 'the volume store is not the one the writer check compared'; throw 'WSLC seed exit 3: /seed is not the expected backing' }
     if ($LASTEXITCODE -ne 0) { throw "WSLC seed failed: $LASTEXITCODE" }
+}
+
+# The typed import inside Stage, after the seed and before the candidate runs: the old home's holder stopped on its pinned
+# image, and no running container holding the state volume in any mode or the old home writable. Unchanged or updated
+# continues; a refusal with no target changed or a verified restore is a known failure; any other outcome halts.
+function Invoke-Import {
+    Assert-OldSourceStopped
+    Assert-NoOtherWriter '' 'importing' @($StateVolume, $OldHomeVolume) @($StateVolume)
+    & $Wslc @MigrateArgs | Out-Host
+    switch ($LASTEXITCODE) {
+        0 { return 'unchanged' }
+        10 { return 'updated' }
+        20 { throw 'WSLC import refused with no target changed' }
+        21 { throw 'WSLC import failed and restored every changed item' }
+        default { $script:Halt = "the import outcome is unknown (exit $LASTEXITCODE)"; throw "WSLC import: $($script:Halt)." }
+    }
 }
 
 function Wait-Ready([string] $Name) {
@@ -409,14 +544,22 @@ function Complete-Stage($Old) {
     if ($Placed) {
         throw "Stage halted after placement attempt ($Placed): $Container kept stopped, logon task targets absent $Candidate, slot and writer state UNKNOWN; recovery needs separate authority."
     }
+    # After the seed, the selected typed import (if any); an updated state is never handed back to the kept rent, whose
+    # compatibility with it is unproven, so any failure after it halts like an unknown outcome. Revert is no credential rollback.
+    $script:Halt = $null; $Imported = $null
     try {
         Invoke-Seed
+        if ($ImportItems.Count) { $Imported = Invoke-Import }
         & $Wslc @StageArgs | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "WSLC run of $Candidate failed: $LASTEXITCODE" }
         if (Wait-Ready $Candidate) { return }
         throw "$Candidate did not stay Running with '$Proof' and '$Ready'."
     } catch {
         $Failure = $_.Exception.Message
+    }
+    if ($script:Halt -or $Imported -ceq 'updated') {
+        $Why = if ($script:Halt) { $script:Halt } else { 'the import updated the state' }
+        throw "Stage halted: $Failure | $Why; $Container kept stopped, $Candidate left as found, logon task not restored, state UNKNOWN; recovery needs separate authority."
     }
     $Steps = [System.Collections.Generic.List[string]]::new()
     try { $Ok = Invoke-Revert $Old $Steps $true } catch { $Ok = $false; $Steps.Add("error: $($_.Exception.Message)") }
@@ -440,13 +583,13 @@ if ($Step -eq 'Revert') {
 }
 
 if ($Step -eq 'Migrate') {
-    if (-not $OldImageSource) { throw 'Migrate needs -OldImageSource, the pre-recorded image of the old container.' }
     Assert-OldSourceStopped
-    Assert-NoOtherWriter
+    # The kept rent, when it exists, is pinned as inspected now (no recorded image) and must stay provably stopped.
+    $Kept = Get-Container $Container
+    if ($Kept -and -not (Test-Stopped $Kept)) { throw "Container $Container is not provably stopped; not migrating." }
+    Assert-NoOtherWriter $Container 'migrating' @($StateVolume, $OldHomeVolume) @($StateVolume)
     & $Wslc volume inspect $OldHomeVolume | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Old home volume is missing: $OldHomeVolume" }
-    $Item = Get-Container $Container
-    if ($Item -and -not ((Get-Images $Item) -ccontains $OldImage)) { throw "Container $Container is not the old $OldImage; not migrating." }
 } else {
     # Create and Stage: repos must already exist (never create an empty one).
     & $Wslc volume inspect $ReposVolume | Out-Null
@@ -474,6 +617,8 @@ if ($Step -ne 'Migrate') {
     if ($LASTEXITCODE -ne 0) {
         & $Wslc volume create $NixVolume
         if ($LASTEXITCODE -ne 0) { throw "WSLC volume create failed: $LASTEXITCODE" }
+        # Created in this invocation: it must read back as the guest driver's with empty options, the layout the anchors assume.
+        if ($script:Anchors -and (Get-VolumeKind $NixVolume) -cne 'guest') { throw "Created $NixVolume is not a guest-driver volume with empty options." }
     }
 }
 
@@ -483,9 +628,16 @@ if ($Step -eq 'Migrate') {
     & $Wslc volume inspect $StateVolume | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "State volume is missing: $StateVolume" }
     Assert-OldSourceStopped
-    Assert-NoOtherWriter
+    $Now = Get-Container $Container
+    if ([bool] $Now -ne [bool] $Kept -or ($Now -and ([string] $Now.Id -cne [string] $Kept.Id -or "$(Get-Images $Now)" -cne "$(Get-Images $Kept)" -or
+            -not (Test-Stopped $Now)))) { throw "Container $Container changed before the import; not migrating." }
+    Assert-NoOtherWriter $Container 'migrating' @($StateVolume, $OldHomeVolume) @($StateVolume)
     & $Wslc @MigrateArgs
-    if ($LASTEXITCODE -ne 0) { throw "WSLC migrate helper failed: $LASTEXITCODE" }
+    switch ($LASTEXITCODE) {
+        0 { Write-Output 'Migrate: every selected item already equal; nothing written.' }
+        10 { Write-Output 'Migrate: selected differing items updated; each original kept as its .prior.' }
+        default { throw "WSLC migrate helper exit $LASTEXITCODE (20 refused with no target changed, 21 restored, else UNKNOWN)." }
+    }
     exit 0
 }
 

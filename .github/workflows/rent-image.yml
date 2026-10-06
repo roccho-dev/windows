@@ -109,8 +109,9 @@ jobs:
               ($n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Get-Images', 'Test-Stopped', 'Test-Running',
                 'Get-OldSourceProblem', 'Get-WriterProblem', 'Test-RunningProof', 'Get-StageProblem', 'Get-Container', 'Get-Named',
                 'Assert-NoOtherWriter', 'Invoke-Seed', 'Wait-Ready', 'Wait-OldRunning', 'Invoke-Revert', 'Invoke-StageStop', 'Complete-Stage',
-                'Get-TaskTarget', 'Set-TaskTarget', 'Invoke-Stage', 'Get-PlacementProblem') -or
-              ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in '$OldImage', '$Mounts', '$Proof', '$Ready', '$ListArgs', '$SeedArgs', '$TaskName') }, $true)) {
+                'Get-TaskTarget', 'Set-TaskTarget', 'Invoke-Stage', 'Get-PlacementProblem', 'Get-MountTable', 'Get-RootRelation', 'Get-Anchors',
+                'Get-VolumeKind', 'Get-SharingProblem', 'Invoke-Import', 'Assert-OldSourceStopped') -or
+              ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in '$Mounts', '$Proof', '$Ready', '$ListArgs', '$SeedArgs', '$TaskName') }, $true)) {
             . ([scriptblock]::Create($N.Extent.Text))
           }
           function J($Text) { $Text | ConvertFrom-Json }
@@ -138,6 +139,68 @@ jobs:
           if (-not (Get-WriterProblem @($Stopped, $OtherRunning))) { 'writer guard allowed another running container'; exit 1 }
           if (-not (Get-WriterProblem @($Stopped, $null))) { 'writer guard allowed an unreadable container'; exit 1 }
           if (-not (Get-WriterProblem @($Stopped, $RentRunning) '')) { 'seed writer guard allowed a running rent container'; exit 1 }
+          # With anchors read in the same invocation, a running container is judged by its own PID 1 mount table: same device
+          # and a root equal to, above or below a volume's (by path component); overlays only by their upper and work dirs.
+          $script:Anchors = @{}
+          foreach ($V in 'repos', 'windows-rent-state', 'windows-rent-nix', 'dev-home') { $script:Anchors[$V] = @{ Dev = '8:32'; Root = "/volumes/$V/_data" } }
+          $Layer = '/var/lib/docker/overlay2/' + ('a' * 64)
+          $RootFs = "1 0 0:45 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/A,upperdir=$Layer/diff,workdir=$Layer/work"
+          $Proc = '2 1 0:46 / /proc rw,nosuid - proc proc rw'
+          $Up = '{"Id":"c1","Name":"/other","State":{"Running":true,"Status":"running","StartedAt":"t1"}}'
+          function Vol($Dev, $Root, $Opt) { "3 1 $Dev $Root /x $Opt - ext4 /dev/sdc rw" }
+          $Tables = [ordered]@{
+            'engine layer, proc and a hosts bind' = @{ Ok = $true; Lines = @($RootFs, $Proc, (Vol '8:32' '/containers/c1/hosts' 'rw')) }
+            'same path on another device' = @{ Ok = $true; Lines = @($RootFs, (Vol '8:48' '/volumes/repos/_data' 'rw')) }
+            'repos read-only' = @{ Ok = $true; Lines = @($RootFs, (Vol '8:32' '/volumes/repos/_data' 'ro')) }
+            'sibling volume name' = @{ Ok = $true; Lines = @($RootFs, (Vol '8:32' '/volumes/reposx/_data' 'rw')) }
+            'overlay lower on a volume' = @{ Ok = $true; Lines = @($RootFs.Replace('lowerdir=/var/lib/docker/overlay2/l/A', 'lowerdir=/volumes/repos/_data')) }
+            'repos writable' = @{ Ok = $false; Lines = @($RootFs, (Vol '8:32' '/volumes/repos/_data' 'rw')) }
+            'below repos writable' = @{ Ok = $false; Lines = @($RootFs, (Vol '8:32' '/volumes/repos/_data/sub' 'rw')) }
+            'store exposed read-only' = @{ Ok = $false; Lines = @($RootFs, (Vol '8:32' '/volumes' 'ro')) }
+            'whole store device exposed' = @{ Ok = $false; Lines = @($RootFs, (Vol '8:32' '/' 'ro')) }
+            'overlay upper outside the engine layers' = @{ Ok = $false; Lines = @($RootFs.Replace("upperdir=$Layer/diff", 'upperdir=/volumes/repos/_data')) }
+            'malformed line' = @{ Ok = $false; Lines = @($RootFs, 'garbage') }
+            'no root mount' = @{ Ok = $false; Lines = @($Proc) }
+            'exec fails' = @{ Ok = $false; Lines = @($RootFs); Exit = 1 }
+            'restarted while read' = @{ Ok = $false; Lines = @($RootFs); After = $Up.Replace('"t1"', '"t2"') }
+          }
+          $Wslc = {
+            $A = @($args) -join ' '; $global:LASTEXITCODE = 0
+            if ($A -ceq 'exec c1 cat /proc/1/mountinfo') { if ($T.Exit) { $global:LASTEXITCODE = $T.Exit }; $T.Lines }
+            elseif ($A -ceq 'inspect c1') { if ($T.After) { $T.After } else { $Up } }
+            else { $global:LASTEXITCODE = 1 }
+          }
+          foreach ($K in $Tables.Keys) {
+            $T = $Tables[$K]
+            $Got = Get-WriterProblem @((J $Up)) 'windows-rent'
+            if ([bool] (-not $Got) -ne $T.Ok) { "writer guard wrong for '$K': $Got"; exit 1 }
+          }
+          # While the typed import runs no container may hold the state volume at all, read-only included.
+          $T = @{ Lines = @($RootFs, (Vol '8:32' '/volumes/windows-rent-state/_data' 'ro')) }
+          if (Get-WriterProblem @((J $Up)) '' @('windows-rent-state')) { 'a read-only state holder counted as a writer'; exit 1 }
+          if (-not (Get-WriterProblem @((J $Up)) '' @('windows-rent-state') @('windows-rent-state'))) { 'the import allowed a state reader'; exit 1 }
+          # Anchors from the holder's actual state mount; an unmounted volume takes its sibling root on that device; only the
+          # guest driver with empty options, and one device for every volume.
+          $HolderJson = '{"Id":"h1","Name":"/windows-rent","State":{"Running":true,"Status":"running","StartedAt":"h"}}'
+          $HLines = @($RootFs, '3 1 8:32 /volumes/repos/_data /work/repos rw - ext4 /dev/sdc rw',
+            '4 1 8:32 /volumes/windows-rent-state/_data /var/lib/rent rw - ext4 /dev/sdc rw')
+          $Driver = 'guest'; $Opts = '{}'
+          $Wslc = {
+            $A = @($args) -join ' '; $global:LASTEXITCODE = 0
+            if ($A -ceq 'exec h1 cat /proc/1/mountinfo') { $HLines }
+            elseif ($A -ceq 'inspect h1') { $HolderJson }
+            elseif ($A -ceq 'volume inspect windows-rent-nix') { $global:LASTEXITCODE = 1 }
+            elseif ($A -clike 'volume inspect *') { '[{"Name":"' + $args[2] + '","Driver":"' + $Driver + '","DriverOpts":' + $Opts + '}]' }
+            else { $global:LASTEXITCODE = 1 }
+          }
+          $Got = Get-Anchors (J $HolderJson)
+          if (-not $Got -or $Got['windows-rent-nix'].Dev -cne '8:32' -or $Got['windows-rent-nix'].Root -cne '/volumes/windows-rent-nix/_data' -or
+              $Got['dev-home'].Root -cne '/volumes/dev-home/_data' -or $Got['repos'].Root -cne '/volumes/repos/_data') { 'anchors not taken from the actual state mount'; exit 1 }
+          $Opts = '{"type":"tmpfs"}'; if (Get-Anchors (J $HolderJson)) { 'anchors accepted volume options'; exit 1 }; $Opts = '{}'
+          $Driver = 'local'; if (Get-Anchors (J $HolderJson)) { 'anchors accepted another driver'; exit 1 }; $Driver = 'guest'
+          $HLines = @($RootFs, '3 1 8:48 /volumes/repos/_data /work/repos rw - ext4 /dev/sdd rw', '4 1 8:32 /volumes/windows-rent-state/_data /var/lib/rent rw - ext4 /dev/sdc rw')
+          if (Get-Anchors (J $HolderJson)) { 'anchors accepted volumes on two devices'; exit 1 }
+          $script:Anchors = $null
           # Stage preconditions: the kept rent Running on images read now (never a recorded digest), no candidate yet.
           $OldUpJson = '{"Name":"windows-rent","State":{"Running":true,"Status":"running"},"Image":"sha256:' + ('3' * 64) + '","Config":{"Image":"' + $Live + '"},"Mounts":[]}'
           $OldDownJson = $OldUpJson.Replace('"Running":true,"Status":"running"', '"Running":false,"Status":"exited"')
@@ -237,6 +300,7 @@ jobs:
               'container list --all -q' { $Case.ListSeen++; if ($Case.List -is [scriptblock]) { & $Case.List $Case.ListSeen } else { $Case.List } }
               'inspect other' { $Case.Other }
               'inspect ghost' { $null }
+              'inspect envs-dev-mutable' { '{"Name":"envs-dev-mutable","State":{"Running":false,"Status":"exited"},"Config":{"Image":"' + $OldImageSource + '"}}' }
               default { 'wslc output' }
             }
             if ($A -clike 'inspect *' -and $null -eq $Out) { $global:LASTEXITCODE = 1 } else { $Out }
@@ -250,7 +314,11 @@ jobs:
           $Back = @($List, 'task -> windows-rent', 'start windows-rent', 'inspect windows-rent', 'inspect windows-rent', 'inspect windows-rent')
           $NoBack = @($List, 'task -> windows-rent', 'start windows-rent') + @(1..60 | ForEach-Object { 'inspect windows-rent' })
           $Halt = { param($R) "Stage halted after placement attempt ($R): windows-rent kept stopped, logon task targets absent windows-rent-cf, slot and writer state UNKNOWN; recovery needs separate authority." }
-          $Writer = 'Container other is not provably stopped. Not restoring. Not starting windows-rent'
+          $Held = { param($F, $W) "Stage halted: $F | $W; windows-rent kept stopped, windows-rent-cf left as found, logon task not restored, state UNKNOWN; recovery needs separate authority." }
+          # The typed import, its selected items appended to the Plan's migrate argv; seeding with an expected backing.
+          $Imp = @($Plan.migrate | Select-Object -Skip 1) + 'session' + 'codex'; $I = $Imp -join ' '; $Ipre = @($Place, $List, $S, 'inspect envs-dev-mutable', $List, $I)
+          $SE = (@($SeedArgs[0..5]) + @('--env', 'RENT_NIX_EXPECT=8:32 /volumes/windows-rent-nix/_data') + @($SeedArgs[6..7])) -join ' '
+          $Writer = 'Container other is running and no volume anchor was read in this invocation. Not restoring. Not starting windows-rent'
           $Unreadable = 'Container  is not provably stopped. Not restoring. Not starting windows-rent'
           $Ok = 'task starts windows-rent; start old exit 0; old Running on its images'
           $NotOk = 'task starts windows-rent; start old exit 0; old not Running on its images within 60 s'
@@ -280,7 +348,7 @@ jobs:
             # A writer that keeps running: the seed guard refuses, and so does the revert's guard; the kept rent stays stopped.
             'another container running' = @{ List = 'other'; Other = $OtherRunning | ConvertTo-Json -Compress; Old = { $OldUpJson }; Cand = { $null }
               Calls = @($Place, $List, 'inspect other', 'inspect windows-rent-cf', $List, 'inspect other')
-              Want = "Stage failed: Container other is not provably stopped. Not seeding. | revert FAILED: $Writer" }
+              Want = "Stage failed: Container other is running and no volume anchor was read in this invocation. Not seeding. | revert FAILED: $Writer" }
             'writer appears before the kept rent restarts' = @{ Exit = @{ $SA = 1 }; List = { param($N) if ($N -ge 2) { 'other' } }
               Other = $OtherRunning | ConvertTo-Json -Compress; Old = { $OldUpJson }; Cand = { $null }
               Calls = $Pre + @('inspect windows-rent-cf', $List, 'inspect other')
@@ -321,12 +389,34 @@ jobs:
             'task cannot be pointed back' = @{ Exit = @{ $S = 1 }; TaskFail = @('windows-rent'); Old = { $OldUpJson }; Cand = { $null }
               Calls = @($Place, $List, $S, 'inspect windows-rent-cf', $List, 'task -> windows-rent')
               Want = 'Stage failed: WSLC seed failed: 1 | revert FAILED: task not restored (fake task failure for windows-rent); not starting windows-rent' }
+            # Anchors read in this invocation reach the seed as the expected backing; a refusal of it halts, never restarts.
+            'seed given the expected backing' = @{ Anchored = $true; Old = { $OldUpJson }; Cand = { $CandUp }; Want = 'ok'
+              Calls = @($Place, $List, $SE, $SA) + @(1..10 | ForEach-Object { $Pair }) }
+            'seed refuses its backing: halt' = @{ Anchored = $true; Exit = @{ $SE = 3 }; Old = { $OldUpJson }; Cand = { $null }; Calls = @($Place, $List, $SE)
+              Want = (& $Held 'WSLC seed exit 3: /seed is not the expected backing' 'the volume store is not the one the writer check compared') }
+            # The typed import between the seed and the candidate: unchanged and updated continue; a known failure with no
+            # target changed or every item restored reverts; an unknown outcome, or any failure after an update, halts.
+            'import unchanged' = @{ Items = $true; Old = { $OldUpJson }; Cand = { $CandUp }; Want = 'ok'; Calls = $Ipre + @($SA) + @(1..10 | ForEach-Object { $Pair }) }
+            'import updated' = @{ Items = $true; Exit = @{ $I = 10 }; Old = { $OldUpJson }; Cand = { $CandUp }; Want = 'ok'; Calls = $Ipre + @($SA) + @(1..10 | ForEach-Object { $Pair }) }
+            'run fails after an updated import: halt' = @{ Items = $true; Exit = @{ $I = 10; $SA = 1 }; Old = { $OldUpJson }; Cand = { $null }; Calls = $Ipre + @($SA)
+              Want = (& $Held 'WSLC run of windows-rent-cf failed: 1' 'the import updated the state') }
+            'run fails after an unchanged import: revert' = @{ Items = $true; Exit = @{ $SA = 1 }; Old = { $OldUpJson }; Cand = { $null }
+              Calls = $Ipre + @($SA, 'inspect windows-rent-cf') + $Back; Want = "Stage failed: WSLC run of windows-rent-cf failed: 1 | revert succeeded: $Ok" }
+            'import refused with no target changed: revert' = @{ Items = $true; Exit = @{ $I = 20 }; Old = { $OldUpJson }; Cand = { $null }
+              Calls = $Ipre + @('inspect windows-rent-cf') + $Back; Want = "Stage failed: WSLC import refused with no target changed | revert succeeded: $Ok" }
+            'import restored every item: revert' = @{ Items = $true; Exit = @{ $I = 21 }; Old = { $OldUpJson }; Cand = { $null }
+              Calls = $Ipre + @('inspect windows-rent-cf') + $Back; Want = "Stage failed: WSLC import failed and restored every changed item | revert succeeded: $Ok" }
+            'import outcome unknown: halt' = @{ Items = $true; Exit = @{ $I = 30 }; Old = { $OldUpJson }; Cand = { $null }; Calls = $Ipre
+              Want = (& $Held 'WSLC import: the import outcome is unknown (exit 30).' 'the import outcome is unknown (exit 30)') }
           }
           foreach ($K in $Cases.Keys) {
             $Case = $Cases[$K]; $Calls = [System.Collections.Generic.List[string]]::new()
+            $script:Anchors = if ($Case.Anchored) { @{ 'windows-rent-nix' = @{ Dev = '8:32'; Root = '/volumes/windows-rent-nix/_data' } } } else { $null }
+            $ImportItems = if ($Case.Items) { @('session', 'codex') } else { @() }; $MigrateArgs = $Imp
             $Got = try { Complete-Stage $OldUp; 'ok' } catch { $_.Exception.Message }
             Assert-Case $K $Got
           }
+          $script:Anchors = $null; $ImportItems = @()
           # The handoff before the candidate exists: the task moves to the candidate while the kept rent still runs, before
           # its stop; if anything fails before the candidate exists, the task goes back to the kept rent.
           $Before = 'Stage failed before windows-rent-cf existed'
@@ -391,7 +481,7 @@ jobs:
               Want = "$Stop but it stopped | restore succeeded: start old exit 0"
               Calls = @('stop windows-rent', 'inspect windows-rent', 'container list --all -q', 'start windows-rent', 'inspect windows-rent', 'inspect windows-rent', 'inspect windows-rent') }
             'stop fails, stopped, another writer running' = @{ Exit = @{ 'stop windows-rent' = 1 }; Old = { $OldDownJson }; List = 'other'; Other = $OtherRunning | ConvertTo-Json -Compress
-              Want = "$Stop but it stopped | restore FAILED: error: Container other is not provably stopped. Not restoring."
+              Want = "$Stop but it stopped | restore FAILED: error: Container other is running and no volume anchor was read in this invocation. Not restoring."
               Calls = @('stop windows-rent', 'inspect windows-rent', 'container list --all -q', 'inspect other') }
             'stop fails, state unknown' = @{ Exit = @{ 'stop windows-rent' = 1 }; Old = { '{"Name":"windows-rent","State":{"Running":"unknown"}}' }
               Want = "$Stop; its state is unknown; not starting anything."; Calls = @('stop windows-rent', 'inspect windows-rent') }
@@ -475,7 +565,16 @@ jobs:
           docker volume create rent-smoke-home
           docker volume create rent-smoke-nix
           # rent's own /nix: seeded from this image while no container uses it (hosts/rent/proof.sh proves the lifecycle).
-          docker run --rm -v rent-smoke-nix:/seed -e RENT_NIX_VOLUME=rent-smoke-nix "$image" /bin/rent-nix-seed
+          # Given an expected backing, the seed compares its own /seed mount first: another root refuses with exit 3 and
+          # nothing written; the backing actually observed for this volume seeds normally.
+          backing=$(docker run --rm -v rent-smoke-nix:/seed "$image" /bin/bash -c \
+            'while read -r _ _ d r m _; do if [ "$m" = /seed ]; then echo "$d $r"; fi; done < /proc/self/mountinfo')
+          rc=0
+          docker run --rm -v rent-smoke-nix:/seed -e RENT_NIX_VOLUME=rent-smoke-nix -e "RENT_NIX_EXPECT=${backing% *} /volumes/other/_data" \
+            "$image" /bin/rent-nix-seed > "$key_dir/seed" 2>&1 || rc=$?
+          test "$rc" = 3 && grep -qF 'not the expected volume backing; nothing written' "$key_dir/seed"
+          test -z "$(docker run --rm -v rent-smoke-nix:/n "$image" /bin/bash -c 'shopt -s nullglob dotglob; f=(/n/*); echo "${f[@]}"')"
+          docker run --rm -v rent-smoke-nix:/seed -e RENT_NIX_VOLUME=rent-smoke-nix -e "RENT_NIX_EXPECT=$backing" "$image" /bin/rent-nix-seed
           # Existing repos content with a foreign owner; rent-start must never chown it.
           docker run --rm -v rent-smoke-repos:/r "$image" /bin/bash -c 'echo repo > /r/marker && chown 4242:4243 /r/marker'
           ids=(-e RENT_REPOS_VOLUME=rent-smoke-repos -e RENT_STATE_VOLUME=rent-smoke-state -e RENT_NIX_VOLUME=rent-smoke-nix)
@@ -528,43 +627,51 @@ jobs:
               /o/.claude/history.jsonl /o/.ssh/id_synthetic \$p/other.jsonl /o/.codex/auth.json /o/.codex/history.jsonl; do echo \"synthetic \$f\" > \$f; done
             chown -R 1000:1000 /o
             chmod 600 /o/.claude/.credentials.json /o/.claude.json \$p/$sid.jsonl /o/.codex/auth.json"
+          # state_import MODE OLDVOLUME ARGS...: the helper on the synthetic old home and import state volumes.
           state_import() {
             docker run --rm -v "rent-smoke-old:/old$1" -v rent-smoke-import:/var/lib/rent \
-              -e "RENT_OLD_VOLUME=${2:-rent-smoke-old}" -e RENT_STATE_VOLUME=rent-smoke-import "$image" /bin/rent-state-import "$sid"
+              -e "RENT_OLD_VOLUME=$2" -e RENT_STATE_VOLUME=rent-smoke-import "$image" /bin/rent-state-import "${@:3}"
           }
+          all=("$sid" credentials session codex)
           import_refused() {
             if "$@" > "$key_dir/import" 2>&1; then echo "imported despite: $*" >&2; exit 1; fi
             if docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c 'shopt -s nullglob dotglob; f=(/s/*); ((${#f[@]}))'; then
               echo "refused import wrote state: $*" >&2; exit 1
             fi
           }
-          import_refused state_import ''
+          # expect_import EXIT MODE OLDVOLUME ARGS...: the typed outcome (0 unchanged, 10 updated, 20 refused, 21 restored).
+          expect_import() {
+            local want=$1 rc=0; shift
+            state_import "$@" > "$key_dir/import" 2>&1 || rc=$?
+            if [ "$rc" != "$want" ]; then echo "import exit $rc, not $want: $*" >&2; cat "$key_dir/import" >&2; exit 1; fi
+            if grep -q synthetic "$key_dir/import"; then echo 'import printed file contents' >&2; exit 1; fi
+          }
+          # Every path, type, owner, mode, size, time and content under the import state volume.
+          import_listing() {
+            docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c \
+              'cd /s && find . -printf "%p %y %U %G %m %s %T@\n" | LC_ALL=C sort; find . -type f -exec sha256sum {} + | LC_ALL=C sort' | sha256sum
+          }
+          import_refused state_import '' rent-smoke-old "${all[@]}"
           grep -qF '/old must be exactly volume rent-smoke-old, mounted read-only' "$key_dir/import"
-          import_refused state_import :ro rent-smoke-home
+          import_refused state_import :ro rent-smoke-home "${all[@]}"
           grep -qF '/old must be exactly volume rent-smoke-home, mounted read-only' "$key_dir/import"
-          import_refused docker run --rm -v rent-smoke-old:/old:ro -v rent-smoke-import:/var/lib/rent "$image" /bin/rent-state-import "$sid"
+          import_refused docker run --rm -v rent-smoke-old:/old:ro -v rent-smoke-import:/var/lib/rent "$image" /bin/rent-state-import "${all[@]}"
           grep -qF 'set RENT_OLD_VOLUME and RENT_STATE_VOLUME' "$key_dir/import"
           import_refused docker run --rm -v rent-smoke-old:/old:ro -v rent-smoke-import:/var/lib/rent:ro \
-            -e RENT_OLD_VOLUME=rent-smoke-old -e RENT_STATE_VOLUME=rent-smoke-import "$image" /bin/rent-state-import "$sid"
+            -e RENT_OLD_VOLUME=rent-smoke-old -e RENT_STATE_VOLUME=rent-smoke-import "$image" /bin/rent-state-import "${all[@]}"
           grep -qF '/var/lib/rent must be exactly volume rent-smoke-import, writable' "$key_dir/import"
-          state_import :ro > "$key_dir/import"
-          if grep -q synthetic "$key_dir/import"; then echo 'import printed file contents' >&2; exit 1; fi
-          # An identical rerun (as after an interruption) is a no-op; a differing target is never overwritten.
-          state_import :ro > /dev/null
-          # A staging directory left by an interrupted import is refused before any write and never deleted.
-          import_listing() { docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c 'cd /s && find . -printf "%p %s %T@\n" | LC_ALL=C sort | sha256sum'; }
-          docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c \
-            'install -d -m 700 /s/dev/codex/.import-auth.json.interrupt && echo foreign > /s/dev/codex/.import-auth.json.interrupt/auth.json'
+          # Nothing is selected by default: an import names its items explicitly.
+          import_refused state_import :ro rent-smoke-old "$sid"
+          grep -qF 'usage: rent-state-import' "$key_dir/import"
+          # The first import of the selected items, then a repeat: unchanged, with no persistent write at all.
+          expect_import 10 :ro rent-smoke-old "${all[@]}"
           before=$(import_listing)
-          if state_import :ro > "$key_dir/import" 2>&1; then echo 'imported over an interrupted staging directory' >&2; exit 1; fi
-          grep -qF '/var/lib/rent/dev/codex/.import-auth.json.interrupt is left from an interrupted import; not deleting it' "$key_dir/import"
+          expect_import 0 :ro rent-smoke-old "${all[@]}"
+          grep -qxF 'rent-state-import unchanged' "$key_dir/import"
           test "$(import_listing)" = "$before"
-          docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c \
-            'f=/s/dev/codex/.import-auth.json.interrupt/auth.json; [ -f $f ] && [ ! -L $f ] && [ "$(cat $f)" = foreign ] && rm -- $f && rmdir -- ${f%/*}'
-          state_import :ro > /dev/null
-          docker run --rm -v rent-smoke-old:/o "$image" /bin/bash -c 'echo changed >> /o/.codex/auth.json'
-          if state_import :ro > "$key_dir/import" 2>&1; then echo 'overwrote a differing target' >&2; exit 1; fi
-          grep -qF 'already exists and differs from its source' "$key_dir/import"
+          expect_import 0 :ro rent-smoke-old --compare "${all[@]}"
+          grep -qxF 'equal /var/lib/rent/dev/codex/auth.json' "$key_dir/import"
+          test "$(import_listing)" = "$before"
           docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c \
             'shopt -s globstar dotglob; cd /s; for f in **; do stat -c "%a %u %n" "$f"; done' | LC_ALL=C sort > "$key_dir/imported"
           printf '%s\n' '755 0 dev' '700 1000 dev/codex' '600 1000 dev/codex/auth.json' '700 1000 dev/claude' '600 1000 dev/claude/.credentials.json' \
@@ -574,6 +681,44 @@ jobs:
             LC_ALL=C sort | diff - "$key_dir/imported"
           test "$(docker run --rm -v rent-smoke-import:/s "$image" /bin/cat /s/dev/claude/.credentials.json)" = \
             'synthetic /o/.claude/.credentials.json'
+          # A differing source item that is not selected is left alone.
+          docker run --rm -v rent-smoke-old:/o "$image" /bin/bash -c 'echo changed >> /o/.codex/auth.json'
+          expect_import 0 :ro rent-smoke-old "$sid" credentials session
+          test "$(import_listing)" = "$before"
+          # A staging copy left by an interrupted import refuses before any target changes, and is never deleted.
+          docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c \
+            'install -d -m 700 /s/dev/codex/.import-auth.json.interrupt && echo foreign > /s/dev/codex/.import-auth.json.interrupt/auth.json'
+          leftover=$(import_listing)
+          expect_import 20 :ro rent-smoke-old "$sid" codex
+          grep -qF '/var/lib/rent/dev/codex/.import-auth.json.interrupt is left from an earlier import; not reusing or deleting it' "$key_dir/import"
+          test "$(import_listing)" = "$leftover"
+          docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c \
+            'f=/s/dev/codex/.import-auth.json.interrupt/auth.json; [ -f $f ] && [ ! -L $f ] && [ "$(cat $f)" = foreign ] && rm -- $f && rmdir -- ${f%/*}'
+          # The selected differing item is updated; its original stays beside it as its prior, byte for byte.
+          docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c 'sha256sum < /s/dev/codex/auth.json' > "$key_dir/auth-original"
+          expect_import 10 :ro rent-smoke-old "$sid" codex
+          grep -qxF 'updated /var/lib/rent/dev/codex/auth.json' "$key_dir/import"
+          test "$(docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c 'sha256sum < /s/dev/codex/auth.json.prior')" = "$(cat "$key_dir/auth-original")"
+          docker run --rm -v rent-smoke-import:/s -v rent-smoke-old:/o:ro "$image" /bin/bash -c \
+            'cmp -s /s/dev/codex/auth.json /o/.codex/auth.json && [ "$(stat -c "%u %g %a" /s/dev/codex/auth.json)" = "$(stat -c "%u %g %a" /o/.codex/auth.json)" ]'
+          # A later difference never overwrites that prior: refused with no target changed.
+          docker run --rm -v rent-smoke-old:/o "$image" /bin/bash -c 'echo again >> /o/.codex/auth.json'
+          before=$(import_listing)
+          expect_import 20 :ro rent-smoke-old "$sid" codex
+          grep -qF '/var/lib/rent/dev/codex/auth.json.prior is left from an earlier import' "$key_dir/import"
+          test "$(import_listing)" = "$before"
+          # A known failure after the first rename: the session directory is replaced, then its journal cannot be (a mount
+          # point cannot be renamed); the directory is put back from its prior, verified, and the outcome is restored (21).
+          docker run --rm -v rent-smoke-old:/o "$image" /bin/bash -c "echo more > /o/.claude/projects/-home-dev/$sid/subagents/b.jsonl && chown 1000:1000 /o/.claude/projects/-home-dev/$sid/subagents/b.jsonl"
+          sessions() { docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c "cd /s/dev/claude/projects/-home-dev/$sid && find . -printf '%p %y %U %G %m %s\n' | LC_ALL=C sort; find . -type f -exec sha256sum {} + | LC_ALL=C sort" | sha256sum; }
+          session_before=$(sessions)
+          printf 'pinned journal\n' > "$key_dir/journal"
+          rc=0
+          docker run --rm -v rent-smoke-old:/old:ro -v rent-smoke-import:/var/lib/rent -v "$key_dir/journal:/var/lib/rent/dev/claude/projects/-home-dev/$sid.jsonl:ro" \
+            -e RENT_OLD_VOLUME=rent-smoke-old -e RENT_STATE_VOLUME=rent-smoke-import "$image" /bin/rent-state-import "$sid" session > "$key_dir/import" 2>&1 || rc=$?
+          test "$rc" = 21 || { cat "$key_dir/import" >&2; exit 1; }
+          grep -qF 'failed; every changed item restored' "$key_dir/import"
+          test "$(sessions)" = "$session_before"
 
           run() {
             docker run -d --name rent-smoke -p 127.0.0.1:2222:2222 \
@@ -698,7 +843,7 @@ jobs:
             -e RENT_NIX_VOLUME=rent-smoke-nix "$image" /bin/rent-nix-seed
           busy '/var/lib/rent is in use by a running rent or another writer' docker run --rm -v rent-smoke-old:/old:ro \
             -v rent-smoke-state:/var/lib/rent -e RENT_OLD_VOLUME=rent-smoke-old -e RENT_STATE_VOLUME=rent-smoke-state "$image" \
-            /bin/rent-state-import "$sid"
+            /bin/rent-state-import "$sid" codex
           busy 'state root locked' docker run --rm -v rent-smoke-state:/var/lib/rent "$real" /bin/bash -c \
             'exec 9</var/lib/rent; flock -x -n 9 || { echo state root locked >&2; exit 1; }'
           test "$(state_listing)" = "$state_before"
