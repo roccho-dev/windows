@@ -10,8 +10,9 @@
 #
 # What a selection proves: the exact declaration above, read as bind checks it (the repository's common-dir config is
 # the caller's own and holds the nine settings bind writes, each exactly once, this helper at a stable profile path, no
-# other local credential, http, url or include key and no worktree config), a slot that is a current-format
-# (version "1") gh file store (a real directory of regular files), and that the pinned native gh answers for the
+# other local credential, http, url or include key and no worktree config), a slot that is a current-format gh file
+# store (one top-level version 1 as native gh writes it; a real directory of regular files), and that the pinned native
+# gh answers for the
 # declared principal as its configured active user. Selection only reads; it never writes, repairs or rebinds a
 # repository. It does not prove the token's provider principal: an account added, copied or swapped into a slot is not
 # detected. A slot is accepted only through separately authorized custody (first login, refresh, loss recovery, any copy, import or added
@@ -101,8 +102,24 @@ let
       p=$pr root=/work/repos/.auth/$pr/gh
       [ -d "$root" ] && [ ! -L "$root" ] || return 1
       for k in config.yml hosts.yml; do [ -f "$root/$k" ] && [ ! -L "$root/$k" ] || return 1; done
-      # gh 2.96.0 migrates and rewrites any config without version "1" as it starts: such a slot is refused first.
-      while IFS= read -r l; do [ "$l" = 'version: "1"' ] && n=$((n + 1)); done < "$root/config.yml"
+      # gh 2.96.0 reads the top-level version as a string and skips its migration only when it is "1"; with no version it
+      # migrates, rewriting the slot, and with another (such as 0) it refuses to start. Only the two lines native gh is
+      # shown to write are accepted, as the one top-level version key: version: 1 (its default template) and
+      # version: "1" (its own write after a migration). Native files break lines with LF only, so a carriage return
+      # anywhere is refused first. Any other or repeated plain version key (any whitespace before the colon) is refused,
+      # and so is every other root-level line that is not blank, a comment, indented (nested) or a plain key: quoted or
+      # escaped keys, document markers, directives, flow collections, anchors, aliases, tags, complex and merge keys. A
+      # refused slot is never read by gh (the wrapper still runs gh unselected). This is a bounded check of native
+      # gh's own output, not a YAML parser.
+      while IFS= read -r l || [ -n "$l" ]; do
+        case $l in
+          *$'\r'*) return 1 ;;
+          'version: 1'|'version: "1"') n=$((n + 1)) ;;
+          version|version[[:space:]:]*) return 1 ;;
+          ""|'#'*|[[:space:]]*|[[:alnum:]_]*) ;;
+          *) return 1 ;;
+        esac
+      done < "$root/config.yml"
       [ "$n" = 1 ]
     }
     answer() {
