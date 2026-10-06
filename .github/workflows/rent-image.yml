@@ -209,7 +209,9 @@ jobs:
           $HLines = @($RootFs, '3 1 8:48 /volumes/repos/_data /work/repos rw - ext4 /dev/sdd rw', '4 1 8:32 /volumes/windows-rent-state/_data /var/lib/rent rw - ext4 /dev/sdc rw')
           if (Get-Anchors (J $HolderJson)) { 'anchors accepted volumes on two devices'; exit 1 }
           # A failed inspect is 'absent' only when a readable volume list does not name the volume.
+          $ListMore = @('guest    System.Management.Automation.Internal.Host.InternalHost')
           if ((Get-VolumeKind 'windows-rent-nix') -cne 'absent') { 'an unlisted failed volume was not absent'; exit 1 }
+          $ListMore = @('guest    windows-rent-nix unexpected'); if ((Get-VolumeKind 'windows-rent-nix') -cne 'unknown') { 'a row with an extra column read as absent'; exit 1 }
           $ListMore = @('guest    windows-rent-nix'); if ((Get-VolumeKind 'windows-rent-nix') -cne 'unknown') { 'a listed failed volume read as absent'; exit 1 }
           $ListMore = @(); $ListExit = 1; if ((Get-VolumeKind 'windows-rent-nix') -cne 'unknown') { 'an unreadable list read as absent'; exit 1 }
           $ListExit = 0; $ListMore = @('malformed-row'); if ((Get-VolumeKind 'windows-rent-nix') -cne 'unknown') { 'a list with an unreadable row read as absent'; exit 1 }
