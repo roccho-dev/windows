@@ -113,7 +113,7 @@
       # still match it; then the original is renamed to <target>.prior (never overwritten) and the copy renamed into place.
       # That evidence, and the originals', lives only in this process's memory: on a failure after the first rename, each
       # changed item is put back only from a prior that still matches its original, and verified. Exit 0 unchanged, 10
-      # updated, 11 updated with an empty staging directory left, 20 refused with no target changed (a staging copy may
+      # updated, 11 updated with a staging directory kept after its removal failed, 20 refused with no target changed (a staging copy may
       # remain), 21 failed and restored; anything else (a crash, drift, unreadable evidence or an unverified restore) is
       # UNKNOWN. Never run by rent-start; prints item paths only.
       stateImport = pkgs.writeShellScriptBin "rent-state-import" ''
@@ -237,11 +237,11 @@
           now=$(state "$dst") && [ "$now" = "''${srcs[i]}" ] || restore
           echo "updated $dst"
         done
-        # Every item is in place and verified, and every staging copy was moved; an empty staging directory that cannot be
-        # removed is reported (11), not undone.
+        # Every item is in place and verified, and every staging copy was moved; a staging directory whose removal fails is
+        # kept and reported (11), not undone.
         left=0
         for n in "''${staged[@]}"; do rmdir "''${n%/*}" || left=1; done
-        if [ "$left" = 1 ]; then echo 'rent-state-import updated; an empty staging directory was left' >&2; exit 11; fi
+        if [ "$left" = 1 ]; then echo 'rent-state-import updated; a staging directory was kept after its removal failed' >&2; exit 11; fi
         echo 'rent-state-import updated'
         exit 10
       '';
