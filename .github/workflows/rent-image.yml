@@ -26,6 +26,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+          fetch-depth: 0
       - name: Parse and dry-plan the Windows script (no WSLC, no live effect)
         shell: pwsh
         run: |
@@ -71,6 +72,15 @@ jobs:
           }
           foreach ($K in $Want.Keys) {
             if ((@($Plan.$K) -join "`n") -cne ($Want[$K] -join "`n")) { "$K differs: $(@($Plan.$K) -join ' ')"; exit 1 }
+          }
+          $ProjectPlan = ((& $Path @Base -SessionProject '-mieru-proof') -join "`n") | ConvertFrom-Json
+          if (($ProjectPlan.migrate -join "`n") -cne (($Want.migrate[0..($Want.migrate.Count - 2)] + @('--project', '-mieru-proof', $Want.migrate[-1])) -join "`n")) {
+            'session project is not forwarded to the production importer'; exit 1
+          }
+          foreach ($BadProject in '', '.', '..', '../x', '/x', 'x/y', 'x\y', 'C:x') {
+            $Rejected = $false
+            try { $null = & $Path @Base -SessionProject $BadProject } catch { $Rejected = $true }
+            if (-not $Rejected) { "unsafe project accepted: $BadProject"; exit 1 }
           }
           if ($Plan.readyGate -notlike "*'rent-mounts ok repos=repos state=windows-rent-state nix=windows-rent-nix'*'rent-start ok services=nix-daemon,cloudflared,sshd'*") { 'readyGate differs'; exit 1 }
           # The candidate takes over exactly the kept rent's loopback port (free only once it is stopped), and exactly one
@@ -518,8 +528,15 @@ jobs:
           $global:LASTEXITCODE = 0
       - uses: cachix/install-nix-action@v31
       - name: Build from locked Nix inputs
+        env:
+          BASE_SOURCE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           set -euo pipefail
+          [[ "$BASE_SOURCE" =~ ^[0-9a-f]{40}$ && "$BASE_SOURCE" != 0000000000000000000000000000000000000000 ]]
+          before=$(nix eval --raw "git+file://$PWD?rev=$BASE_SOURCE#own-image.drvPath")
+          after=$(nix eval --raw .#own-image.drvPath)
+          test "$before" = "$after" || { echo 'own image derivation changed' >&2; exit 1; }
+          echo "own image derivation unchanged: $after"
           # result: the published image; result-1: its CI-only tunnel-stub twin; result-2: the stub twin plus one package.
           nix build .#rent-image .#rent-image-stub .#rent-image-next --no-write-lock-file --print-build-logs
           test -e result && test -e result-1 && test -e result-2
@@ -684,6 +701,21 @@ jobs:
           # Nothing is selected by default: an import names its items explicitly.
           import_refused state_import :ro rent-smoke-old "$sid"
           grep -qF 'usage: rent-state-import' "$key_dir/import"
+          # A project is one owned, real directory element, never a path or an implicit fallback.
+          for project in '' . .. ../escape /absolute 'nested/project' 'nested\project'; do
+            import_refused state_import :ro rent-smoke-old --project "$project" "$sid" session
+            grep -qF 'project must be one plain element' "$key_dir/import"
+          done
+          import_refused state_import :ro rent-smoke-old --project -missing "$sid" session
+          grep -qF 'source project must be a UID 1000 directory' "$key_dir/import"
+          docker run --rm -v rent-smoke-old:/o "$image" /bin/bash -c \
+            'ln -s -- -home-dev /o/.claude/projects/-linked; chown 999 /o/.claude/projects/-home-dev'
+          import_refused state_import :ro rent-smoke-old --project -linked "$sid" session
+          grep -qF 'not a real directory' "$key_dir/import"
+          import_refused state_import :ro rent-smoke-old "$sid" session
+          grep -qF 'source project must be a UID 1000 directory' "$key_dir/import"
+          docker run --rm -v rent-smoke-old:/o "$image" /bin/bash -c \
+            'rm -- /o/.claude/projects/-linked; chown 1000 /o/.claude/projects/-home-dev'
           # The first import of the selected items, then a repeat: unchanged, with no persistent write at all.
           expect_import 10 :ro rent-smoke-old "${all[@]}"
           before=$(import_listing)
@@ -702,6 +734,22 @@ jobs:
             LC_ALL=C sort | diff - "$key_dir/imported"
           test "$(docker run --rm -v rent-smoke-import:/s "$image" /bin/cat /s/dev/claude/.credentials.json)" = \
             'synthetic /o/.claude/.credentials.json'
+          # A second explicitly selected project preserves the legacy session and all unrelated state.
+          docker run --rm -v rent-smoke-old:/o "$image" /bin/bash -c "set -eu
+            mkdir -p /o/.claude/projects/-mieru-proof/$sid
+            echo synthetic-project > /o/.claude/projects/-mieru-proof/$sid.jsonl
+            chown -R 1000:1000 /o/.claude/projects/-mieru-proof
+            chmod 600 /o/.claude/projects/-mieru-proof/$sid.jsonl"
+          expect_import 10 :ro rent-smoke-old --project -mieru-proof "$sid" session
+          before=$(import_listing)
+          expect_import 0 :ro rent-smoke-old --compare --project -mieru-proof "$sid" session
+          test "$(import_listing)" = "$before"
+          docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c 'chown 999 /s/dev/claude/projects/-mieru-proof'
+          wrong_owner=$(import_listing)
+          expect_import 20 :ro rent-smoke-old --project -mieru-proof "$sid" session
+          test "$(import_listing)" = "$wrong_owner"
+          docker run --rm -v rent-smoke-import:/s "$image" /bin/bash -c 'chown 1000 /s/dev/claude/projects/-mieru-proof'
+          before=$(import_listing)
           # A differing source item that is not selected is left alone.
           docker run --rm -v rent-smoke-old:/o "$image" /bin/bash -c 'echo changed >> /o/.codex/auth.json'
           expect_import 0 :ro rent-smoke-old "$sid" credentials session
