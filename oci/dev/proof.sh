@@ -293,6 +293,7 @@ const provenance = { schema: 'roccho.voice-ui-target-runtime.release-provenance/
 for (const [name, alter, stage] of [
   ['canonical repository', () => {}, 'deploy_closure'],
   ['historical repository', p => { p.source.repository='roccho-dev/ops'; }, 'deploy_proof'],
+  ['wrong repository', p => { p.source.repository='other/ops'; }, 'deploy_proof'],
   ['wrong review repository', (p,q) => { q.r_exact_head_verdict_ref='https://github.com/other/ops/pull/1#pullrequestreview-0'; }, 'deploy_proof'],
   ['wrong locator', p => { p.deploy.locator=p.deploy.locator.replace('roccho-org/ops','other/ops'); }, 'deploy_export'],
   ['wrong commit', p => { p.source.commit='f'.repeat(40); }, 'deploy_proof'],
