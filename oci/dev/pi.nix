@@ -17,7 +17,7 @@ let
     };
 
     nativeBuildInputs = [ pkgs.autoPatchelfHook ];
-    buildInputs = [ pkgs.stdenv.cc.cc.lib ];
+    buildInputs = [ pkgs.stdenv.cc.cc.lib pkgs.libxcb ];
 
     sourceRoot = ".";
     unpackPhase = ''
