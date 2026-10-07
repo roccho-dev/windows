@@ -71,8 +71,9 @@ pi_clear() {
     plain "$fx/other.out" && plain "$fx/bad-kind.out" && plain "$fx/empty.out" && plain "$fx/missing.out" &&
     plain "$fx/go-missing.out" && plain "$fx/other-provider.out" && plain "$fx/conflict.out" &&
     plain "$fx/scratch-clear.sh" &&
-    plain "$fx/agent/auth.json" && empty "$fx/agent" &&
-    plain "$fx/agent-failure/auth.json" && empty "$fx/agent-failure" && empty "$fx"
+    plain "$fx/agent/auth.json" && plain "$fx/agent/models-store.json" && empty "$fx/agent" &&
+    plain "$fx/agent-failure/auth.json" && plain "$fx/agent-failure/models-store.json" &&
+    empty "$fx/agent-failure" && empty "$fx"
 }
 cleanup() {
   code=$?
@@ -754,6 +755,12 @@ pi_proof() {
   echo 'PI_PROOF_STAGE other-provider-run'
   grep -Eq '^anthropic[[:space:]]' "$fx/other-provider.out"
   echo 'PI_PROOF_STAGE other-provider-visible'
+  if [ -e "$fx/agent-failure/models-store.json" ]; then
+    { [ -f "$fx/agent-failure/models-store.json" ] && [ ! -L "$fx/agent-failure/models-store.json" ]; } ||
+      { echo 'Pi failure fixture native model store is not a regular file' >&2; return 1; }
+    ! grep -qF "$key" "$fx/agent-failure/models-store.json"
+    ! grep -qF "ambient-$key" "$fx/agent-failure/models-store.json"
+  fi
 
   pi_encrypt > "$cipher"
   current=$(pi_commit restored-credential)
@@ -784,6 +791,12 @@ pi_proof() {
   test "$(stat -c '%i|%s|%y' "$fx/agent/auth.json")" = "$auth_state"
   ! grep -qF "$key" "$fx/list2.out"
   ! find "$fx/agent" -maxdepth 1 -name '.auth.*' -print -quit | grep -q .
+  if [ -e "$fx/agent/models-store.json" ]; then
+    { [ -f "$fx/agent/models-store.json" ] && [ ! -L "$fx/agent/models-store.json" ]; } ||
+      { echo 'Pi fixture native model store is not a regular file' >&2; return 1; }
+    ! grep -qF "$key" "$fx/agent/models-store.json"
+    ! grep -qF "ambient-$key" "$fx/agent/models-store.json"
+  fi
 
   printf '%s\n' '{"opencode-go":{"type":"api_key","key":"literal-conflict"}}' > "$fx/agent/auth.json"
   chmod 600 "$fx/agent/auth.json"
@@ -796,7 +809,7 @@ pi_proof() {
   test "$(sha256sum "$fx/agent/auth.json")" = "$conflict_state"
   ! grep -qF "$key" "$fx/conflict.out"
 
-  echo 'PASS Pi source fixture: v1.0.4 pin, native opencode-go catalog, same-code resolver, bounded scratch cleanup with foreign preservation, exact binding target/cipher currentness, target recipient, missing/empty/refused Go auth with unrelated-provider control, dedicated auth, repeat no-write, conflict refusal, no dummy-key log/auth leak'
+  echo 'PASS Pi source fixture: v1.0.4 pin, native opencode-go catalog, same-code resolver, bounded scratch cleanup with foreign preservation, exact binding target/cipher currentness, target recipient, missing/empty/refused Go auth with unrelated-provider control, finite native models-store checked for secret absence, dedicated auth, repeat no-write, conflict refusal, no dummy-key log/auth leak'
 }
 jev_proof
 pi_proof
