@@ -55,6 +55,18 @@ jev_clear() {
     plain "$fx/launch.out" && plain "$fx/ops.out" && plain "$fx/ops.err" && plain "$fx/scratch-clear.sh" &&
     empty "$fx/tmp" && empty "$fx"
 }
+# Everything the Pi source proof creates under $evidence/pi. It shares the generic fixture Git cleanup above.
+pi_clear() {
+  local fx=$evidence/pi
+  if [ -e "$fx/envs/.git" ]; then git_clear "$fx/envs" || return 1; fi
+  plain "$fx/envs/contracts/bindings.jsonl" && empty "$fx/envs/contracts" &&
+    plain "$fx/envs/ciphertexts/dev-opencode-go.oci-dev.sops.yaml" &&
+    empty "$fx/envs/ciphertexts" && empty "$fx/envs" &&
+    plain "$fx/age.key" && plain "$fx/other.key" &&
+    plain "$fx/list.out" && plain "$fx/list2.out" && plain "$fx/stale.out" &&
+    plain "$fx/other.out" && plain "$fx/conflict.out" &&
+    plain "$fx/agent/auth.json" && empty "$fx/agent" && empty "$fx"
+}
 cleanup() {
   code=$?
   if [ "$code" -ne 0 ]; then
@@ -65,6 +77,7 @@ cleanup() {
   docker volume rm "$nix_volume" "$work_volume" >/dev/null 2>&1 || true
   plain "$evidence/page" && plain "$evidence/before" || code=1
   if [ -e "$evidence/jev" ]; then jev_clear || code=1; fi
+  if [ -e "$evidence/pi" ]; then pi_clear || code=1; fi
   empty "$evidence" || code=1
   exit "$code"
 }
@@ -516,7 +529,134 @@ NIX
   echo 'PASS jev fixtures: Git-verified objects and known files removed, foreign entries kept and refused; no fixture or test identity left;'
   echo 'PASS jev RED: arguments, host, stale/off/unknown envs commit, unbuildable apps, identity mode/missing/other, tamper, two recipients, extra field, absent'
 }
+
+# Pi/OpenCode Go source proof only. It uses a throwaway local envs authority, throwaway age identities and a dummy
+# key; it never reads a real envs ciphertext, OpenCode credential or provider. Production and fixture launchers/resolvers
+# are both built from oci/dev/pi.nix, with only target constants changed.
+pi_proof() {
+  local nx=(nix --extra-experimental-features 'nix-command flakes')
+  local fx="$evidence/pi" pkgs='import (builtins.getFlake (toString ./.)).inputs.nixpkgs { system = "x86_64-linux"; }'
+  mkdir "$fx"
+
+  local profile prod_pi prod_resolver version
+  profile=$("${nx[@]}" build --no-link --print-out-paths --no-write-lock-file .#dev-profile)
+  prod_pi=$(readlink -f "$profile/bin/pi")
+  test -x "$prod_pi"
+  version=$("$profile/bin/pi" --version)
+  grep -Eq '(^|[^0-9])1[.]0[.]4([^0-9]|$)' <<<"$version"
+  test ! -e "$profile/bin/pi-upstream"
+  test ! -e "$profile/bin/pi-opencode-go-key"
+  sed -E 's/^[[:space:]]*//' "$prod_pi" | grep -xF 'agent_dir=/home/dev/.pi/agent-oci-dev' >/dev/null
+  grep -qF 'unset OPENCODE_API_KEY' "$prod_pi"
+  grep -qF 'models.json would override native providers' "$prod_pi"
+  prod_resolver=$(sed -n 's/^[[:space:]]*resolver=//p' "$prod_pi")
+  test -x "$prod_resolver"
+  sed -E 's/^[[:space:]]*//' "$prod_resolver" | grep -xF 'remote=https://github.com/roccho-org/envs' >/dev/null
+  sed -E 's/^[[:space:]]*//' "$prod_resolver" | grep -xF 'identity=/work/repos/.auth/roccho-dev/age/oci-dev.key' >/dev/null
+  grep -qF 'binding=opencode-go.oci-dev' "$prod_resolver"
+  grep -qF 'OPENCODE_API_KEY' "$prod_resolver"
+  if grep -qE '^[[:space:]]*set -(x|o xtrace)' "$prod_pi" "$prod_resolver"; then
+    echo 'Pi launcher or resolver enables xtrace' >&2
+    return 1
+  fi
+
+  local expr fixture_pi fixture_resolver other_resolver tools
+  expr="import ./oci/dev/pi.nix { pkgs = $pkgs; envsRemote = \"file://$fx/envs\";
+    identity = \"$fx/age.key\"; agentDir = \"$fx/agent\"; }"
+  fixture_pi=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($expr).launcher")/bin/pi
+  fixture_resolver=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($expr).resolver")/bin/pi-opencode-go-key
+  tools=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($expr).fixtureTools")
+  local other_expr
+  other_expr="import ./oci/dev/pi.nix { pkgs = $pkgs; envsRemote = \"file://$fx/envs\";
+    identity = \"$fx/other.key\"; agentDir = \"$fx/agent-other\"; }"
+  other_resolver=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($other_expr).resolver")/bin/pi-opencode-go-key
+
+  same_resolver() { grep -vE '^[[:space:]]*(remote|identity)=' "$1" | sha256sum; }
+  same_launcher() { grep -vE '^[[:space:]]*(agent_dir|resolver)=' "$1" | sha256sum; }
+  test "$(same_resolver "$fixture_resolver")" = "$(same_resolver "$prod_resolver")"
+  test "$(same_launcher "$fixture_pi")" = "$(same_launcher "$prod_pi")"
+  test "$fixture_resolver" != "$prod_resolver"
+  test "$fixture_pi" != "$prod_pi"
+
+  "$tools/bin/age-keygen" -o "$fx/age.key" >/dev/null 2>&1
+  "$tools/bin/age-keygen" -o "$fx/other.key" >/dev/null 2>&1
+  local recipient key cipher stale current
+  recipient=$("$tools/bin/age-keygen" -y "$fx/age.key")
+  key="fixture-opencode-$RANDOM$RANDOM$RANDOM"
+  pi_g() { git -c user.name=proof -c user.email=proof@invalid "$@"; }
+  pi_fixture_init() {
+    pi_g init -q --template= -b proposals "$1"
+    pi_g -C "$1" config core.logAllRefUpdates false
+    pi_g -C "$1" config gc.auto 0
+  }
+  pi_commit() {
+    pi_g -C "$fx/envs" add -A
+    pi_g -C "$fx/envs" commit -q -m "$1"
+    pi_g -C "$fx/envs" rev-parse HEAD
+  }
+  pi_encrypt() {
+    printf '{"OPENCODE_API_KEY":"%s"}\n' "$key" |
+      SOPS_AGE_RECIPIENTS="$recipient" "$tools/bin/sops" --encrypt --input-type json --output-type yaml /dev/stdin
+  }
+
+  pi_fixture_init "$fx/envs"
+  mkdir -p "$fx/envs/contracts" "$fx/envs/ciphertexts"
+  printf '%s\n' \
+    '{"id":"opencode-go.oci-dev","kind":"envs.authCapability.v1","capability":"opencode-go","ciphertext":"ciphertexts/dev-opencode-go.oci-dev.sops.yaml","source_key":"OPENCODE_API_KEY","target":{"repository":"roccho-dev/windows","host":"oci-dev","kind":"pi_auth_command"}}' \
+    > "$fx/envs/contracts/bindings.jsonl"
+  cipher="$fx/envs/ciphertexts/dev-opencode-go.oci-dev.sops.yaml"
+  pi_encrypt > "$cipher"; stale=$(pi_commit stale)
+  pi_encrypt > "$cipher"; current=$(pi_commit current)
+
+  local got
+  got=$("$fixture_resolver" --envs-sha "$current")
+  test "$got" = "$key"
+  if "$fixture_resolver" --envs-sha "$stale" >"$fx/stale.out" 2>&1; then
+    echo 'Pi resolver accepted a stale ciphertext revision' >&2
+    return 1
+  fi
+  if "$other_resolver" --envs-sha "$current" >"$fx/other.out" 2>&1; then
+    echo 'Pi resolver accepted the wrong target identity' >&2
+    return 1
+  fi
+  ! grep -qF "$key" "$fx/stale.out" "$fx/other.out"
+
+  OPENCODE_API_KEY="ambient-$key" "$fixture_pi" --envs-sha "$current" \
+    --offline --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files --no-approve \
+    --list-models opencode-go >"$fx/list.out" 2>&1
+  grep -qi 'opencode-go' "$fx/list.out"
+  ! grep -qF "$key" "$fx/list.out"
+  ! grep -qF "ambient-$key" "$fx/list.out"
+  test "$(stat -c %a "$fx/agent")" = 700
+  test "$(stat -c %a "$fx/agent/auth.json")" = 600
+  grep -qF "\"key\":\"!$fixture_resolver --envs-sha $current\"" "$fx/agent/auth.json"
+  ! grep -qF "$key" "$fx/agent/auth.json"
+  ! test -e "$fx/agent/models.json"
+
+  local auth_state
+  auth_state=$(stat -c '%i|%s|%y' "$fx/agent/auth.json")
+  OPENCODE_API_KEY="ambient-$key" "$fixture_pi" --envs-sha "$current" \
+    --offline --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files --no-approve \
+    --list-models opencode-go >"$fx/list2.out" 2>&1
+  test "$(stat -c '%i|%s|%y' "$fx/agent/auth.json")" = "$auth_state"
+  ! grep -qF "$key" "$fx/list2.out"
+  ! find "$fx/agent" -maxdepth 1 -name '.auth.*' -print -quit | grep -q .
+
+  printf '%s\n' '{"opencode-go":{"type":"api_key","key":"literal-conflict"}}' > "$fx/agent/auth.json"
+  chmod 600 "$fx/agent/auth.json"
+  local conflict_state
+  conflict_state=$(sha256sum "$fx/agent/auth.json")
+  if "$fixture_pi" --envs-sha "$current" --offline --list-models opencode-go >"$fx/conflict.out" 2>&1; then
+    echo 'Pi launcher accepted conflicting auth state' >&2
+    return 1
+  fi
+  test "$(sha256sum "$fx/agent/auth.json")" = "$conflict_state"
+  ! grep -qF "$key" "$fx/conflict.out"
+
+  echo 'PASS Pi source fixture: v1.0.4 pin, native opencode-go catalog, same-code resolver, exact binding/cipher currentness, target recipient, dedicated auth, repeat no-write, conflict refusal, no dummy-key log/auth leak'
+}
 jev_proof
+pi_proof
 [ "$mode" = full ] || exit 0
 
 docker load < "$image_archive"
