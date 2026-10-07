@@ -96,8 +96,7 @@ let
         and .kind == "envs.authCapability.v1"
         and .capability == "opencode-go"
         and .source_key == "OPENCODE_API_KEY"
-        and .target.repository == "roccho-dev/windows"
-        and .target.host == "oci-dev"
+        and .target == {"repository":"roccho-dev/windows","host":"oci-dev","kind":"pi_auth_command"}
         and (.ciphertext | type == "string")
       ' >/dev/null || fail "binding meaning differs"
 
