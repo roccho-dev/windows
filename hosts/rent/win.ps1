@@ -514,10 +514,18 @@ function Wait-Ready([string] $Name) {
 
 # WSLC exposes these inputs, but not configured mounts. Compare image defaults plus the same four run overrides.
 # The audited create call and returned immutable ID retain the mount declaration; only rent-start proves actual mounts.
-function Get-PreparedProblem($Item, $Spec, [string] $Id) {
+function Get-PreparedProblem($Item, $Spec, [string] $Id, [switch] $Running) {
+    $StateOk = if ($Running) { (Test-Running $Item) -and [string] $Item.State.Status -ceq 'running' } else { Test-Stopped $Item }
     if (-not $Item -or -not $Spec -or $Id -cnotmatch '^[a-f0-9]{64}$' -or [string] $Item.Id -cne $Id -or
-        ([string] $Item.Name).TrimStart('/') -cne $Container -or -not (Test-Stopped $Item)) { return 'Prepared identity/state differs.' }
-    if ([string] $Spec.Id -cnotmatch '^sha256:[a-f0-9]{64}$' -or [string] $Item.Image -cne [string] $Spec.Id) { return 'Prepared image differs.' }
+        ([string] $Item.Name).TrimStart('/') -cne $Container -or -not $StateOk) { return 'Prepared identity/state differs.' }
+    # WSLC container Image is an immutable registry reference or a config ID. Image inspect binds those different
+    # identities through RepoDigests; neither a mutable tag nor one matching field can excuse a conflicting field.
+    if ([string] $Spec.Id -cnotmatch '^sha256:[a-f0-9]{64}$' -or $Spec.RepoDigests -isnot [array] -or
+        @($Spec.RepoDigests | Where-Object { $_ -isnot [string] }).Count -or $Spec.RepoDigests -cnotcontains $Image -or
+        $Item.Image -isnot [string] -or -not $Item.Image) { return 'Prepared image differs.' }
+    foreach ($Observed in (Get-Images $Item)) {
+        if ($Observed -cne $Image -and $Observed -cne [string] $Spec.Id) { return 'Prepared image differs.' }
+    }
     foreach ($Field in 'Cmd', 'Entrypoint', 'User', 'WorkingDir') {
         if (-not $Item.Config.PSObject.Properties[$Field] -or -not $Spec.Config.PSObject.Properties[$Field] -or
             (ConvertTo-Json -InputObject $Item.Config.$Field -Compress) -cne (ConvertTo-Json -InputObject $Spec.Config.$Field -Compress)) {
@@ -576,10 +584,8 @@ function Invoke-Prepared {
         & $Wslc start $PreparedId | Out-Host
         if ($LASTEXITCODE -ne 0) { throw 'Start outcome is unknown; retain state, no retry or old restart.' }
         if (-not (Wait-Ready $Container)) { throw 'Prepared container failed the production mount/ready gate; retained, no automatic restart.' }
-        $Now = Get-Named $Container
-        if (-not (Test-Running $Now) -or [string] $Now.Id -cne $PreparedId -or [string] $Now.Image -cne [string] $Spec.Id) {
-            throw 'Prepared identity changed during the ready gate; retained, no next effect.'
-        }
+        $Problem = Get-PreparedProblem (Get-Named $Container) $Spec $PreparedId -Running
+        if ($Problem) { throw "$Problem During the ready gate; retained, no next effect." }
         Write-Output $Proof
     }
 }
