@@ -15,6 +15,17 @@ rec {
   ghWrapper = github.wrapper;
   ghCredential = github.helper;
 
+  # Dev-only gh-infra: one immutable upstream release asset. Its GitHub operations still execute the existing gh
+  # wrapper from this profile's PATH, so repository-bound principal selection stays owned by hosts/profile/gh.nix.
+  ghInfra = pkgs.runCommand "gh-infra-0.14.0" {
+    src = pkgs.fetchurl {
+      url = "https://github.com/babarot/gh-infra/releases/download/v0.14.0/gh-infra_linux-amd64";
+      hash = "sha256-Qw9oo6XnUMLUTSYiNrG2jOCtQUH6RogiYt2rj/0Hoxw=";
+    };
+  } ''
+    install -Dm755 "$src" "$out/bin/gh-infra"
+  '';
+
   # Local real-Jev prerequisite (roccho-dev/adrs#460): three bounded tools over exactly four build-time constants.
   # Only the production instance below is linked into the profile; oci/dev/proof.sh builds a fixture instance of this
   # same source. sops, age and age-keygen are reached by absolute store path inside these closures, never via PATH.
@@ -372,6 +383,7 @@ rec {
     opsRemote = "https://github.com/roccho-dev/ops";
     identity = "/work/repos/.auth/roccho-dev/age/oci-dev.key";
   };
+
   pi = import ./pi.nix {
     inherit pkgs;
     envsRemote = "https://github.com/roccho-org/envs";
@@ -391,6 +403,7 @@ rec {
         openssh
       ])
       ++ [
+        ghInfra
         ghWrapper
         ghCredential
         jev.init
