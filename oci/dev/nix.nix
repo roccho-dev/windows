@@ -384,6 +384,13 @@ rec {
     identity = "/work/repos/.auth/roccho-dev/age/oci-dev.key";
   };
 
+  pi = import ./pi.nix {
+    inherit pkgs;
+    envsRemote = "https://github.com/roccho-org/envs";
+    identity = "/work/repos/.auth/roccho-dev/age/oci-dev.key";
+    agentDir = "/home/dev/.pi/agent-oci-dev";
+  };
+
   # The tools that the Tools step realizes into /nix/var/nix/profiles/windows-dev.
   profile = pkgs.buildEnv {
     name = "windows-dev";
@@ -402,6 +409,7 @@ rec {
         jev.init
         jev.launch
         jev.ops
+        pi.launcher
       ];
     pathsToLink = [
       "/bin"
