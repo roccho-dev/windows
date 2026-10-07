@@ -159,6 +159,7 @@ let
 
       agent_dir=${pkgs.lib.escapeShellArg agentDir}
       cu=${pkgs.coreutils}/bin
+      cmp=${pkgs.diffutils}/bin/cmp
       resolver=${resolver}/bin/pi-opencode-go-key
       upstream=${upstream}/bin/pi-upstream
       package_dir=${upstream}/share/pi
@@ -205,7 +206,7 @@ let
       { [ -f "$auth" ] && [ ! -L "$auth" ]; } || fail "auth.json is not a regular file"
       [ "$("$cu/stat" -c %a "$auth")" = 600 ] || fail "auth.json mode differs"
       [ "$("$cu/stat" -c %u "$auth")" = "$("$cu/id" -u)" ] || fail "auth.json owner differs"
-      printf '%s' "$expected" | "$cu/cmp" -s - "$auth" || fail "auth.json conflicts with canonical Go command"
+      printf '%s' "$expected" | "$cmp" -s - "$auth" || fail "auth.json conflicts with canonical Go command"
       cleanup
       trap - EXIT
 
