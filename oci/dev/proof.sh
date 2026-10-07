@@ -64,8 +64,10 @@ pi_clear() {
     empty "$fx/envs/ciphertexts" && empty "$fx/envs" &&
     plain "$fx/age.key" && plain "$fx/other.key" &&
     plain "$fx/list.out" && plain "$fx/list2.out" && plain "$fx/stale.out" &&
-    plain "$fx/other.out" && plain "$fx/conflict.out" &&
-    plain "$fx/agent/auth.json" && empty "$fx/agent" && empty "$fx"
+    plain "$fx/other.out" && plain "$fx/bad-kind.out" && plain "$fx/empty.out" && plain "$fx/missing.out" &&
+    plain "$fx/go-missing.out" && plain "$fx/other-provider.out" && plain "$fx/conflict.out" &&
+    plain "$fx/agent/auth.json" && empty "$fx/agent" &&
+    plain "$fx/agent-failure/auth.json" && empty "$fx/agent-failure" && empty "$fx"
 }
 cleanup() {
   code=$?
@@ -560,12 +562,16 @@ pi_proof() {
     return 1
   fi
 
-  local expr fixture_pi fixture_resolver other_resolver tools
+  local expr fixture_pi failure_pi fixture_resolver other_resolver tools
   expr="import ./oci/dev/pi.nix { pkgs = $pkgs; envsRemote = \"file://$fx/envs\";
     identity = \"$fx/age.key\"; agentDir = \"$fx/agent\"; }"
   fixture_pi=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($expr).launcher")/bin/pi
   fixture_resolver=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($expr).resolver")/bin/pi-opencode-go-key
   tools=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($expr).fixtureTools")
+  local failure_expr
+  failure_expr="import ./oci/dev/pi.nix { pkgs = $pkgs; envsRemote = \"file://$fx/envs\";
+    identity = \"$fx/age.key\"; agentDir = \"$fx/agent-failure\"; }"
+  failure_pi=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($failure_expr).launcher")/bin/pi
   local other_expr
   other_expr="import ./oci/dev/pi.nix { pkgs = $pkgs; envsRemote = \"file://$fx/envs\";
     identity = \"$fx/other.key\"; agentDir = \"$fx/agent-other\"; }"
@@ -595,7 +601,9 @@ pi_proof() {
     pi_g -C "$fx/envs" rev-parse HEAD
   }
   pi_encrypt() {
-    printf '{"OPENCODE_API_KEY":"%s"}\n' "$key" |
+    local value=$key
+    [ "$#" -eq 0 ] || value=$1
+    printf '{"OPENCODE_API_KEY":"%s"}\n' "$value" |
       SOPS_AGE_RECIPIENTS="$recipient" "$tools/bin/sops" --encrypt --input-type json --output-type yaml /dev/stdin
   }
 
@@ -619,7 +627,50 @@ pi_proof() {
     echo 'Pi resolver accepted the wrong target identity' >&2
     return 1
   fi
-  ! grep -qF "$key" "$fx/stale.out" "$fx/other.out"
+
+  # Exact binding target shape: repository/host with a non-Pi target kind must be refused before decrypt.
+  sed -i 's/"kind":"pi_auth_command"/"kind":"process_env"/' "$fx/envs/contracts/bindings.jsonl"
+  local bad_kind
+  bad_kind=$(pi_commit bad-kind)
+  if "$fixture_resolver" --envs-sha "$bad_kind" >"$fx/bad-kind.out" 2>&1; then
+    echo 'Pi resolver accepted a non-pi-auth target kind' >&2
+    return 1
+  fi
+  sed -i 's/"kind":"process_env"/"kind":"pi_auth_command"/' "$fx/envs/contracts/bindings.jsonl"
+  current=$(pi_commit restored-binding)
+
+  # Finite credential negatives: encrypted empty value and absent ciphertext both fail without exposing the dummy key.
+  pi_encrypt "" > "$cipher"
+  local empty
+  empty=$(pi_commit empty-credential)
+  if "$fixture_resolver" --envs-sha "$empty" >"$fx/empty.out" 2>&1; then
+    echo 'Pi resolver accepted an empty credential' >&2
+    return 1
+  fi
+  rm -f "$cipher"
+  local missing
+  missing=$(pi_commit missing-credential)
+  if "$fixture_resolver" --envs-sha "$missing" >"$fx/missing.out" 2>&1; then
+    echo 'Pi resolver accepted a missing credential' >&2
+    return 1
+  fi
+
+  # Pi-level resolver failure makes Go unavailable, but an unrelated native provider remains independently usable.
+  OPENCODE_API_KEY="ambient-$key" "$failure_pi" --envs-sha "$missing" \
+    --offline --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files --no-approve \
+    --list-models opencode-go >"$fx/go-missing.out" 2>&1
+  ! grep -Eq '^opencode-go[[:space:]]' "$fx/go-missing.out"
+  ANTHROPIC_API_KEY="fixture-anthropic" OPENCODE_API_KEY="ambient-$key" "$failure_pi" --envs-sha "$missing" \
+    --offline --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files --no-approve \
+    --list-models anthropic >"$fx/other-provider.out" 2>&1
+  grep -Eq '^anthropic[[:space:]]' "$fx/other-provider.out"
+
+  pi_encrypt > "$cipher"
+  current=$(pi_commit restored-credential)
+  got=$("$fixture_resolver" --envs-sha "$current")
+  test "$got" = "$key"
+  ! grep -qF "$key" "$fx/stale.out" "$fx/other.out" "$fx/bad-kind.out" "$fx/empty.out" "$fx/missing.out" \
+    "$fx/go-missing.out" "$fx/other-provider.out"
 
   OPENCODE_API_KEY="ambient-$key" "$fixture_pi" --envs-sha "$current" \
     --offline --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files --no-approve \
@@ -653,7 +704,7 @@ pi_proof() {
   test "$(sha256sum "$fx/agent/auth.json")" = "$conflict_state"
   ! grep -qF "$key" "$fx/conflict.out"
 
-  echo 'PASS Pi source fixture: v1.0.4 pin, native opencode-go catalog, same-code resolver, exact binding/cipher currentness, target recipient, dedicated auth, repeat no-write, conflict refusal, no dummy-key log/auth leak'
+  echo 'PASS Pi source fixture: v1.0.4 pin, native opencode-go catalog, same-code resolver, exact binding target/cipher currentness, target recipient, missing/empty/refused Go auth with unrelated-provider control, dedicated auth, repeat no-write, conflict refusal, no dummy-key log/auth leak'
 }
 jev_proof
 pi_proof
