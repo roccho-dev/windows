@@ -1,7 +1,0 @@
-apiVersion: gh-infra/v1
-kind: Repository
-metadata:
-  name: windows
-  owner: roccho-dev
-spec:
-  description: ""

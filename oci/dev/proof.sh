@@ -55,10 +55,6 @@ jev_clear() {
     plain "$fx/launch.out" && plain "$fx/ops.out" && plain "$fx/ops.err" && plain "$fx/scratch-clear.sh" &&
     empty "$fx/tmp" && empty "$fx"
 }
-ghinfra_clear() {
-  local fx=$evidence/ghinfra
-  plain "$fx/unknown.yaml" && plain "$fx/empty.yaml" && empty "$fx"
-}
 # Everything the Pi source proof creates under $evidence/pi. It shares the generic fixture Git cleanup above.
 pi_clear() {
   local fx=$evidence/pi
@@ -85,43 +81,11 @@ cleanup() {
   docker volume rm "$nix_volume" "$work_volume" >/dev/null 2>&1 || true
   plain "$evidence/page" && plain "$evidence/before" || code=1
   if [ -e "$evidence/jev" ]; then jev_clear || code=1; fi
-  if [ -e "$evidence/ghinfra" ]; then ghinfra_clear || code=1; fi
   if [ -e "$evidence/pi" ]; then pi_clear || code=1; fi
   empty "$evidence" || code=1
   exit "$code"
 }
 trap cleanup EXIT
-
-# gh-infra source gate for windows #49. No GitHub API call: validate is schema-only for this manifest. The proof checks
-# the exact dev-only binary, the existing gh wrapper selected by PATH, one recognized Repository, and rejects unknown/
-# empty inputs as completion evidence.
-ghinfra_proof() {
-  local nx=(nix --extra-experimental-features 'nix-command flakes')
-  local profile tool gh out fx
-  profile=$("${nx[@]}" build --no-link --print-out-paths --no-write-lock-file .#dev-profile)
-  tool=$profile/bin/gh-infra
-  test -x "$tool"
-  case "$("$tool" --version)" in *v0.14.0*) ;; *) echo "gh-infra version differs: $("$tool" --version)" >&2; return 1 ;; esac
-  gh=$(readlink -f "$profile/bin/gh")
-  test -x "$gh"
-  grep -qF 'GH_CONFIG_DIR=/proc/gh-unselected' "$gh"
-  test "$(PATH="$profile/bin" command -v gh)" = "$profile/bin/gh"
-  recognized() {
-    out=$(NO_COLOR=1 "$tool" validate "$1" --fail-on-unknown 2>&1) || return 1
-    grep -Fq '1 repositories, 0 filesets defined' <<< "$out" && grep -Fq 'roccho-dev/windows' <<< "$out"
-  }
-  recognized infra/github.yaml
-  fx=$evidence/ghinfra
-  mkdir "$fx"
-  cat > "$fx/unknown.yaml" <<'EOF'
-apiVersion: gh-infra/v1
-kind: Unknown
-EOF
-  : > "$fx/empty.yaml"
-  if recognized "$fx/unknown.yaml"; then echo 'gh-infra accepted an unknown kind as the one target' >&2; return 1; fi
-  if recognized "$fx/empty.yaml"; then echo 'gh-infra accepted an empty input as the one target' >&2; return 1; fi
-  echo 'PASS gh-infra source: pinned v0.14.0 in dev profile, existing gh wrapper on PATH, one explicit windows Repository; unknown/empty are not accepted as that target'
-}
 
 # Local real-Jev prerequisite (roccho-dev/adrs#460). Fixtures only: throwaway identities, a fixture key, local git
 # remotes and a stub app; no credential, no real Jev and no provider effect. It proves the production tools and a
@@ -862,8 +826,6 @@ pi_proof() {
 jev_proof
 pi_proof
 [ "$mode" = full ] || exit 0
-ghinfra_proof
-
 docker load < "$image_archive"
 # Tags select the just-loaded artifact once; every subsequent run pins its immutable ID.
 image=$(docker image inspect ghcr.io/roccho-dev/windows-dev:nix --format '{{.Id}}')
