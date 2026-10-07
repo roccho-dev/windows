@@ -529,9 +529,11 @@ jobs:
           # Actual production Prepare/Start on a WSLC fixture with Mounts=[]: an old repos writer is not exempted.
           $Port = 2222; $Key = '<contents of ci.pub>'; $PrepareArgs = @($Plan.prepare | Select-Object -Skip 1)
           $PreparedId = 'a' * 64
-          $Spec = [pscustomobject] @{ Id = 'sha256:' + ('3' * 64); Config = [pscustomobject] @{
+          $Spec = [pscustomobject] @{ Id = 'sha256:' + ('3' * 64); RepoDigests = @($Image); Config = [pscustomobject] @{
             Cmd = @('/start'); Entrypoint = $null; User = ''; WorkingDir = ''; Env = @('HOME=/home/dev') } }
-          $Prepared = [pscustomobject] @{ Id = $PreparedId; Name = '/windows-rent'; Image = $Spec.Id; Mounts = @()
+          # Actual WSLC 2.9.3 schema: container Image is the requested digest reference, Config.Image is absent;
+          # image inspect Id is a distinct config ID, with that reference in RepoDigests. No digest-kind conversion.
+          $Prepared = [pscustomobject] @{ Id = $PreparedId; Name = '/windows-rent'; Image = $Image; Mounts = @()
             State = [pscustomobject] @{ Running = $false; Status = 'created'; StartedAt = '' }
             Config = [pscustomobject] @{ Cmd = @('/start'); Entrypoint = $null; User = ''; WorkingDir = ''
               Env = @('HOME=/home/dev', 'RENT_REPOS_VOLUME=repos', 'RENT_STATE_VOLUME=windows-rent-state',
@@ -565,6 +567,37 @@ jobs:
           if (-not $Parallel.Created -or $Prepared.State.Running -or -not $RepoHolder.State.Running -or
               @($Calls | Where-Object { $_ -cmatch '^(start|stop|remove|volume create) ' }).Count) { throw 'Prepare changed runtime or volumes' }
           if (Test-RunningProof $Prepared @($Proof, $Ready)) { throw 'Stopped Prepare was treated as ready' }
+          # Both exposed image forms must bind through image inspect, and pre-start/post-start states stay distinct.
+          foreach ($Form in 'reference', 'config ID', 'consistent fields') {
+            $Item = $Prepared | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+            if ($Form -ceq 'config ID') { $Item.Image = $Spec.Id }
+            if ($Form -ceq 'consistent fields') { $Item.Config | Add-Member NoteProperty Image $Spec.Id }
+            if (Get-PreparedProblem $Item $Spec $PreparedId) { throw "Actual image form refused: $Form" }
+            if (-not (Get-PreparedProblem $Item $Spec $PreparedId -Running)) { throw 'Stopped item accepted after Start' }
+            $Item.State.Running = $true; $Item.State.Status = 'running'
+            if (-not (Get-PreparedProblem $Item $Spec $PreparedId)) { throw 'Running item accepted before Start' }
+            if (Get-PreparedProblem $Item $Spec $PreparedId -Running) { throw "Running identity refused: $Form" }
+          }
+          foreach ($Failure in 'wrong reference', 'wrong config ID', 'missing image', 'conflicting fields', 'mutable tag',
+              'missing mapping', 'wrong mapping', 'untyped mapping', 'wrong spec ID', 'unknown state', 'contradictory running state') {
+            $Item = $Prepared | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+            $ImageSpec = $Spec | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+            switch ($Failure) {
+              'wrong reference' { $Item.Image = $Other }
+              'wrong config ID' { $Item.Image = 'sha256:' + ('b' * 64) }
+              'missing image' { $Item.PSObject.Properties.Remove('Image') }
+              'conflicting fields' { $Item.Config | Add-Member NoteProperty Image $Other }
+              'mutable tag' { $Item.Image = 'ghcr.io/roccho-dev/windows-rent:nix' }
+              'missing mapping' { $ImageSpec.PSObject.Properties.Remove('RepoDigests') }
+              'wrong mapping' { $ImageSpec.RepoDigests = @($Other) }
+              'untyped mapping' { $ImageSpec.RepoDigests = $Image }
+              'wrong spec ID' { $ImageSpec.Id = $Image }
+              'unknown state' { $Item.State.Running = 'false' }
+              'contradictory running state' { $Item.State.Running = $true; $Item.State.Status = 'exited' }
+            }
+            if (-not (Get-PreparedProblem $Item $ImageSpec $PreparedId) -or
+                -not (Get-PreparedProblem $Item $ImageSpec $PreparedId -Running)) { throw "Inconsistent identity/state accepted: $Failure" }
+          }
           foreach ($Field in 'Id', 'Image', 'Cmd', 'Entrypoint', 'User', 'WorkingDir', 'Env', 'Ports') {
             $Bad = $Prepared | ConvertTo-Json -Depth 8 | ConvertFrom-Json
             if ($Field -ceq 'Id') { $Bad.Id = 'b' * 64 }
