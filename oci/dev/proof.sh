@@ -264,6 +264,54 @@ JS
     grep -qF "RED: formal_admission_$expected_stage" <<< "$formal_out"
     if grep -qE 'decrypt|target identity|cannot fetch|jev-upstream-send:' <<< "$formal_out"; then echo 'formal rejection reached target/provider' >&2; return 1; fi
   done
+  # A valid, tiny, public never-product export prevents an invalid archive from masking the locator guard.
+  # The canonical identity reaches a deliberate closure mismatch; this is not full provided-tuple admission.
+  local formal_root
+  formal_root=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($pkgs).writeText \"voice-ui-target-runtime\" \"NEVER_PRODUCT_PUBLIC_FIXTURE\"")
+  nix-store --export "$formal_root" > "$fx/formal/deploy/voice-ui-target-runtime.nix-export"
+  "$node" --input-type=module - "$fx/formal" "$formal_root" "$launch" <<'JS'
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+// A valid never-product export distinguishes identity admission from import/closure admission.
+const [directory, root, launch] = process.argv.slice(2);
+const deploy = path.join(directory, 'deploy'), sha = '0'.repeat(40), tree = '1'.repeat(40);
+const bytes = fs.readFileSync(path.join(deploy, 'voice-ui-target-runtime.nix-export'));
+const digest = value => crypto.createHash('sha256').update(value).digest('hex');
+fs.writeFileSync(path.join(deploy, 'voice-ui-target-runtime.nix-export.sha256'), digest(bytes)+'  voice-ui-target-runtime.nix-export\n');
+const proof = { pr_number: 1, base: 'proposals', reviewed_head: sha, merge_sha: sha,
+  reviewed_tree: tree, merge_tree: tree, merged_at: 'never-product-fixture',
+  r_exact_head_verdict_ref: 'https://github.com/roccho-org/ops/pull/1#pullrequestreview-0' };
+const provenance = { schema: 'roccho.voice-ui-target-runtime.release-provenance/1',
+  source: { repository: 'roccho-org/ops', commit: sha, tree },
+  deploy: { name: 'voice-ui-target-runtime.nix-export', format: 'nix-store --export',
+    sha256: digest(bytes), bytes: bytes.length, root, entry: root+'/bin/voice-ui-target-runtime',
+    locator: 'https://github.com/roccho-org/ops/releases/download/voice-ui-target-runtime-'+sha+'/voice-ui-target-runtime.nix-export',
+    closure: [] } };
+for (const [name, alter, stage] of [
+  ['canonical repository', () => {}, 'deploy_closure'],
+  ['historical repository', p => { p.source.repository='roccho-dev/ops'; }, 'deploy_proof'],
+  ['wrong repository', p => { p.source.repository='other/ops'; }, 'deploy_proof'],
+  ['wrong review repository', (p,q) => { q.r_exact_head_verdict_ref='https://github.com/other/ops/pull/1#pullrequestreview-0'; }, 'deploy_proof'],
+  ['wrong locator', p => { p.deploy.locator=p.deploy.locator.replace('roccho-org/ops','other/ops'); }, 'deploy_export'],
+  ['wrong commit', p => { p.source.commit='f'.repeat(40); }, 'deploy_proof'],
+]) {
+  const p=structuredClone(provenance), q=structuredClone(proof); alter(p,q);
+  const pbytes=Buffer.from(JSON.stringify(p)), qbytes=Buffer.from(JSON.stringify(q));
+  fs.writeFileSync(path.join(deploy,'provenance.json'),pbytes);
+  fs.writeFileSync(path.join(deploy,'merged-pr-proof.json'),qbytes);
+  const result=spawnSync(launch,['--formal','--envs-sha',sha,'--deploy-sha',sha,
+    '--deploy-provenance-sha256',digest(pbytes),'--deploy-proof-sha256',digest(qbytes),
+    '--artifacts',directory,'--port','23001'],{env:{},encoding:'utf8',timeout:30000});
+  assert.equal(result.error,undefined,name);
+  assert.equal(result.status,1,name);
+  assert.match(result.stdout+result.stderr,new RegExp('RED: formal_admission_'+stage+'\\b'),name);
+  assert.doesNotMatch(result.stdout+result.stderr,/decrypt|target identity|cannot fetch|jev-upstream-send:/u,name);
+}
+console.log('PASS formal canonical repository identity progression: valid never-product export reaches deliberate closure refusal; wrong repository/review/commit before import, wrong locator before import; no target/key/provider');
+JS
   for name in provenance.json merged-pr-proof.json voice-ui-target-runtime.nix-export voice-ui-target-runtime.nix-export.sha256; do plain "$fx/formal/deploy/$name"; done
   empty "$fx/formal/deploy"; empty "$fx/formal"
   # jev-age-init: refuses an unsafe parent and any overwrite, writes 0600, prints only the public recipient.
