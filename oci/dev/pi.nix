@@ -61,10 +61,25 @@ let
 
       work=$("$cu/mktemp" -d)
       repo=$work/envs.git
-      cleanup() {
-        "$cu/rm" -rf --one-file-system "$work"
+      scratch_clear() {
+        [ -e "$work" ] || return 0
+        local f d
+        for f in "$repo"/objects/pack/*; do
+          [[ ''${f##*/} =~ ^pack-[0-9a-f]{40}([0-9a-f]{24})?\.(pack|idx|rev)$ ]] || continue
+          if [ -L "$f" ] || [ ! -f "$f" ]; then return 1; fi
+          "$cu/rm" -f -- "$f"
+        done
+        for f in "$work/cipher.yaml" "$repo/HEAD" "$repo/config" "$repo/FETCH_HEAD" "$repo/packed-refs" \
+          "$repo/refs/heads/proposals"; do
+          if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then return 1; fi
+          "$cu/rm" -f -- "$f"
+        done
+        for d in "$repo/objects/pack" "$repo/objects/info" "$repo/objects" "$repo/refs/heads" "$repo/refs/tags" \
+          "$repo/refs" "$repo" "$work"; do
+          [ ! -e "$d" ] || "$cu/rmdir" -- "$d" 2>/dev/null || return 1
+        done
       }
-      trap cleanup EXIT
+      trap 'scratch_clear || echo "pi-opencode-go-key: kept $work: unexpected scratch entries" >&2' EXIT
 
       git_() {
         "$cu/env" -i \
@@ -84,21 +99,21 @@ let
       git_ -C "$repo" merge-base --is-ancestor "$envs_sha" proposals || fail "envs revision is not on proposals"
 
       binding_at=$(git_ -C "$repo" show "$envs_sha:contracts/bindings.jsonl" \
-        | "$jq" -csS --arg id "$binding" '[.[] | select(.id == $id)] | if length == 1 then .[0] else error("binding") end' 2>/dev/null) \
+        | "$jq" -csS --arg id "$binding" "[.[] | select(.id == \$id)] | if length == 1 then .[0] else error(\"binding\") end" 2>/dev/null) \
         || fail "binding is absent at envs revision"
       binding_now=$(git_ -C "$repo" show "proposals:contracts/bindings.jsonl" \
-        | "$jq" -csS --arg id "$binding" '[.[] | select(.id == $id)] | if length == 1 then .[0] else error("binding") end' 2>/dev/null) \
+        | "$jq" -csS --arg id "$binding" "[.[] | select(.id == \$id)] | if length == 1 then .[0] else error(\"binding\") end" 2>/dev/null) \
         || fail "binding is absent on current proposals"
       [ "$binding_at" = "$binding_now" ] || fail "binding changed after envs revision"
 
-      printf '%s\n' "$binding_at" | "$jq" -e --arg id "$binding" '
-        .id == $id
-        and .kind == "envs.authCapability.v1"
-        and .capability == "opencode-go"
-        and .source_key == "OPENCODE_API_KEY"
-        and .target == {"repository":"roccho-dev/windows","host":"oci-dev","kind":"pi_auth_command"}
-        and (.ciphertext | type == "string")
-      ' >/dev/null || fail "binding meaning differs"
+      printf '%s\n' "$binding_at" | "$jq" -e --arg id "$binding" "
+        .id == \$id
+        and .kind == \"envs.authCapability.v1\"
+        and .capability == \"opencode-go\"
+        and .source_key == \"OPENCODE_API_KEY\"
+        and .target == {\"repository\":\"roccho-dev/windows\",\"host\":\"oci-dev\",\"kind\":\"pi_auth_command\"}
+        and (.ciphertext | type == \"string\")
+      " >/dev/null || fail "binding meaning differs"
 
       cipher_path=$(printf '%s\n' "$binding_at" | "$jq" -er '.ciphertext')
       [[ $cipher_path =~ ^ciphertexts/[A-Za-z0-9._-]+[.]sops[.]ya?ml$ ]] || fail "ciphertext path differs"
@@ -129,7 +144,7 @@ let
       [ "$(printf %s "$key" | "$cu/wc" -c)" -le 4096 ] || fail "credential is too large"
       [[ $key != *$'\n'* ]] || fail "credential is not one line"
 
-      cleanup
+      scratch_clear || fail "kept scratch with unexpected entries"
       trap - EXIT
       printf '%s\n' "$key"
     '';
