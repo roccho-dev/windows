@@ -723,6 +723,7 @@ pi_proof() {
     echo 'Pi resolver accepted an empty credential' >&2
     return 1
   fi
+  echo 'PI_PROOF_STAGE empty-refused'
   rm -f "$cipher"
   local missing
   missing=$(pi_commit missing-credential)
@@ -730,21 +731,27 @@ pi_proof() {
     echo 'Pi resolver accepted a missing credential' >&2
     return 1
   fi
+  echo 'PI_PROOF_STAGE missing-refused'
 
   # Pi-level resolver failure makes Go unavailable, but an unrelated native provider remains independently usable.
   OPENCODE_API_KEY="ambient-$key" "$failure_pi" --envs-sha "$missing" \
     --offline --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files --no-approve \
     --list-models opencode-go >"$fx/go-missing.out" 2>&1
+  echo 'PI_PROOF_STAGE go-unavailable-run'
   ! grep -Eq '^opencode-go[[:space:]]' "$fx/go-missing.out"
+  echo 'PI_PROOF_STAGE go-unavailable-checked'
   ANTHROPIC_API_KEY="fixture-anthropic" OPENCODE_API_KEY="ambient-$key" "$failure_pi" --envs-sha "$missing" \
     --offline --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files --no-approve \
     --list-models anthropic >"$fx/other-provider.out" 2>&1
+  echo 'PI_PROOF_STAGE other-provider-run'
   grep -Eq '^anthropic[[:space:]]' "$fx/other-provider.out"
+  echo 'PI_PROOF_STAGE other-provider-visible'
 
   pi_encrypt > "$cipher"
   current=$(pi_commit restored-credential)
   got=$("$fixture_resolver" --envs-sha "$current")
   test "$got" = "$key"
+  echo 'PI_PROOF_STAGE restored-resolver'
   echo 'PI_PROOF_STAGE pi-auth'
   ! grep -qF "$key" "$fx/stale.out" "$fx/other.out" "$fx/bad-kind.out" "$fx/empty.out" "$fx/missing.out" \
     "$fx/go-missing.out" "$fx/other-provider.out"
