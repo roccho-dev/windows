@@ -257,6 +257,7 @@ rec {
               import { execFileSync } from 'node:child_process';
               import { pathToFileURL } from 'node:url';
               const [directory, sha, provenanceHash, proofHash] = process.argv.slice(2);
+              const repository = 'roccho-org/ops';
               const require = value => { if (!value) throw Error('formal_admission'); };
               const file = p => { require(fs.lstatSync(p).isFile()); return fs.readFileSync(p); };
               const hash = p => {
@@ -287,14 +288,14 @@ rec {
               stage='deploy_provenance'; require(hash(path.join(deploy,'provenance.json')) === provenanceHash);
               stage='deploy_proof'; require(hash(path.join(deploy,'merged-pr-proof.json')) === proofHash);
                 const p = json(path.join(deploy,'provenance.json')), q = json(path.join(deploy,'merged-pr-proof.json'));
-                require(p.schema === 'roccho.voice-ui-target-runtime.release-provenance/1' && p.source.repository === 'roccho-dev/ops' && p.source.commit === sha);
+                require(p.schema === 'roccho.voice-ui-target-runtime.release-provenance/1' && p.source.repository === repository && p.source.commit === sha);
                 require(q.merge_sha === sha && q.base === 'proposals' && q.reviewed_tree === q.merge_tree && q.merge_tree === p.source.tree && q.merged_at);
-                require(Number.isSafeInteger(q.pr_number) && q.r_exact_head_verdict_ref.startsWith('https://github.com/roccho-dev/ops/pull/'+q.pr_number+'#pullrequestreview-'));
+                require(Number.isSafeInteger(q.pr_number) && q.r_exact_head_verdict_ref.startsWith('https://github.com/'+repository+'/pull/'+q.pr_number+'#pullrequestreview-'));
               stage='deploy_export';
               const exp = path.join(deploy,'voice-ui-target-runtime.nix-export');
                 require(p.deploy.name === 'voice-ui-target-runtime.nix-export' && p.deploy.format === 'nix-store --export' && hash(exp) === p.deploy.sha256 && fs.statSync(exp).size === p.deploy.bytes);
               require(new RegExp('^/nix/store/[0-9a-z]{32}-voice-ui-target-runtime$').test(p.deploy.root) && p.deploy.entry === p.deploy.root+'/bin/voice-ui-target-runtime');
-                require(p.deploy.locator === 'https://github.com/roccho-dev/ops/releases/download/voice-ui-target-runtime-'+sha+'/voice-ui-target-runtime.nix-export');
+                require(p.deploy.locator === 'https://github.com/'+repository+'/releases/download/voice-ui-target-runtime-'+sha+'/voice-ui-target-runtime.nix-export');
                 require(file(exp+'.sha256').toString() === p.deploy.sha256+'  voice-ui-target-runtime.nix-export\n');
                 importArchive(exp);
               stage='deploy_closure'; closure(p.deploy.root,p.deploy.closure);
