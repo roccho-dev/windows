@@ -70,6 +70,7 @@ pi_clear() {
     plain "$fx/list.out" && plain "$fx/list2.out" && plain "$fx/stale.out" &&
     plain "$fx/other.out" && plain "$fx/bad-kind.out" && plain "$fx/empty.out" && plain "$fx/missing.out" &&
     plain "$fx/go-missing.out" && plain "$fx/other-provider.out" && plain "$fx/conflict.out" &&
+    plain "$fx/scratch-clear.sh" &&
     plain "$fx/agent/auth.json" && empty "$fx/agent" &&
     plain "$fx/agent-failure/auth.json" && empty "$fx/agent-failure" && empty "$fx"
 }
@@ -618,6 +619,398 @@ pi_proof() {
   test "$(same_launcher "$fixture_pi")" = "$(same_launcher "$prod_pi")"
   test "$fixture_resolver" != "$prod_resolver"
   test "$fixture_pi" != "$prod_pi"
+  ! grep -qF 'rm -rf' "$prod_resolver"
+
+  # Execute the resolver's own bounded scratch cleanup. Known entries disappear; a foreign object-shaped entry is
+  # preserved and makes cleanup RED until the fixture removes only that planted file.
+  sed -n '/^[[:space:]]*scratch_clear() {$/,/^[[:space:]]*}$/p' "$fixture_resolver" > "$fx/scratch-clear.sh"
+  grep -q '^[[:space:]]*scratch_clear() {  "$tools/bin/age-keygen" -o "$fx/other.key" >/dev/null 2>&1
+  local recipient key cipher stale current
+  recipient=$("$tools/bin/age-keygen" -y "$fx/age.key")
+  key="fixture-opencode-$RANDOM$RANDOM$RANDOM"
+  pi_g() { git -c user.name=proof -c user.email=proof@invalid "$@"; }
+  pi_fixture_init() {
+    pi_g init -q --template= -b proposals "$1"
+    pi_g -C "$1" config core.logAllRefUpdates false
+    pi_g -C "$1" config gc.auto 0
+  }
+  pi_commit() {
+    pi_g -C "$fx/envs" add -A
+    pi_g -C "$fx/envs" commit -q -m "$1"
+    pi_g -C "$fx/envs" rev-parse HEAD
+  }
+  pi_encrypt() {
+    local value=$key
+    [ "$#" -eq 0 ] || value=$1
+    printf '{"OPENCODE_API_KEY":"%s"}\n' "$value" |
+      SOPS_AGE_RECIPIENTS="$recipient" "$tools/bin/sops" --encrypt --input-type json --output-type yaml /dev/stdin
+  }
+
+  pi_fixture_init "$fx/envs"
+  mkdir -p "$fx/envs/contracts" "$fx/envs/ciphertexts"
+  printf '%s\n' \
+    '{"id":"opencode-go.oci-dev","kind":"envs.authCapability.v1","capability":"opencode-go","ciphertext":"ciphertexts/dev-opencode-go.oci-dev.sops.yaml","source_key":"OPENCODE_API_KEY","target":{"repository":"roccho-dev/windows","host":"oci-dev","kind":"pi_auth_command"}}' \
+    > "$fx/envs/contracts/bindings.jsonl"
+  cipher="$fx/envs/ciphertexts/dev-opencode-go.oci-dev.sops.yaml"
+  pi_encrypt > "$cipher"; stale=$(pi_commit stale)
+  pi_encrypt > "$cipher"; current=$(pi_commit current)
+
+  local got
+  got=$("$fixture_resolver" --envs-sha "$current")
+  test "$got" = "$key"
+  if "$fixture_resolver" --envs-sha "$stale" >"$fx/stale.out" 2>&1; then
+    echo 'Pi resolver accepted a stale ciphertext revision' >&2
+    return 1
+  fi
+  if "$other_resolver" --envs-sha "$current" >"$fx/other.out" 2>&1; then
+    echo 'Pi resolver accepted the wrong target identity' >&2
+    return 1
+  fi
+
+  # Exact binding target shape: repository/host with a non-Pi target kind must be refused before decrypt.
+  sed -i 's/"kind":"pi_auth_command"/"kind":"process_env"/' "$fx/envs/contracts/bindings.jsonl"
+  local bad_kind
+  bad_kind=$(pi_commit bad-kind)
+  if "$fixture_resolver" --envs-sha "$bad_kind" >"$fx/bad-kind.out" 2>&1; then
+    echo 'Pi resolver accepted a non-pi-auth target kind' >&2
+    return 1
+  fi
+  sed -i 's/"kind":"process_env"/"kind":"pi_auth_command"/' "$fx/envs/contracts/bindings.jsonl"
+  current=$(pi_commit restored-binding)
+
+  # Finite credential negatives: encrypted empty value and absent ciphertext both fail without exposing the dummy key.
+  pi_encrypt "" > "$cipher"
+  local empty
+  empty=$(pi_commit empty-credential)
+  if "$fixture_resolver" --envs-sha "$empty" >"$fx/empty.out" 2>&1; then
+    echo 'Pi resolver accepted an empty credential' >&2
+    return 1
+  fi
+  rm -f "$cipher"
+  local missing
+  missing=$(pi_commit missing-credential)
+  if "$fixture_resolver" --envs-sha "$missing" >"$fx/missing.out" 2>&1; then
+    echo 'Pi resolver accepted a missing credential' >&2
+    return 1
+  fi
+
+  # Pi-level resolver failure makes Go unavailable, but an unrelated native provider remains independently usable.
+  OPENCODE_API_KEY="ambient-$key" "$failure_pi" --envs-sha "$missing" \
+    --offline --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files --no-approve \
+    --list-models opencode-go >"$fx/go-missing.out" 2>&1
+  ! grep -Eq '^opencode-go[[:space:]]' "$fx/go-missing.out"
+  ANTHROPIC_API_KEY="fixture-anthropic" OPENCODE_API_KEY="ambient-$key" "$failure_pi" --envs-sha "$missing" \
+    --offline --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files --no-approve \
+    --list-models anthropic >"$fx/other-provider.out" 2>&1
+  grep -Eq '^anthropic[[:space:]]' "$fx/other-provider.out"
+
+  pi_encrypt > "$cipher"
+  current=$(pi_commit restored-credential)
+  got=$("$fixture_resolver" --envs-sha "$current")
+  test "$got" = "$key"
+  ! grep -qF "$key" "$fx/stale.out" "$fx/other.out" "$fx/bad-kind.out" "$fx/empty.out" "$fx/missing.out" \
+    "$fx/go-missing.out" "$fx/other-provider.out"
+
+  OPENCODE_API_KEY="ambient-$key" "$fixture_pi" --envs-sha "$current" \
+    --offline --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files --no-approve \
+    --list-models opencode-go >"$fx/list.out" 2>&1
+  grep -qi 'opencode-go' "$fx/list.out"
+  ! grep -qF "$key" "$fx/list.out"
+  ! grep -qF "ambient-$key" "$fx/list.out"
+  test "$(stat -c %a "$fx/agent")" = 700
+  test "$(stat -c %a "$fx/agent/auth.json")" = 600
+  grep -qF "\"key\":\"!$fixture_resolver --envs-sha $current\"" "$fx/agent/auth.json"
+  ! grep -qF "$key" "$fx/agent/auth.json"
+  ! test -e "$fx/agent/models.json"
+
+  local auth_state
+  auth_state=$(stat -c '%i|%s|%y' "$fx/agent/auth.json")
+  OPENCODE_API_KEY="ambient-$key" "$fixture_pi" --envs-sha "$current" \
+    --offline --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files --no-approve \
+    --list-models opencode-go >"$fx/list2.out" 2>&1
+  test "$(stat -c '%i|%s|%y' "$fx/agent/auth.json")" = "$auth_state"
+  ! grep -qF "$key" "$fx/list2.out"
+  ! find "$fx/agent" -maxdepth 1 -name '.auth.*' -print -quit | grep -q .
+
+  printf '%s\n' '{"opencode-go":{"type":"api_key","key":"literal-conflict"}}' > "$fx/agent/auth.json"
+  chmod 600 "$fx/agent/auth.json"
+  local conflict_state
+  conflict_state=$(sha256sum "$fx/agent/auth.json")
+  if "$fixture_pi" --envs-sha "$current" --offline --list-models opencode-go >"$fx/conflict.out" 2>&1; then
+    echo 'Pi launcher accepted conflicting auth state' >&2
+    return 1
+  fi
+  test "$(sha256sum "$fx/agent/auth.json")" = "$conflict_state"
+  ! grep -qF "$key" "$fx/conflict.out"
+
+  echo 'PASS Pi source fixture: v1.0.4 pin, native opencode-go catalog, same-code resolver, bounded scratch cleanup with foreign preservation, exact binding target/cipher currentness, target recipient, missing/empty/refused Go auth with unrelated-provider control, dedicated auth, repeat no-write, conflict refusal, no dummy-key log/auth leak'
+}
+jev_proof
+pi_proof
+[ "$mode" = full ] || exit 0
+ghinfra_proof
+
+docker load < "$image_archive"
+# Tags select the just-loaded artifact once; every subsequent run pins its immutable ID.
+image=$(docker image inspect ghcr.io/roccho-dev/windows-dev:nix --format '{{.Id}}')
+printf 'image %s\napps revision %s\n' "$image" "$apps_rev"
+docker volume create "$nix_volume" >/dev/null
+docker volume create "$work_volume" >/dev/null
+
+# Same explicit Init pattern as win.ps1: no Docker auto-copy, daemon or host Nix store.
+# A volume at /seed leaves the image's /nix visible for the one-time seed operation.
+docker run --rm --network none --volume "$nix_volume:/seed" "$image" \
+  /bin/bash --login -euc '
+    test -z "$(ls -A /seed)"
+    cp -a /nix/. /seed/
+    printf "%s\n" "$1" > /seed/var/windows-seed-image
+  ' seed "$image"
+
+start() {
+  docker run -d --name "$core" --network "$1" \
+    --mount "type=volume,source=$nix_volume,target=/nix,volume-nocopy" \
+    --mount "type=volume,source=$work_volume,target=/work/repos,volume-nocopy" \
+    "$image" /bin/sleep infinity >/dev/null
+  docker inspect "$core" --format '{{json .Mounts}}' | \
+    jq -e 'length == 2 and ([.[].Destination] | sort) == ["/nix", "/work/repos"]' >/dev/null
+}
+inside() { docker exec "$core" /bin/bash --login -euc "$@"; }
+serve() {
+  docker exec -d "$core" /bin/bash --login -ec \
+    "cd /work/repos/apps; exec nix run $1 --no-write-lock-file .#dev > /tmp/apps-dev.log 2>&1"
+  for attempt in {1..180}; do
+    if docker exec "$core" /bin/curl -fsS http://127.0.0.1:8787/ > "$evidence/page" 2>/dev/null; then
+      grep -q 'windows-8-uncommitted-proof' "$evidence/page"
+      return
+    fi
+    sleep 1
+  done
+  echo 'apps development endpoint did not become ready' >&2
+  return 1
+}
+
+start bridge
+inside '
+  test "$HOME" = /home/dev
+  test -r "$NIX_SSL_CERT_FILE"
+  test "$(cat /nix/var/windows-seed-image)" = "$1"
+  nix --version
+  nix-store --verify --check-contents
+  git init -q /work/repos/apps
+  cd /work/repos/apps
+  git remote add origin https://github.com/roccho-dev/apps
+  git fetch -q --depth 1 origin "$2"
+  git checkout -q --detach FETCH_HEAD
+  test "$(git rev-parse HEAD)" = "$2"
+  sha256sum flake.lock > /work/repos/lock.sha256
+  printf "\n<!-- windows-8-uncommitted-proof -->\n" >> packages/voice-ui/web/index.html
+  printf "untracked work\n" > /work/repos/apps/untracked-proof
+  printf "discard this HOME\n" > "$HOME/disposable-proof"
+  # Real apps build, not a canned hello or a nix --version success.
+  nix build --no-write-lock-file .#voice-ui-dist --profile /nix/var/nix/profiles/apps-proof
+  sha256sum -c /work/repos/lock.sha256
+  readlink -f /nix/var/nix/profiles/windows-dev > /work/repos/dev-profile.txt
+  git diff --binary > /work/repos/work.diff
+' fresh "$image" "$apps_rev"
+serve ''
+cp "$evidence/page" "$evidence/before"
+old_id=$(docker inspect "$core" --format '{{.Id}}')
+echo 'PASS fresh -> develop (real apps build and HTTP response with uncommitted edit)'
+
+# Owner GitHub routing shared with own and rent (hosts/profile/gh.nix), on this image's own Git, gh and helper, offline
+# with synthetic tokens only, in the image's default exec environment entered as is. win.ps1's Tools bind still
+# recognises the wrapper by its exact check. Synthetic global (~/.gitconfig, ~/.config/git/config) and system
+# (/etc/gitconfig) Git helpers are planted as files: real Git returns no credential at all outside a bound clone, only the
+# owner token in one and none for another owner; the controls show those helpers answer once their files are read. gh:
+# elsewhere no credentials and no store; token variables, GH_HOST, HOME and XDG never win; GH_REPO is checked statically.
+inside '
+  # This image ships no grep, sed or find: bash builtins and coreutils only.
+  test "$GIT_CONFIG_NOSYSTEM" = 1 && test "$GIT_CONFIG_GLOBAL" = /dev/null
+  gh_text=$(cat /bin/gh)
+  case $gh_text in *credential.*.username*GH_CONFIG_DIR=/proc/gh-unselected*) ;; *) echo "Tools bind would refuse this gh" >&2; exit 1 ;; esac
+  case $gh_text in *"unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_REPO GH_HOST"*) ;; *) exit 1 ;; esac
+  h=/bin/git-credential-github-roccho-dev
+  test -x "$h"
+  # hosts DIR TOKEN [USER]: a gh file store of one synthetic account; a principal slot also carries the current config.
+  hosts() {
+    install -d -m 700 "$1"
+    printf "github.com:\n    users:\n        %s:\n            oauth_token: %s\n    git_protocol: https\n    user: %s\n    oauth_token: %s\n" "${3:-ci}" "$2" "${3:-ci}" "$2" > "$1/hosts.yml"
+    printf "version: \"1\"\n" > "$1/config.yml"
+    chmod 600 "$1/hosts.yml" "$1/config.yml"
+  }
+  helper() { printf "[credential]\n\thelper = \"!echo username=ci; echo password=%s #\"\n" "$2" > "$1"; }
+  install -d -m 700 /work/repos/.auth /work/repos/.auth/roccho-dev /work/repos/gh-proof "$HOME/.config/git"
+  hosts /work/repos/.auth/roccho-dev/gh ci-owner-token roccho-dev
+  hosts "$HOME/.config/gh" ci-home-token
+  hosts "$HOME/xdg/gh" ci-xdg-token
+  helper /etc/gitconfig ci-system-token
+  helper "$HOME/.gitconfig" ci-global-token
+  helper "$HOME/.config/git/config" ci-xdg-git-token
+  cd /work/repos/gh-proof
+  for r in bound unbound other; do git init -q "$r"; done
+  # The clone is bound by the production bind of the profile helper with its declared principal; the other clone is a
+  # hostile raw edit that names the helper without a principal.
+  git -C bound config remote.origin.url https://github.com/roccho-dev/windows
+  case $(/nix/var/nix/profiles/windows-dev/bin/git-credential-github-roccho-dev bind /work/repos/gh-proof/bound https://github.com/roccho-dev/windows roccho-dev) in
+    "bind result=ok "*) ;; *) echo "production bind failed" >&2; exit 1 ;;
+  esac
+  git -C unbound config remote.origin.url https://github.com/roccho-dev/windows
+  git -C other config remote.origin.url https://github.com/other/windows
+  git -C other config --replace-all credential.helper ""
+  git -C other config --replace-all credential.https://github.com/other/windows.helper "$h"
+  git -C other config credential.useHttpPath true
+  git -C other config http.followRedirects false
+  fill() {
+    local d=$1 p=$2 out l; shift 2
+    out=$(printf "protocol=https\nhost=github.com\npath=%s\n\n" "$p" | (cd "$d" && env "$@" GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null)) || true
+    while IFS= read -r l; do case $l in password=*) printf %s "${l#password=}" ;; esac; done <<< "$out"
+  }
+  # No credential at all: Git must fail and print nothing, whatever fields a reply could carry.
+  nofill() {
+    local out
+    if out=$(printf "protocol=https\nhost=github.com\npath=%s\n\n" "$2" | (cd "$1" && GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null)); then
+      echo "$1: git credential fill succeeded" >&2; return 1
+    fi
+    test -z "$out"
+  }
+  test -n "$(fill unbound roccho-dev/windows -u GIT_CONFIG_GLOBAL)"
+  test "$(fill unbound roccho-dev/windows -u GIT_CONFIG_NOSYSTEM)" = ci-system-token
+  nofill unbound roccho-dev/windows
+  test "$(fill bound roccho-dev/windows)" = ci-owner-token
+  nofill other other/windows
+  export XDG_CONFIG_HOME="$HOME/xdg" GH_TOKEN=ci-env-gh GITHUB_TOKEN=ci-env-github GH_ENTERPRISE_TOKEN=ci-env-ghe \
+    GITHUB_ENTERPRISE_TOKEN=ci-env-ghes GH_HOST=evil.example GH_REPO=other/elsewhere GIT_TERMINAL_PROMPT=0
+  # This session is root: unselected gh uses the absent procfs path /proc/gh-unselected, which root cannot create.
+  test "$(stat -f -c %T /proc)" = proc
+  test ! -e /proc/gh-unselected
+  case $(gh --version) in "gh version "*) ;; *) exit 1 ;; esac
+  gh help > /dev/null
+  snap() {
+    ls -lAR --time-style=+%s.%N "$HOME/.config" "$HOME/xdg" /work/repos/.auth
+    sha256sum "$HOME/.config/gh/hosts.yml" "$HOME/xdg/gh/hosts.yml" /work/repos/.auth/roccho-dev/gh/hosts.yml \
+      /work/repos/.auth/roccho-dev/gh/config.yml
+  }
+  before=$(snap)
+  if (cd "$HOME" && gh auth token) > /dev/null 2>&1; then echo "gh outside a bound clone returned a token" >&2; exit 1; fi
+  if (cd "$HOME" && gh config set editor vi) > /dev/null 2>&1; then echo "gh outside a bound clone wrote a config" >&2; exit 1; fi
+  test "$(snap)" = "$before"
+  test ! -e /proc/gh-unselected
+  test "$(cd bound && gh auth token)" = ci-owner-token
+  for r in unbound other; do if (cd "$r" && gh auth token) > /dev/null 2>&1; then echo "$r: gh returned a token" >&2; exit 1; fi; done
+  # The helper itself answers get only in the bound clone, for its exact origin path and declared principal; store and
+  # erase never answer; every other request, and any request outside a bound clone, gets nothing.
+  pw() { local l; while IFS= read -r l; do case $l in password=*) printf %s "${l#password=}" ;; esac; done; }
+  ok="protocol=https\nhost=github.com\npath=roccho-dev/windows\nusername=roccho-dev\n\n"
+  test "$(cd bound && printf "%b" "$ok" | "$h" get | pw)" = ci-owner-token
+  test "$(cd bound && printf "%b" "url=https://github.com/other/x\n$ok" | "$h" get | pw)" = ci-owner-token
+  for a in get store erase; do test -z "$(cd "$HOME" && printf "%b" "$ok" | "$h" "$a" 2>&1)"; test -z "$(cd other && printf "%b" "$ok" | "$h" "$a" 2>&1)"; done
+  for r in "protocol=https\nhost=github.com\npath=other/windows\nusername=roccho-dev\n\n" "protocol=https\nhost=github.com\nusername=roccho-dev\n\n" \
+    "protocol=https\nhost=github.com\npath=roccho-dev/windows\n\n" "protocol=https\nhost=github.com\npath=roccho-dev/windows\nusername=other\n\n" \
+    "protocol=http\nhost=github.com\npath=roccho-dev/windows\nusername=roccho-dev\n\n" "protocol=https\nhost=example.com\npath=roccho-dev/windows\nusername=roccho-dev\n\n" \
+    "protocol=https\nhost=github.com\npath=roccho-dev/windows\npath=other/windows\nusername=roccho-dev\n\n" \
+    "protocol=https\nhost=github.com\npath=roccho-dev/windows/extra\nusername=roccho-dev\n\n" \
+    "protocol=https\nhost=github.com\npath=roccho-dev/windowsx\nusername=roccho-dev\n\n" \
+    "protocol=https\nhost=github.com\npath=roccho-dev/../other\nusername=roccho-dev\n\n" "$ok"; do
+    for a in store erase; do test -z "$(cd bound && printf "%b" "$r" | "$h" "$a" 2>&1)"; done
+    [ "$r" = "$ok" ] || test -z "$(cd bound && printf "%b" "$r" | "$h" get 2>&1)"
+  done
+  test "$(snap)" = "$before"
+'
+echo 'PASS owner gh/Git routing (dev image): bind check holds; real Git gives no credential outside a bound clone despite global/system helper files; bound clone selects the owner only; other owner/outside get nothing; overrides never win'
+
+# Production dev Tools bind: the exact fragment win.ps1 plans for Tools, run in this image. Through the profile helper
+# it binds a clone with the Spec's githubPrincipal and confirms all nine settings, and repeating is a no-op. A helper
+# without bind (as an older toolsRev builds) exits 0 with no effect; Tools refuses that (exit 6) and nothing is bound.
+tools=$(ProgramFiles="$evidence" COMPUTERNAME=G6I3 pwsh -NoProfile -NonInteractive -File oci/dev/win.ps1 -Step Plan -Binding oci/dev/bindings/G6I3.json |
+  jq -er '.Tools as $a | $a[([range(0; $a | length)] | map(select($a[.] == "-c")) | first) + 1]')
+principal=$(ProgramFiles="$evidence" COMPUTERNAME=G6I3 pwsh -NoProfile -NonInteractive -File oci/dev/win.ps1 -Step Plan -Binding oci/dev/bindings/G6I3.json |
+  jq -er '.Tools[-1]')
+[ "$principal" = "$(jq -er .githubPrincipal oci/dev/spec.json)" ] || { echo 'Tools does not pass the Spec githubPrincipal' >&2; exit 1; }
+frag=${tools#*'readlink $d || exit 1; '}
+[ "$frag" != "$tools" ] && [[ $frag == 'u=$1 P=$2; '* ]] || { echo 'Tools bind fragment not found in the planned argv' >&2; exit 1; }
+inside '
+  u=https://github.com/roccho-dev/windows
+  frag=$1
+  run() { R=$1 D=$2 bash -c "r=\$R d=\$D; set -f; $frag" sh "$u" roccho-dev; }
+  install -d -m 700 /work/repos/tools-proof
+  cd /work/repos/tools-proof
+  for x in new old; do git init -q "$x"; git -C "$x" config remote.origin.url "$u.git"; done
+  install -d -m 755 /tmp/old-dev /tmp/old-dev/bin
+  printf "#!/bin/bash\nwhile IFS= read -r l && [ -n \"\$l\" ]; do :; done\nexit 0\n" > /tmp/old-dev/bin/git-credential-github-roccho-dev
+  chmod 755 /tmp/old-dev/bin/git-credential-github-roccho-dev
+  ln -s /nix/var/nix/profiles/windows-dev/bin/git /tmp/old-dev/bin/git
+  ln -s /nix/var/nix/profiles/windows-dev/bin/gh /tmp/old-dev/bin/gh
+  before=$(git -C old config --local --list)
+  rc=0; out=$(run /work/repos/tools-proof/old /tmp/old-dev) || rc=$?
+  test "$rc" = 6 || { echo "old helper: Tools bind exit $rc, not 6: $out" >&2; exit 1; }
+  test "$(git -C old config --local --list)" = "$before" || { echo "old helper: config changed" >&2; exit 1; }
+  rc=0; out=$(run /work/repos/tools-proof/new /nix/var/nix/profiles/windows-dev) || rc=$?
+  test "$rc" = 0 || { echo "Tools bind exit $rc: $out" >&2; exit 1; }
+  test "$out" = "bind result=ok reason=- repo=/work/repos/tools-proof/new url=$u prior=AAAAAAAGA writes=9 restored=0 retained=0
+bound /work/repos/tools-proof/new $u" || { echo "Tools bind output: $out" >&2; exit 1; }
+  before=$(git -C new config --local --list)
+  rc=0; out=$(run /work/repos/tools-proof/new /nix/var/nix/profiles/windows-dev) || rc=$?
+  test "$rc" = 0 && [[ $out == "bind result=ok reason=- repo=/work/repos/tools-proof/new url=$u prior=PPPPPPPPP writes=0 "* ]] ||
+    { echo "Tools bind repeat exit $rc: $out" >&2; exit 1; }
+  test "$(git -C new config --local --list)" = "$before"
+' tools-bind "$frag"
+echo 'PASS dev Tools bind (planned fragment): production bind with the Spec principal and nine-setting readback; repeat is a no-op; an old helper without bind exits 0 and is refused with nothing bound'
+
+docker rm -f "$core" >/dev/null
+# No network on the successor: neither the old HOME nor a silent re-download can rescue it.
+start none
+test "$(docker inspect "$core" --format '{{.Id}}')" != "$old_id"
+inside '
+  test ! -e "$HOME/disposable-proof"
+  test "$(cat /nix/var/windows-seed-image)" = "$1"
+  test "$(readlink -f /nix/var/nix/profiles/windows-dev)" = "$(cat /work/repos/dev-profile.txt)"
+  cd /work/repos/apps
+  test "$(git rev-parse HEAD)" = "$2"
+  test "$(cat untracked-proof)" = "untracked work"
+  git diff --binary > /tmp/work.diff
+  test "$(sha256sum < /work/repos/work.diff)" = "$(sha256sum < /tmp/work.diff)"
+  sha256sum -c /work/repos/lock.sha256
+  nix build --offline --no-write-lock-file .#voice-ui-dist --profile /nix/var/nix/profiles/apps-proof
+' continue "$image" "$apps_rev"
+serve '--offline'
+cmp "$evidence/before" "$evidence/page"
+inside '
+  nix-store --gc
+  test -x /nix/var/nix/profiles/windows-dev/bin/git
+  nix --version
+  nix-store --verify --check-contents
+'
+echo 'PASS replace -> continue (different container, retained work/store/profile, disposable HOME, offline apps)'
+ "$fx/scratch-clear.sh"
+  pi_scratch_case() {
+    local kind=$1 cu work repo pack foreign code=0
+    cu=$(dirname "$(readlink -f "$(command -v rmdir)")")
+    work=$(mktemp -d -p "$fx")
+    repo=$work/envs.git
+    pack=pack-$(printf '%040d' 0)
+    mkdir -p "$repo/objects/pack" "$repo/objects/info" "$repo/refs/heads" "$repo/refs/tags"
+    touch "$work/cipher.yaml" "$repo/HEAD" "$repo/config" "$repo/FETCH_HEAD" "$repo/refs/heads/proposals" \
+      "$repo/objects/pack/$pack.pack" "$repo/objects/pack/$pack.idx" "$repo/objects/pack/$pack.rev"
+    foreign=$repo/objects/ab/$(printf '%038d' 0)
+    if [ "$kind" = foreign ]; then mkdir -p "${foreign%/*}"; echo planted > "$foreign"; fi
+    # shellcheck disable=SC1091
+    (source "$fx/scratch-clear.sh"; scratch_clear) || code=$?
+    if [ "$kind" = clean ]; then
+      [ "$code" -eq 0 ] && [ ! -e "$work" ] || { echo 'Pi scratch cleanup refused known entries' >&2; return 1; }
+      return
+    fi
+    [ "$code" -ne 0 ] && [ "$(cat "$foreign")" = planted ] ||
+      { echo 'Pi scratch cleanup removed or accepted a foreign entry' >&2; return 1; }
+    plain "$foreign"
+    empty "${foreign%/*}"
+    code=0
+    # shellcheck disable=SC1091
+    (source "$fx/scratch-clear.sh"; scratch_clear) || code=$?
+    [ "$code" -eq 0 ] && [ ! -e "$work" ] ||
+      { echo 'Pi scratch cleanup did not close after foreign fixture removal' >&2; return 1; }
+  }
+  pi_scratch_case clean
+  pi_scratch_case foreign
 
   "$tools/bin/age-keygen" -o "$fx/age.key" >/dev/null 2>&1
   "$tools/bin/age-keygen" -o "$fx/other.key" >/dev/null 2>&1
