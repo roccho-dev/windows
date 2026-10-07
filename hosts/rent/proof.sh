@@ -114,17 +114,19 @@ root() { docker exec "$c" /bin/bash -euc "$@"; }
 python_work() {
   dev 'cd /work/repos/proof
     export UV_PYTHON_DOWNLOADS=never UV_PYTHON_PREFERENCE=only-system UV_OFFLINE=1
-    python3 -c "import sys; assert sys.version_info >= (3,12)"
+    python3 -c "import sys; assert sys.version_info[:2] == (3,13)"
     uv --version
     if [ ! -d python-work ]; then
       mkdir python-work
       printf "[project]\nname = \"rent-proof\"\nversion = \"0.0.0\"\nrequires-python = \">=3.12\"\ndependencies = []\n" > python-work/pyproject.toml
       cd python-work
-      uv venv --python python3 .venv
+      printf "3.13\n" > .python-version
+      uv venv .venv
       printf "retained python work\n" > work.txt
     else cd python-work; fi
     test "$(cat work.txt)" = "retained python work"
-    uv run --no-sync --python .venv/bin/python python -c "import sys; assert sys.version_info >= (3,12)"'
+    test "$(cat .python-version)" = 3.13
+    uv run --no-sync python -c "import sys; assert sys.version_info[:2] == (3,13)"'
 }
 boundaries() {
   # PID 1's mountinfo, parsed on the runner (the image ships no awk; the dev profile stays small).

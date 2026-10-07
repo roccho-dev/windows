@@ -481,7 +481,7 @@
             Labels."org.opencontainers.image.source" = "https://github.com/roccho-dev/windows";
           };
         };
-      rentExtras = with pkgs; [ python3 uv ];
+      rentExtras = with pkgs; [ python313 uv ];
       rentProfileFor = extra: import ./hosts/profile/nix.nix { inherit pkgs; extra = rentExtras ++ extra; };
       rentProfile = rentProfileFor [];
       # CI only, never published: stands in for cloudflared under the exact argv rent-start uses, so local SSH, state
