@@ -734,9 +734,17 @@ pi_proof() {
   echo 'PI_PROOF_STAGE missing-refused'
 
   # Pi-level resolver failure makes Go unavailable, but an unrelated native provider remains independently usable.
+  local go_missing_code=0
   OPENCODE_API_KEY="ambient-$key" "$failure_pi" --envs-sha "$missing" \
     --offline --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files --no-approve \
-    --list-models opencode-go >"$fx/go-missing.out" 2>&1
+    --list-models opencode-go >"$fx/go-missing.out" 2>&1 || go_missing_code=$?
+  if [ "$go_missing_code" -ne 0 ]; then
+    ! grep -qF "$key" "$fx/go-missing.out"
+    ! grep -qF "ambient-$key" "$fx/go-missing.out"
+    echo "PI_PROOF_DIAG go-unavailable-exit=$go_missing_code"
+    sed -E 's#/nix/store/[0-9a-z]{32}-#/nix/store/HASH-#g; s#[0-9a-f]{40}#SHA40#g' "$fx/go-missing.out"
+    return 1
+  fi
   echo 'PI_PROOF_STAGE go-unavailable-run'
   ! grep -Eq '^opencode-go[[:space:]]' "$fx/go-missing.out"
   echo 'PI_PROOF_STAGE go-unavailable-checked'
