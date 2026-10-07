@@ -591,6 +591,8 @@ pi_proof() {
 
   local profile prod_pi prod_resolver version
   profile=$("${nx[@]}" build --no-link --print-out-paths --no-write-lock-file .#dev-profile)
+  # Removed gh-infra must be absent from the built dev profile, including any dangling symlink.
+  test ! -e "$profile/bin/gh-infra" && test ! -L "$profile/bin/gh-infra"
   prod_pi=$(readlink -f "$profile/bin/pi")
   test -x "$prod_pi"
   version=$("$profile/bin/pi" --version)
