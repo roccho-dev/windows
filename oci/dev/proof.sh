@@ -613,6 +613,7 @@ pi_proof() {
     identity = \"$fx/other.key\"; agentDir = \"$fx/agent-other\"; }"
   other_resolver=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($other_expr).resolver")/bin/pi-opencode-go-key
 
+  echo 'PI_PROOF_STAGE same-source'
   same_resolver() { grep -vE '^[[:space:]]*(remote|identity)=' "$1" | sha256sum; }
   same_launcher() { grep -vE '^[[:space:]]*(agent_dir|resolver)=' "$1" | sha256sum; }
   test "$(same_resolver "$fixture_resolver")" = "$(same_resolver "$prod_resolver")"
@@ -620,6 +621,7 @@ pi_proof() {
   test "$fixture_resolver" != "$prod_resolver"
   test "$fixture_pi" != "$prod_pi"
   ! grep -qF 'rm -rf' "$prod_resolver"
+  echo 'PI_PROOF_STAGE scratch-cleanup'
 
   # Execute the resolver's own bounded scratch cleanup. Known entries disappear; a foreign object-shaped entry is
   # preserved and makes cleanup RED until the fixture removes only that planted file.
@@ -654,6 +656,7 @@ pi_proof() {
   }
   pi_scratch_case clean
   pi_scratch_case foreign
+  echo 'PI_PROOF_STAGE fixture-authority'
 
   "$tools/bin/age-keygen" -o "$fx/age.key" >/dev/null 2>&1
   "$tools/bin/age-keygen" -o "$fx/other.key" >/dev/null 2>&1
@@ -686,6 +689,7 @@ pi_proof() {
   cipher="$fx/envs/ciphertexts/dev-opencode-go.oci-dev.sops.yaml"
   pi_encrypt > "$cipher"; stale=$(pi_commit stale)
   pi_encrypt > "$cipher"; current=$(pi_commit current)
+  echo 'PI_PROOF_STAGE resolver-bound'
 
   local got
   got=$("$fixture_resolver" --envs-sha "$current")
@@ -709,6 +713,7 @@ pi_proof() {
   fi
   sed -i 's/"kind":"process_env"/"kind":"pi_auth_command"/' "$fx/envs/contracts/bindings.jsonl"
   current=$(pi_commit restored-binding)
+  echo 'PI_PROOF_STAGE credential-negatives'
 
   # Finite credential negatives: encrypted empty value and absent ciphertext both fail without exposing the dummy key.
   pi_encrypt "" > "$cipher"
@@ -740,6 +745,7 @@ pi_proof() {
   current=$(pi_commit restored-credential)
   got=$("$fixture_resolver" --envs-sha "$current")
   test "$got" = "$key"
+  echo 'PI_PROOF_STAGE pi-auth'
   ! grep -qF "$key" "$fx/stale.out" "$fx/other.out" "$fx/bad-kind.out" "$fx/empty.out" "$fx/missing.out" \
     "$fx/go-missing.out" "$fx/other-provider.out"
 
