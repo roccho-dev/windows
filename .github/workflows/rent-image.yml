@@ -47,6 +47,7 @@ jobs:
             '--env', 'RENT_AUTHORIZED_KEY=<contents of ci.pub>', $Image)
           $Want = [ordered]@{
             create = @($W, 'run', '--name', 'windows-rent', '--detach', '--publish', '127.0.0.1:2222:2222') + $Volumes
+            prepare = @($W, 'create', '--name', 'windows-rent', '--publish', '127.0.0.1:2222:2222') + $Volumes
             stageRun = @($W, 'run', '--name', 'windows-rent-cf', '--detach', '--publish', '127.0.0.1:2222:2222') + $Volumes
             stageStop = @($W, 'stop', 'windows-rent')
             readyLogs = @($W, 'logs', 'windows-rent-cf')
@@ -121,7 +122,8 @@ jobs:
                 'Get-OldSourceProblem', 'Get-WriterProblem', 'Test-RunningProof', 'Get-StageProblem', 'Get-Container', 'Get-Named',
                 'Assert-NoOtherWriter', 'Invoke-Seed', 'Wait-Ready', 'Wait-OldRunning', 'Invoke-Revert', 'Invoke-StageStop', 'Complete-Stage',
                 'Get-TaskTarget', 'Set-TaskTarget', 'Invoke-Stage', 'Get-PlacementProblem', 'Get-MountTable', 'Get-RootRelation', 'Get-Anchors',
-                'Get-VolumeKind', 'Get-SharingProblem', 'Invoke-Import', 'Assert-OldSourceStopped') -or
+                'Get-VolumeKind', 'Get-SharingProblem', 'Invoke-Import', 'Assert-OldSourceStopped', 'Assert-Volume',
+                'Get-PreparedProblem', 'Invoke-Prepared') -or
               ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in '$Mounts', '$Proof', '$Ready', '$ListArgs', '$SeedArgs', '$TaskName') }, $true)) {
             . ([scriptblock]::Create($N.Extent.Text))
           }
@@ -524,6 +526,80 @@ jobs:
             $Got = try { Invoke-StageStop $OldUp; 'ok' } catch { $_.Exception.Message }
             Assert-Case $K $Got
           }
+          # Actual production Prepare/Start on a WSLC fixture with Mounts=[]: an old repos writer is not exempted.
+          $Port = 2222; $Key = '<contents of ci.pub>'; $PrepareArgs = @($Plan.prepare | Select-Object -Skip 1)
+          $PreparedId = 'a' * 64
+          $Spec = [pscustomobject] @{ Id = 'sha256:' + ('3' * 64); Config = [pscustomobject] @{
+            Cmd = @('/start'); Entrypoint = $null; User = ''; WorkingDir = ''; Env = @('HOME=/home/dev') } }
+          $Prepared = [pscustomobject] @{ Id = $PreparedId; Name = '/windows-rent'; Image = $Spec.Id; Mounts = @()
+            State = [pscustomobject] @{ Running = $false; Status = 'created'; StartedAt = '' }
+            Config = [pscustomobject] @{ Cmd = @('/start'); Entrypoint = $null; User = ''; WorkingDir = ''
+              Env = @('HOME=/home/dev', 'RENT_REPOS_VOLUME=repos', 'RENT_STATE_VOLUME=windows-rent-state',
+                'RENT_NIX_VOLUME=windows-rent-nix', "RENT_AUTHORIZED_KEY=$Key") }
+            Ports = [pscustomobject] @{ '2222/tcp' = @([pscustomobject] @{ HostIp = '127.0.0.1'; HostPort = '2222' }) } }
+          $RepoHolder = [pscustomobject] @{ Id = 'old'; Name = '/envs-dev-mutable'
+            State = [pscustomobject] @{ Running = $true; Status = 'running'; StartedAt = 'same-start' } }
+          $RepoLines = @($RootFs, '3 1 8:32 /volumes/repos/_data /work/repos rw - ext4 /dev/sdc rw')
+          $Calls = [System.Collections.Generic.List[string]]::new(); $Parallel = @{ Created = $false }; $CreateExit = 0; $SeedExit = 0; $StartExit = 0
+          $Driver = 'guest'; $Opts = '{}'
+          $Wslc = {
+            $A = @($args) -join ' '; $Calls.Add($A); $global:LASTEXITCODE = 0
+            if ($A -clike 'volume inspect *') { '[{"Name":"' + $args[2] + '","Driver":"' + $Driver + '","DriverOpts":' + $Opts + '}]' }
+            elseif ($A -ceq "image inspect $Image") { ConvertTo-Json -InputObject @($Spec) -Depth 8 -Compress }
+            elseif ($A -ceq 'inspect windows-rent') { if ($Parallel.Created) { $Prepared | ConvertTo-Json -Depth 8 -Compress } else { $global:LASTEXITCODE = 1 } }
+            elseif ($A -ceq 'container list --all -q') { 'old'; if ($Parallel.Created) { $PreparedId } }
+            elseif ($A -ceq 'inspect old') { $RepoHolder | ConvertTo-Json -Depth 8 -Compress }
+            elseif ($A -ceq "inspect $PreparedId") { $Prepared | ConvertTo-Json -Depth 8 -Compress }
+            elseif ($A -ceq 'exec old cat /proc/1/mountinfo') { $RepoLines }
+            elseif ($args[0] -ceq 'run') {
+              if ($A -cnotlike '*--volume windows-rent-nix:/seed*--env RENT_NIX_EXPECT=8:32 /volumes/windows-rent-nix/_data*' -or
+                  $A -cmatch 'repos:/|windows-rent-state:/|start|detach') { throw 'Prepare seed is not Nix-only with mandatory backing' }
+              $global:LASTEXITCODE = $SeedExit
+            }
+            elseif ($args[0] -ceq 'create') { $Parallel.Created = $true; $global:LASTEXITCODE = $CreateExit; $PreparedId }
+            elseif ($A -ceq "start $PreparedId") { $global:LASTEXITCODE = $StartExit; $Prepared.State.Running = $true; $Prepared.State.Status = 'running' }
+            elseif ($A -ceq 'logs windows-rent') { @($Proof, $Ready) }
+            else { throw "Unexpected parallel Prepare/Start call: $A" }
+          }
+          $Step = 'Prepare'; Invoke-Prepared
+          if (-not $Parallel.Created -or $Prepared.State.Running -or -not $RepoHolder.State.Running -or
+              @($Calls | Where-Object { $_ -cmatch '^(start|stop|remove|volume create) ' }).Count) { throw 'Prepare changed runtime or volumes' }
+          if (Test-RunningProof $Prepared @($Proof, $Ready)) { throw 'Stopped Prepare was treated as ready' }
+          foreach ($Field in 'Id', 'Image', 'Cmd', 'Entrypoint', 'User', 'WorkingDir', 'Env', 'Ports') {
+            $Bad = $Prepared | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+            if ($Field -ceq 'Id') { $Bad.Id = 'b' * 64 }
+            elseif ($Field -ceq 'Image') { $Bad.Image = 'sha256:' + ('b' * 64) }
+            elseif ($Field -ceq 'Ports') { $Bad.Ports.'2222/tcp'[0].HostIp = '0.0.0.0' }
+            elseif ($Field -ceq 'Env') { $Bad.Config.Env += 'UNEXPECTED=value' }
+            else { $Bad.Config.$Field = 'different' }
+            if (-not (Get-PreparedProblem $Bad $Spec $PreparedId)) { throw "Prepared $Field mismatch accepted" }
+          }
+          $Step = 'Start'; $script:Anchors = $null; $Calls.Clear()
+          $Rejected = $false; try { Invoke-Prepared } catch { $Rejected = $true }
+          if (-not $Rejected -or @($Calls | Where-Object { $_ -clike 'start *' }).Count) { throw 'Start allowed old shared repos writer' }
+          $RepoHolder.State.Running = $false; $RepoHolder.State.Status = 'exited'; $Calls.Clear()
+          Invoke-Prepared
+          if (@($Calls | Where-Object { $_ -ceq "start $PreparedId" }).Count -ne 1 -or
+              @($Calls | Where-Object { $_ -cmatch '^(run|create|stop|remove) ' }).Count) { throw 'Start was not exactly one standard start' }
+          $Prepared.State.Running = $false; $Prepared.State.Status = 'created'; $StartExit = 1; $Calls.Clear()
+          $Rejected = $false; try { Invoke-Prepared } catch { $Rejected = $true }
+          if (-not $Rejected -or @($Calls | Where-Object { $_ -ceq "start $PreparedId" }).Count -ne 1 -or
+              @($Calls | Where-Object { $_ -clike 'logs *' -or $_ -cmatch '^(run|create|stop|remove) ' }).Count) { throw 'Unknown Start advanced or retried' }
+          # Every UNKNOWN attempt terminates before the next effect; no retries, replacement or task/recovery calls.
+          $Step = 'Prepare'; $RepoHolder.State.Running = $true; $RepoHolder.State.Status = 'running'
+          foreach ($Failure in 'seed', 'create', 'driver', 'alias', 'shared-nix', 'no-anchor') {
+            $Parallel.Created = $false; $Calls.Clear(); $Prepared.State.Running = $false; $Prepared.State.Status = 'created'
+            $SeedExit = if ($Failure -ceq 'seed') { 3 } else { 0 }; $CreateExit = if ($Failure -ceq 'create') { 1 } else { 0 }
+            $Driver = if ($Failure -ceq 'driver') { 'local' } else { 'guest' }
+            $RepoLines = @($RootFs, '3 1 8:32 /volumes/repos/_data /work/repos rw - ext4 /dev/sdc rw')
+            if ($Failure -ceq 'alias') { $RepoLines += '4 1 8:32 /volumes /alias ro - ext4 /dev/sdc rw' }
+            if ($Failure -ceq 'shared-nix') { $RepoLines += '4 1 8:32 /volumes/windows-rent-nix/_data /nix rw - ext4 /dev/sdc rw' }
+            if ($Failure -ceq 'no-anchor') { $RepoLines = @($RootFs) }
+            $Rejected = $false; try { Invoke-Prepared } catch { $Rejected = $true }
+            if (-not $Rejected -or @($Calls | Where-Object { $_ -cmatch '^(start|stop|remove) ' }).Count -or
+                @($Calls | Where-Object { $_ -clike 'create *' }).Count -gt 1 -or
+                ($Failure -cne 'create' -and @($Calls | Where-Object { $_ -clike 'create *' }).Count)) { throw "Unknown/refusal advanced: $Failure" }
+          }
           # The fake's last exit code must not become this step's exit code.
           $global:LASTEXITCODE = 0
       - uses: cachix/install-nix-action@v31
@@ -535,9 +611,11 @@ jobs:
           after=$(nix eval --raw .#own-image.drvPath)
           # Evidence for the current slice, not a permanent ban on legitimate own changes.
           echo "own image derivation head: $after"
+          echo "rent image derivation head: $(nix eval --raw .#rent-image.drvPath)"
           if [[ "$BASE_SOURCE" =~ ^[0-9a-f]{40}$ && "$BASE_SOURCE" != 0000000000000000000000000000000000000000 ]]; then
             before=$(nix eval --raw "git+file://$PWD?rev=$BASE_SOURCE#own-image.drvPath")
             echo "own image derivation base: $before"
+            echo "rent image derivation base: $(nix eval --raw "git+file://$PWD?rev=$BASE_SOURCE#rent-image.drvPath")"
           else
             echo 'own image derivation base: unavailable for this event'
           fi
@@ -616,7 +694,28 @@ jobs:
             "$image" /bin/rent-nix-seed > "$key_dir/seed" 2>&1 || rc=$?
           test "$rc" = 3 && grep -qF 'not the expected volume backing; nothing written' "$key_dir/seed"
           test -z "$(docker run --rm -v rent-smoke-nix:/n "$image" /bin/bash -c 'shopt -s nullglob dotglob; f=(/n/*); echo "${f[@]}"')"
+          # A real repo job continues while the real RW seed runs; no state volume is attached to either writer.
+          docker run -d --name rent-refuse -v rent-smoke-repos:/work/repos "$image" /bin/bash -c \
+            'set -eu; while :; do printf "work\n" >> /work/repos/parallel-progress; sleep 0.01; done'
+          for _ in {1..100}; do
+            if docker exec rent-refuse /bin/test -s /work/repos/parallel-progress; then break; fi
+            sleep 0.1
+          done
+          before_work=$(docker exec rent-refuse /bin/bash -c 'wc -l < /work/repos/parallel-progress')
           docker run --rm -v rent-smoke-nix:/seed -e RENT_NIX_VOLUME=rent-smoke-nix -e "RENT_NIX_EXPECT=$backing" "$image" /bin/rent-nix-seed
+          after_work=$(docker exec rent-refuse /bin/bash -c 'wc -l < /work/repos/parallel-progress')
+          test "$after_work" -gt "$before_work"
+          prepared=$(docker create --name rent-cand -p 127.0.0.1:2222:2222 -v rent-smoke-repos:/work/repos \
+            -v rent-smoke-state:/var/lib/rent --mount type=volume,source=rent-smoke-nix,target=/nix,volume-nocopy \
+            -e RENT_REPOS_VOLUME=rent-smoke-repos -e RENT_STATE_VOLUME=rent-smoke-state -e RENT_NIX_VOLUME=rent-smoke-nix \
+            -e "RENT_AUTHORIZED_KEY=$(cat "$key_dir/key.pub")" "$image")
+          test "$(docker inspect --format '{{.Id}} {{.State.Running}} {{.State.Status}}' rent-cand)" = "$prepared false created"
+          test -z "$(docker logs rent-cand 2>&1)"
+          test "$(docker inspect --format '{{.State.Running}}' rent-refuse)" = true
+          docker rm rent-cand
+          docker stop rent-refuse
+          docker rm rent-refuse
+          docker run --rm -v rent-smoke-repos:/r "$image" /bin/bash -c 'test -f /r/parallel-progress && test ! -L /r/parallel-progress && rm -- /r/parallel-progress'
           # Existing repos content with a foreign owner; rent-start must never chown it.
           docker run --rm -v rent-smoke-repos:/r "$image" /bin/bash -c 'echo repo > /r/marker && chown 4242:4243 /r/marker'
           ids=(-e RENT_REPOS_VOLUME=rent-smoke-repos -e RENT_STATE_VOLUME=rent-smoke-state -e RENT_NIX_VOLUME=rent-smoke-nix)

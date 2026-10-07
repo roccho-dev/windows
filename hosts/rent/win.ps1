@@ -1,7 +1,7 @@
 #Requires -Version 7
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Plan', 'Pull', 'Create', 'Stage', 'Revert', 'Migrate', 'LogonTask')]
+    [ValidateSet('Plan', 'Pull', 'Prepare', 'Start', 'Create', 'Stage', 'Revert', 'Migrate', 'LogonTask')]
     [string] $Step,
 
     [Parameter(Mandatory)]
@@ -18,6 +18,9 @@ param(
     [int] $Port,
 
     [string] $Image,
+    # Start only: the full container ID returned by Prepare; not an image or a name.
+    [ValidatePattern('^[a-f0-9]{64}$')]
+    [string] $PreparedId,
     # Stage/Revert: the separately named candidate on the same named volumes.
     [ValidatePattern('^[a-z0-9][a-z0-9-]+$')]
     [string] $Candidate = 'windows-rent-cf',
@@ -147,11 +150,11 @@ function Get-RootRelation([string] $Root, [string] $Anchor) {
     return $null
 }
 
-# Where each rent volume and the old home live, from a container that mounts the state volume now: its device and
-# filesystem root. A volume that holder does not mount takes the state volume's device and sibling root, the guest
+# Where each rent volume and the old home live, from a container that mounts state (or repos for Prepare): its device and
+# filesystem root. A volume that holder does not mount takes that volume's device and sibling root, the guest
 # driver's layout; the seed checks that expectation against its own mount before any write. Every existing volume must
 # be the guest driver's with empty options. $null when any of this is unsupported or unreadable.
-function Get-Anchors($Holder) {
+function Get-Anchors($Holder, [switch] $FromRepos) {
     $Table = Get-MountTable $Holder
     if (-not $Table) { return $null }
     $Names = @(@($Mounts.Values) + $OldHomeVolume)
@@ -164,9 +167,10 @@ function Get-Anchors($Holder) {
         if ($M.Count -gt 1) { return $null }
         if ($M.Count -eq 1) { $Found[$Name] = @{ Dev = $M[0].Dev; Root = $M[0].Root } }
     }
-    $State = $Found[$StateVolume]
-    if (-not $State -or -not $State.Root.EndsWith("/volumes/$StateVolume/_data", [StringComparison]::Ordinal)) { return $null }
-    $Store = $State.Root.Substring(0, $State.Root.Length - "/$StateVolume/_data".Length)
+    $BaseName = if ($FromRepos -and -not $Found[$StateVolume]) { $ReposVolume } else { $StateVolume }
+    $State = $Found[$BaseName]
+    if (-not $State -or -not $State.Root.EndsWith("/volumes/$BaseName/_data", [StringComparison]::Ordinal)) { return $null }
+    $Store = $State.Root.Substring(0, $State.Root.Length - "/$BaseName/_data".Length)
     foreach ($Name in $Names) {
         if (-not $Found[$Name]) { $Found[$Name] = @{ Dev = $State.Dev; Root = "$Store/$Name/_data" } }
         elseif ($Found[$Name].Dev -cne $State.Dev -or $Found[$Name].Root -cne "$Store/$Name/_data") { return $null }
@@ -307,13 +311,13 @@ function Assert-OldSourceStopped {
     if ($Problem) { throw "$Problem Not migrating." }
 }
 
-if ($Step -in @('Plan', 'Pull', 'Create', 'Stage', 'Migrate')) {
+if ($Step -in @('Plan', 'Pull', 'Prepare', 'Start', 'Create', 'Stage', 'Migrate')) {
     if ($Image -cnotmatch '^ghcr\.io/roccho-dev/windows-rent@sha256:[a-f0-9]{64}$') {
         throw 'Provide the CI image by exact GHCR digest.'
     }
 }
 $Key = "<contents of $PublicKeyFile>"
-if ($Step -in @('Create', 'Stage')) {
+if ($Step -in @('Prepare', 'Start', 'Create', 'Stage')) {
     if (-not $PublicKeyFile) { throw 'Provide a public key file.' }
     $Key = (Get-Content -LiteralPath $PublicKeyFile -Raw).Trim()
     if ($Key -notmatch '^ssh-ed25519 [A-Za-z0-9+/=]+(?: .*)?$') { throw 'Expected one ed25519 public key.' }
@@ -324,6 +328,8 @@ if ($Step -eq 'Stage') {
     if ($Problem) { throw "$Problem Not staging." }
 }
 if ($Step -eq 'Migrate' -and -not $ImportItems.Count) { throw 'Migrate needs -ImportItems, the selected items to import.' }
+if ($Step -eq 'Start' -and -not $PreparedId) { throw 'Start needs the full -PreparedId returned by Prepare.' }
+if ($Step -in @('Prepare', 'Start') -and $ImportItems.Count) { throw 'Prepare and Start do not import state.' }
 if (@($ImportItems | Sort-Object -Unique).Count -ne $ImportItems.Count) { throw 'Each import item may be named only once.' }
 if ($ImportItems.Count -and -not $OldImageSource) { throw 'An import needs -OldImageSource, the pre-recorded image of the old home holder.' }
 
@@ -335,6 +341,7 @@ function Get-RunArgs([string] $Name) {
         '--env', "RENT_NIX_VOLUME=$NixVolume", '--env', "RENT_AUTHORIZED_KEY=$Key", $Image)
 }
 $RunArgs = Get-RunArgs $Container
+$PrepareArgs = @('create') + @($RunArgs | Select-Object -Skip 1 | Where-Object { $_ -cne '--detach' })
 $StageArgs = Get-RunArgs $Candidate
 $MigrateArgs = @('run', '--rm', '--volume', "${OldHomeVolume}:/old:ro", '--volume', "${StateVolume}:/var/lib/rent",
     '--env', "RENT_OLD_VOLUME=$OldHomeVolume", '--env', "RENT_STATE_VOLUME=$StateVolume",
@@ -362,6 +369,10 @@ if ($Step -eq 'Plan') {
         seedContainerList = @($Wslc) + $ListArgs
         seed = @($Wslc) + $SeedArgs
         create = @($Wslc) + $RunArgs
+        prepare = @($Wslc) + $PrepareArgs
+        prepareAccepts = 'existing guest volumes only; actual repos/state anchor; expected RW Nix backing; Nix-only seed then stopped create; no ready claim'
+        start = @($Wslc, 'start', $(if ($PreparedId) { $PreparedId } else { '<Prepare full container ID>' }))
+        startAccepts = 'same stopped full ID, image and observable inputs; every shared writer excluded; no seed/import/placement/task change; production mount and ready gate'
         readyGate = "within 60 s: Running with log lines '$Proof' and '$Ready', then Running for 10 consecutive polls"
         stageAccepts = "$Container exists and is Running (its images read by inspect now), $Candidate absent, every other container provably stopped or Running without mounting a rent volume writable or exposing its store (judged by its own PID 1 mounts against volume anchors read from $Container now; unreadable anchors or mounts refuse), logon task $TaskName exactly '$Wslc start $Container'; placement inputs are plain files and the state volume is windows-rent-state, checked before any change"
         # Order: stageTask (while $Container still runs, so a logon can only try the not-yet-existing candidate),
@@ -438,7 +449,7 @@ if ($Step -eq 'LogonTask') {
 
 # Only when another container runs are anchors needed: read once in this invocation from the running $Except holder.
 function Assert-NoOtherWriter([string] $Except = $Container, [string] $Action = 'migrating', [string[]] $Write = @($Mounts.Values),
-    [string[]] $NoReader = @()) {
+    [string[]] $NoReader = @(), [switch] $FromRepos) {
     $Ids = @(& $Wslc @ListArgs | Where-Object { $_ })
     if ($LASTEXITCODE -ne 0 -or $Ids.Count -gt 64) { throw "Container list is unreadable; not $Action." }
     $Items = @($Ids | ForEach-Object { Get-Container $_ })
@@ -446,6 +457,12 @@ function Assert-NoOtherWriter([string] $Except = $Container, [string] $Action = 
     if (-not $script:Anchors -and @($Items | Where-Object { $_ -and (& $Named $_) -cne $Except -and (Test-Running $_) }).Count) {
         $Holder = @($Items | Where-Object { $_ -and $Except -and (& $Named $_) -ceq $Except -and (Test-Running $_) })
         if ($Holder.Count -eq 1) { $script:Anchors = Get-Anchors $Holder[0] }
+        if ($FromRepos -and -not $script:Anchors) {
+            foreach ($Item in @($Items | Where-Object { Test-Running $_ })) {
+                $script:Anchors = Get-Anchors $Item -FromRepos
+                if ($script:Anchors) { break }
+            }
+        }
     }
     $Problem = Get-WriterProblem $Items $Except $Write $NoReader
     if ($Problem) { throw "$Problem Not $Action." }
@@ -454,8 +471,9 @@ function Assert-NoOtherWriter([string] $Except = $Container, [string] $Action = 
 # Seed the nix volume from exactly $Image while no other container can write it; rent-nix-seed proves its own mounts.
 # With anchors, the seed is given the expected backing and refuses before any write when its actual mount differs: the
 # store is then unknown, so that halts rather than restarting anything.
-function Invoke-Seed {
-    Assert-NoOtherWriter '' 'seeding' @($NixVolume)
+function Invoke-Seed([switch] $RequireAnchor) {
+    Assert-NoOtherWriter '' 'seeding' @($NixVolume) -FromRepos:$RequireAnchor
+    if ($RequireAnchor -and -not $script:Anchors) { throw 'Prepare requires an actual repos/state backing anchor before seeding.' }
     $Argv = $SeedArgs
     if ($script:Anchors) {
         $Expect = "RENT_NIX_EXPECT=$($script:Anchors[$NixVolume].Dev) $($script:Anchors[$NixVolume].Root)"
@@ -492,6 +510,78 @@ function Wait-Ready([string] $Name) {
         } elseif ($Seen) { return $false }
     }
     return $false
+}
+
+# WSLC exposes these inputs, but not configured mounts. Compare image defaults plus the same four run overrides.
+# The audited create call and returned immutable ID retain the mount declaration; only rent-start proves actual mounts.
+function Get-PreparedProblem($Item, $Spec, [string] $Id) {
+    if (-not $Item -or -not $Spec -or $Id -cnotmatch '^[a-f0-9]{64}$' -or [string] $Item.Id -cne $Id -or
+        ([string] $Item.Name).TrimStart('/') -cne $Container -or -not (Test-Stopped $Item)) { return 'Prepared identity/state differs.' }
+    if ([string] $Spec.Id -cnotmatch '^sha256:[a-f0-9]{64}$' -or [string] $Item.Image -cne [string] $Spec.Id) { return 'Prepared image differs.' }
+    foreach ($Field in 'Cmd', 'Entrypoint', 'User', 'WorkingDir') {
+        if (-not $Item.Config.PSObject.Properties[$Field] -or -not $Spec.Config.PSObject.Properties[$Field] -or
+            (ConvertTo-Json -InputObject $Item.Config.$Field -Compress) -cne (ConvertTo-Json -InputObject $Spec.Config.$Field -Compress)) {
+            return "Prepared $Field differs."
+        }
+    }
+    $Expected = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+    foreach ($E in @($Spec.Config.Env)) {
+        if ([string] $E -cnotmatch '^([^=]+)=(.*)$' -or $Expected.ContainsKey($Matches[1])) { return 'Image environment is unreadable.' }
+        $Expected.Add($Matches[1], $Matches[2])
+    }
+    $Expected['RENT_REPOS_VOLUME'] = $ReposVolume; $Expected['RENT_STATE_VOLUME'] = $StateVolume
+    $Expected['RENT_NIX_VOLUME'] = $NixVolume; $Expected['RENT_AUTHORIZED_KEY'] = $Key
+    $Actual = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+    foreach ($E in @($Item.Config.Env)) {
+        if ([string] $E -cnotmatch '^([^=]+)=(.*)$' -or $Actual.ContainsKey($Matches[1])) { return 'Prepared environment is unreadable.' }
+        $Actual.Add($Matches[1], $Matches[2])
+    }
+    if ($Actual.Count -ne $Expected.Count) { return 'Prepared environment differs.' }
+    foreach ($Name in $Expected.Keys) { if (-not $Actual.ContainsKey($Name) -or $Actual[$Name] -cne $Expected[$Name]) { return 'Prepared environment differs.' } }
+    $Ports = @($Item.Ports.PSObject.Properties)
+    $Bindings = @($Item.Ports.'2222/tcp')
+    if ($Ports.Count -ne 1 -or $Ports[0].Name -cne '2222/tcp' -or $Bindings.Count -ne 1 -or
+        [string] $Bindings[0].HostIp -cne '127.0.0.1' -or [string] $Bindings[0].HostPort -cne [string] $Port) { return 'Prepared loopback port differs.' }
+    return $null
+}
+
+function Invoke-Prepared {
+    foreach ($Name in $Mounts.Values) { Assert-Volume $Name }
+    $Text = (& $Wslc image inspect $Image 2>$null) -join "`n"
+    if ($LASTEXITCODE -ne 0) { throw 'Image inspection failed; no next effect.' }
+    $Specs = @($Text | ConvertFrom-Json)
+    if ($Specs.Count -ne 1 -or -not $Specs[0].Config) { throw 'Image inspection is unreadable; no next effect.' }
+    $Spec = $Specs[0]
+    if ([string] $Spec.Id -cnotmatch '^sha256:[a-f0-9]{64}$') { throw 'Image identity is unreadable; no next effect.' }
+    if ($Step -ceq 'Prepare') {
+        if (Get-Named $Container) { throw 'Prepare requires an absent container; not repeating create or seed.' }
+        # A repos holder is an anchor reader, never a writer exemption. The helper validates expected RW backing itself.
+        $script:Anchors = $null
+        Invoke-Seed -RequireAnchor
+        if (Get-Named $Container) { throw 'Container appeared during Prepare; not creating.' }
+        $Result = @(& $Wslc @PrepareArgs)
+        if ($LASTEXITCODE -ne 0 -or $Result.Count -ne 1 -or [string] $Result[0] -cnotmatch '^[a-f0-9]{64}$') {
+            throw 'Create outcome is unknown; retain state, no retry or start.'
+        }
+        $Id = [string] $Result[0]
+        $Problem = Get-PreparedProblem (Get-Named $Container) $Spec $Id
+        if ($Problem) { throw "$Problem Retain the created container; no start." }
+        Write-Output "Prepare: stopped container $Container ID=$Id; not ready."
+    } else {
+        $Problem = Get-PreparedProblem (Get-Named $Container) $Spec $PreparedId
+        if ($Problem) { throw "$Problem Not starting." }
+        Assert-NoOtherWriter '' 'starting'
+        $Problem = Get-PreparedProblem (Get-Named $Container) $Spec $PreparedId
+        if ($Problem) { throw "$Problem Not starting." }
+        & $Wslc start $PreparedId | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw 'Start outcome is unknown; retain state, no retry or old restart.' }
+        if (-not (Wait-Ready $Container)) { throw 'Prepared container failed the production mount/ready gate; retained, no automatic restart.' }
+        $Now = Get-Named $Container
+        if (-not (Test-Running $Now) -or [string] $Now.Id -cne $PreparedId -or [string] $Now.Image -cne [string] $Spec.Id) {
+            throw 'Prepared identity changed during the ready gate; retained, no next effect.'
+        }
+        Write-Output $Proof
+    }
 }
 
 # The kept rent is back only when it is Running on the images inspect showed for it, for 3 consecutive polls.
@@ -613,6 +703,11 @@ function Complete-Stage($Old) {
     try { $Ok = Invoke-Revert $Old $Steps $true } catch { $Ok = $false; $Steps.Add("error: $($_.Exception.Message)") }
     $Outcome = if ($Ok) { 'succeeded' } else { 'FAILED' }
     throw "Stage failed: $Failure | revert ${Outcome}: $($Steps -join '; ')"
+}
+
+if ($Step -in @('Prepare', 'Start')) {
+    Invoke-Prepared
+    exit 0
 }
 
 if ($Step -eq 'Revert') {
