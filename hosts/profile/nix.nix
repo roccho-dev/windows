@@ -1,6 +1,6 @@
 # The one small development profile for own and rent (Issue #8). Codex and Claude Code are official releases pinned
 # by hash; every other package comes from the locked nixpkgs. Adding a package is a change here, CI, and a new image;
-# nothing is installed into a host by hand. `extra` exists only for the CI upgrade proof. `owner` only names the
+# nothing is installed into a host by hand. `extra` supplies role tools and the CI upgrade proof. `owner` only names the
 # profile's stable Git credential helper (own: its Binding; rent keeps the default); each repository's principal is
 # declared by its own binding (hosts/profile/gh.nix), never derived from owner or the URL namespace.
 { pkgs, extra ? [], owner ? "roccho-dev" }:

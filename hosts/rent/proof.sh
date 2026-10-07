@@ -111,6 +111,23 @@ dev() {
     "$c" /bin/bash -euc "$@"
 }
 root() { docker exec "$c" /bin/bash -euc "$@"; }
+python_work() {
+  dev 'cd /work/repos/proof
+    export UV_PYTHON_DOWNLOADS=never UV_PYTHON_PREFERENCE=only-system UV_OFFLINE=1
+    python3 -c "import sys; assert sys.version_info[:2] == (3,13)"
+    uv --version
+    if [ ! -d python-work ]; then
+      mkdir python-work
+      printf "[project]\nname = \"rent-proof\"\nversion = \"0.0.0\"\nrequires-python = \">=3.12\"\ndependencies = []\n" > python-work/pyproject.toml
+      cd python-work
+      printf "3.13\n" > .python-version
+      uv venv .venv
+      printf "retained python work\n" > work.txt
+    else cd python-work; fi
+    test "$(cat work.txt)" = "retained python work"
+    test "$(cat .python-version)" = 3.13
+    uv run --no-sync python -c "import sys; assert sys.version_info[:2] == (3,13)"'
+}
 boundaries() {
   # PID 1's mountinfo, parsed on the runner (the image ships no awk; the dev profile stays small).
   docker exec "$c" /bin/cat /proc/1/mountinfo |
@@ -151,6 +168,7 @@ start "$base" bridge
 first=$(docker inspect "$c" --format '{{.Id}}')
 root 'install -d -o 1000 -g 1000 /work/repos/proof'
 boundaries
+python_work
 dev 'test "$(readlink -f "$(command -v nix)")" = "$(readlink -f /nix/var/nix/profiles/rent-dev/bin/nix)"
   test "$(readlink /nix/var/nix/profiles/rent-dev)" = rent-dev-1-link
   if command -v hello >/dev/null; then exit 1; fi
@@ -181,6 +199,7 @@ seed "$next" | grep -qE "^rent-nix-seed ok volume=$nixv roots=$next_roots copied
 start "$next" none
 test "$(docker inspect "$c" --format '{{.Id}}')" != "$first" || fail 'not a new container'
 boundaries
+python_work
 dev 'test ! -e ~/home-proof
   test "$(cat ~/.codex/proof)" = codex-session && test "$(cat ~/.claude/proof)" = claude-session
   hello > /dev/null
@@ -204,6 +223,7 @@ root 'NIX_REMOTE=daemon nix-store --gc > /dev/null
     "$(readlink /work/repos/proof/dist)" "$(readlink /work/repos/proof/dist-1)"
   nix-store --verify --check-contents'
 echo 'PASS gc (seeded runtimes, profile generations and work roots survive; store verifies)'
+python_work
 
 # Roll back: the old image starts on the retained volume without reseeding and restores its own profile; reseeding it
 # from the same definition is a no-op.

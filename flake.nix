@@ -122,9 +122,16 @@
         fail() { echo "rent-state-import: $*" >&2; exit 20; }
         compare=0
         if [ "''${1:-}" = --compare ]; then compare=1; shift; fi
+        project=-home-dev
+        if [ "''${1:-}" = --project ]; then
+          [ "$#" -ge 2 ] || fail '--project needs one plain project element'
+          project=$2; shift 2
+        fi
+        [[ $project =~ ^[A-Za-z0-9_.-]+$ && $project != . && $project != .. ]] ||
+          fail 'project must be one plain element'
         id=''${1:-}
         [[ $id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] && [ "$#" -ge 2 ] ||
-          fail 'usage: rent-state-import [--compare] <session-uuid> credentials|session|codex...'
+          fail 'usage: rent-state-import [--compare] [--project <element>] <session-uuid> credentials|session|codex...'
         shift
         ${mountLib}
         oldvol=''${RENT_OLD_VOLUME:-}
@@ -136,7 +143,7 @@
         exec 9<${rentState}
         flock -x -n 9 || fail "${rentState} is in use by a running rent or another writer"
         s=${rentState}/dev
-        p=projects/-home-dev
+        p=projects/$project
         items=() seen=
         for item in "$@"; do
           case " $seen " in *" $item "*) fail "item $item is named twice" ;; esac
@@ -152,6 +159,13 @@
         for d in /old/.claude /old/.claude/projects "/old/.claude/$p" /old/.codex "$s" "$s/claude" "$s/claude/projects" "$s/claude/$p" "$s/codex"; do
           if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then fail "$d is not a real directory"; fi
         done
+        case " $seen " in *' session '*)
+          [ -d "/old/.claude/$p" ] && [ "$(stat -c %u "/old/.claude/$p")" = 1000 ] ||
+            fail 'source project must be a UID 1000 directory'
+          if [ -e "$s/claude/$p" ] && [ "$(stat -c %u "$s/claude/$p")" != 1000 ]; then
+            fail 'target project must be a UID 1000 directory'
+          fi
+          ;; esac
         # Content, type, owner and mode of one file or tree, symlinks not followed, or 'absent'; any read failure fails.
         # Held only in this process's memory, never printed.
         state() {
@@ -467,7 +481,9 @@
             Labels."org.opencontainers.image.source" = "https://github.com/roccho-dev/windows";
           };
         };
-      rentProfile = import ./hosts/profile/nix.nix { inherit pkgs; };
+      rentExtras = with pkgs; [ python313 uv ];
+      rentProfileFor = extra: import ./hosts/profile/nix.nix { inherit pkgs; extra = rentExtras ++ extra; };
+      rentProfile = rentProfileFor [];
       # CI only, never published: stands in for cloudflared under the exact argv rent-start uses, so local SSH, state
       # and #8 continuity can run without Cloudflare. A synthetic token proves nothing about Cloudflare itself.
       rentTunnelStub = pkgs.writeShellScriptBin "cloudflared" ''
@@ -491,7 +507,7 @@
         rent-image-stub = mkRent { profile = rentProfile; tag = "stub"; tunnel = rentTunnelStub; };
         # CI only, never published: the stub image plus one package, to prove seed-on-upgrade and rollback.
         rent-image-next = mkRent {
-          profile = import ./hosts/profile/nix.nix { inherit pkgs; extra = [ pkgs.hello ]; };
+          profile = rentProfileFor [ pkgs.hello ];
           tag = "next";
           tunnel = rentTunnelStub;
         };

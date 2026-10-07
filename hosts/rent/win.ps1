@@ -37,6 +37,10 @@ param(
     [string] $OldContainer = 'envs-dev-mutable',
     [ValidatePattern('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')]
     [string] $SessionId = '4eba321e-6ade-4815-930d-dfa58b6fc960',
+    # One existing Claude project directory, never an absolute or traversing path.
+    [ValidateNotNullOrEmpty()]
+    [ValidatePattern('^(?!\.{1,2}$)[A-Za-z0-9_.-]+$')]
+    [string] $SessionProject = '-home-dev',
     # Migrate, and Stage with an old home: the typed items selected for import where they differ (credentials: Claude
     # .credentials.json; session: that session's journal and directory; codex: Codex auth.json). None means no import.
     [ValidateSet('credentials', 'session', 'codex')]
@@ -334,7 +338,9 @@ $RunArgs = Get-RunArgs $Container
 $StageArgs = Get-RunArgs $Candidate
 $MigrateArgs = @('run', '--rm', '--volume', "${OldHomeVolume}:/old:ro", '--volume', "${StateVolume}:/var/lib/rent",
     '--env', "RENT_OLD_VOLUME=$OldHomeVolume", '--env', "RENT_STATE_VOLUME=$StateVolume",
-    $Image, '/bin/rent-state-import', $SessionId) + $ImportItems
+    $Image, '/bin/rent-state-import')
+if ($SessionProject -cne '-home-dev') { $MigrateArgs += @('--project', $SessionProject) }
+$MigrateArgs += @($SessionId) + $ImportItems
 $ListArgs = @('container', 'list', '--all', '-q')
 # One-shot helper from exactly $Image: the nix volume at /seed, the image's own /nix beneath it; removed by --rm.
 $SeedArgs = @('run', '--rm', '--volume', "${NixVolume}:/seed", '--env', "RENT_NIX_VOLUME=$NixVolume", $Image, '/bin/rent-nix-seed')
