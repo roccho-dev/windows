@@ -35,6 +35,49 @@ let
          ([($before | keys[]), ($after | keys[])] | unique |
           all(.[]; . == "description" or $before[.] == $after[.])))))
   '';
+  # Standard Nix fixed-output dependency fetch. The fixed hash is verified
+  # by Nix; unlike ordinary source checks, FODs can fetch the publisher's
+  # registry metadata without turning off any sandbox or GPG enforcement.
+  signedLock = pkgs.runCommand "github-root-signed-6.13.0-provider-lock" {
+    nativeBuildInputs = [ pkgs.opentofu pkgs.jq pkgs.gnugrep ];
+    outputHashAlgo = "sha256";
+    outputHashMode = "flat";
+    # Discovery only: deliberately mismatches until actual upstream signed
+    # output is produced by pinned tofu and its digest is read back from CI.
+    outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+  } ''
+    set -eu
+    [ "$(tofu version -json | jq -r .terraform_version)" = 1.12.4 ] || {
+      echo 'S1_LOCK_GENERATOR: pinned tofu version mismatched' >&2
+      exit 1
+    }
+    mkdir -p source home
+    cp ${./main.tf} source/main.tf
+    cd source
+    unset GITHUB_TOKEN GH_TOKEN GITHUB_ENTERPRISE_TOKEN TF_ENCRYPTION SSH_PRIVATE_KEY
+    export HOME="$NIX_BUILD_TOP/home" TF_IN_AUTOMATION=1 OPENTOFU_ENFORCE_GPG_VALIDATION=true
+    echo 'S1_LOCK_GENERATOR: origin registry with mandatory publisher GPG signature'
+    if ! tofu providers lock -platform=linux_amd64 registry.terraform.io/integrations/github >../lock-generator.log 2>&1; then
+      sed -n '1,90p' ../lock-generator.log >&2
+      echo 'S1_LOCK_GENERATOR: registry source not verifiable; stopping' >&2
+      exit 1
+    fi
+    sed -n '1,90p' ../lock-generator.log
+    if ! grep -Eiq 'signed|signature|key ID' ../lock-generator.log; then
+      echo 'S1_LOCK_GENERATOR: no provider signer in native output' >&2
+      exit 1
+    fi
+    [ "$(grep -c '"zh:' .terraform.lock.hcl)" = 13 ] || {
+      echo 'S1_LOCK_GENERATOR: upstream ZIP hash count not 13' >&2
+      exit 1
+    }
+    grep -q '"h1:' .terraform.lock.hcl || {
+      echo 'S1_LOCK_GENERATOR: no native installed-package h1 checksum' >&2
+      exit 1
+    }
+    cp .terraform.lock.hcl "$out"
+    echo 'S1_LOCK_GENERATOR: native signed origin lock produced; awaiting Nix fixed hash'
+  '';
   # Source is inert under CI: only --source-check runs without principals.
   # A future operational GO must prove existing native principal and custody.
   app = pkgs.writeShellScriptBin "github-root" ''
@@ -170,35 +213,16 @@ PLAN
     reject '.resource_changes[0].change.after_sensitive.token = true'
     reject '.resource_changes[0].deposed = "old-object"'
     reject '.checks = [{"status":"unknown"}]'
-    # S1 source dependency only. The pinned OpenTofu executable itself
-    # performs registry-origin signed checksums and writes the actual lock.
-    # No provider init/import/plan/apply, no GitHub API or state ref access.
-    [ "$(tofu version -json | jq -r .terraform_version)" = 1.12.4 ] || {
-      echo 'github-root: pinned OpenTofu 1.12.4 unavailable' >&2
-      exit 1
-    }
-    lockdir=$(mktemp -d)
-    install -d "$lockdir/home"
-    cp ${./main.tf} "$lockdir/main.tf"
-    cd "$lockdir"
-    unset GITHUB_TOKEN GH_TOKEN GITHUB_ENTERPRISE_TOKEN TF_ENCRYPTION SSH_PRIVATE_KEY
-    export HOME="$lockdir/home" TF_IN_AUTOMATION=1 OPENTOFU_ENFORCE_GPG_VALIDATION=true
-    echo 'S1_LOCK_GENERATOR: pinned tofu providers lock; registry origin; GPG validation required'
-    if ! tofu providers lock -platform=linux_amd64 registry.terraform.io/integrations/github >provider-lock.log 2>&1; then
-      sed -n '1,100p' provider-lock.log >&2
-      echo 'S1_LOCK_GENERATOR: FAILED; no generated lock committed' >&2
+    # Consume only Nix's hash-pinned, publisher-signed origin generator
+    # output. Never accept the former hand-seeded lock as equivalent.
+    if ! cmp -s ${signedLock} ${./.terraform.lock.hcl}; then
+      echo 'S1_GENERATED_LOCK_BEGIN'
+      cat ${signedLock}
+      echo 'S1_GENERATED_LOCK_END'
+      echo 'S1_LOCK_GENERATOR: generated signed lock differs from tracked source' >&2
       exit 1
     fi
-    # Public immutable provider digests and signer identifier only, no secrets.
-    sed -n '1,100p' provider-lock.log
-    echo 'S1_GENERATED_LOCK_BEGIN'
-    cat .terraform.lock.hcl
-    echo 'S1_GENERATED_LOCK_END'
-    if ! cmp -s .terraform.lock.hcl ${./.terraform.lock.hcl}; then
-      echo 'S1_LOCK_GENERATOR: generated lock differs from committed lock' >&2
-      exit 1
-    fi
-    echo 'S1_LOCK_GENERATOR: generated lock equals tracked source, GPG required'
+    echo 'S1_LOCK_GENERATOR: exact signed origin lock matches committed source'
     touch "$out"
   '';
 in {
