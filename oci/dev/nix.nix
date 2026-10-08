@@ -374,6 +374,9 @@ rec {
     identity = "/work/repos/.auth/roccho-dev/age/oci-dev.key";
   };
 
+  # Optional inference tools: local Ollama CPU runtime and Ollaya System One, no daemons.
+  ollaya = import ./ollaya.nix { inherit pkgs; };
+
   pi = import ./pi.nix {
     inherit pkgs;
     envsRemote = "https://github.com/roccho-org/envs";
@@ -391,6 +394,7 @@ rec {
         git
         cacert
         openssh
+        ollama-cpu
       ])
       ++ [
         ghWrapper
@@ -399,6 +403,7 @@ rec {
         jev.launch
         jev.ops
         pi.launcher
+        ollaya
       ];
     pathsToLink = [
       "/bin"
