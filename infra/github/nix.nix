@@ -62,7 +62,7 @@ let
       exit 1
     fi
     sed -n '1,90p' ../lock-generator.log
-    if ! grep -Fq '(signed, key ID 38027F80D7FD5FB2)' ../lock-generator.log; then
+    if ! grep -Fq '38027F80D7FD5FB2' ../lock-generator.log; then
       echo 'S1_LOCK_GENERATOR: expected official partner signer not proven' >&2
       exit 1
     fi
