@@ -108,11 +108,20 @@ tf_init() {
     -backend-config="unlock_address=$url" \
     -backend-config="lock_method=LOCK" \
     -backend-config="unlock_method=UNLOCK" \
-    >"$fx/init-$client.log" 2>&1
+    >"$fx/init-$client.log" 2>&1 || {
+    echo "synthetic tofu init failed for client-$client" >&2
+    sed -n '1,55p' "$fx/init-$client.log" >&2
+    return 1
+  }
+  echo "GIT_STATE_POC client-$client-init"
 }
 tf_init a "$url_a"
 tofu -chdir="$fx/a" apply -input=false -no-color -auto-approve \
-  >"$fx/apply-a.log" 2>&1
+  >"$fx/apply-a.log" 2>&1 || {
+  echo 'synthetic tofu initial apply failed' >&2
+  sed -n '1,55p' "$fx/apply-a.log" >&2
+  exit 1
+}
 tofu -chdir="$fx/a" state pull >"$fx/state-a.json"
 jq -e --arg v "$canary_a" \
   '[.resources[] | select(.type == "terraform_data") | .instances[].attributes.input] | any(. == $v)' \
