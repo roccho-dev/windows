@@ -133,7 +133,19 @@ jq -e --arg v "$canary_a" \
   '[.resources[] | select(.type == "terraform_data") | .instances[].attributes.input] | any(. == $v)' \
   "$fx/state-a.json" >/dev/null || {
   echo 'synthetic state missing its expected built-in terraform_data value' >&2
-  jq -c '{lineage, serial, resource_types: [.resources[]?.type]}' "$fx/state-a.json" >&2 || true
+  jq -c '{
+    resource_count: (.resources | length),
+    fixture: [.resources[] | select(.type == "terraform_data" and .name == "fixture") |
+      {mode, type, name, instance_count: (.instances | length),
+       schemas: [.instances[] | .attributes |
+         {attribute_names: keys,
+          input_kind: (.input | type),
+          input_keys: (if (.input | type) == "object" then (.input | keys) else [] end),
+          input_fields: (if (.input | type) == "object" then (.input | to_entries | map({key, kind: (.value | type)})) else [] end),
+          output_kind: (.output | type),
+          output_keys: (if (.output | type) == "object" then (.output | keys) else [] end),
+          output_fields: (if (.output | type) == "object" then (.output | to_entries | map({key, kind: (.value | type)})) else [] end)}]}]
+  }' "$fx/state-a.json" >&2 || true
   exit 1
 }
 echo 'GIT_STATE_POC client-a-resource-value-verified'
@@ -161,6 +173,9 @@ echo 'GIT_STATE_POC independent-restore-lineage-serial-plan'
 cat >"$fx/owner-lock.json" <<'EOF'
 {"ID":"finite-fixture-owned-lock","Operation":"OperationTypeApply","Who":"synthetic-client-a","Version":"fixture","Created":"2026-10-08T00:00:00Z","Path":"state.tfstate"}
 EOF
+cat >"$fx/challenger-lock.json" <<'EOF'
+{"ID":"finite-fixture-challenger-lock","Operation":"OperationTypeApply","Who":"synthetic-client-b","Version":"fixture","Created":"2026-10-08T00:00:00Z","Path":"state.tfstate"}
+EOF
 http_code() {
   local method=$1 url=$2 payload=$3
   curl --silent --max-time 15 --output "$fx/http-response" --write-out '%{http_code}' \
@@ -170,10 +185,12 @@ http_code() {
 test "$(http_code LOCK "$url_a" "$fx/owner-lock.json")" = 200
 lock_ref=refs/heads/locks/state.tfstate
 git --git-dir="$remote" show-ref --verify --quiet "$lock_ref"
+git --git-dir="$remote" show "$lock_ref:state.tfstate.lock" |
+  jq -e '.ID == "finite-fixture-owned-lock" and .Who == "synthetic-client-a"' >/dev/null
 main_at_lock=$(git --git-dir="$remote" rev-parse refs/heads/main)
 # Reject a second independent lock requester; a 500 due to upstream incompatibility
 # is NOT misreported as successful 409 semantics.
-code=$(http_code LOCK "$url_b" "$fx/owner-lock.json")
+code=$(http_code LOCK "$url_b" "$fx/challenger-lock.json")
 test "$code" = 409 || { echo "second backend failed to report conflict (HTTP $code)" >&2; exit 1; }
 if timeout 45s tofu -chdir="$fx/b" plan -input=false -no-color -lock-timeout=0s \
   >"$fx/lock-refusal.log" 2>&1; then
