@@ -122,10 +122,21 @@ tofu -chdir="$fx/a" apply -input=false -no-color -auto-approve \
   sed -n '1,55p' "$fx/apply-a.log" >&2
   exit 1
 }
-tofu -chdir="$fx/a" state pull >"$fx/state-a.json"
+echo 'GIT_STATE_POC client-a-apply-success'
+tofu -chdir="$fx/a" state pull >"$fx/state-a.json" 2>"$fx/state-pull-a.log" || {
+  echo 'synthetic state pull failed after apply' >&2
+  sed -n '1,45p' "$fx/state-pull-a.log" >&2
+  exit 1
+}
+echo 'GIT_STATE_POC client-a-state-pull-success'
 jq -e --arg v "$canary_a" \
   '[.resources[] | select(.type == "terraform_data") | .instances[].attributes.input] | any(. == $v)' \
-  "$fx/state-a.json" >/dev/null
+  "$fx/state-a.json" >/dev/null || {
+  echo 'synthetic state missing its expected built-in terraform_data value' >&2
+  jq -c '{lineage, serial, resource_types: [.resources[]?.type]}' "$fx/state-a.json" >&2 || true
+  exit 1
+}
+echo 'GIT_STATE_POC client-a-resource-value-verified'
 serial_a=$(jq -er '.serial' "$fx/state-a.json")
 lineage_a=$(jq -er '.lineage' "$fx/state-a.json")
 test -n "$lineage_a" && test "$serial_a" -gt 0
