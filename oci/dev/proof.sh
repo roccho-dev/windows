@@ -1060,6 +1060,9 @@ inside '
   test -x /nix/var/nix/profiles/windows-dev/bin/ollaya
   /nix/var/nix/profiles/windows-dev/bin/ollama --help >/dev/null
   /nix/var/nix/profiles/windows-dev/bin/ollaya --help >/dev/null
+  test "$OLLAMA_MODELS" = /work/repos/.models/ollama
+  test "$OLLAYA_MODELS" = /work/repos/.models/ollaya
+  test ! -e "$OLLAMA_MODELS" && test ! -e "$OLLAYA_MODELS"
   nix --version
   nix-store --verify --check-contents
 '
