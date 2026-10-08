@@ -237,7 +237,53 @@ if git --git-dir="$remote" show-ref --verify --quiet "$lock_ref"; then
 fi
 echo 'GIT_STATE_POC interruption-owned-unlock'
 
+# Standard Git pre-receive is fixture-only fault injection, not an owned
+# backend or a new lock protocol: accept lock refs but deny main state writes.
+save_ref_before=$(git --git-dir="$remote" rev-parse refs/heads/main)
+test ! -e "$remote/hooks/pre-receive" && test ! -L "$remote/hooks/pre-receive"
+cat >"$remote/hooks/pre-receive" <<EOF
+#!/bin/sh
+while read -r old new ref; do
+  if [ "\$ref" = refs/heads/main ]; then
+    printf '%s\n' denied-main > "$fx/denied-main-push"
+    echo 'synthetic Git main ref save denied' >&2
+    exit 1
+  fi
+done
+exit 0
+EOF
+chmod 700 "$remote/hooks/pre-receive"
 export TF_VAR_synthetic_value="$canary_b"
+if timeout 70s tofu -chdir="$fx/b" apply -input=false -no-color -auto-approve \
+  >"$fx/apply-rejected-save.log" 2>&1; then
+  echo 'synthetic remote rejected state save but tofu reported success' >&2
+  exit 1
+else
+  status=$?
+  test "$status" -ne 124 || { echo 'synthetic failed-save apply timed out' >&2; exit 1; }
+fi
+test -f "$fx/denied-main-push" && test "$(cat "$fx/denied-main-push")" = denied-main || {
+  echo 'failed apply did not reach standard Git main state push' >&2; exit 1
+}
+test "$(git --git-dir="$remote" rev-parse refs/heads/main)" = "$save_ref_before" || {
+  echo 'failed state save changed remote Git main' >&2; exit 1
+}
+if git --git-dir="$remote" show-ref --verify --quiet "$lock_ref"; then
+  echo 'failed state save left unresolved lock; standard-tool repair deferred' >&2; exit 1
+fi
+tofu -chdir="$fx/b" state pull >"$fx/state-save-rejected.json" 2>"$fx/rejected-pull.log" || {
+  echo 'failed save left state unreadable; repair deferred' >&2; exit 1
+}
+jq -e --arg l "$lineage_a" --argjson s "$serial_a" \
+  '.lineage == $l and .serial == $s' "$fx/state-save-rejected.json" >/dev/null
+fixture_matches "$fx/state-save-rejected.json" "$canary_a"
+# Delete only the exact fixture hook we created; never purge foreign entries.
+test -f "$remote/hooks/pre-receive"
+rm -- "$remote/hooks/pre-receive"
+test ! -e "$remote/hooks/pre-receive"
+echo 'GIT_STATE_POC denied-state-save-remote-preserved'
+
+# Retry using only the now-repaired standard Git storage backend.
 tofu -chdir="$fx/b" apply -input=false -no-color -auto-approve \
   >"$fx/apply-b.log" 2>&1
 tofu -chdir="$fx/b" state pull >"$fx/state-after.json"
@@ -254,8 +300,19 @@ if env -u TF_ENCRYPTION tofu -chdir="$fx/b" plan -input=false -no-color \
   echo 'tofu wrote a plan without required encryption' >&2; exit 1
 fi
 test ! -e "$fx/no-encryption.plan"
+# Exit status alone is not encryption proof; require a native encryption
+# diagnostic and exclude unrelated transport failures.
+if ! grep -Eiq '(encrypt|enforc)' "$fx/no-encryption.log"; then
+  echo 'missing native encryption was not the diagnosed refusal cause' >&2; exit 1
+fi
+if grep -Eiq '(connection refused|no route to host|dial tcp|HTTP 50[0-9])' "$fx/no-encryption.log"; then
+  echo 'network error cannot prove enforced encryption rejection' >&2; exit 1
+fi
 test "$(git --git-dir="$remote" rev-parse refs/heads/main)" = "$main_before"
-echo 'GIT_STATE_POC missing-encryption-refused'
+if git --git-dir="$remote" show-ref --verify --quiet "$lock_ref"; then
+  echo 'missing-encryption test left a Git lock' >&2; exit 1
+fi
+echo 'GIT_STATE_POC missing-encryption-diagnostic-and-ref-refusal'
 
 # All object blobs, including unreachable historical Git objects, must be free
 # of either synthetic state secret. Never print or hash real key material.
