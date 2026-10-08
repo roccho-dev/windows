@@ -5,6 +5,7 @@ let
   app = pkgs.writeShellScriptBin "github-root" ''
     set -euo pipefail
     umask 077
+    export PATH=${pkgs.lib.makeBinPath [ pkgs.opentofu pkgs.coreutils pkgs.python3 pkgs.jq pkgs.curl pkgs.git ]}:$PATH
     fail() { echo "github-root: $1" >&2; exit 64; }
     if [ "$#" = 1 ] && [ "$1" = --source-check ]; then
       echo 'github-root: source-only check, no backend or provider'
@@ -37,11 +38,16 @@ key_provider "pbkdf2" "github" {
 method "aes_gcm" "github" {
   keys = key_provider.pbkdf2.github
 }
-state { method = method.aes_gcm.github; enforced = true }
-plan { method = method.aes_gcm.github; enforced = true }
+state {
+  method = method.aes_gcm.github
+  enforced = true
+}
+plan {
+  method = method.aes_gcm.github
+  enforced = true
+}
 ENCRYPT
 )"
-    export PATH=${pkgs.lib.makeBinPath [ pkgs.opentofu pkgs.coreutils pkgs.python3 pkgs.jq pkgs.curl pkgs.git ]}:$PATH
     port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
     tmp=$(mktemp -d)
     pid=
