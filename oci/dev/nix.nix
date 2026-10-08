@@ -243,7 +243,7 @@ rec {
               import path from 'node:path';
             import crypto from 'node:crypto';
             import assert from 'node:assert/strict';
-              import { execFileSync } from 'node:child_process';
+              import { execFileSync, spawnSync } from 'node:child_process';
               import { pathToFileURL } from 'node:url';
               const [directory, sha, provenanceHash, proofHash] = process.argv.slice(2);
               const repository = 'roccho-org/ops';
@@ -256,7 +256,15 @@ rec {
                 finally { fs.closeSync(fd); }
                 return digest.digest('hex');
               };
-              const importArchive = p => {
+              const importArchive = (p, root) => {
+                const checked = spawnSync(store, ['--check-validity','--print-invalid',root],
+                  {env:{},encoding:'utf8',stdio:['ignore','pipe','pipe']});
+                require(checked.error === undefined && checked.signal === null && checked.status === 0 && checked.stderr === "");
+                if (checked.stdout === "") return;
+                require(checked.stdout === root+'\n');
+                let absent = false;
+                try { fs.lstatSync(root); } catch (error) { require(error.code === 'ENOENT'); absent = true; }
+                require(absent);
                 const fd = fs.openSync(p, 'r');
                 try { execFileSync(store, ['--import'], {env:{},stdio:[fd,'ignore','ignore']}); }
                 finally { fs.closeSync(fd); }
@@ -286,7 +294,7 @@ rec {
               require(new RegExp('^/nix/store/[0-9a-z]{32}-voice-ui-target-runtime$').test(p.deploy.root) && p.deploy.entry === p.deploy.root+'/bin/voice-ui-target-runtime');
                 require(p.deploy.locator === 'https://github.com/'+repository+'/releases/download/voice-ui-target-runtime-'+sha+'/voice-ui-target-runtime.nix-export');
                 require(file(exp+'.sha256').toString() === p.deploy.sha256+'  voice-ui-target-runtime.nix-export\n');
-                importArchive(exp);
+                importArchive(exp,p.deploy.root);
               stage='deploy_closure'; closure(p.deploy.root,p.deploy.closure);
               stage='deploy_configuration';
                 const runtime = p.deploy.root+'/share/voice-ui-target-runtime';
@@ -301,7 +309,7 @@ rec {
               const acceptance = path.join(directory,'voice-ui-acceptance-runtime.nix-export');
                 require(hash(acceptance) === a.sha256 && fs.statSync(acceptance).size === a.bytes);
               require(new RegExp('^/nix/store/[0-9a-z]{32}-voice-ui-acceptance-node$').test(a.root) && a.entry === a.root+'/bin/voice-ui-acceptance-node');
-                importArchive(acceptance);
+                importArchive(acceptance,a.root);
               stage='acceptance_closure'; closure(a.root,a.closure);
               stage='formal_entry';
                 require(fs.statSync(a.entry).mode & 0o111);

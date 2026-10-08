@@ -278,6 +278,31 @@ console.log('PASS formal canonical repository identity progression: valid never-
 JS
   for name in provenance.json merged-pr-proof.json voice-ui-target-runtime.nix-export voice-ui-target-runtime.nix-export.sha256; do plain "$fx/formal/deploy/$name"; done
   empty "$fx/formal/deploy"; empty "$fx/formal"
+  # Exercise the built formal importer's exact literal without Nix/store effects or target access.
+  "$node" --input-type=module - "$prod_launch" <<'JS'
+import fs from 'node:fs';import assert from 'node:assert/strict';
+const text=fs.readFileSync(process.argv[2],'utf8');
+const start=text.indexOf('const importArchive = '), end=text.indexOf('const json = ',start);
+assert(start>=0&&end>start);
+const literal=text.slice(start,end).trim();
+const root='/nix/store/'+ '0'.repeat(32)+'-voice-ui-target-runtime';
+const check=(name,reply,exists,expected,imports)=>{
+ let calls=0,closed=0;
+ const f={lstatSync(){if(exists)return {};throw Object.assign(Error('absent'),{code:'ENOENT'});},openSync(){calls++;return 7;},closeSync(){closed++;}};
+ const query=(bin,args,options)=>{assert.equal(bin,'fixed-store');assert.deepEqual(args,['--check-validity','--print-invalid',root]);assert.deepEqual(options.env,{});return reply;};
+ const exec=(bin,args)=>{assert.equal(bin,'fixed-store');assert.deepEqual(args,['--import']);};
+ const importer=Function('fs','store','execFileSync','spawnSync','require',literal+';return importArchive;')(f,'fixed-store',exec,query,value=>{if(!value)throw Error('formal_admission');});
+ if(expected==='PASS')importer('public-export',root);else assert.throws(()=>importer('public-export',root),/formal_admission/u,name);
+ assert.equal(calls,imports,name);assert.equal(closed,imports,name);
+};
+const good={status:0,signal:null,error:undefined,stdout:'',stderr:''};
+check('registered skips import',good,true,'PASS',0);
+check('positively absent imports once',{...good,stdout:root+'\n'},false,'PASS',1);
+check('invalid physical root refuses',{...good,stdout:root+'\n'},true,'RED',0);
+for(const [name,reply]of [['nonzero',{...good,status:1}],['signal',{...good,status:null,signal:'SIGTERM'}],['error',{...good,error:Error('query')}],['stderr',{...good,stderr:'query diagnostic'}],['unexpected output',{...good,stdout:'other\n'}],['missing newline',{...good,stdout:root}],['extra output',{...good,stdout:root+'\nextra\n'}]])
+ check(name,reply,false,'RED',0);
+console.log('PASS source-only formal importer: registered skip; explicit absent import; invalid physical root and all query uncertainty refuse without import; closure verification remains outside importer');
+JS
   # jev-age-init: refuses an unsafe parent and any overwrite, writes 0600, prints only the public recipient.
   local recipient other
   mkdir "$fx/age"
