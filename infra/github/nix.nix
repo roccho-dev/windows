@@ -125,7 +125,7 @@ let
       ($r.name == "windows") and
       ($r.instances | type == "array" and length == 1) and
       ($r.instances[0].attributes.id == "windows") and
-      ($r.instances[0].attributes.name == "windows"));
+      ($r.instances[0].attributes.name == "windows"))
   '';
   # Source is inert under CI: only --source-check runs without principals.
   # A future operational GO must prove existing native principal and custody.
