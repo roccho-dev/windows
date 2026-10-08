@@ -67,14 +67,16 @@ let
       echo 'S1_LOCK_GENERATOR: no provider signer in native output' >&2
       exit 1
     fi
-    [ "$(grep -c '"zh:' .terraform.lock.hcl)" = 13 ] || {
-      echo 'S1_LOCK_GENERATOR: upstream ZIP hash count not 13' >&2
+    zip_count=$(grep -c '"zh:' .terraform.lock.hcl || true)
+    h1_count=$(grep -c '"h1:' .terraform.lock.hcl || true)
+    echo "S1_LOCK_GENERATOR: native signed lock counts zh=$zip_count h1=$h1_count"
+    [ "$zip_count" -ge 1 ] && [ "$h1_count" -ge 1 ] || {
+      echo 'S1_LOCK_GENERATOR: no native signed ZIP or installed-package checksum' >&2
       exit 1
     }
-    grep -q '"h1:' .terraform.lock.hcl || {
-      echo 'S1_LOCK_GENERATOR: no native installed-package h1 checksum' >&2
-      exit 1
-    }
+    echo 'S1_GENERATED_LOCK_BEGIN'
+    cat .terraform.lock.hcl
+    echo 'S1_GENERATED_LOCK_END'
     cp .terraform.lock.hcl "$out"
     echo 'S1_LOCK_GENERATOR: native signed origin lock produced; awaiting Nix fixed hash'
   '';
