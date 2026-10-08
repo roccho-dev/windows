@@ -129,9 +129,24 @@ tofu -chdir="$fx/a" state pull >"$fx/state-a.json" 2>"$fx/state-pull-a.log" || {
   exit 1
 }
 echo 'GIT_STATE_POC client-a-state-pull-success'
-jq -e --arg v "$canary_a" \
-  '[.resources[] | select(.type == "terraform_data") | .instances[].attributes.input] | any(. == $v)' \
-  "$fx/state-a.json" >/dev/null || {
+# Exact observed native terraform_data DynamicPseudoType encoding is
+# {"type":"string","value":...}; require one managed fixture and both values.
+# Never log the value or its hashes. The same assertion is used on both clients.
+fixture_matches() {
+  local file=$1 expected=$2
+  jq -e --arg v "$expected" '
+    def packed_string($s):
+      type == "object" and (keys | sort) == ["type","value"]
+      and .type == "string" and (.value | type) == "string" and .value == $s;
+    (.resources | length) == 1 and
+    ([.resources[] | select(.mode == "managed" and .type == "terraform_data" and .name == "fixture")] | length) == 1 and
+    ([.resources[] | select(.mode == "managed" and .type == "terraform_data" and .name == "fixture") | .instances[]] | length) == 1 and
+    (.resources[0].instances[0].attributes |
+      (.input | packed_string($v)) and
+      (.output | packed_string($v)) and .input == .output)
+  ' "$file" >/dev/null
+}
+fixture_matches "$fx/state-a.json" "$canary_a" || {
   echo 'synthetic state missing its expected built-in terraform_data value' >&2
   jq -c '{
     resource_count: (.resources | length),
@@ -158,10 +173,9 @@ echo 'GIT_STATE_POC clean-init-apply-encrypted-git-save'
 # Second clean working directory and second independent backend process.
 tf_init b "$url_b"
 tofu -chdir="$fx/b" state pull >"$fx/state-b.json"
-jq -e --arg s "$serial_a" --arg l "$lineage_a" --arg v "$canary_a" \
-  '(.serial | tostring) == $s and .lineage == $l and
-   ([.resources[] | select(.type == "terraform_data") | .instances[].attributes.input] | any(. == $v))' \
+jq -e --arg s "$serial_a" --arg l "$lineage_a" '(.serial | tostring) == $s and .lineage == $l' \
   "$fx/state-b.json" >/dev/null
+fixture_matches "$fx/state-b.json" "$canary_a"
 tofu -chdir="$fx/b" plan -input=false -no-color -out="$fx/plan.encrypted" \
   >"$fx/plan-b.log" 2>&1
 test -s "$fx/plan.encrypted"
@@ -227,10 +241,9 @@ export TF_VAR_synthetic_value="$canary_b"
 tofu -chdir="$fx/b" apply -input=false -no-color -auto-approve \
   >"$fx/apply-b.log" 2>&1
 tofu -chdir="$fx/b" state pull >"$fx/state-after.json"
-jq -e --arg v "$canary_b" --arg l "$lineage_a" --argjson s "$serial_a" \
-  '.lineage == $l and .serial > $s and
-   ([.resources[] | select(.type == "terraform_data") | .instances[].attributes.input] | any(. == $v))' \
-  "$fx/state-after.json" >/dev/null
+jq -e --arg l "$lineage_a" --argjson s "$serial_a" \
+  '.lineage == $l and .serial > $s' "$fx/state-after.json" >/dev/null
+fixture_matches "$fx/state-after.json" "$canary_b"
 echo 'GIT_STATE_POC post-interruption-save-no-overwrite'
 
 # With the native encryption environment missing, the source-enforced state/plan
