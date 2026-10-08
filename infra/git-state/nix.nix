@@ -16,11 +16,14 @@ let
       --library-path ${pkgs.glibc}/lib \
       ${gitBackendElf}/bin/terraform-backend-git-elf "$@"
   '';
-in
-pkgs.runCommand "git-state-finite-poc" {
+in {
+  # The actual pinned upstream executable is independent of the synthetic check.
+  backend = gitBackend;
+  fixture = pkgs.runCommand "git-state-finite-poc" {
   nativeBuildInputs = with pkgs; [
     bash coreutils curl git gnugrep jq openssh opentofu python3
   ];
 } ''
   bash ${./proof.sh} ${./main.tf} ${gitBackend}/bin/terraform-backend-git "$out"
-''
+'';
+}
