@@ -75,7 +75,7 @@ start_backend() {
     >"$fx/backend-$which.log" 2>&1 &
   local pid=$!
   pids+=("$pid")
-  if [ "$which" = a ]; then pid_a=$pid; else pid_b=$pid; fi
+  if [ "$which" = a ]; then pid_a=$pid; elif [ "$which" = b ]; then pid_b=$pid; fi
   local url code round
   url=$(state_url "$port")
   for round in $(seq 1 70); do
@@ -271,22 +271,41 @@ test "$(git --git-dir="$remote" rev-parse refs/heads/main)" = "$save_ref_before"
 if git --git-dir="$remote" show-ref --verify --quiet "$lock_ref"; then
   echo 'failed state save left unresolved lock; standard-tool repair deferred' >&2; exit 1
 fi
-tofu -chdir="$fx/b" state pull >"$fx/state-save-rejected.json" 2>"$fx/rejected-pull.log" || {
-  echo 'failed save left state unreadable; repair deferred' >&2; exit 1
-}
-jq -e --arg l "$lineage_a" --argjson s "$serial_a" \
-  '.lineage == $l and .serial == $s' "$fx/state-save-rejected.json" >/dev/null
-fixture_matches "$fx/state-save-rejected.json" "$canary_a"
-# Delete only the exact fixture hook we created; never purge foreign entries.
+# Distinguish failed in-memory backend cache from remote recoverability.
+if tofu -chdir="$fx/b" state pull >"$fx/state-save-rejected.json" 2>"$fx/rejected-pull.log"; then
+  jq -e --arg l "$lineage_a" --argjson s "$serial_a" \
+    '.lineage == $l and .serial == $s' "$fx/state-save-rejected.json" >/dev/null
+  fixture_matches "$fx/state-save-rejected.json" "$canary_a"
+  echo 'GIT_STATE_POC original-process-read-after-denied-save-ok'
+else
+  echo 'GIT_STATE_POC original-process-read-after-denied-save-failed'
+fi
+# Remove only the known synthetic standard Git fault hook.
 test -f "$remote/hooks/pre-receive"
 rm -- "$remote/hooks/pre-receive"
 test ! -e "$remote/hooks/pre-receive"
-echo 'GIT_STATE_POC denied-state-save-remote-preserved'
 
-# Retry using only the now-repaired standard Git storage backend.
-tofu -chdir="$fx/b" apply -input=false -no-color -auto-approve \
+# Independent fresh process and client recover the persisted Git state.
+mkdir -p "$fx/c" "$fx/tmp-c"
+cp "$main_tf" "$fx/c/main.tf"
+port_c=$(port_free)
+test "$port_c" != "$port_a" && test "$port_c" != "$port_b"
+start_backend c "$port_c"
+url_c=$(state_url "$port_c")
+tf_init c "$url_c"
+tofu -chdir="$fx/c" state pull >"$fx/state-recovered.json" 2>"$fx/recovery-pull.log" || {
+  echo 'independent clean process could not recover persisted state' >&2; exit 1
+}
+jq -e --arg l "$lineage_a" --argjson s "$serial_a" \
+  '.lineage == $l and .serial == $s' "$fx/state-recovered.json" >/dev/null
+fixture_matches "$fx/state-recovered.json" "$canary_a"
+test "$(git --git-dir="$remote" rev-parse refs/heads/main)" = "$save_ref_before"
+echo 'GIT_STATE_POC denied-state-save-independent-process-restore'
+
+# Retry only through the ordinary repaired backend with this fresh client.
+tofu -chdir="$fx/c" apply -input=false -no-color -auto-approve \
   >"$fx/apply-b.log" 2>&1
-tofu -chdir="$fx/b" state pull >"$fx/state-after.json"
+tofu -chdir="$fx/c" state pull >"$fx/state-after.json"
 jq -e --arg l "$lineage_a" --argjson s "$serial_a" \
   '.lineage == $l and .serial > $s' "$fx/state-after.json" >/dev/null
 fixture_matches "$fx/state-after.json" "$canary_b"
@@ -295,7 +314,7 @@ echo 'GIT_STATE_POC post-interruption-save-no-overwrite'
 # With the native encryption environment missing, the source-enforced state/plan
 # encryption must fail closed; no additional Git commit or plaintext plan file.
 main_before=$(git --git-dir="$remote" rev-parse refs/heads/main)
-if env -u TF_ENCRYPTION tofu -chdir="$fx/b" plan -input=false -no-color \
+if env -u TF_ENCRYPTION tofu -chdir="$fx/c" plan -input=false -no-color \
   -out="$fx/no-encryption.plan" >"$fx/no-encryption.log" 2>&1; then
   echo 'tofu wrote a plan without required encryption' >&2; exit 1
 fi
