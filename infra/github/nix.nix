@@ -170,6 +170,35 @@ PLAN
     reject '.resource_changes[0].change.after_sensitive.token = true'
     reject '.resource_changes[0].deposed = "old-object"'
     reject '.checks = [{"status":"unknown"}]'
+    # S1 source dependency only. The pinned OpenTofu executable itself
+    # performs registry-origin signed checksums and writes the actual lock.
+    # No provider init/import/plan/apply, no GitHub API or state ref access.
+    [ "$(tofu version -json | jq -r .terraform_version)" = 1.12.4 ] || {
+      echo 'github-root: pinned OpenTofu 1.12.4 unavailable' >&2
+      exit 1
+    }
+    lockdir=$(mktemp -d)
+    install -d "$lockdir/home"
+    cp ${./main.tf} "$lockdir/main.tf"
+    cd "$lockdir"
+    unset GITHUB_TOKEN GH_TOKEN GITHUB_ENTERPRISE_TOKEN TF_ENCRYPTION SSH_PRIVATE_KEY
+    export HOME="$lockdir/home" TF_IN_AUTOMATION=1 OPENTOFU_ENFORCE_GPG_VALIDATION=true
+    echo 'S1_LOCK_GENERATOR: pinned tofu providers lock; registry origin; GPG validation required'
+    if ! tofu providers lock -platform=linux_amd64 registry.terraform.io/integrations/github >provider-lock.log 2>&1; then
+      sed -n '1,100p' provider-lock.log >&2
+      echo 'S1_LOCK_GENERATOR: FAILED; no generated lock committed' >&2
+      exit 1
+    fi
+    # Public immutable provider digests and signer identifier only, no secrets.
+    sed -n '1,100p' provider-lock.log
+    echo 'S1_GENERATED_LOCK_BEGIN'
+    cat .terraform.lock.hcl
+    echo 'S1_GENERATED_LOCK_END'
+    if ! cmp -s .terraform.lock.hcl ${./.terraform.lock.hcl}; then
+      echo 'S1_LOCK_GENERATOR: generated lock differs from committed lock' >&2
+      exit 1
+    fi
+    echo 'S1_LOCK_GENERATOR: generated lock equals tracked source, GPG required'
     touch "$out"
   '';
 in {
