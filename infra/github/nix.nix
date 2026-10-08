@@ -33,7 +33,7 @@ let
         ($c.before as $before |
          $c.after as $after |
          ([($before | keys[]), ($after | keys[])] | unique |
-          all(.[]; . == "description" or $before[.] == $after[.])))));
+          all(.[]; . == "description" or $before[.] == $after[.])))))
   '';
   # Source is inert under CI: only --source-check runs without principals.
   # A future operational GO must prove existing native principal and custody.
