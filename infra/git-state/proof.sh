@@ -313,7 +313,58 @@ echo 'GIT_STATE_POC post-interruption-save-no-overwrite'
 
 # With the native encryption environment missing, the source-enforced state/plan
 # encryption must fail closed; no additional Git commit or plaintext plan file.
+# Distinguish standard-tool errors without printing any unfiltered diagnostic,
+# passphrase, state, canary or their hashes to public CI logs.
+classify_native_error() {
+  local log=$1 spec label pattern seen=0
+  printf 'GIT_STATE_POC native-error-classes:'
+  for spec in 'crypto|encrypt|enforc|decrypt|cryptographic' \
+              'state-format|state snapshot|state format|state file' \
+              'backend|backend initialization|backend configuration' \
+              'lock|lock (acquisition|state|info)' \
+              'transport|connection refused|no route to host|dial tcp|HTTP 50[0-9]' \
+              'variables|variable|no value for required'; do
+    label=${spec%%|*}
+    pattern=${spec#*|}
+    if grep -Eiq "$pattern" "$log"; then
+      printf ' %s' "$label"
+      seen=1
+    fi
+  done
+  if [ "$seen" -eq 0 ]; then printf ' unknown'; fi
+  printf '\n'
+}
 main_before=$(git --git-dir="$remote" rev-parse refs/heads/main)
+# A third clean directory has no cached .terraform state. The same main.tf
+# successfully initialized with TF_ENCRYPTION for client C above; withholding
+# only the environment method must now yield a native encryption diagnosis.
+mkdir -p "$fx/omit-env"
+cp "$main_tf" "$fx/omit-env/main.tf"
+if env -u TF_ENCRYPTION tofu -chdir="$fx/omit-env" init -input=false -no-color -reconfigure \
+  -backend-config="address=$url_c" \
+  -backend-config="lock_address=$url_c" \
+  -backend-config="unlock_address=$url_c" \
+  -backend-config="lock_method=LOCK" \
+  -backend-config="unlock_method=UNLOCK" \
+  >"$fx/omit-env-init.log" 2>&1; then
+  echo 'clean backend init accepted missing enforced encryption' >&2
+  exit 1
+fi
+if ! grep -Eiq '(encrypt|enforc|decrypt)' "$fx/omit-env-init.log"; then
+  classify_native_error "$fx/omit-env-init.log" >&2
+  echo 'clean native init failed for a reason other than enforced encryption' >&2
+  exit 1
+fi
+if grep -Eiq '(connection refused|no route to host|dial tcp|HTTP 50[0-9])' "$fx/omit-env-init.log"; then
+  echo 'transport failure cannot prove enforced encryption during clean init' >&2
+  exit 1
+fi
+test "$(git --git-dir="$remote" rev-parse refs/heads/main)" = "$main_before"
+if git --git-dir="$remote" show-ref --verify --quiet "$lock_ref"; then
+  echo 'clean missing-environment init left a Git lock' >&2
+  exit 1
+fi
+echo 'GIT_STATE_POC clean-native-missing-encryption-enforced-refusal'
 if env -u TF_ENCRYPTION tofu -chdir="$fx/c" plan -input=false -no-color \
   -out="$fx/no-encryption.plan" >"$fx/no-encryption.log" 2>&1; then
   echo 'tofu wrote a plan without required encryption' >&2; exit 1
@@ -322,6 +373,7 @@ test ! -e "$fx/no-encryption.plan"
 # Exit status alone is not encryption proof; require a native encryption
 # diagnostic and exclude unrelated transport failures.
 if ! grep -Eiq '(encrypt|enforc)' "$fx/no-encryption.log"; then
+  classify_native_error "$fx/no-encryption.log" >&2
   echo 'missing native encryption was not the diagnosed refusal cause' >&2; exit 1
 fi
 if grep -Eiq '(connection refused|no route to host|dial tcp|HTTP 50[0-9])' "$fx/no-encryption.log"; then
