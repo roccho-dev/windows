@@ -42,9 +42,8 @@ let
     nativeBuildInputs = [ pkgs.opentofu pkgs.jq pkgs.gnugrep ];
     outputHashAlgo = "sha256";
     outputHashMode = "flat";
-    # Discovery only: deliberately mismatches until actual upstream signed
-    # output is produced by pinned tofu and its digest is read back from CI.
-    outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    # Pinned from the publisher-signed native origin lock output in CI 37786506387.
+    outputHash = "sha256-IBsjPz1jHdA4COlZfFZPqnGXDKVVSuGFJsNWj+3Rft0=";
   } ''
     set -eu
     [ "$(tofu version -json | jq -r .terraform_version)" = 1.12.4 ] || {
@@ -63,8 +62,8 @@ let
       exit 1
     fi
     sed -n '1,90p' ../lock-generator.log
-    if ! grep -Eiq 'signed|signature|key ID' ../lock-generator.log; then
-      echo 'S1_LOCK_GENERATOR: no provider signer in native output' >&2
+    if ! grep -Fq '(signed, key ID 38027F80D7FD5FB2)' ../lock-generator.log; then
+      echo 'S1_LOCK_GENERATOR: expected official partner signer not proven' >&2
       exit 1
     fi
     zip_count=$(grep -c '"zh:' .terraform.lock.hcl || true)

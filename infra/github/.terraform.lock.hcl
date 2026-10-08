@@ -1,10 +1,11 @@
-# Official GitHub Provider 6.13.0 ZIP hashes from release SHA256SUMS.
-# Native "tofu providers lock" signature/shape verification is still pending;
-# source seed is not a claim that providers were downloaded or executed.
+# This file is maintained automatically by "tofu init".
+# Manual edits may be lost in future updates.
+
 provider "registry.terraform.io/integrations/github" {
   version     = "6.13.0"
-  constraints = "= 6.13.0"
+  constraints = "6.13.0"
   hashes = [
+    "h1:2kD+4leuV8tBBXv+EPeehmfW6cDhIzVki61OXsGCtRI=",
     "zh:0ab29fc21699f34345cf0bbbe44745fd1b143b7c73b410c1dc4abe05ffad0a84",
     "zh:1aed10d06755d420bb3a893bf548ab2932297a9d094c04c5a8501e949ca186ed",
     "zh:2a6a11c21eae408055f45b9533c07afd2e845f6d496fd1b645aec2e873012103",
@@ -18,5 +19,6 @@ provider "registry.terraform.io/integrations/github" {
     "zh:e739a0b7e81ca816944a18a38e679f4015edf8be7ac319815cdea865ba7727d7",
     "zh:ec099487ea3de8999c84b3b791e242d728461e51fe344832b37bd8d521201c77",
     "zh:f016ff9e2daab5b88185cec0795213049d105439ffd585d3309a714514ccae13",
+    "zh:fbd1fee2c9df3aa19cf8851ce134dea6e45ea01cb85695c1726670c285797e25",
   ]
 }
