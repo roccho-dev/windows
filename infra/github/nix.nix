@@ -34,6 +34,7 @@ let
          $c.after as $after |
          ([($before | keys[]), ($after | keys[])] | unique |
           all(.[]; . == "description" or $before[.] == $after[.])))));
+  '';
   # Source is inert under CI: only --source-check runs without principals.
   # A future operational GO must prove existing native principal and custody.
   app = pkgs.writeShellScriptBin "github-root" ''
@@ -51,7 +52,9 @@ let
       fail 'native provider and Git principals not bound'
     # Native GitHub provider token stays shell-private outside OpenTofu.
     provider_token=$GITHUB_TOKEN
+    export -n provider_token
     unset GITHUB_TOKEN GH_TOKEN GITHUB_ENTERPRISE_TOKEN TF_ENCRYPTION
+    unset secret encryption_config
     [ "$(id -u)" = 0 ] &&
       [ "$PWD" = /work/repos/windows ] &&
       [ -f infra/github/main.tf ] ||
