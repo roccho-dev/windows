@@ -523,6 +523,7 @@
       };
       checks.${system} = {
         windows-dist = common.check;
+        git-state-finite-poc = import ./infra/git-state/nix.nix { inherit pkgs; };
         # The alternate Binding through the production projection (hosts/common/nix.nix) and the existing pack.py
         # validators: its own values only, none of the sample's, and no distribution or image is built.
         own-alt-binding = pkgs.runCommand "own-alt-binding-check" {
