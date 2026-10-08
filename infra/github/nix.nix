@@ -13,12 +13,15 @@ let
     fi
     [ "$#" = 1 ] && [ "$1" = plan ] ||
       fail 'plan-only; import/apply requires separate operational GO'
+    [ -n "''${GITHUB_TOKEN:-}" ] && [ -n "''${SSH_PRIVATE_KEY:-}" ] ||
+      fail 'native provider and Git principals not bound'
+    # Native GitHub provider token stays shell-private outside OpenTofu.
+    provider_token=$GITHUB_TOKEN
+    unset GITHUB_TOKEN GH_TOKEN GITHUB_ENTERPRISE_TOKEN TF_ENCRYPTION
     [ "$(id -u)" = 0 ] &&
       [ "$PWD" = /work/repos/windows ] &&
       [ -f infra/github/main.tf ] ||
       fail 'selected OCIdev UID0 and /work/repos/windows not established'
-    [ -n "''${GITHUB_TOKEN:-}" ] && [ -n "''${SSH_PRIVATE_KEY:-}" ] ||
-      fail 'native provider and Git principals not bound'
     [ -f "$SSH_PRIVATE_KEY" ] && [ ! -L "$SSH_PRIVATE_KEY" ] ||
       fail 'native Git principal file unavailable'
     dir=/work/repos/.auth/roccho-dev/opentofu
@@ -30,7 +33,7 @@ let
       fail 'dedicated UID0 0700/0600 custody not proven'
     # Raw key is read through stdin only; never argv, public log or Windows file.
     secret=$(jq -Rs . < "$key")
-    export TF_ENCRYPTION="$(cat <<ENCRYPT
+    encryption_config="$(cat <<ENCRYPT
 key_provider "pbkdf2" "github" {
   passphrase = $secret
   iterations = 200000
@@ -48,6 +51,7 @@ plan {
 }
 ENCRYPT
 )"
+    unset secret
     port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
     tmp=$(mktemp -d)
     pid=
@@ -60,7 +64,7 @@ ENCRYPT
       rmdir -- "$tmp" 2>/dev/null || true
     }
     trap cleanup EXIT
-    ${backend}/bin/terraform-backend-git --address "127.0.0.1:$port" >"$tmp/backend.log" 2>&1 &
+    env -u GITHUB_TOKEN -u GH_TOKEN -u GITHUB_ENTERPRISE_TOKEN -u TF_ENCRYPTION ${backend}/bin/terraform-backend-git --address "127.0.0.1:$port" >"$tmp/backend.log" 2>&1 &
     pid=$!
     url="http://127.0.0.1:$port/?type=git&repository=git%40github.com%3Aroccho-dev%2Fwindows.git&ref=tofu-state&state=state%2Fgithub-windows.json"
     ready=0
@@ -71,17 +75,17 @@ ENCRYPT
       sleep 0.2
     done
     [ "$ready" = 1 ] || fail 'transient loopback backend not ready'
-    if ! tofu -chdir=/work/repos/windows/infra/github init -input=false -reconfigure -lockfile=readonly \
+    if ! TF_ENCRYPTION="$encryption_config" GITHUB_TOKEN="$provider_token" tofu -chdir=/work/repos/windows/infra/github init -input=false -reconfigure -lockfile=readonly \
       -backend-config="address=$url" -backend-config="lock_address=$url" \
       -backend-config="unlock_address=$url" -backend-config="lock_method=LOCK" \
       -backend-config="unlock_method=UNLOCK" >"$tmp/init.log" 2>&1; then
       fail 'standard native init rejected; no fallback'
     fi
-    if ! tofu -chdir=/work/repos/windows/infra/github plan -input=false -out="$tmp/plan" >"$tmp/plan.log" 2>&1; then
+    if ! TF_ENCRYPTION="$encryption_config" GITHUB_TOKEN="$provider_token" tofu -chdir=/work/repos/windows/infra/github plan -input=false -out="$tmp/plan" >"$tmp/plan.log" 2>&1; then
       fail 'standard native plan rejected; no apply'
     fi
     # A plan cannot authorize its own effect. Reject every outside-F delta.
-    if ! tofu -chdir=/work/repos/windows/infra/github show -json "$tmp/plan" |
+    if ! TF_ENCRYPTION="$encryption_config" tofu -chdir=/work/repos/windows/infra/github show -json "$tmp/plan" |
       jq -e '
         (.resource_changes // []) as $r |
         ($r | length == 1) and
@@ -105,6 +109,13 @@ ENCRYPT
     bash -n ${app}/bin/github-root
     ${app}/bin/github-root --source-check >source-check.log
     grep -qF 'source-only check, no backend or provider' source-check.log
+    grep -qF 'unset GITHUB_TOKEN GH_TOKEN GITHUB_ENTERPRISE_TOKEN TF_ENCRYPTION' ${app}/bin/github-root
+    grep -qF 'env -u GITHUB_TOKEN -u GH_TOKEN -u GITHUB_ENTERPRISE_TOKEN -u TF_ENCRYPTION' ${app}/bin/github-root
+    grep -qF 'TF_ENCRYPTION="$encryption_config" GITHUB_TOKEN="$provider_token" tofu' ${app}/bin/github-root
+    if grep -qF 'export TF_ENCRYPTION=' ${app}/bin/github-root; then
+      echo 'github-root: broad secret export' >&2
+      exit 1
+    fi
     grep -qF 'zh:5dd05dee677f6ebdbed00cbb1b9be444ab2d1062d345cbc9ec50a47cb41b8622' ${./.terraform.lock.hcl}
     touch "$out"
   '';
