@@ -449,6 +449,9 @@ rec {
       Env = [
         "HOME=/home/dev"
         "USER=root"
+        # Model blobs persist in the existing work volume; home and image are disposable.
+        "OLLAMA_MODELS=/work/repos/.models/ollama"
+        "OLLAYA_MODELS=/work/repos/.models/ollaya"
         "NIX_REMOTE=local"
         "PATH=/nix/var/nix/profiles/windows-dev/bin:/bin"
         "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
