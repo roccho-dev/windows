@@ -7,6 +7,7 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
+      gitState = import ./infra/git-state/nix.nix { inherit pkgs; };
       ownSpec = builtins.fromJSON (builtins.readFile ./hosts/own/spec.json);
       # The target's declared owner names own's stable gh helper (rent keeps the default); each repository's principal
       # is the one its own binding declares (hosts/profile/gh.nix).
@@ -516,6 +517,7 @@
         ci-alt-owner-gh = let alt = import ./hosts/profile/gh.nix { inherit pkgs; inherit (ciAltBinding) owner; }; in
           pkgs.buildEnv { name = "ci-alt-owner-gh"; paths = [ alt.wrapper alt.helper ]; pathsToLink = [ "/bin" ]; };
         ci-alt-own-binding = pkgs.writeText "ci-alt-own-binding.json" (builtins.toJSON ciAltBinding);
+        git-state-backend = gitState.backend;
         dev-profile = dev.profile;
         dev-image = dev.image;
         common-fonts = common.fonts;
@@ -523,7 +525,7 @@
       };
       checks.${system} = {
         windows-dist = common.check;
-        git-state-finite-poc = import ./infra/git-state/nix.nix { inherit pkgs; };
+        git-state-finite-poc = gitState.fixture;
         # The alternate Binding through the production projection (hosts/common/nix.nix) and the existing pack.py
         # validators: its own values only, none of the sample's, and no distribution or image is built.
         own-alt-binding = pkgs.runCommand "own-alt-binding-check" {
