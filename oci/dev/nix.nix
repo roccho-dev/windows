@@ -259,8 +259,8 @@ rec {
               const importArchive = (p, root) => {
                 const checked = spawnSync(store, ['--check-validity','--print-invalid',root],
                   {env:{},encoding:'utf8',stdio:['ignore','pipe','pipe']});
-                require(checked.error === undefined && checked.signal === null && checked.status === 0 && checked.stderr === '');
-                if (checked.stdout === '') return;
+                require(checked.error === undefined && checked.signal === null && checked.status === 0 && checked.stderr === "");
+                if (checked.stdout === "") return;
                 require(checked.stdout === root+'\n');
                 let absent = false;
                 try { fs.lstatSync(root); } catch (error) { require(error.code === 'ENOENT'); absent = true; }
