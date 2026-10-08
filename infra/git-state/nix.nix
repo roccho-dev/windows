@@ -10,6 +10,11 @@ let
     };
   } ''
     install -Dm755 "$src" "$out/bin/terraform-backend-git"
+    # Upstream's CGO-enabled release expects the host /lib64 ELF interpreter.
+    # Preserve its verified source digest; adapt only the ELF loader to locked Nix libc.
+    "${pkgs.patchelf}/bin/patchelf" \
+      --set-interpreter "$(cat ${pkgs.stdenv.cc}/nix-support/dynamic-linker)" \
+      --set-rpath "${pkgs.glibc}/lib" "$out/bin/terraform-backend-git"
   '';
 in
 pkgs.runCommand "git-state-finite-poc" {
