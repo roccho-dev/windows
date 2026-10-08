@@ -79,7 +79,11 @@ start_backend() {
   local url code round
   url=$(state_url "$port")
   for round in $(seq 1 70); do
-    if ! kill -0 "$pid" 2>/dev/null; then echo "backend-$which terminated during startup" >&2; return 1; fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "backend-$which terminated during startup" >&2
+      sed -n '1,35p' "$fx/backend-$which.log" >&2
+      return 1
+    fi
     code=$(curl --silent --max-time 2 -o "$fx/ready-$which" -w '%{http_code}' "$url") || code=000
     if [ "$code" = 204 ] || [ "$code" = 200 ]; then return 0; fi
     sleep 0.2
