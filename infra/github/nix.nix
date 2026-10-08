@@ -79,6 +79,53 @@ let
     cp .terraform.lock.hcl "$out"
     echo 'S1_LOCK_GENERATOR: native signed origin lock produced; awaiting Nix fixed hash'
   '';
+  # Separate ABSENT-state admission; normal planGuard still rejects imports.
+  adoptionGuard = pkgs.writeText "github-root-adoption-guard.jq" ''
+    def no_unknown:
+      if type == "object" then all(.[]; no_unknown)
+      elif type == "array" then all(.[]; no_unknown)
+      else . == false or . == null
+      end;
+    (.format_version | type == "string" and startswith("1.")) and
+    ((.resource_drift // []) | type == "array" and length == 0) and
+    ((.output_changes // {}) | type == "object" and length == 0) and
+    ((.checks // []) | type == "array" and all(.[]; .status == "pass")) and
+    (.resource_changes | type == "array" and length == 1) and
+    (.resource_changes[0] as $r |
+      ($r.address == "github_repository.windows") and
+      ($r.mode == "managed") and
+      ($r.type == "github_repository") and
+      ($r.name == "windows") and
+      ($r | has("deposed") | not) and
+      ($r | has("previous_address") | not) and
+      ($r.change as $c |
+        ($c.actions == ["no-op"] or $c.actions == ["update"]) and
+        ($c.importing == {"id":"windows"}) and
+        ($c.before | type == "object") and
+        ($c.after | type == "object") and
+        ($c.before.id == "windows") and
+        ($c.after.id == "windows") and
+        ($c.before.name == "windows" and $c.after.name == "windows") and
+        (($c.after_unknown // {}) | no_unknown) and
+        (($c.before_sensitive // {}) | no_unknown) and
+        (($c.after_sensitive // {}) | no_unknown) and
+        ($c.before as $before |
+         $c.after as $after |
+         ([($before | keys[]), ($after | keys[])] | unique |
+          all(.[]; . == "description" or $before[.] == $after[.])))))
+  '';
+  # Readback verifies only the existing repository and native state identity.
+  receiptGuard = pkgs.writeText "github-root-adoption-receipt.jq" ''
+    (.lineage | type == "string" and length > 0) and
+    (.serial | type == "number" and . >= 1) and
+    (.resources | type == "array" and length == 1) and
+    (.resources[0] as $r |
+      ($r.mode == "managed") and
+      ($r.type == "github_repository") and
+      ($r.name == "windows") and
+      ($r.instances | type == "array" and length == 1) and
+      ($r.instances[0].attributes.id == "windows") and
+      ($r.instances[0].attributes.name == "windows"));
   # Source is inert under CI: only --source-check runs without principals.
   # A future operational GO must prove existing native principal and custody.
   app = pkgs.writeShellScriptBin "github-root" ''
@@ -90,8 +137,11 @@ let
       echo 'github-root: source-only check, no backend or provider'
       exit 0
     fi
-    [ "$#" = 1 ] && [ "$1" = plan ] ||
-      fail 'plan-only; import/apply requires separate operational GO'
+    [ "$#" = 1 ] || fail 'usage: github-root plan|adopt; separate operational GO required'
+    case "$1" in
+      plan|adopt) mode=$1 ;;
+      *) fail 'only named plan/adopt modes; no generic apply/import route' ;;
+    esac
     [ -n "''${GITHUB_TOKEN:-}" ] && [ -n "''${SSH_PRIVATE_KEY:-}" ] ||
       fail 'native provider and Git principals not bound'
     # Native GitHub provider token stays shell-private outside OpenTofu.
@@ -141,7 +191,7 @@ ENCRYPT
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
       fi
-      rm -f -- "$tmp/backend.log" "$tmp/init.log" "$tmp/plan.log" "$tmp/plan"
+      rm -f -- "$tmp/backend.log" "$tmp/init.log" "$tmp/plan.log" "$tmp/plan" "$tmp/apply.log" "$tmp/readback.log"
       rmdir -- "$tmp" 2>/dev/null || true
     }
     trap cleanup EXIT
@@ -165,13 +215,32 @@ ENCRYPT
     if ! TF_ENCRYPTION="$encryption_config" GITHUB_TOKEN="$provider_token" tofu -chdir=/work/repos/windows/infra/github plan -input=false -out="$tmp/plan" >"$tmp/plan.log" 2>&1; then
       fail 'standard native plan rejected; no apply'
     fi
-    # A plan is evidence, not an effect grant. Unknowns, drift, import and
-    # outside-F changes refuse; later V8 requires independent world readback.
+    # The existing plan mode remains read-only and rejects all importing.
+    # A separately authorized G operator can later invoke adopt only after
+    # I/B/K/G principal, inventory, custody, exclusive owner and review gates.
+    guard=${planGuard}
+    [ "$mode" = adopt ] && guard=${adoptionGuard}
     if ! TF_ENCRYPTION="$encryption_config" tofu -chdir=/work/repos/windows/infra/github show -json "$tmp/plan" |
-      jq -e -f ${planGuard} >/dev/null; then
-      fail 'unknown, drift, import or non-description plan; no apply'
+      jq -e -f "$guard" >/dev/null; then
+      fail 'native plan not admissible for this mode; no apply'
     fi
-    echo 'github-root: bounded native plan only; no apply'
+    if [ "$mode" = plan ]; then
+      echo 'github-root: bounded native plan only; no apply'
+      exit 0
+    fi
+    # Only the ONE reviewed, saved import plan: never auto-approve or replan.
+    if ! TF_ENCRYPTION="$encryption_config" GITHUB_TOKEN="$provider_token" \
+      tofu -chdir=/work/repos/windows/infra/github apply -input=false -no-color "$tmp/plan" \
+      >"$tmp/apply.log" 2>&1; then
+      fail 'native saved-plan adoption failed; reconcile UNKNOWN before retry'
+    fi
+    # State readback stays in an in-memory pipe, never a plaintext file/log.
+    if ! TF_ENCRYPTION="$encryption_config" GITHUB_TOKEN="$provider_token" \
+      tofu -chdir=/work/repos/windows/infra/github state pull 2>"$tmp/readback.log" |
+      jq -e -f ${receiptGuard} >/dev/null; then
+      fail 'native adoption receipt not proven; reconcile UNKNOWN'
+    fi
+    echo 'github-root: native existing-repository adoption receipt verified'
   '';
   # No provider download/init, external Git ref or secret read in this check.
   check = pkgs.runCommand "github-root-source-check" {
@@ -214,6 +283,40 @@ PLAN
     reject '.resource_changes[0].change.after_sensitive.token = true'
     reject '.resource_changes[0].deposed = "old-object"'
     reject '.checks = [{"status":"unknown"}]'
+    # Source-only import tests. The real backend/provider/apply is never run.
+    jq '.resource_changes[0].change.importing = {"id":"windows"} |
+        .resource_changes[0].change.before.id = "windows" |
+        .resource_changes[0].change.after.id = "windows"' plan.json >adopt.json
+    jq -e -f ${adoptionGuard} adopt.json >/dev/null
+    if jq -e -f ${planGuard} adopt.json >/dev/null; then
+      echo 'github-root: normal plan incorrectly admitted import' >&2; exit 1
+    fi
+    reject_adopt() {
+      if jq "$1" adopt.json | jq -e -f ${adoptionGuard} >/dev/null; then
+        echo 'github-root: unsafe synthetic adoption admitted' >&2; exit 1
+      fi
+    }
+    reject_adopt 'del(.resource_changes[0].change.importing)'
+    reject_adopt '.resource_changes[0].change.importing.id = "other"'
+    reject_adopt '.resource_changes[0].change.importing.extra = "other"'
+    reject_adopt '.resource_changes[0].change.actions = ["create"]'
+    reject_adopt '.resource_changes[0].change.actions = ["delete","create"]'
+    reject_adopt '.resource_changes[0].change.before.id = "other"'
+    reject_adopt '.resource_changes[0].change.after.name = "another"'
+    reject_adopt '.resource_changes[0].change.after.homepage = "unexpected"'
+    reject_adopt '.resource_changes[0].change.after_unknown.homepage = true'
+    reject_adopt '.resource_drift = [{"address":"github_repository.windows"}]'
+    reject_adopt '.output_changes = {"out":{"change":{"actions":["create"]}}}'
+    reject_adopt '.resource_changes += [.resource_changes[0]]'
+    cat >receipt.json <<'RECEIPT'
+{"lineage":"synthetic","serial":2,"resources":[{"mode":"managed","type":"github_repository","name":"windows","instances":[{"attributes":{"id":"windows","name":"windows"}}]}]}
+RECEIPT
+    jq -e -f ${receiptGuard} receipt.json >/dev/null
+    if jq '.resources[0].instances[0].attributes.id = "unrelated"' receipt.json |
+      jq -e -f ${receiptGuard} >/dev/null; then
+      echo 'github-root: wrong-state receipt accepted' >&2; exit 1
+    fi
+    echo 'github-root-source: guarded existing-repository adoption fixtures passed'
     # Consume only Nix's hash-pinned, publisher-signed origin generator
     # output. Never accept the former hand-seeded lock as equivalent.
     if ! cmp -s ${signedLock} ${./.terraform.lock.hcl}; then
