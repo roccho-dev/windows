@@ -533,7 +533,7 @@
       };
       checks.${system} = {
         release-watch = pkgs.runCommand "release-watch-check" {
-          nativeBuildInputs = [ pkgs.nodejs_22 ];
+          nativeBuildInputs = [ pkgs.nodejs_22 pkgs.git ];
           expected = builtins.toJSON releaseVersions;
           source = ./infra/release-watch;
           registry = ./hosts/profile/releases.json;
