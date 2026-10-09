@@ -209,6 +209,41 @@ for (const tool of tools) {
 }
 console.log('PASS compiled public Git CA: pinned bundle, empty helper, caller CA overridden only in Git subprocess, four refusal controls per tool; fixture only, no TLS/Auth/Jev claim');
 JS
+  # One public certificate constant joins the closed child environment; no caller SSL settings.
+  "$node" --input-type=module - "$ca" "$prod_launch" "$prod_ops" <<'JS'
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+const [ca, ...tools] = process.argv.slice(2);
+for (const tool of tools) {
+  const text = fs.readFileSync(tool, 'utf8');
+  const start = text.indexOf('exec "$cu/env" -i PATH="$cu" HOME=/homeless-shelter LANG=C.UTF-8 ');
+  assert(start >= 0);
+  const boundary = text.slice(start);
+  const match = boundary.match(/^exec "\$cu\/env" -i PATH="\$cu" HOME=\/homeless-shelter LANG=C[.]UTF-8 SSL_CERT_FILE=([^\s]+) /);
+  assert(match); assert.equal(match[1], ca);
+  assert(!boundary.includes('NODE_EXTRA_CA_CERTS=') && !boundary.includes('SSL_CERT_DIR='));
+  for (const bad of [boundary.replace('SSL_CERT_FILE=' + ca + ' ', ''), boundary.replace(ca, '/caller-ca')])
+    assert.throws(() => { const m = bad.match(/^exec "\$cu\/env" -i PATH="\$cu" HOME=\/homeless-shelter LANG=C[.]UTF-8 SSL_CERT_FILE=([^\s]+) /); assert(m); assert.equal(m[1], ca); });
+  const node = process.execPath, bash = text.split('\n')[0].slice(2);
+  const probe = 'console.log(JSON.stringify({names:Object.keys(process.env).sort(),ca:process.env.SSL_CERT_FILE,key:process.env.JEV_API_KEY,extra:process.env.NODE_EXTRA_CA_CERTS??null,dir:process.env.SSL_CERT_DIR??null}));';
+  const q = s => "'" + s.replaceAll("'", "'\\''") + "'";
+  const prefix = 'cu=' + q('/nix/store/cp7wjv1pl4wapfk48svvizxd089v9h0a-coreutils-9.11/bin') +
+    '\nprogram=' + q(node) + '\nprogram_args=(--input-type=module -e ' + q(probe) + ')\nkey=public-fixture-not-a-real-key\nport=23001\nhost=127.0.0.1\n';
+  const result = spawnSync(bash, ['-c', prefix + boundary], {
+    env: { SSL_CERT_FILE: '/caller-ca', NODE_EXTRA_CA_CERTS: '/caller-extra', SSL_CERT_DIR: '/caller-dir', FOREIGN: 'public-fixture' },
+    encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  assert.equal(result.status, 0); assert.equal(result.signal, null); assert.equal(result.stderr, '');
+  const actual = JSON.parse(result.stdout);
+  const names = ['HOME', 'JEV_API_KEY', 'LANG', 'PATH', 'SSL_CERT_FILE'];
+  if (boundary.includes('PORT="$port"')) names.push('PORT', 'HOST');
+  assert.deepEqual(actual.names, names.sort());
+  assert.equal(actual.ca, ca); assert.equal(actual.key, 'public-fixture-not-a-real-key');
+  assert.equal(actual.extra, null); assert.equal(actual.dir, null);
+}
+console.log('PASS compiled child public CA: closed names, one fixed certificate file, caller SSL ignored, FD3 synthetic key unchanged; fixture only, no Auth/Jev/TLS claim');
+JS
   # Formal rejection must precede identity, ciphertext, network and child access.
   # The supplied C tuple's real positive case is a separate final-operand proof.
   local formal_code=0 formal_out
@@ -482,7 +517,7 @@ NIX
   local args=(--envs-sha "$good" --apps-sha "$apps_good" --port "$port")
 
   launch_as pass "${args[@]}"
-  test "$(head -n 1 "$marker")" = "names HOME HOST JEV_API_KEY LANG PATH PORT "
+  test "$(head -n 1 "$marker")" = "names HOME HOST JEV_API_KEY LANG PATH PORT SSL_CERT_FILE "
   grep -qx 'host 127.0.0.1' "$marker"
   grep -qx 'core 0' "$marker"
   grep -qx 'home /homeless-shelter absent' "$marker"
@@ -492,7 +527,7 @@ NIX
   test "$(grep -n 'voice-ui-jev-dev: built ' "$out" | cut -d: -f1)" -lt "$(grep -n 'voice-ui-jev-dev: decrypt ' "$out" | cut -d: -f1)"
   # An explicit --host alone chooses the listen address, in any position; the hostile HOST above never does.
   launch_as pass --host 0.0.0.0 "${args[@]}"
-  test "$(head -n 1 "$marker")" = "names HOME HOST JEV_API_KEY LANG PATH PORT "
+  test "$(head -n 1 "$marker")" = "names HOME HOST JEV_API_KEY LANG PATH PORT SSL_CERT_FILE "
   grep -qx 'host 0.0.0.0' "$marker"
   grep -qx 'argv clean' "$marker"
   grep -qF "on 0.0.0.0:$port with" "$out"
@@ -558,7 +593,7 @@ NIX
   local ops_args=(--envs-sha "$good" --ops-sha "$ops_good") digest
   digest=$(printf %s "$key" | sha256sum | cut -d' ' -f1)
   ops_as pass "$request" "${ops_args[@]}"
-  test "$(cat "$ops_out")" = "{\"names\":\"HOME JEV_API_KEY LANG PATH \",\"home\":\"/homeless-shelter absent\",\"core\":\"0\",\"key\":\"$digest\",\"request\":\"$(printf %s "$request" | sha256sum | cut -d' ' -f1)\",\"argv\":\"clean\"}"
+  test "$(cat "$ops_out")" = "{\"names\":\"HOME JEV_API_KEY LANG PATH SSL_CERT_FILE \",\"home\":\"/homeless-shelter absent\",\"core\":\"0\",\"key\":\"$digest\",\"request\":\"$(printf %s "$request" | sha256sum | cut -d' ' -f1)\",\"argv\":\"clean\"}"
   only_stdio "$ops_fds"
   test "$(grep -n 'ops-jev: built ' "$ops_err" | cut -d: -f1)" -lt "$(grep -n 'ops-jev: decrypt ' "$ops_err" | cut -d: -f1)"
   ops_as pass "$request" --ops-sha "$ops_good" --envs-sha "$good"
@@ -641,7 +676,7 @@ NIX
   echo 'PASS formal admission: absent operand refused before identity/cipher/network/child; classifier owner-only true, empty/CI-only/mixed/product false;'
   echo 'PASS jev tools (fixtures): production profile has only the three bounded tools and exact constants; same source;'
   echo 'PASS jev launch: closed child environment, loopback unless --host 0.0.0.0 is explicit, no core, absent HOME, only stdio descriptors, no temp left after any launch, key never in argv or output, build before decrypt;'
-  echo 'PASS ops-jev: caller stdin is the request, one stdout JSON line, exit status passed through, launcher messages on stderr only, PATH HOME LANG JEV_API_KEY only, only stdio descriptors, build before decrypt, RED on arguments/stale/off/unbuildable/unknown/identity;'
+  echo 'PASS ops-jev: caller stdin is the request, one stdout JSON line, exit status passed through, launcher messages on stderr only, PATH HOME LANG SSL_CERT_FILE JEV_API_KEY only, only stdio descriptors, build before decrypt, RED on arguments/stale/off/unbuildable/unknown/identity;'
   echo 'PASS jev scratch: removed file by file before the child, never recursively; unexpected entries and types kept and refused;'
   echo 'PASS jev fixtures: Git-verified objects and known files removed, foreign entries kept and refused; no fixture or test identity left;'
   echo 'PASS jev RED: arguments, host, stale/off/unknown envs commit, unbuildable apps, identity mode/missing/other, tamper, two recipients, extra field, absent'
