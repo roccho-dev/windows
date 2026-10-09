@@ -1,0 +1,132 @@
+name: source completion blob materialization
+
+on:
+  pull_request:
+    branches: [proposals]
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'proposal/cli-release-watch-20261009'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+      - name: Materialize exact accepted-path source blobs without moving a ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          python - <<'PY'
+          import base64, json, os, pathlib, urllib.request
+
+          root = pathlib.Path('.')
+
+          def replace_exact(path, old, new, count):
+              file = root / path
+              text = file.read_text()
+              found = text.count(old)
+              if found != count:
+                  raise SystemExit(f'{path}: expected {count} exact matches, found {found}')
+              file.write_text(text.replace(old, new))
+
+          replace_exact(
+              '.github/workflows/own-image.yml',
+              'test "$(codex --version)" = "codex-cli 0.157.1"',
+              'test "$(codex --version)" = "codex-cli $(release-version codex)"',
+              2,
+          )
+          replace_exact(
+              '.github/workflows/own-image.yml',
+              'test "$(claude --version)" = "2.1.283 (Claude Code)"',
+              'test "$(claude --version)" = "$(release-version claude) (Claude Code)"',
+              2,
+          )
+          replace_exact(
+              '.github/workflows/rent-image.yml',
+              """test "$("${ssh_cmd[@]}" codex --version)" = 'codex-cli 0.157.1'""",
+              """test "$("${ssh_cmd[@]}" codex --version)" = "codex-cli $("${ssh_cmd[@]}" release-version codex)"""",
+              1,
+          )
+          replace_exact(
+              '.github/workflows/rent-image.yml',
+              """test "$("${ssh_cmd[@]}" claude --version)" = '2.1.283 (Claude Code)'""",
+              """test "$("${ssh_cmd[@]}" claude --version)" = "$("${ssh_cmd[@]}" release-version claude) (Claude Code)"""",
+              1,
+          )
+          replace_exact(
+              'flake.nix',
+              '      rentProfile = rentProfileFor [];\n      # CI only, never published:',
+              '      rentProfile = rentProfileFor [];\n      releaseVersions = rentProfile.releaseVersions;\n      # CI only, never published:',
+              1,
+          )
+          replace_exact(
+              'flake.nix',
+              "    in {\n      packages.${system} = {",
+              "    in {\n      inherit releaseVersions;\n      packages.${system} = {",
+              1,
+          )
+          replace_exact(
+              'flake.nix',
+              '        rent-image = mkRent { profile = rentProfile; tag = "nix"; };',
+              '        rent-image = mkRent { profile = rentProfile; tag = "nix"; };\n        release-profile = rentProfile;',
+              1,
+          )
+          release_check = (
+              '      checks.${system} = {\n'
+              '        release-watch = pkgs.runCommand "release-watch-check" {\n'
+              '          nativeBuildInputs = [ pkgs.nodejs_22 ];\n'
+              '          expected = builtins.toJSON releaseVersions;\n'
+              "        } ''\n"
+              '          set -eu\n'
+              '          node ${./infra/release-watch/watch.test.mjs}\n'
+              '          test "$(node ${./infra/release-watch/watch.mjs} validate ${./hosts/profile/releases.json})" = "$expected"\n'
+              '          touch $out\n'
+              "        '';\n"
+              '        windows-dist = common.check;'
+          )
+          replace_exact(
+              'flake.nix',
+              '      checks.${system} = {\n        windows-dist = common.check;',
+              release_check,
+              1,
+          )
+
+          token = os.environ['GH_TOKEN']
+          repository = os.environ['REPOSITORY']
+          for path in ('flake.nix', '.github/workflows/own-image.yml', '.github/workflows/rent-image.yml'):
+              content = (root / path).read_bytes()
+              payload = json.dumps({'content': base64.b64encode(content).decode(), 'encoding': 'base64'}).encode()
+              request = urllib.request.Request(
+                  f'https://api.github.com/repos/{repository}/git/blobs',
+                  data=payload,
+                  method='POST',
+                  headers={
+                      'Accept': 'application/vnd.github+json',
+                      'Authorization': f'Bearer {token}',
+                      'Content-Type': 'application/json',
+                      'X-GitHub-Api-Version': '2022-11-28',
+                  },
+              )
+              with urllib.request.urlopen(request) as response:
+                  sha = json.load(response)['sha']
+              print(f'RELEASE_WATCH_BLOB {path} {sha}')
+          PY
+          git diff --check
+          node --test infra/release-watch/watch.test.mjs
+          versions=$(nix eval --json .#releaseVersions --no-write-lock-file)
+          test "$versions" = '{"claude":"2.1.283","codex":"0.157.1"}'
+          echo "releaseVersions=$versions" >> "$GITHUB_STEP_SUMMARY"
+          git diff --stat >> "$GITHUB_STEP_SUMMARY"
+          git diff -- .github/workflows/own-image.yml .github/workflows/rent-image.yml flake.nix >> "$GITHUB_STEP_SUMMARY"
