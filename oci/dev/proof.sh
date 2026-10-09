@@ -169,6 +169,46 @@ try {
 } finally { process.stderr.write=write; }
 console.log('PASS fixed built-tool upstream limit: boundary0, concurrent12, 13th0, redirect:error, transparent response');
 JS
+  # The bootstrap Git subprocess has its own locked public CA, not the caller profile.
+  local ca
+  ca=$("${nx[@]}" eval --impure --raw --expr "($pkgs).cacert")/etc/ssl/certs/ca-bundle.crt
+  "$node" --input-type=module - "$ca" "$prod_launch" "$prod_ops" <<'JS'
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+const [ca, ...tools] = process.argv.slice(2);
+assert.match(ca, /^\/nix\/store\/[0-9a-z]{32}-nss-cacert-[^/]+\/etc\/ssl\/certs\/ca-bundle[.]crt$/);
+assert(fs.lstatSync(ca).isFile());
+const pattern = /^GIT_SSL_CAINFO=([^ ]+) GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=\/dev\/null GIT_TERMINAL_PROMPT=0 (\/nix\/store\/[^ ]+\/bin\/git) -c credential[.]helper= "\$@" < \/dev\/null$/;
+let negative = 0;
+for (const tool of tools) {
+  const text = fs.readFileSync(tool, 'utf8');
+  const found = [...text.matchAll(/git_\(\) \{\n([^\n]+)\n\s*\}/g)];
+  assert.equal(found.length, 1);
+  const line = found[0][1].trim();
+  const validate = value => { const match = value.match(pattern); assert(match); assert.equal(match[1], ca); return match; };
+  const match = validate(line);
+  for (const bad of [
+    line.replace(/^GIT_SSL_CAINFO=[^ ]+ /, ''),
+    line.replace(/^GIT_SSL_CAINFO=[^ ]+/, 'GIT_SSL_CAINFO=/caller-ca'),
+    'GIT_SSL_CAINFO=/caller-ca ' + line,
+    line.replace('credential.helper=', 'credential.helper=other'),
+  ]) { assert.throws(() => validate(bad)); negative++; }
+  const bash = text.split('\n')[0].slice(2);
+  assert.match(bash, /^\/nix\/store\/[^/]+\/bin\/bash$/);
+  const fixture = 'fixture_git() { printf "%s\\n" "$GIT_SSL_CAINFO|$GIT_CONFIG_NOSYSTEM|$GIT_CONFIG_GLOBAL|$GIT_TERMINAL_PROMPT" "$*"; }\n';
+  const body = found[0][0].replace(match[2], 'fixture_git');
+  const result = spawnSync(bash, ['-c', fixture + body + '\ngit_ fixture-public\nprintf "%s\\n" "$GIT_SSL_CAINFO|$GIT_CONFIG_NOSYSTEM|$GIT_CONFIG_GLOBAL|$GIT_TERMINAL_PROMPT"'], {
+    env: { GIT_SSL_CAINFO: '/caller-ca', GIT_CONFIG_NOSYSTEM: '0', GIT_CONFIG_GLOBAL: '/caller-config', GIT_TERMINAL_PROMPT: '1' },
+    encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  assert.equal(result.status, 0); assert.equal(result.signal, null); assert.equal(result.stderr, '');
+  assert.deepEqual(result.stdout.trim().split('\n'), [
+    ca + '|1|/dev/null|0', '-c credential.helper= fixture-public', '/caller-ca|0|/caller-config|1',
+  ]);
+}
+console.log('PASS compiled public Git CA: pinned bundle, empty helper, caller CA overridden only in Git subprocess, four refusal controls per tool; fixture only, no TLS/Auth/Jev claim');
+JS
   # Formal rejection must precede identity, ciphertext, network and child access.
   # The supplied C tuple's real positive case is a separate final-operand proof.
   local formal_code=0 formal_out

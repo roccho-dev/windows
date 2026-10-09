@@ -63,7 +63,7 @@ rec {
                   echo "${name}: $*" >&${say}
                 }
                 git_() {
-                  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 ${pkgs.git}/bin/git -c credential.helper= "$@" < /dev/null
+                  GIT_SSL_CAINFO=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 ${pkgs.git}/bin/git -c credential.helper= "$@" < /dev/null
                 }
                 nix_() {
                   ${pkgs.nix}/bin/nix --extra-experimental-features 'nix-command flakes' "$@" < /dev/null
