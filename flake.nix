@@ -535,10 +535,15 @@
         release-watch = pkgs.runCommand "release-watch-check" {
           nativeBuildInputs = [ pkgs.nodejs_22 ];
           expected = builtins.toJSON releaseVersions;
+          source = ./infra/release-watch;
+          registry = ./hosts/profile/releases.json;
         } ''
           set -eu
-          node ${./infra/release-watch/watch.test.mjs}
-          test "$(node ${./infra/release-watch/watch.mjs} validate ${./hosts/profile/releases.json})" = "$expected"
+          cp -R "$source" release-watch
+          chmod -R u+w release-watch
+          cd release-watch
+          node --test watch.test.mjs
+          test "$(node watch.mjs validate "$registry")" = "$expected"
           touch $out
         '';
         windows-dist = common.check;

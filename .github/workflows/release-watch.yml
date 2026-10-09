@@ -1,91 +1,41 @@
-name: release watch check fix materialization
+name: release watch
 
 on:
-  pull_request:
-    branches: [proposals]
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-watch
+  cancel-in-progress: false
 
 jobs:
-  materialize:
-    if: >-
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.head_ref == 'proposal/cli-release-watch-20261009'
+  propose:
+    if: github.ref == 'refs/heads/proposals'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
+          fetch-depth: 0
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
-      - name: Close release-watch check source directory
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+      - name: Verify pure contract and canonical versions
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-          python - <<'PY'
-          import base64, json, os, pathlib, urllib.request
-
-          path = pathlib.Path('flake.nix')
-          text = path.read_text()
-          old = '''        release-watch = pkgs.runCommand "release-watch-check" {
-                    nativeBuildInputs = [ pkgs.nodejs_22 ];
-                    expected = builtins.toJSON releaseVersions;
-                  } ''
-                    set -eu
-                    node ${./infra/release-watch/watch.test.mjs}
-                    test "$(node ${./infra/release-watch/watch.mjs} validate ${./hosts/profile/releases.json})" = "$expected"
-                    touch $out
-                  '';
-          '''
-          new = '''        release-watch = pkgs.runCommand "release-watch-check" {
-                    nativeBuildInputs = [ pkgs.nodejs_22 ];
-                    expected = builtins.toJSON releaseVersions;
-                    source = ./infra/release-watch;
-                    registry = ./hosts/profile/releases.json;
-                  } ''
-                    set -eu
-                    cp -R "$source" release-watch
-                    chmod -R u+w release-watch
-                    cd release-watch
-                    node --test watch.test.mjs
-                    test "$(node watch.mjs validate "$registry")" = "$expected"
-                    touch $out
-                  '';
-          '''
-          count = text.count(old)
-          if count != 1:
-              raise SystemExit(f'flake.nix: expected one release-watch check block, found {count}')
-          path.write_text(text.replace(old, new))
-
-          token = os.environ['GH_TOKEN']
-          repository = os.environ['REPOSITORY']
-          content = path.read_bytes()
-          payload = json.dumps({'content': base64.b64encode(content).decode(), 'encoding': 'base64'}).encode()
-          request = urllib.request.Request(
-              f'https://api.github.com/repos/{repository}/git/blobs',
-              data=payload,
-              method='POST',
-              headers={
-                  'Accept': 'application/vnd.github+json',
-                  'Authorization': f'Bearer {token}',
-                  'Content-Type': 'application/json',
-                  'X-GitHub-Api-Version': '2022-11-28',
-              },
-          )
-          with urllib.request.urlopen(request) as response:
-              sha = json.load(response)['sha']
-          print(f'RELEASE_WATCH_FIX_BLOB flake.nix {sha}')
-          PY
-          git diff --check
           node --test infra/release-watch/watch.test.mjs
-          nix build .#checks.x86_64-linux.release-watch --no-write-lock-file --print-build-logs
-          versions=$(nix eval --json .#releaseVersions --no-write-lock-file)
-          test "$versions" = '{"claude":"2.1.283","codex":"0.157.1"}'
-          echo "releaseVersions=$versions" >> "$GITHUB_STEP_SUMMARY"
-          git diff -- flake.nix >> "$GITHUB_STEP_SUMMARY"
+          watcher=$(node infra/release-watch/watch.mjs validate hosts/profile/releases.json)
+          nix_versions=$(nix eval --json .#releaseVersions --no-write-lock-file)
+          test "$watcher" = "$nix_versions"
+          printf 'source %s\nreleaseVersions %s\n' "$(git rev-parse HEAD)" "$nix_versions" >> "$GITHUB_STEP_SUMMARY"
+      - name: Resolve official stable releases and maintain one draft PR per CLI
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          node infra/release-watch/watch.mjs propose hosts/profile/releases.json | tee -a "$GITHUB_STEP_SUMMARY"
