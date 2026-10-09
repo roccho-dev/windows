@@ -260,6 +260,23 @@ jobs:
           plain() { if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then echo "kept unexpected entry $1" >&2; return 1; fi; rm -f -- "$1"; }
           trap 'status=$?; [ "$status" -eq 0 ] || docker logs own-smoke 2>&1 | tail -n 40 || true; docker rm -f own-smoke own-hold >/dev/null 2>&1 || true; docker volume rm own-smoke-home own-smoke-work own-smoke-nix own-smoke-empty own-smoke-foreign own-smoke-mig-home own-smoke-mig-work own-smoke-mig-nix own-smoke-rp-home own-smoke-rp-work own-smoke-rp-nix >/dev/null 2>&1 || true; for f in "${d_files[@]}"; do plain "$d/$f" || exit 1; done; rmdir -- "$d" || { echo "kept $d: unexpected entries" >&2; exit 1; }' EXIT
           fail() { echo "FAIL $*" >&2; exit 1; }
+          resolve_comparison_base() {
+            local source first
+            if [ -n "$BASE" ]; then
+              [[ $BASE =~ ^[0-9a-f]{40}$ ]] || fail 'malformed comparison base'
+              git cat-file -e "$BASE^{commit}" 2>/dev/null || fail 'comparison base unreadable'
+              return
+            fi
+            [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || fail 'no comparison base for the legacy migration'
+            [[ $GITHUB_SHA =~ ^[0-9a-f]{40}$ ]] || fail 'manual comparison source malformed'
+            source=$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || fail 'manual comparison source unreadable'
+            test "$source" = "$GITHUB_SHA" || fail 'manual comparison source moved'
+            first=$(git rev-parse --verify "$source^1^{commit}" 2>/dev/null) || fail 'manual comparison base absent or unreadable'
+            test "$(git rev-parse "$source^1")" = "$first" || fail 'manual comparison first parent differs'
+            git merge-base --is-ancestor "$first" "$source" || fail 'manual comparison base is not an ancestor'
+            BASE=$first
+          }
+          resolve_comparison_base
           ssh-keygen -q -t ed25519 -N '' -f "$d/key"
           for v in home work nix empty foreign; do docker volume create "own-smoke-$v" >/dev/null; done
           nixm() { echo "type=volume,source=$1,target=/nix,volume-nocopy"; }
