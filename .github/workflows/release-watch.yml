@@ -56,13 +56,13 @@ jobs:
           replace_exact(
               '.github/workflows/rent-image.yml',
               """test "$("${ssh_cmd[@]}" codex --version)" = 'codex-cli 0.157.1'""",
-              """test "$("${ssh_cmd[@]}" codex --version)" = "codex-cli $("${ssh_cmd[@]}" release-version codex)"""",
+              '''test "$("${ssh_cmd[@]}" codex --version)" = "codex-cli $("${ssh_cmd[@]}" release-version codex)"''',
               1,
           )
           replace_exact(
               '.github/workflows/rent-image.yml',
               """test "$("${ssh_cmd[@]}" claude --version)" = '2.1.283 (Claude Code)'""",
-              """test "$("${ssh_cmd[@]}" claude --version)" = "$("${ssh_cmd[@]}" release-version claude) (Claude Code)"""",
+              '''test "$("${ssh_cmd[@]}" claude --version)" = "$("${ssh_cmd[@]}" release-version claude) (Claude Code)"''',
               1,
           )
           replace_exact(
