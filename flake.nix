@@ -486,6 +486,7 @@
       rentExtras = with pkgs; [ python313 uv ];
       rentProfileFor = extra: import ./hosts/profile/nix.nix { inherit pkgs; extra = rentExtras ++ extra; };
       rentProfile = rentProfileFor [];
+      releaseVersions = rentProfile.releaseVersions;
       # CI only, never published: stands in for cloudflared under the exact argv rent-start uses, so local SSH, state
       # and #8 continuity can run without Cloudflare. A synthetic token proves nothing about Cloudflare itself.
       rentTunnelStub = pkgs.writeShellScriptBin "cloudflared" ''
@@ -497,6 +498,7 @@
         wait $!
       '';
     in {
+      inherit releaseVersions;
       packages.${system} = {
         own-image = own.image;
         # CI only, never published: the same own definition plus one profile package, to prove seed-on-upgrade.
@@ -505,6 +507,7 @@
           tag = "next";
         }).image;
         rent-image = mkRent { profile = rentProfile; tag = "nix"; };
+        release-profile = rentProfile;
         # CI only, never published: the published definition with the tunnel stub, for local SSH/state/#8 proofs.
         rent-image-stub = mkRent { profile = rentProfile; tag = "stub"; tunnel = rentTunnelStub; };
         # CI only, never published: the stub image plus one package, to prove seed-on-upgrade and rollback.
@@ -529,6 +532,20 @@
         program = "${githubRoot.app}/bin/github-root";
       };
       checks.${system} = {
+        release-watch = pkgs.runCommand "release-watch-check" {
+          nativeBuildInputs = [ pkgs.nodejs_22 pkgs.git ];
+          expected = builtins.toJSON releaseVersions;
+          source = ./infra/release-watch;
+          registry = ./hosts/profile/releases.json;
+        } ''
+          set -eu
+          cp -R "$source" release-watch
+          chmod -R u+w release-watch
+          cd release-watch
+          node --test watch.test.mjs
+          test "$(node watch.mjs validate "$registry")" = "$expected"
+          touch $out
+        '';
         windows-dist = common.check;
         git-state-finite-poc = gitState.fixture;
         github-root-source = githubRoot.check;

@@ -1,10 +1,22 @@
-{ pkgs }:
+{ pkgs, definition }:
 
+assert builtins.isAttrs definition;
+assert builtins.isAttrs definition.contract;
+assert builtins.isAttrs definition.contract.proof;
+assert builtins.isAttrs definition.pin;
+assert definition.contract.sourceKind == "github-release";
+assert definition.contract.channel == "stable";
+assert definition.contract.versionScheme == "semver";
+assert definition.contract.platform == "x86_64-unknown-linux-musl";
+assert definition.contract.verifyKind == "sigstore-bundle";
+assert definition.contract.proof.kind == "sigstore-bundle";
+assert definition.contract.packageShape == "codex-musl-tar";
 let
-  version = "0.157.1";
+  inherit (definition) contract pin;
+  inherit (pin) version contentHash;
   archive = pkgs.fetchurl {
-    url = "https://github.com/openai/codex/releases/download/rust-v${version}/codex-package-x86_64-unknown-linux-musl.tar.gz";
-    sha256 = "0e211868c9fd73cb49ad35ac675b5eafdf6b9f453df8a493df980c59a590fe5f";
+    url = "https://github.com/${contract.officialSource}/releases/download/rust-v${version}/${contract.assetSelector}";
+    sha256 = contentHash;
   };
 in
 pkgs.runCommand "codex-cli-${version}" {

@@ -1,0 +1,108 @@
+name: release watch
+
+on:
+  pull_request:
+    branches: [proposals]
+    paths:
+      - hosts/profile/releases.json
+      - hosts/profile/nix.nix
+      - hosts/own/codex.nix
+      - infra/release-watch/watch.mjs
+      - infra/release-watch/watch.test.mjs
+      - .github/workflows/release-watch.yml
+      - flake.nix
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: release-watch-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+      - name: Build locked proof tools
+        id: tools
+        run: |
+          set -euo pipefail
+          tools=$(nix build --impure --no-link --print-out-paths --expr '
+            let
+              flake = builtins.getFlake (toString ./.);
+              pkgs = flake.inputs.nixpkgs.legacyPackages.x86_64-linux;
+            in pkgs.buildEnv {
+              name = "release-proof-tools";
+              paths = [ pkgs.cosign pkgs.gnupg ];
+            }
+          ')
+          test -x "$tools/bin/cosign"
+          test -x "$tools/bin/gpg"
+          echo "cosign=$tools/bin/cosign" >> "$GITHUB_OUTPUT"
+          echo "gpg=$tools/bin/gpg" >> "$GITHUB_OUTPUT"
+      - name: Verify contract, protocol and actual official selected bytes
+        env:
+          RELEASE_WATCH_COSIGN: ${{ steps.tools.outputs.cosign }}
+          RELEASE_WATCH_GPG: ${{ steps.tools.outputs.gpg }}
+        run: |
+          set -euo pipefail
+          node --test infra/release-watch/watch.test.mjs
+          watcher=$(node infra/release-watch/watch.mjs validate hosts/profile/releases.json)
+          nix_versions=$(nix eval --json .#releaseVersions --no-write-lock-file)
+          test "$watcher" = "$nix_versions"
+          node infra/release-watch/watch.mjs resolve hosts/profile/releases.json | tee release-proof.json
+          printf 'source %s\nreleaseVersions %s\n' "$(git rev-parse HEAD)" "$nix_versions" >> "$GITHUB_STEP_SUMMARY"
+          cat release-proof.json >> "$GITHUB_STEP_SUMMARY"
+
+  propose:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/proposals'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+      - name: Build locked proof tools
+        id: tools
+        run: |
+          set -euo pipefail
+          tools=$(nix build --impure --no-link --print-out-paths --expr '
+            let
+              flake = builtins.getFlake (toString ./.);
+              pkgs = flake.inputs.nixpkgs.legacyPackages.x86_64-linux;
+            in pkgs.buildEnv {
+              name = "release-proof-tools";
+              paths = [ pkgs.cosign pkgs.gnupg ];
+            }
+          ')
+          echo "cosign=$tools/bin/cosign" >> "$GITHUB_OUTPUT"
+          echo "gpg=$tools/bin/gpg" >> "$GITHUB_OUTPUT"
+      - name: Resolve, prove and maintain one draft PR per CLI
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_WATCH_COSIGN: ${{ steps.tools.outputs.cosign }}
+          RELEASE_WATCH_GPG: ${{ steps.tools.outputs.gpg }}
+        run: |
+          set -euo pipefail
+          checkout_sha=$(git rev-parse HEAD)
+          test "$checkout_sha" = "$GITHUB_SHA"
+          RELEASE_WATCH_CHECKOUT_SHA="$checkout_sha" \
+            node infra/release-watch/watch.mjs propose hosts/profile/releases.json | tee -a "$GITHUB_STEP_SUMMARY"
