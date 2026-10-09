@@ -3,7 +3,7 @@ import test from 'node:test';
 import { createHash } from 'node:crypto';
 import {
   applyPin, bindCanonicalInput, compareVersions, createImmutableCommit, decideCandidate, decideThreeVersion, githubClient,
-  inspectExistingBotPr, listAll, maintainOne, planApiEffect, prKey, prMarker, reconcileEffect,
+  generationBranch, inspectExistingBotPr, listAll, maintainOne, planApiEffect, prKey, prMarker, reconcileEffect,
   reconcilePrCreate, reconcileRef, releaseVersions, resolveCandidate, validateRegistry,
 } from './watch.mjs';
 
@@ -420,7 +420,7 @@ test('canonical movement immediately before first effect stops with blob/tree/co
   const api = async (method, path, body) => {
     calls.push({ method, path, body });
     if (method === 'GET' && path.startsWith('/pulls?state=open')) return [];
-    if (method === 'GET' && path === '/git/ref/heads/bot%2Fcli-release-alpha') return null;
+    if (method === 'GET' && path === `/git/ref/heads/${encodeURIComponent(generationBranch('alpha', base))}`) return null;
     if (method === 'GET' && path === '/git/ref/heads/proposals') return { object: { sha: moved } };
     throw new Error(`unexpected ${method} ${path}`);
   };
@@ -477,10 +477,7 @@ test('unknown-after-success ref create/update and PR create reconcile read-only 
   assert.equal(patches.length, 1);
   assert.equal(patches[0].path, '/git/refs/heads/bot%2Fcli-release-alpha');
   assert.deepEqual(patches[0].body, { sha: '2'.repeat(40), force: false });
-  fixture.failAfterApply('create-pr');
-  const pr = await reconcilePrCreate({ api, repository: fixture.repository, baseBranch: 'proposals', branch: 'bot/cli-release-alpha', name: 'alpha', title: 'update', body: prMarker('alpha') });
-  assert.deepEqual({ state: pr.state, sends: pr.sends }, { state: 'CONFIRMED_DONE', sends: 1 });
-  assert.equal(fixture.calls.filter((call) => call.method === 'POST' && call.path === '/pulls').length, 1);
+  assert.equal(fixture.calls.filter((call) => call.method === 'POST' && call.path === '/pulls').length, 0);
 });
 
 test('partial/unknown effects stop and never resend', async () => {
@@ -546,104 +543,10 @@ test('actual PR ownership reads every commit page and rejects a foreign commit a
   );
 });
 
-test('retained merged bot branch survives merge/squash/rebase and advances by normal FF without deletion', async () => {
-  for (const [mode, mergeChar] of [['merge', '6'], ['squash', '7'], ['rebase', '8']]) {
-    const repository = 'roccho-dev/windows';
-    const name = 'alpha';
-    const branch = 'bot/cli-release-alpha';
-    const oldBase = '1'.repeat(40);
-    const retainedHead = '2'.repeat(40);
-    const canonicalBase = '3'.repeat(40);
-    const admittedMergeSha = mergeChar.repeat(40);
-    const before = registry();
-    const canonical = applyPin(before, name, candidate('1.2.4', hex('d')));
-    const objects = new GitObjectFixture(canonicalBase);
-    let refHead = retainedHead;
-    let openPr = null;
-    let createdParents = null;
-    const calls = [];
-    const api = async (method, path, body) => {
-      calls.push({ method, path, body });
-      if (method === 'GET' && path.startsWith('/pulls?state=open')) return openPr ? [openPr] : [];
-      if (method === 'GET' && path.startsWith('/pulls?state=closed')) return [{ number: 9, head: { sha: retainedHead } }];
-      if (method === 'GET' && path === '/pulls/9') return {
-        number: 9, merged_at: '2026-10-01T00:00:00Z', merge_commit_sha: admittedMergeSha,
-        user: { login: BOT }, body: prMarker(name),
-        base: { ref: 'proposals', sha: oldBase },
-        head: { ref: branch, sha: retainedHead, repo: { full_name: repository } },
-      };
-      if (method === 'GET' && decodeURIComponent(path) === `/git/ref/heads/${branch}`) return { object: { sha: refHead } };
-      if (method === 'GET' && path === '/git/ref/heads/proposals') return { object: { sha: canonicalBase } };
-      if (method === 'GET' && path === '/pulls/9/commits?per_page=100&page=1') return [{ sha: retainedHead, author: { login: BOT } }];
-      if (method === 'GET' && path === `/commits/${retainedHead}`) return { author: { login: BOT }, committer: { login: BOT } };
-      if (method === 'GET' && path === '/pulls/9/files?per_page=100&page=1') return [{ filename: 'hosts/profile/releases.json' }];
-      if (method === 'GET' && path.includes(`/contents/hosts/profile/releases.json?ref=${retainedHead}`)) return { content: Buffer.from(JSON.stringify(canonical)).toString('base64') };
-      if (method === 'GET' && path.includes(`/contents/hosts/profile/releases.json?ref=${oldBase}`)) return { content: Buffer.from(JSON.stringify(before)).toString('base64') };
-      if (method === 'GET' && path === `/compare/${admittedMergeSha}...${canonicalBase}`) return { merge_base_commit: { sha: admittedMergeSha } };
-      if (method === 'GET' && path.startsWith(`/compare/${retainedHead}...`)) return { merge_base_commit: { sha: retainedHead } };
-      if (method === 'PATCH' && path === '/git/refs/heads/bot%2Fcli-release-alpha') {
-        assert.deepEqual(body, { sha: body.sha, force: false });
-        refHead = body.sha;
-        return { object: { sha: body.sha } };
-      }
-      if (method === 'POST' && path === '/pulls') {
-        openPr = {
-          number: 10, html_url: `https://github.test/${mode}/10`, user: { login: BOT }, body: body.body,
-          base: { ref: body.base }, head: { ref: body.head, sha: refHead, repo: { full_name: repository } },
-        };
-        return openPr;
-      }
-      if (method === 'POST' && path === '/git/commits') createdParents = body.parents;
-      return objects.api(method, path, body);
-    };
-    const result = await maintainOne({
-      repository, token: 'unused', baseSha: canonicalBase, registry: canonical,
-      name, candidate: candidate('1.2.5', hex('e')), api,
-    });
-    assert.equal(result.state, 'DONE', mode);
-    assert.deepEqual(createdParents, [retainedHead, canonicalBase], mode);
-    assert.notEqual(refHead, retainedHead, mode);
-    assert.equal(calls.filter((call) => call.method === 'PATCH').length, 1, mode);
-    assert.equal(calls.filter((call) => call.method === 'DELETE').length, 0, mode);
-    assert.equal(calls.filter((call) => call.method === 'POST' && call.path === '/pulls').length, 1, mode);
-  }
-});
-
-test('retained branch contamination holds on orphan, unmerged or non-ancestor evidence', async () => {
-  const repository = 'roccho-dev/windows';
-  const branch = 'bot/cli-release-alpha';
-  const retainedHead = '2'.repeat(40);
-  const canonicalBase = '3'.repeat(40);
-  const data = registry();
-  const baseApi = async (mode, method, path) => {
-    if (method === 'GET' && path.startsWith('/pulls?state=open')) return [];
-    if (method === 'GET' && decodeURIComponent(path) === `/git/ref/heads/${branch}`) return { object: { sha: retainedHead } };
-    if (method === 'GET' && path.startsWith('/pulls?state=closed')) return mode === 'orphan' ? [] : [{ number: 9, head: { sha: retainedHead } }];
-    if (method === 'GET' && path === '/pulls/9') return {
-      number: 9, merged_at: mode === 'unmerged' ? null : '2026-10-01T00:00:00Z',
-      merge_commit_sha: '6'.repeat(40),
-      user: { login: BOT }, body: prMarker('alpha'), base: { ref: 'proposals', sha: '1'.repeat(40) },
-      head: { ref: branch, sha: retainedHead, repo: { full_name: repository } },
-    };
-    if (method === 'GET' && path === '/pulls/9/commits?per_page=100&page=1') return [{ sha: retainedHead, author: { login: BOT } }];
-    if (method === 'GET' && path === `/commits/${retainedHead}`) return { author: { login: BOT } };
-    if (method === 'GET' && path === '/pulls/9/files?per_page=100&page=1') return [{ filename: 'hosts/profile/releases.json' }];
-    if (method === 'GET' && path.includes(`ref=${retainedHead}`)) return { content: Buffer.from(JSON.stringify(applyPin(data, 'alpha', candidate('1.2.4')))).toString('base64') };
-    if (method === 'GET' && path.includes(`ref=${'1'.repeat(40)}`)) return { content: Buffer.from(JSON.stringify(data)).toString('base64') };
-    if (method === 'GET' && path.startsWith('/compare/')) return { merge_base_commit: { sha: 'f'.repeat(40) } };
-    throw new Error(`unexpected ${method} ${path}`);
-  };
-  for (const [mode, pattern] of [
-    ['orphan', /orphaned or ambiguous/],
-    ['unmerged', /was not merged/],
-    ['non-ancestor', /merged PR result is not an ancestor/],
-  ]) {
-    const api = (method, path) => baseApi(mode, method, path);
-    await assert.rejects(
-      inspectExistingBotPr({ api, repository, baseBranch: 'proposals', baseSha: canonicalBase, registry: data, name: 'alpha' }),
-      pattern,
-    );
-  }
+test('generation branch changes with canonical A; stable PRKey and no retained ref rewrite', () => {
+  const a = 'a'.repeat(40), b = 'b'.repeat(40);
+  assert.notEqual(generationBranch('alpha', a), generationBranch('alpha', b));
+  assert.equal(prKey('alpha'), 'cli-release:alpha');
 });
 
 const BOT = 'github-actions[bot]';
@@ -669,4 +572,83 @@ test('planApiEffect fails closed on author, marker, actor, lease, preimage, path
     assert.equal(plan.effectResend, 0);
   }
   assert.equal(prKey('alpha'), 'cli-release:alpha');
+});
+
+test('native Git graph: generation candidate has only A pin delta for merge/squash/rebase', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  for (const mode of ['merge', 'squash', 'rebase']) {
+    const dir = mkdtempSync(join(tmpdir(), 'watch-git-'));
+    const git = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 'bot', GIT_AUTHOR_EMAIL: 'bot@example.org', GIT_COMMITTER_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.org' } }).trim();
+    const commit = (value) => { writeFileSync(join(dir, 'pin'), `${value}\n`); git('add', 'pin'); git('commit', '-qm', value); };
+    try {
+      git('init', '-q', '-b', 'proposals'); commit('1');
+      const firstA = git('rev-parse', 'HEAD');
+      git('checkout', '-qb', generationBranch('alpha', firstA)); commit('2');
+      git('checkout', '-q', 'proposals');
+      if (mode === 'merge') git('merge', '--no-ff', '-qm', 'adopt', generationBranch('alpha', firstA));
+      if (mode === 'squash') { git('merge', '--squash', generationBranch('alpha', firstA)); git('commit', '-qm', 'adopt'); }
+      if (mode === 'rebase') { git('checkout', '-q', generationBranch('alpha', firstA)); git('rebase', '-q', 'proposals'); git('checkout', '-q', 'proposals'); git('merge', '--ff-only', generationBranch('alpha', firstA)); }
+      const nextA = git('rev-parse', 'HEAD');
+      git('checkout', '-qb', generationBranch('alpha', nextA)); commit('3');
+      assert.equal(git('rev-list', '--count', `proposals..${generationBranch('alpha', nextA)}`), '1');
+      assert.equal(git('diff', '--name-only', `proposals..${generationBranch('alpha', nextA)}`), 'pin');
+      git('checkout', '-q', 'proposals');
+      if (mode === 'merge') git('merge', '--no-ff', '-qm', 'adopt2', generationBranch('alpha', nextA));
+      if (mode === 'squash') { git('merge', '--squash', generationBranch('alpha', nextA)); git('commit', '-qm', 'adopt2'); }
+      if (mode === 'rebase') { git('checkout', '-q', generationBranch('alpha', nextA)); git('rebase', '-q', 'proposals'); git('checkout', '-q', 'proposals'); git('merge', '--ff-only', generationBranch('alpha', nextA)); }
+      assert.equal(git('show', 'HEAD:pin'), '3');
+      assert.equal(git('cat-file', '-t', firstA), 'commit');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('canonical A moves after immutable objects: no ref or PR write', async () => {
+  const base = '3'.repeat(40), moved = '4'.repeat(40);
+  const fixture = new GitObjectFixture(base);
+  const calls = [];
+  let reads = 0;
+  const api = async (method, path, body) => {
+    calls.push({ method, path, body });
+    if (method === 'GET' && path.startsWith('/pulls?state=open')) return [];
+    if (method === 'GET' && path === `/git/ref/heads/${encodeURIComponent(generationBranch('alpha', base))}`) return null;
+    if (method === 'GET' && path === '/git/ref/heads/proposals') return { object: { sha: ++reads > 1 ? moved : base } };
+    return fixture.api(method, path, body);
+  };
+  await assert.rejects(maintainOne({ repository: 'roccho-dev/windows', token: 'unused', baseSha: base, registry: registry(), name: 'alpha', candidate: candidate('1.2.4'), api }), /canonical A moved/);
+  assert.equal(calls.filter(({ method, path }) => method === 'PATCH' || method === 'DELETE' || method === 'POST' && ['/git/refs', '/pulls'].includes(path)).length, 0);
+  assert.equal(calls.filter(({ method, path }) => method === 'POST' && path === '/git/commits').length, 1);
+});
+
+test('PR response-loss cannot admit a moved branch or mismatched base', async () => {
+  const fixture = new ProtocolFixture();
+  const api = githubClient(fixture.repository, 'token', fixture.fetch);
+  const branch = generationBranch('alpha', '3'.repeat(40));
+  const expectedHead = '1'.repeat(40);
+  fixture.refs.set(branch, '2'.repeat(40));
+  const result = await reconcilePrCreate({ api, repository: fixture.repository, baseBranch: 'proposals', baseSha: '3'.repeat(40), branch, name: 'alpha', title: 'update', body: prMarker('alpha'), expectedHead, expectedRegistry: registry() });
+  assert.notEqual(result.state, 'CONFIRMED_DONE');
+  assert.equal(fixture.calls.filter(({ method, path }) => method === 'POST' && path === '/pulls').length, 1);
+});
+
+test('mixed author/committer on PR commits or head is RED', async () => {
+  const base = '2'.repeat(40), head = '1'.repeat(40), branch = generationBranch('alpha', base);
+  const data = registry();
+  const next = applyPin(data, 'alpha', candidate('1.2.4'));
+  for (const mixedAt of ['page', 'head']) {
+    const api = async (method, path) => {
+      if (path.startsWith('/pulls?state=open')) return [{ number: 7, user: { login: BOT }, body: prMarker('alpha'), base: { ref: 'proposals', sha: base }, head: { ref: branch, sha: head, repo: { full_name: 'roccho-dev/windows' } } }];
+      if (decodeURIComponent(path) === `/git/ref/heads/${branch}`) return { object: { sha: head } };
+      if (path.startsWith('/pulls/7/commits?')) return [{ author: { login: BOT }, committer: { login: mixedAt === 'page' ? 'human' : BOT } }];
+      if (path === `/commits/${head}`) return { author: { login: BOT }, committer: { login: mixedAt === 'head' ? 'human' : BOT } };
+      if (path.startsWith('/pulls/7/files?')) return [{ filename: 'hosts/profile/releases.json' }];
+      if (path.includes(`ref=${head}`)) return { content: Buffer.from(JSON.stringify(next)).toString('base64') };
+      if (path.includes(`ref=${base}`)) return { content: Buffer.from(JSON.stringify(data)).toString('base64') };
+      if (path.startsWith('/compare/')) return { merge_base_commit: { sha: base } };
+      throw new Error(`unexpected ${method} ${path}`);
+    };
+    await assert.rejects(inspectExistingBotPr({ api, repository: 'roccho-dev/windows', baseBranch: 'proposals', baseSha: base, registry: data, name: 'alpha' }), /foreign/);
+  }
 });

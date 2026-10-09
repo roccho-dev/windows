@@ -441,6 +441,11 @@ export async function listAll(api, path, { maxPages = MAX_API_PAGES, maxItems = 
   fail(`GitHub collection exceeds declared limit ${maxPages * PAGE_SIZE}: ${path}`);
 }
 
+export function generationBranch(name, baseSha) {
+  if (!/^[0-9a-f]{40}$/.test(baseSha ?? '')) fail('generation source SHA is absent');
+  return `bot/cli-release-${name}-g${baseSha}`;
+}
+
 function assertPrShape({ pr, repository, baseBranch, branch, name, expectedPrincipal }) {
   if (pr.user?.login !== expectedPrincipal) fail(`${name}: foreign PR author`);
   if (pr.base?.ref !== baseBranch || pr.head?.ref !== branch || pr.head?.repo?.full_name !== repository) {
@@ -454,11 +459,13 @@ async function inspectBotPrHistory({ api, pr, refSha, registry, name, expectedPr
   const commits = await listAll(api, `/pulls/${pr.number}/commits`, COLLECTION_LIMITS.commits);
   if (commits.length === 0) fail(`${name}: bot PR has no commits`);
   const foreignCommits = commits.filter((commit) =>
-    (commit.author?.login ?? commit.committer?.login) !== expectedPrincipal);
+    ![commit.author?.login, commit.committer?.login].filter((actor) => actor !== null && actor !== undefined).length
+    || [commit.author?.login, commit.committer?.login].some((actor) => actor != null && actor !== expectedPrincipal));
   if (foreignCommits.length !== 0) fail(`${name}: human or foreign commit`);
   const headCommit = await api('GET', `/commits/${refSha}`);
-  const actor = headCommit?.author?.login ?? headCommit?.committer?.login;
-  if (actor !== expectedPrincipal) fail(`${name}: foreign head actor`);
+  const headActors = [headCommit?.author?.login, headCommit?.committer?.login].filter((actor) => actor != null);
+  if (headActors.length === 0 || headActors.some((actor) => actor !== expectedPrincipal)) fail(`${name}: foreign head actor`);
+  const actor = expectedPrincipal;
   const files = await listAll(api, `/pulls/${pr.number}/files`, COLLECTION_LIMITS.files);
   const changedPaths = files.map((file) => file.filename);
   if (changedPaths.length !== 1 || changedPaths[0] !== REGISTRY_PATH) fail(`${name}: unexpected changed path`);
@@ -476,20 +483,24 @@ async function inspectBotPrHistory({ api, pr, refSha, registry, name, expectedPr
 
 export async function inspectExistingBotPr({ api, repository, baseBranch, baseSha, registry, name, expectedPrincipal = BOT_LOGIN }) {
   const [owner] = repository.split('/');
-  const branch = `bot/cli-release-${name}`;
-  const openPrs = await listAll(api, `/pulls?state=open&base=${encodeURIComponent(baseBranch)}&head=${encodeURIComponent(`${owner}:${branch}`)}`, COLLECTION_LIMITS.openPrs);
+  const branch = generationBranch(name, baseSha);
+  // Query all open candidates for this CLI; generation refs change across adopted cycles.
+  const openPrsAll = await listAll(api, `/pulls?state=open&base=${encodeURIComponent(baseBranch)}`, COLLECTION_LIMITS.closedPrs);
+  const openPrs = openPrsAll.filter((pr) => String(pr.body ?? '').includes(prMarker(name)) ||
+    String(pr.head?.ref ?? '').startsWith(`bot/cli-release-${name}-g`));
   if (openPrs.length > 1) fail(`${name}: more than one bot PR exists`);
-  const ref = await api('GET', `/git/ref/heads/${encodeURIComponent(branch)}`);
+  const activeBranch = openPrs.length ? openPrs[0].head.ref : branch;
+  const ref = await api('GET', `/git/ref/heads/${encodeURIComponent(activeBranch)}`);
 
   if (openPrs.length === 1) {
     const pr = openPrs[0];
-    assertPrShape({ pr, repository, baseBranch, branch, name, expectedPrincipal });
+    assertPrShape({ pr, repository, baseBranch, branch: activeBranch, name, expectedPrincipal });
     if (!ref?.object?.sha || ref.object.sha !== pr.head.sha) fail(`${name}: head lease differs`);
     const history = await inspectBotPrHistory({ api, pr, refSha: ref.object.sha, registry, name, expectedPrincipal });
     const compare = await api('GET', `/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(ref.object.sha)}`);
     if (compare?.merge_base_commit?.sha !== baseSha) fail(`${name}: target preimage differs`);
     return {
-      exists: true, retained: false, branch, pr, head: ref.object.sha,
+      exists: true, retained: false, branch: activeBranch, pr, head: ref.object.sha,
       headActor: history.actor, expectedPrincipal,
       pendingPin: structuredClone(history.branchRegistry[name].pin),
       pendingRegistry: history.branchRegistry,
@@ -503,31 +514,10 @@ export async function inspectExistingBotPr({ api, repository, baseBranch, baseSh
     };
   }
 
-  if (ref === null) {
-    return { exists: false, retained: false, branch, pendingPin: null, effect: 'CONFIRMED_NOT_DONE' };
-  }
-  if (!ref?.object?.sha) fail(`${name}: retained branch ref is malformed`);
-  const retainedHead = ref.object.sha;
-  const closedPrs = await listAll(api, `/pulls?state=closed&base=${encodeURIComponent(baseBranch)}&head=${encodeURIComponent(`${owner}:${branch}`)}&sort=updated&direction=desc`, COLLECTION_LIMITS.closedPrs);
-  const matching = closedPrs.filter((pr) => pr.head?.sha === retainedHead);
-  if (matching.length !== 1) fail(`${name}: retained branch is orphaned or ambiguous`);
-  const pr = await api('GET', `/pulls/${matching[0].number}`);
-  if (!pr?.merged_at) fail(`${name}: retained branch PR was not merged`);
-  assertPrShape({ pr, repository, baseBranch, branch, name, expectedPrincipal });
-  if (pr.head?.sha !== retainedHead) fail(`${name}: retained branch head differs from merged PR`);
-  const history = await inspectBotPrHistory({ api, pr, refSha: retainedHead, registry, name, expectedPrincipal });
-  const admittedMergeSha = pr.merge_commit_sha;
-  if (!/^[0-9a-f]{40}$/.test(admittedMergeSha ?? '')) fail(`${name}: merged PR admission commit is absent`);
-  const ancestry = await api('GET', `/compare/${encodeURIComponent(admittedMergeSha)}...${encodeURIComponent(baseSha)}`);
-  if (ancestry?.merge_base_commit?.sha !== admittedMergeSha) fail(`${name}: merged PR result is not an ancestor of canonical A`);
-  const canonicalVsRetained = comparePin(registry[name].pin, history.branchRegistry[name].pin);
-  if (canonicalVsRetained?.state === 'RED' || canonicalVsRetained?.order < 0) {
-    fail(`${name}: retained branch pin is not admitted by canonical A`);
-  }
-  return {
-    exists: false, retained: true, branch, retainedHead, admittedMergeSha,
-    pendingPin: null, effect: 'CONFIRMED_NOT_DONE',
-  };
+  // Old generation refs are retained but never reused as parents. A new cycle
+  // starts at canonical A, so GitHub merge, squash and rebase see one pin delta.
+  if (ref !== null) fail(`${name}: generation ref already exists without an open PR`);
+  return { exists: false, retained: false, branch, pendingPin: null, effect: 'CONFIRMED_NOT_DONE' };
 }
 
 export async function bindCanonicalInput({ api, baseBranch = BASE_BRANCH, checkoutSha, localRegistry }) {
@@ -708,13 +698,23 @@ export async function reconcileRef({ api, branch, expectedOldSha, newSha, create
     : api('PATCH', writePath, { sha: newSha, force: false }) });
 }
 
-export async function reconcilePrCreate({ api, repository, baseBranch, branch, name, title, body }) {
+export async function reconcilePrCreate({ api, repository, baseBranch, baseSha, branch, name, title, body, expectedHead, expectedRegistry }) {
   const [owner] = repository.split('/');
   const observePr = async () => {
     const prs = await listAll(api, `/pulls?state=open&base=${encodeURIComponent(baseBranch)}&head=${encodeURIComponent(`${owner}:${branch}`)}`, COLLECTION_LIMITS.openPrs);
     if (prs.length === 0) return 'CONFIRMED_NOT_DONE';
     if (prs.length !== 1) return 'PARTIAL_OR_FAILED';
-    return prs[0].user?.login === BOT_LOGIN && String(prs[0].body ?? '').includes(prMarker(name)) ? 'CONFIRMED_DONE' : 'PARTIAL_OR_FAILED';
+    const pr = prs[0];
+    const ref = await api('GET', `/git/ref/heads/${encodeURIComponent(branch)}`);
+    const baseRef = await api('GET', `/git/ref/heads/${encodeURIComponent(baseBranch)}`);
+    if (baseRef?.object?.sha !== baseSha || ref?.object?.sha !== expectedHead) return 'PARTIAL_OR_FAILED';
+    try {
+      assertPrShape({ pr, repository, baseBranch, branch, name, expectedPrincipal: BOT_LOGIN });
+      if (pr.head?.sha !== expectedHead || pr.base?.sha !== baseSha) return 'PARTIAL_OR_FAILED';
+      const history = await inspectBotPrHistory({ api, pr, refSha: expectedHead, registry: expectedRegistry, name, expectedPrincipal: BOT_LOGIN });
+      if (JSON.stringify(history.branchRegistry) !== JSON.stringify(expectedRegistry)) return 'PARTIAL_OR_FAILED';
+      return 'CONFIRMED_DONE';
+    } catch { return 'PARTIAL_OR_FAILED'; }
   };
   return reconcileEffect({ observe: observePr, mutate: () => api('POST', '/pulls', { title, head: branch, base: baseBranch, body, draft: true }) });
 }
@@ -730,8 +730,7 @@ export async function maintainOne({
   if (decision.action === 'RESUME') return { name, decision, effects: 0, pr: existing.pr?.html_url ?? null };
   const next = applyPin(registry, name, candidate);
   await assertCanonicalLease({ api, baseBranch, baseSha });
-  const parentShas = existing.exists ? [existing.head]
-    : existing.retained ? [existing.retainedHead, baseSha] : [baseSha];
+  const parentShas = existing.exists ? [existing.head] : [baseSha];
   const treeBaseSha = existing.exists ? existing.head : baseSha;
   const commit = await createImmutableCommit({
     api, parentShas, treeBaseSha, registry: next,
@@ -739,12 +738,16 @@ export async function maintainOne({
 
 ${prKey(name)}`,
   });
-  const createRef = !existing.exists && !existing.retained;
-  const expectedOldSha = existing.exists ? existing.head : existing.retainedHead ?? null;
+  await assertCanonicalLease({ api, baseBranch, baseSha });
+  const createRef = !existing.exists;
+  const expectedOldSha = existing.exists ? existing.head : null;
   const refEffect = await reconcileRef({ api, branch: existing.branch, expectedOldSha, newSha: commit.sha, create: createRef });
   if (refEffect.state !== 'CONFIRMED_DONE') return { name, decision, refEffect, effects: 1, state: 'STOP' };
   let prEffect = { state: 'CONFIRMED_DONE', sends: 0 };
   if (!existing.exists) {
+    await assertCanonicalLease({ api, baseBranch, baseSha });
+    const currentRef = await api('GET', `/git/ref/heads/${encodeURIComponent(existing.branch)}`);
+    if (currentRef?.object?.sha !== commit.sha) fail('candidate branch moved before PR create');
     const title = `chore: update ${name} to ${candidate.version}`;
     const body = `${prMarker(name)}
 
@@ -754,8 +757,9 @@ Official stable release verified cryptographically.
 - version: \`${candidate.version}\`
 - sha256: \`${candidate.contentHash}\`
 - manual approval and CI are still required.`;
-    prEffect = await reconcilePrCreate({ api, repository, baseBranch, branch: existing.branch, name, title, body });
+    prEffect = await reconcilePrCreate({ api, repository, baseBranch, baseSha, branch: existing.branch, name, title, body, expectedHead: commit.sha, expectedRegistry: next });
   }
+  await assertCanonicalLease({ api, baseBranch, baseSha });
   return { name, decision, refEffect, prEffect, effects: refEffect.sends + prEffect.sends, state: prEffect.state === 'CONFIRMED_DONE' ? 'DONE' : 'STOP' };
 }
 
