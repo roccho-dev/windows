@@ -1155,7 +1155,16 @@ cmp "$evidence/before" "$evidence/page"
 inside '
   nix-store --gc
   test -x /nix/var/nix/profiles/windows-dev/bin/git
+  # Optional pinned inference tools must survive an offline image replacement with no service startup.
+  test -x /nix/var/nix/profiles/windows-dev/bin/ollama
+  test -x /nix/var/nix/profiles/windows-dev/bin/ollaya
+  /nix/var/nix/profiles/windows-dev/bin/ollama --help >/dev/null
+  /nix/var/nix/profiles/windows-dev/bin/ollaya --help >/dev/null
+  test "$OLLAMA_MODELS" = /work/repos/.models/ollama
+  test "$OLLAYA_MODELS" = /work/repos/.models/ollaya
+  test ! -e "$OLLAMA_MODELS" && test ! -e "$OLLAYA_MODELS"
   nix --version
   nix-store --verify --check-contents
 '
+echo 'PASS optional Ollama/Ollaya CLI after offline replace (no model pull, key, or daemon)'
 echo 'PASS replace -> continue (different container, retained work/store/profile, disposable HOME, offline apps)'

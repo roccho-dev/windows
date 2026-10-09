@@ -382,6 +382,9 @@ rec {
     identity = "/work/repos/.auth/roccho-dev/age/oci-dev.key";
   };
 
+  # Optional inference tools: local Ollama CPU runtime and Ollaya System One, no daemons.
+  ollaya = import ./ollaya.nix { inherit pkgs; };
+
   pi = import ./pi.nix {
     inherit pkgs;
     envsRemote = "https://github.com/roccho-org/envs";
@@ -399,6 +402,7 @@ rec {
         git
         cacert
         openssh
+        ollama-cpu
       ])
       ++ [
         ghWrapper
@@ -407,6 +411,7 @@ rec {
         jev.launch
         jev.ops
         pi.launcher
+        ollaya
       ];
     pathsToLink = [
       "/bin"
@@ -452,6 +457,9 @@ rec {
       Env = [
         "HOME=/home/dev"
         "USER=root"
+        # Model blobs persist in the existing work volume; home and image are disposable.
+        "OLLAMA_MODELS=/work/repos/.models/ollama"
+        "OLLAYA_MODELS=/work/repos/.models/ollaya"
         "NIX_REMOTE=local"
         "PATH=/nix/var/nix/profiles/windows-dev/bin:/bin"
         "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
