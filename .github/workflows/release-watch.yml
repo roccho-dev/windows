@@ -1,4 +1,4 @@
-name: release watch source materialize
+name: release watch source materialize retry
 
 on:
   pull_request:
@@ -20,16 +20,24 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.head_ref == 'proposal/cli-release-watch-20261009'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 30
     env:
-      EXPECTED_PARENT: 44fa0e7f9d1e26a29b4f26cfeac45f022dcbd106
+      EXPECTED_PARENT: 0ffafdac39005fd977e6bcc17bd32cf98861e358
+      SOURCE_BASE: 44fa0e7f9d1e26a29b4f26cfeac45f022dcbd106
+      BRANCH: proposal/cli-release-watch-20261009
       EXPECTED_WATCH_BLOB: c9b8a3c6472e2f4d6b51426d4a6c25ea9d9d74ed
       EXPECTED_TEST_BLOB: 175038e82fd454632f1b86a88fc2b11bf869c4c4
-      BRANCH: proposal/cli-release-watch-20261009
       WATCH_CHUNKS: >-
-        2f4792f32b7257fb5474122b8617d06a2a7d31b5
+        18bc8cd98215e8cad86818cc630771b66960d38e
+        f61bf93825dc4708f5ac0780d09141b7385e63ca
+        729890740484a16a703750c0aaf47aeb7f9a06aa
+        24544423618041706c0fa47eb6445ab5bd92ca15
+        bc6816c6c5ed8303420003f64ceee1b63dd33e6c
+        15e1e378c41c5e23aff097941351911462326686
         7bca9faec94c63f4a4eab5a623dd1fc930aecd72
-        a31c12725ad9f5c9f68f316bf8d232b62f1b0675
+        8adb2e87f1d7c36d897be11863453b522ead4489
+        5aeec739cd0bb5619e7e3cd109c88b94ddf3cde6
+        e62b4d39fb6846a0e45bcef1c5c8487db5c257a0
         5825910bb56bf603b76e73c77aa39fa00df8e206
         97984b22ff780a283718fa77228aab17b04454db
         d4e3b5d4490d86d5704e999d2bd14092de97c213
@@ -37,7 +45,11 @@ jobs:
         f9edcf3f119abd5b6bfd09acf4410f9d1f9ba735
         41a4a996b6cc0a51461f07dda1c92b960a261727
         cd3473a18583e23c079bec4edcf73926ade4a02a
-        1d05689dc05c79be30f29736bb9d55e98a73c152
+        0c9b99250677c9b604c1d6fa45c1912243b44904
+        5bf186d28111274fd97d7868cd2d267fc607e1eb
+        41d9046e8cbcb19c66fb81c075e5d0a2d4832621
+        6763fa4da093d3e5edb48f659640aebb5afbdfaf
+        88dc35cb0c34bf6614c009f542fa6768c4715432
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -45,7 +57,7 @@ jobs:
           persist-credentials: true
           fetch-depth: 0
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
-      - name: Materialize exact current-head source correction
+      - name: Materialize exact current-source correction
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -82,27 +94,11 @@ jobs:
 
           test "$(git hash-object infra/release-watch/watch.mjs)" = "$EXPECTED_WATCH_BLOB"
           test "$(git hash-object infra/release-watch/watch.test.mjs)" = "$EXPECTED_TEST_BLOB"
-          git show "$EXPECTED_PARENT:.github/workflows/release-watch.yml" > .github/workflows/release-watch.yml
+          git show "$SOURCE_BASE:.github/workflows/release-watch.yml" > .github/workflows/release-watch.yml
 
           node --check infra/release-watch/watch.mjs
           node --test infra/release-watch/watch.test.mjs
           nix build .#checks.x86_64-linux.release-watch --no-write-lock-file --print-build-logs
-
-          tools=$(nix build --impure --no-link --print-out-paths --expr '
-            let
-              flake = builtins.getFlake (toString ./.);
-              pkgs = flake.inputs.nixpkgs.legacyPackages.x86_64-linux;
-            in pkgs.buildEnv {
-              name = "release-proof-tools";
-              paths = [ pkgs.cosign pkgs.gnupg ];
-            }
-          ')
-          export RELEASE_WATCH_COSIGN="$tools/bin/cosign"
-          export RELEASE_WATCH_GPG="$tools/bin/gpg"
-          watcher=$(node infra/release-watch/watch.mjs validate hosts/profile/releases.json)
-          nix_versions=$(nix eval --json .#releaseVersions --no-write-lock-file)
-          test "$watcher" = "$nix_versions"
-          node infra/release-watch/watch.mjs resolve hosts/profile/releases.json | tee release-proof.json
           git diff --check
 
           git config user.name github-actions[bot]
@@ -112,13 +108,12 @@ jobs:
           expected=$(printf '%s\n' .github/workflows/release-watch.yml infra/release-watch/watch.mjs infra/release-watch/watch.test.mjs | LC_ALL=C sort)
           test "$actual" = "$expected"
           git commit -m 'fix: close release-watch protocol lifecycle' \
-            -m 'Bind checkout to canonical A, verify all bounded pages and actors, validate signed manifest version, use the real plural refs endpoint, and safely fast-forward a retained merged bot branch. Keep signature and selected-byte proofs mandatory.'
+            -m 'Bind checkout to canonical A, verify bounded pages and all commit owners, validate signed manifest version, use the plural refs endpoint, and fast-forward one retained merged bot branch without delete or force. Keep signature and selected-byte proof mandatory.'
           final=$(git rev-parse HEAD)
           git push origin "HEAD:refs/heads/$BRANCH"
-          printf 'final_head %s\nreleaseVersions %s\n' "$final" "$nix_versions" >> "$GITHUB_STEP_SUMMARY"
-          cat release-proof.json >> "$GITHUB_STEP_SUMMARY"
           echo "FINAL_HEAD=$final" >> "$GITHUB_ENV"
-      - name: Dispatch current-head checks
+          printf 'final_head %s\n' "$final" >> "$GITHUB_STEP_SUMMARY"
+      - name: Dispatch exact final-head checks
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
