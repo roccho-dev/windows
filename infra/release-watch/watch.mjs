@@ -143,7 +143,13 @@ function comparePin(left, right) {
 
 /** A=current source, B=existing admitted bot PR pin or null, C=new proven official pin. */
 export function decideThreeVersion(definition, candidate, pendingPin = null) {
-  exactKeys(candidate, ['contentHash', 'proof', 'version'], 'candidate');
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) fail('candidate must be an object');
+const allowedCandidateKeys = new Set(['contentHash', 'proof', 'proofReceipt', 'selectedBytes', 'sourceUrl', 'version']);
+const unexpectedCandidateKeys = Object.keys(candidate).filter((key) => !allowedCandidateKeys.has(key));
+if (unexpectedCandidateKeys.length !== 0) fail(`candidate has unexpected keys: ${unexpectedCandidateKeys.sort().join(',')}`);
+for (const key of ['contentHash', 'proof', 'version']) {
+  if (!Object.hasOwn(candidate, key)) fail(`candidate missing required key: ${key}`);
+}
   if (candidate.proof !== true) return { state: 'RED', reason: 'proof-failed', mutations: 0, action: 'STOP' };
   if (!parseVersion(candidate.version)) return { state: 'RED', reason: 'incomparable-version', mutations: 0, action: 'STOP' };
   if (!/^[0-9a-f]{64}$/.test(candidate.contentHash)) return { state: 'RED', reason: 'invalid-hash', mutations: 0, action: 'STOP' };

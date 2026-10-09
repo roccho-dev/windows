@@ -112,6 +112,18 @@ test('V1 versions are ordered only as stable semver', () => {
   assert.equal(compareVersions('latest', '1.2.3'), null);
 });
 
+test('V1 proven resolver evidence is admitted without weakening required candidate fields', () => {
+  const full = {
+    ...candidate('1.2.4', hex('d')),
+    sourceUrl: 'https://example.invalid/tool.tar.gz',
+    selectedBytes: 123,
+    proofReceipt: { kind: 'sigstore-bundle', identity: 'issuer-bound' },
+  };
+  assert.equal(decideCandidate(definition(), full).state, 'UPDATE');
+  assert.throws(() => decideCandidate(definition(), { ...full, arbitrary: true }), /unexpected keys/);
+  assert.throws(() => decideCandidate(definition(), { proof: true, version: '1.2.4' }), /missing required key: contentHash/);
+});
+
 test('V1 A/B/C monotonicity never reverses and equal-version hash drift is RED', () => {
   const A = definition('2.0.0', hex('a'));
   assert.equal(decideThreeVersion(A, candidate('1.9.9'), null).reason, 'C-before-A');

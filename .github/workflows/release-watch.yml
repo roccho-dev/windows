@@ -1,92 +1,105 @@
-name: verified candidate schema materialization
+name: release watch
 
 on:
   pull_request:
     branches: [proposals]
+    paths:
+      - hosts/profile/releases.json
+      - hosts/profile/nix.nix
+      - hosts/own/codex.nix
+      - infra/release-watch/watch.mjs
+      - infra/release-watch/watch.test.mjs
+      - .github/workflows/release-watch.yml
+      - flake.nix
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: release-watch-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  materialize:
-    if: >-
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.head_ref == 'proposal/cli-release-watch-20261009'
+  verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - name: Patch exact candidate contract and materialize blobs only
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+      - name: Build locked proof tools
+        id: tools
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-          python - <<'PY'
-          import base64, json, os, pathlib, urllib.request
-
-          root = pathlib.Path('.')
-          watch = root / 'infra/release-watch/watch.mjs'
-          text = watch.read_text()
-          old = "  exactKeys(candidate, ['contentHash', 'proof', 'version'], 'candidate');"
-          new = """  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) fail('candidate must be an object');
-          const allowedCandidateKeys = new Set(['contentHash', 'proof', 'proofReceipt', 'selectedBytes', 'sourceUrl', 'version']);
-          const unexpectedCandidateKeys = Object.keys(candidate).filter((key) => !allowedCandidateKeys.has(key));
-          if (unexpectedCandidateKeys.length !== 0) fail(`candidate has unexpected keys: ${unexpectedCandidateKeys.sort().join(',')}`);
-          for (const key of ['contentHash', 'proof', 'version']) {
-            if (!Object.hasOwn(candidate, key)) fail(`candidate missing required key: ${key}`);
-          }"""
-          if text.count(old) != 1:
-              raise SystemExit(f'watch.mjs: expected one old candidate contract, found {text.count(old)}')
-          watch.write_text(text.replace(old, new))
-
-          tests = root / 'infra/release-watch/watch.test.mjs'
-          text = tests.read_text()
-          anchor = """test('V1 A/B/C monotonicity never reverses and equal-version hash drift is RED', () => {"""
-          addition = """test('V1 proven resolver evidence is admitted without weakening required candidate fields', () => {
-            const full = {
-              ...candidate('1.2.4', hex('d')),
-              sourceUrl: 'https://example.invalid/tool.tar.gz',
-              selectedBytes: 123,
-              proofReceipt: { kind: 'sigstore-bundle', identity: 'issuer-bound' },
-            };
-            assert.equal(decideCandidate(definition(), full).state, 'UPDATE');
-            assert.throws(() => decideCandidate(definition(), { ...full, arbitrary: true }), /unexpected keys/);
-            assert.throws(() => decideCandidate(definition(), { proof: true, version: '1.2.4' }), /missing required key: contentHash/);
-          });
-
-          """
-          if text.count(anchor) != 1 or addition in text:
-              raise SystemExit('watch.test.mjs: candidate evidence insertion precondition failed')
-          tests.write_text(text.replace(anchor, addition + anchor))
-
-          token = os.environ['GH_TOKEN']
-          repository = os.environ['REPOSITORY']
-          headers = {
-              'Accept': 'application/vnd.github+json',
-              'Authorization': f'Bearer {token}',
-              'Content-Type': 'application/json',
-              'X-GitHub-Api-Version': '2022-11-28',
-          }
-          for path in ('infra/release-watch/watch.mjs', 'infra/release-watch/watch.test.mjs'):
-              content = (root / path).read_bytes()
-              payload = json.dumps({'content': base64.b64encode(content).decode(), 'encoding': 'base64'}).encode()
-              request = urllib.request.Request(
-                  f'https://api.github.com/repos/{repository}/git/blobs',
-                  data=payload,
-                  method='POST',
-                  headers=headers,
-              )
-              with urllib.request.urlopen(request) as response:
-                  sha = json.load(response)['sha']
-              print(f'CORRECTION_BLOB {path} {sha}')
-          PY
-          node --check infra/release-watch/watch.mjs
+          tools=$(nix build --impure --no-link --print-out-paths --expr '
+            let
+              flake = builtins.getFlake (toString ./.);
+              pkgs = flake.inputs.nixpkgs.legacyPackages.x86_64-linux;
+            in pkgs.buildEnv {
+              name = "release-proof-tools";
+              paths = [ pkgs.cosign pkgs.gnupg ];
+            }
+          ')
+          test -x "$tools/bin/cosign"
+          test -x "$tools/bin/gpg"
+          echo "cosign=$tools/bin/cosign" >> "$GITHUB_OUTPUT"
+          echo "gpg=$tools/bin/gpg" >> "$GITHUB_OUTPUT"
+      - name: Verify contract, protocol and actual official selected bytes
+        env:
+          RELEASE_WATCH_COSIGN: ${{ steps.tools.outputs.cosign }}
+          RELEASE_WATCH_GPG: ${{ steps.tools.outputs.gpg }}
+        run: |
+          set -euo pipefail
           node --test infra/release-watch/watch.test.mjs
-          test "$(node infra/release-watch/watch.mjs validate hosts/profile/releases.json)" = '{"claude":"2.1.283","codex":"0.157.1"}'
-          git diff --check
+          watcher=$(node infra/release-watch/watch.mjs validate hosts/profile/releases.json)
+          nix_versions=$(nix eval --json .#releaseVersions --no-write-lock-file)
+          test "$watcher" = "$nix_versions"
+          node infra/release-watch/watch.mjs resolve hosts/profile/releases.json | tee release-proof.json
+          printf 'source %s\nreleaseVersions %s\n' "$(git rev-parse HEAD)" "$nix_versions" >> "$GITHUB_STEP_SUMMARY"
+          cat release-proof.json >> "$GITHUB_STEP_SUMMARY"
+
+  propose:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/proposals'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+      - name: Build locked proof tools
+        id: tools
+        run: |
+          set -euo pipefail
+          tools=$(nix build --impure --no-link --print-out-paths --expr '
+            let
+              flake = builtins.getFlake (toString ./.);
+              pkgs = flake.inputs.nixpkgs.legacyPackages.x86_64-linux;
+            in pkgs.buildEnv {
+              name = "release-proof-tools";
+              paths = [ pkgs.cosign pkgs.gnupg ];
+            }
+          ')
+          echo "cosign=$tools/bin/cosign" >> "$GITHUB_OUTPUT"
+          echo "gpg=$tools/bin/gpg" >> "$GITHUB_OUTPUT"
+      - name: Resolve, prove and maintain one draft PR per CLI
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_WATCH_COSIGN: ${{ steps.tools.outputs.cosign }}
+          RELEASE_WATCH_GPG: ${{ steps.tools.outputs.gpg }}
+        run: |
+          set -euo pipefail
+          node infra/release-watch/watch.mjs propose hosts/profile/releases.json | tee -a "$GITHUB_STEP_SUMMARY"
