@@ -441,9 +441,12 @@ export async function listAll(api, path, { maxPages = MAX_API_PAGES, maxItems = 
   fail(`GitHub collection exceeds declared limit ${maxPages * PAGE_SIZE}: ${path}`);
 }
 
-export function generationBranch(name, baseSha) {
+export function generationBranch(name, baseSha, candidate) {
+  prKey(name);
   if (!/^[0-9a-f]{40}$/.test(baseSha ?? '')) fail('generation source SHA is absent');
-  return `bot/cli-release-${name}-g${baseSha}`;
+  if (!candidate || !parseVersion(candidate.version)) fail('generation candidate version is invalid');
+  if (!/^[0-9a-f]{64}$/.test(candidate.contentHash ?? '')) fail('generation candidate hash is invalid');
+  return `bot/cli-release-${name}-g${baseSha}-v${candidate.version}-h${candidate.contentHash}`;
 }
 
 function assertPrShape({ pr, repository, baseBranch, branch, name, expectedPrincipal }) {
@@ -454,17 +457,20 @@ function assertPrShape({ pr, repository, baseBranch, branch, name, expectedPrinc
   if (!String(pr.body ?? '').includes(prMarker(name))) fail(`${name}: PRKey marker differs`);
 }
 
+function assertExpectedPrincipalActors(value, expectedPrincipal, label) {
+  if (value?.author?.login !== expectedPrincipal) fail(`${label}: author differs`);
+  if (value?.committer?.login !== expectedPrincipal) fail(`${label}: committer differs`);
+}
+
 async function inspectBotPrHistory({ api, pr, refSha, registry, name, expectedPrincipal }) {
   if (!/^[0-9a-f]{40}$/.test(pr.base?.sha ?? '')) fail(`${name}: PR base preimage is absent`);
   const commits = await listAll(api, `/pulls/${pr.number}/commits`, COLLECTION_LIMITS.commits);
   if (commits.length === 0) fail(`${name}: bot PR has no commits`);
-  const foreignCommits = commits.filter((commit) =>
-    ![commit.author?.login, commit.committer?.login].filter((actor) => actor !== null && actor !== undefined).length
-    || [commit.author?.login, commit.committer?.login].some((actor) => actor != null && actor !== expectedPrincipal));
-  if (foreignCommits.length !== 0) fail(`${name}: human or foreign commit`);
+  for (const commit of commits) {
+    assertExpectedPrincipalActors(commit, expectedPrincipal, `${name}: PR commit`);
+  }
   const headCommit = await api('GET', `/commits/${refSha}`);
-  const headActors = [headCommit?.author?.login, headCommit?.committer?.login].filter((actor) => actor != null);
-  if (headActors.length === 0 || headActors.some((actor) => actor !== expectedPrincipal)) fail(`${name}: foreign head actor`);
+  assertExpectedPrincipalActors(headCommit, expectedPrincipal, `${name}: head commit`);
   const actor = expectedPrincipal;
   const files = await listAll(api, `/pulls/${pr.number}/files`, COLLECTION_LIMITS.files);
   const changedPaths = files.map((file) => file.filename);
@@ -481,15 +487,19 @@ async function inspectBotPrHistory({ api, pr, refSha, registry, name, expectedPr
   return { actor, changedPaths, branchRegistry, pointers };
 }
 
-export async function inspectExistingBotPr({ api, repository, baseBranch, baseSha, registry, name, expectedPrincipal = BOT_LOGIN }) {
+export async function inspectExistingBotPr({
+  api, repository, baseBranch, baseSha, registry, name, candidate, expectedPrincipal = BOT_LOGIN,
+}) {
   const [owner] = repository.split('/');
-  const branch = generationBranch(name, baseSha);
-  // Query all open candidates for this CLI; generation refs change across adopted cycles.
+  const candidateBranch = generationBranch(name, baseSha, candidate);
+  // Query all open candidates for this CLI; an admitted open PR keeps its branch
+  // while B advances to C, but a new unopened candidate receives a new immutable generation.
   const openPrsAll = await listAll(api, `/pulls?state=open&base=${encodeURIComponent(baseBranch)}`, COLLECTION_LIMITS.closedPrs);
   const openPrs = openPrsAll.filter((pr) => String(pr.body ?? '').includes(prMarker(name)) ||
     String(pr.head?.ref ?? '').startsWith(`bot/cli-release-${name}-g`));
   if (openPrs.length > 1) fail(`${name}: more than one bot PR exists`);
-  const activeBranch = openPrs.length ? openPrs[0].head.ref : branch;
+  const activeBranch = openPrs.length ? openPrs[0].head.ref : candidateBranch;
+  if (!String(activeBranch ?? '').startsWith(`bot/cli-release-${name}-g`)) fail(`${name}: generation branch differs`);
   const ref = await api('GET', `/git/ref/heads/${encodeURIComponent(activeBranch)}`);
 
   if (openPrs.length === 1) {
@@ -500,13 +510,13 @@ export async function inspectExistingBotPr({ api, repository, baseBranch, baseSh
     const compare = await api('GET', `/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(ref.object.sha)}`);
     if (compare?.merge_base_commit?.sha !== baseSha) fail(`${name}: target preimage differs`);
     return {
-      exists: true, retained: false, branch: activeBranch, pr, head: ref.object.sha,
+      exists: true, refReady: false, branch: activeBranch, pr, head: ref.object.sha,
       headActor: history.actor, expectedPrincipal,
       pendingPin: structuredClone(history.branchRegistry[name].pin),
       pendingRegistry: history.branchRegistry,
       observed: {
         effect: 'CONFIRMED_DONE', principal: pr.user.login, expectedPrincipal,
-        marker: prMarker(name), branch, headActor: history.actor,
+        marker: prMarker(name), branch: activeBranch, headActor: history.actor,
         head: ref.object.sha, expectedHead: ref.object.sha,
         preimage: compare.merge_base_commit.sha, expectedPreimage: baseSha,
         humanCommits: 0, changedPaths: history.changedPaths, changedPointers: history.pointers,
@@ -514,10 +524,27 @@ export async function inspectExistingBotPr({ api, repository, baseBranch, baseSh
     };
   }
 
-  // Old generation refs are retained but never reused as parents. A new cycle
-  // starts at canonical A, so GitHub merge, squash and rebase see one pin delta.
-  if (ref !== null) fail(`${name}: generation ref already exists without an open PR`);
-  return { exists: false, retained: false, branch, pendingPin: null, effect: 'CONFIRMED_NOT_DONE' };
+  if (ref === null) {
+    return { exists: false, refReady: false, branch: candidateBranch, pendingPin: null, effect: 'CONFIRMED_NOT_DONE' };
+  }
+
+  // A ref left by an interrupted ref→PR transition may be resumed only when it
+  // is the exact deterministic candidate and has no closed PR history. Closed
+  // unmerged or foreign evidence remains HOLD; old candidates use other refs.
+  const closedPrs = await listAll(
+    api,
+    `/pulls?state=closed&base=${encodeURIComponent(baseBranch)}&head=${encodeURIComponent(`${owner}:${candidateBranch}`)}`,
+    COLLECTION_LIMITS.closedPrs,
+  );
+  if (closedPrs.length !== 0) fail(`${name}: generation ref has closed PR evidence`);
+  const prepared = await inspectPreparedCandidateRef({
+    api, refSha: ref.object?.sha, baseSha, registry, name, candidate, expectedPrincipal,
+  });
+  return {
+    exists: false, refReady: true, branch: candidateBranch, head: ref.object.sha,
+    pendingPin: null, pendingRegistry: prepared.registry,
+    effect: 'REF_READY_NO_PR',
+  };
 }
 
 export async function bindCanonicalInput({ api, baseBranch = BASE_BRANCH, checkoutSha, localRegistry }) {
@@ -599,6 +626,67 @@ function gitCommitSha({ tree, parents, message, author, committer }) {
   return gitObjectSha('commit', content);
 }
 
+function candidateCommitMessage(name, version) {
+  return `chore: update ${name} to ${version}\n\n${prKey(name)}`;
+}
+
+async function planImmutableCommit({ api, parentShas, treeBaseSha, registry, message }) {
+  if (!Array.isArray(parentShas) || parentShas.length < 1 || parentShas.some((sha) => !/^[0-9a-f]{40}$/.test(sha))) {
+    fail('commit parents are invalid');
+  }
+  if (!/^[0-9a-f]{40}$/.test(treeBaseSha ?? '')) fail('tree base commit is invalid');
+  const baseCommit = await api('GET', `/git/commits/${treeBaseSha}`);
+  if (!baseCommit?.tree?.sha) fail('tree base commit/tree absent');
+  const registryBytes = Buffer.from(`${JSON.stringify(registry, null, 2)}\n`);
+  const blobSha = gitObjectSha('blob', registryBytes);
+  const treeSha = await expectedTreeWithReplacement(
+    api, baseCommit.tree.sha, REGISTRY_PATH.split('/'),
+    { mode: '100644', type: 'blob', sha: blobSha },
+  );
+  const date = normalizedGitDate(baseCommit.committer?.date ?? baseCommit.author?.date);
+  const normalizedMessage = message.endsWith('\n') ? message : `${message}\n`;
+  const author = { ...BOT_GIT_IDENTITY, date };
+  const committer = { ...BOT_GIT_IDENTITY, date };
+  const commitBody = { message: normalizedMessage, tree: treeSha, parents: parentShas, author, committer };
+  const commitSha = gitCommitSha(commitBody);
+  return { baseCommit, registryBytes, blobSha, treeSha, date, normalizedMessage, author, committer, commitBody, commitSha };
+}
+
+function commitMatchesPlan(commit, plan) {
+  if (!commit) return false;
+  const parents = (commit.parents ?? []).map((parent) => parent.sha);
+  return commit.sha === plan.commitSha && commit.tree?.sha === plan.treeSha
+    && JSON.stringify(parents) === JSON.stringify(plan.commitBody.parents)
+    && commit.message === plan.normalizedMessage
+    && commit.author?.name === plan.author.name && commit.author?.email === plan.author.email
+    && normalizedGitDate(commit.author?.date) === plan.date
+    && commit.committer?.name === plan.committer.name && commit.committer?.email === plan.committer.email
+    && normalizedGitDate(commit.committer?.date) === plan.date;
+}
+
+async function inspectPreparedCandidateRef({ api, refSha, baseSha, registry, name, candidate, expectedPrincipal }) {
+  if (!/^[0-9a-f]{40}$/.test(refSha ?? '')) fail(`${name}: generation ref is malformed`);
+  const next = applyPin(registry, name, candidate);
+  const plan = await planImmutableCommit({
+    api, parentShas: [baseSha], treeBaseSha: baseSha, registry: next,
+    message: candidateCommitMessage(name, candidate.version),
+  });
+  if (refSha !== plan.commitSha) fail(`${name}: generation ref is foreign or stale`);
+  const rawCommit = await api('GET', `/git/commits/${refSha}`);
+  if (!commitMatchesPlan(rawCommit, plan)) fail(`${name}: prepared commit differs`);
+  const associatedCommit = await api('GET', `/commits/${refSha}`);
+  assertExpectedPrincipalActors(associatedCommit, expectedPrincipal, `${name}: prepared commit`);
+  const preparedRegistry = await readRegistryAt(api, refSha);
+  if (JSON.stringify(preparedRegistry) !== JSON.stringify(next)) fail(`${name}: prepared registry differs`);
+  const pointers = changedPointers(registry, preparedRegistry, name);
+  if (pointers.length !== 2 || pointers.some((pointer) => ![`/${name}/pin/version`, `/${name}/pin/contentHash`].includes(pointer))) {
+    fail(`${name}: prepared pin diff differs`);
+  }
+  const compare = await api('GET', `/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(refSha)}`);
+  if (compare?.merge_base_commit?.sha !== baseSha) fail(`${name}: prepared base differs`);
+  return { registry: preparedRegistry, plan, pointers };
+}
+
 async function requireObjectReceipt(label, effect) {
   const result = await reconcileEffect(effect);
   if (result.state !== 'CONFIRMED_DONE') fail(`${label}: ${result.state}`);
@@ -606,76 +694,47 @@ async function requireObjectReceipt(label, effect) {
 }
 
 export async function createImmutableCommit({ api, parentShas, treeBaseSha, registry, message }) {
-  if (!Array.isArray(parentShas) || parentShas.length < 1 || parentShas.some((sha) => !/^[0-9a-f]{40}$/.test(sha))) {
-    fail('commit parents are invalid');
-  }
-  if (!/^[0-9a-f]{40}$/.test(treeBaseSha ?? '')) fail('tree base commit is invalid');
-  const baseCommit = await api('GET', `/git/commits/${treeBaseSha}`);
-  if (!baseCommit?.tree?.sha) fail('tree base commit/tree absent');
-
-  const registryBytes = Buffer.from(`${JSON.stringify(registry, null, 2)}\n`);
-  const blobSha = gitObjectSha('blob', registryBytes);
+  const plan = await planImmutableCommit({ api, parentShas, treeBaseSha, registry, message });
   const blobReceipt = await requireObjectReceipt('registry blob', {
     observe: async () => {
-      const blob = await api('GET', `/git/blobs/${blobSha}`);
+      const blob = await api('GET', `/git/blobs/${plan.blobSha}`);
       if (blob === null) return 'CONFIRMED_NOT_DONE';
       if (blob?.encoding !== 'base64' || typeof blob.content !== 'string') return 'PARTIAL_OR_FAILED';
       const actual = Buffer.from(blob.content.replace(/\n/g, ''), 'base64');
-      return gitObjectSha('blob', actual) === blobSha && actual.equals(registryBytes)
+      return gitObjectSha('blob', actual) === plan.blobSha && actual.equals(plan.registryBytes)
         ? 'CONFIRMED_DONE' : 'PARTIAL_OR_FAILED';
     },
     mutate: async () => {
-      const created = await api('POST', '/git/blobs', { content: registryBytes.toString('base64'), encoding: 'base64' });
-      if (created?.sha !== blobSha) fail('registry blob response sha differs');
+      const created = await api('POST', '/git/blobs', { content: plan.registryBytes.toString('base64'), encoding: 'base64' });
+      if (created?.sha !== plan.blobSha) fail('registry blob response sha differs');
     },
   });
-
-  const treeSha = await expectedTreeWithReplacement(
-    api, baseCommit.tree.sha, REGISTRY_PATH.split('/'),
-    { mode: '100644', type: 'blob', sha: blobSha },
-  );
   const treeReceipt = await requireObjectReceipt('registry tree', {
     observe: async () => {
-      const tree = await api('GET', `/git/trees/${treeSha}`);
+      const tree = await api('GET', `/git/trees/${plan.treeSha}`);
       return tree === null ? 'CONFIRMED_NOT_DONE'
-        : tree?.sha === treeSha && tree.truncated !== true ? 'CONFIRMED_DONE' : 'PARTIAL_OR_FAILED';
+        : tree?.sha === plan.treeSha && tree.truncated !== true ? 'CONFIRMED_DONE' : 'PARTIAL_OR_FAILED';
     },
     mutate: async () => {
       const created = await api('POST', '/git/trees', {
-        base_tree: baseCommit.tree.sha,
-        tree: [{ path: REGISTRY_PATH, mode: '100644', type: 'blob', sha: blobSha }],
+        base_tree: plan.baseCommit.tree.sha,
+        tree: [{ path: REGISTRY_PATH, mode: '100644', type: 'blob', sha: plan.blobSha }],
       });
-      if (created?.sha !== treeSha) fail('registry tree response sha differs');
+      if (created?.sha !== plan.treeSha) fail('registry tree response sha differs');
     },
   });
-
-  const date = normalizedGitDate(baseCommit.committer?.date ?? baseCommit.author?.date);
-  const normalizedMessage = message.endsWith('\n') ? message : `${message}\n`;
-  const author = { ...BOT_GIT_IDENTITY, date };
-  const committer = { ...BOT_GIT_IDENTITY, date };
-  const commitBody = { message: normalizedMessage, tree: treeSha, parents: parentShas, author, committer };
-  const commitSha = gitCommitSha(commitBody);
   const commitReceipt = await requireObjectReceipt('candidate commit', {
     observe: async () => {
-      const commit = await api('GET', `/git/commits/${commitSha}`);
+      const commit = await api('GET', `/git/commits/${plan.commitSha}`);
       if (commit === null) return 'CONFIRMED_NOT_DONE';
-      const parents = (commit.parents ?? []).map((parent) => parent.sha);
-      const exact = commit?.sha === commitSha && commit.tree?.sha === treeSha
-        && JSON.stringify(parents) === JSON.stringify(parentShas)
-        && commit.message === normalizedMessage
-        && commit.author?.name === author.name && commit.author?.email === author.email
-        && normalizedGitDate(commit.author?.date) === date
-        && commit.committer?.name === committer.name && commit.committer?.email === committer.email
-        && normalizedGitDate(commit.committer?.date) === date;
-      return exact ? 'CONFIRMED_DONE' : 'PARTIAL_OR_FAILED';
+      return commitMatchesPlan(commit, plan) ? 'CONFIRMED_DONE' : 'PARTIAL_OR_FAILED';
     },
     mutate: async () => {
-      const created = await api('POST', '/git/commits', commitBody);
-      if (created?.sha !== commitSha) fail('candidate commit response sha differs');
+      const created = await api('POST', '/git/commits', plan.commitBody);
+      if (created?.sha !== plan.commitSha) fail('candidate commit response sha differs');
     },
   });
-
-  return { sha: commitSha, receipts: { blob: blobReceipt, tree: treeReceipt, commit: commitReceipt } };
+  return { sha: plan.commitSha, receipts: { blob: blobReceipt, tree: treeReceipt, commit: commitReceipt } };
 }
 
 export async function reconcileRef({ api, branch, expectedOldSha, newSha, create }) {
@@ -701,13 +760,14 @@ export async function reconcileRef({ api, branch, expectedOldSha, newSha, create
 export async function reconcilePrCreate({ api, repository, baseBranch, baseSha, branch, name, title, body, expectedHead, expectedRegistry }) {
   const [owner] = repository.split('/');
   const observePr = async () => {
+    // These leases are checked before POST as well as after an unknown response.
+    const baseRef = await api('GET', `/git/ref/heads/${encodeURIComponent(baseBranch)}`);
+    const ref = await api('GET', `/git/ref/heads/${encodeURIComponent(branch)}`);
+    if (baseRef?.object?.sha !== baseSha || ref?.object?.sha !== expectedHead) return 'PARTIAL_OR_FAILED';
     const prs = await listAll(api, `/pulls?state=open&base=${encodeURIComponent(baseBranch)}&head=${encodeURIComponent(`${owner}:${branch}`)}`, COLLECTION_LIMITS.openPrs);
     if (prs.length === 0) return 'CONFIRMED_NOT_DONE';
     if (prs.length !== 1) return 'PARTIAL_OR_FAILED';
     const pr = prs[0];
-    const ref = await api('GET', `/git/ref/heads/${encodeURIComponent(branch)}`);
-    const baseRef = await api('GET', `/git/ref/heads/${encodeURIComponent(baseBranch)}`);
-    if (baseRef?.object?.sha !== baseSha || ref?.object?.sha !== expectedHead) return 'PARTIAL_OR_FAILED';
     try {
       assertPrShape({ pr, repository, baseBranch, branch, name, expectedPrincipal: BOT_LOGIN });
       if (pr.head?.sha !== expectedHead || pr.base?.sha !== baseSha) return 'PARTIAL_OR_FAILED';
@@ -724,25 +784,31 @@ export async function maintainOne({
   fetchImpl = fetch, api: apiOverride = null,
 }) {
   const api = apiOverride ?? githubClient(repository, token, fetchImpl);
-  const existing = await inspectExistingBotPr({ api, repository, baseBranch, baseSha, registry, name });
+  const existing = await inspectExistingBotPr({ api, repository, baseBranch, baseSha, registry, name, candidate });
   const decision = decideThreeVersion(registry[name], candidate, existing.pendingPin);
   if (decision.state === 'RED' || decision.state === 'NOOP') return { name, decision, effects: 0 };
   if (decision.action === 'RESUME') return { name, decision, effects: 0, pr: existing.pr?.html_url ?? null };
   const next = applyPin(registry, name, candidate);
-  await assertCanonicalLease({ api, baseBranch, baseSha });
-  const parentShas = existing.exists ? [existing.head] : [baseSha];
-  const treeBaseSha = existing.exists ? existing.head : baseSha;
-  const commit = await createImmutableCommit({
-    api, parentShas, treeBaseSha, registry: next,
-    message: `chore: update ${name} to ${candidate.version}
-
-${prKey(name)}`,
-  });
-  await assertCanonicalLease({ api, baseBranch, baseSha });
-  const createRef = !existing.exists;
-  const expectedOldSha = existing.exists ? existing.head : null;
-  const refEffect = await reconcileRef({ api, branch: existing.branch, expectedOldSha, newSha: commit.sha, create: createRef });
-  if (refEffect.state !== 'CONFIRMED_DONE') return { name, decision, refEffect, effects: 1, state: 'STOP' };
+  let commit;
+  let refEffect;
+  if (existing.refReady) {
+    commit = { sha: existing.head };
+    refEffect = { state: 'CONFIRMED_DONE', sends: 0, recovery: 'REF_READY_NO_PR' };
+  } else {
+    await assertCanonicalLease({ api, baseBranch, baseSha });
+    const parentShas = existing.exists ? [existing.head] : [baseSha];
+    const treeBaseSha = existing.exists ? existing.head : baseSha;
+    commit = await createImmutableCommit({
+      api, parentShas, treeBaseSha, registry: next,
+      message: candidateCommitMessage(name, candidate.version),
+    });
+    await assertCanonicalLease({ api, baseBranch, baseSha });
+    refEffect = await reconcileRef({
+      api, branch: existing.branch, expectedOldSha: existing.exists ? existing.head : null,
+      newSha: commit.sha, create: !existing.exists,
+    });
+    if (refEffect.state !== 'CONFIRMED_DONE') return { name, decision, refEffect, effects: 1, state: 'STOP' };
+  }
   let prEffect = { state: 'CONFIRMED_DONE', sends: 0 };
   if (!existing.exists) {
     await assertCanonicalLease({ api, baseBranch, baseSha });
@@ -757,10 +823,18 @@ Official stable release verified cryptographically.
 - version: \`${candidate.version}\`
 - sha256: \`${candidate.contentHash}\`
 - manual approval and CI are still required.`;
-    prEffect = await reconcilePrCreate({ api, repository, baseBranch, baseSha, branch: existing.branch, name, title, body, expectedHead: commit.sha, expectedRegistry: next });
+    prEffect = await reconcilePrCreate({
+      api, repository, baseBranch, baseSha, branch: existing.branch, name, title, body,
+      expectedHead: commit.sha, expectedRegistry: next,
+    });
   }
   await assertCanonicalLease({ api, baseBranch, baseSha });
-  return { name, decision, refEffect, prEffect, effects: refEffect.sends + prEffect.sends, state: prEffect.state === 'CONFIRMED_DONE' ? 'DONE' : 'STOP' };
+  return {
+    name, decision, refEffect, prEffect,
+    recovery: existing.refReady ? 'REF_READY_NO_PR' : null,
+    effects: refEffect.sends + prEffect.sends,
+    state: prEffect.state === 'CONFIRMED_DONE' ? 'DONE' : 'STOP',
+  };
 }
 
 async function loadRegistry(path) {

@@ -420,7 +420,7 @@ test('canonical movement immediately before first effect stops with blob/tree/co
   const api = async (method, path, body) => {
     calls.push({ method, path, body });
     if (method === 'GET' && path.startsWith('/pulls?state=open')) return [];
-    if (method === 'GET' && path === `/git/ref/heads/${encodeURIComponent(generationBranch('alpha', base))}`) return null;
+    if (method === 'GET' && path === `/git/ref/heads/${encodeURIComponent(generationBranch('alpha', base, candidate('1.2.4')))}`) return null;
     if (method === 'GET' && path === '/git/ref/heads/proposals') return { object: { sha: moved } };
     throw new Error(`unexpected ${method} ${path}`);
   };
@@ -492,16 +492,16 @@ test('partial/unknown effects stop and never resend', async () => {
 test('actual PR acceptance requires author, marker/PRKey, branch, actor, lease, preimage, path and pointers', async () => {
   const data = registry();
   const pending = applyPin(data, 'alpha', candidate('1.2.4', hex('d')));
-  const branch = 'bot/cli-release-alpha';
   const head = '1'.repeat(40);
   const base = '2'.repeat(40);
+  const branch = generationBranch('alpha', base, candidate('1.2.4', hex('d')));
   const api = async (method, path) => {
     if (method === 'GET' && path.startsWith('/pulls?state=open')) return [{
       number: 7, user: { login: BOT }, body: prMarker('alpha'),
       base: { ref: 'proposals', sha: base }, head: { ref: branch, sha: head, repo: { full_name: 'roccho-dev/windows' } },
     }];
     if (decodeURIComponent(path) === `/git/ref/heads/${branch}`) return { object: { sha: head } };
-    if (path === '/pulls/7/commits?per_page=100&page=1') return [{ sha: '0'.repeat(40), author: { login: BOT } }, { sha: head, author: { login: BOT } }];
+    if (path === '/pulls/7/commits?per_page=100&page=1') return [{ sha: '0'.repeat(40), author: { login: BOT }, committer: { login: BOT } }, { sha: head, author: { login: BOT }, committer: { login: BOT } }];
     if (path === `/commits/${head}`) return { author: { login: BOT }, committer: { login: BOT } };
     if (path === '/pulls/7/files?per_page=100&page=1') return [{ filename: 'hosts/profile/releases.json' }];
     if (path.includes(`/contents/hosts/profile/releases.json?ref=${head}`)) return { content: Buffer.from(JSON.stringify(pending)).toString('base64') };
@@ -509,7 +509,7 @@ test('actual PR acceptance requires author, marker/PRKey, branch, actor, lease, 
     if (path.startsWith('/compare/')) return { merge_base_commit: { sha: base } };
     throw new Error(`unexpected ${method} ${path}`);
   };
-  const result = await inspectExistingBotPr({ api, repository: 'roccho-dev/windows', baseBranch: 'proposals', baseSha: base, registry: data, name: 'alpha' });
+  const result = await inspectExistingBotPr({ api, repository: 'roccho-dev/windows', baseBranch: 'proposals', baseSha: base, registry: data, name: 'alpha', candidate: candidate('1.2.4', hex('d')) });
   assert.equal(result.pendingPin.version, '1.2.4');
   assert.equal(result.observed.effect, 'CONFIRMED_DONE');
   assert.equal(result.observed.marker, prMarker('alpha'));
@@ -518,10 +518,10 @@ test('actual PR acceptance requires author, marker/PRKey, branch, actor, lease, 
 test('actual PR ownership reads every commit page and rejects a foreign commit after item 100', async () => {
   const data = registry();
   const pending = applyPin(data, 'alpha', candidate('1.2.4', hex('d')));
-  const branch = 'bot/cli-release-alpha';
   const head = '1'.repeat(40);
   const base = '2'.repeat(40);
-  const firstPage = Array.from({ length: 100 }, (_, index) => ({ sha: String(index).padStart(40, '0'), author: { login: BOT } }));
+  const branch = generationBranch('alpha', base, candidate('1.2.4', hex('d')));
+  const firstPage = Array.from({ length: 100 }, (_, index) => ({ sha: String(index).padStart(40, '0'), author: { login: BOT }, committer: { login: BOT } }));
   const api = async (method, path) => {
     if (method === 'GET' && path.startsWith('/pulls?state=open')) return [{
       number: 7, user: { login: BOT }, body: prMarker('alpha'),
@@ -529,7 +529,7 @@ test('actual PR ownership reads every commit page and rejects a foreign commit a
     }];
     if (decodeURIComponent(path) === `/git/ref/heads/${branch}`) return { object: { sha: head } };
     if (path === '/pulls/7/commits?per_page=100&page=1') return firstPage;
-    if (path === '/pulls/7/commits?per_page=100&page=2') return [{ sha: head, author: { login: 'human' } }];
+    if (path === '/pulls/7/commits?per_page=100&page=2') return [{ sha: head, author: { login: 'human' }, committer: { login: BOT } }];
     if (path === `/commits/${head}`) return { author: { login: BOT }, committer: { login: BOT } };
     if (path === '/pulls/7/files?per_page=100&page=1') return [{ filename: 'hosts/profile/releases.json' }];
     if (path.includes(`/contents/hosts/profile/releases.json?ref=${head}`)) return { content: Buffer.from(JSON.stringify(pending)).toString('base64') };
@@ -538,15 +538,115 @@ test('actual PR ownership reads every commit page and rejects a foreign commit a
     throw new Error(`unexpected ${method} ${path}`);
   };
   await assert.rejects(
-    inspectExistingBotPr({ api, repository: 'roccho-dev/windows', baseBranch: 'proposals', baseSha: base, registry: data, name: 'alpha' }),
-    /human or foreign commit/,
+    inspectExistingBotPr({ api, repository: 'roccho-dev/windows', baseBranch: 'proposals', baseSha: base, registry: data, name: 'alpha', candidate: candidate('1.2.4', hex('d')) }),
+    /author differs|committer differs/,
   );
 });
 
-test('generation branch changes with canonical A; stable PRKey and no retained ref rewrite', () => {
+test('generation identity includes A, candidate version and hash while PRKey stays stable', () => {
   const a = 'a'.repeat(40), b = 'b'.repeat(40);
-  assert.notEqual(generationBranch('alpha', a), generationBranch('alpha', b));
+  const c1 = candidate('1.2.4', hex('d'));
+  const c2 = candidate('1.2.5', hex('e'));
+  assert.notEqual(generationBranch('alpha', a, c1), generationBranch('alpha', b, c1));
+  assert.notEqual(generationBranch('alpha', a, c1), generationBranch('alpha', a, c2));
+  assert.match(generationBranch('alpha', a, c1), /-v1\.2\.4-hd{64}$/);
   assert.equal(prKey('alpha'), 'cli-release:alpha');
+});
+
+
+test('exact prepared candidate ref resumes PR only after response loss', async () => {
+  const repository = 'roccho-dev/windows';
+  const base = '3'.repeat(40);
+  const c = candidate('1.2.4', hex('d'));
+  const data = registry();
+  const next = applyPin(data, 'alpha', c);
+  const objectFixture = new GitObjectFixture(base);
+  const prepared = await createImmutableCommit({
+    api: objectFixture.api, parentShas: [base], treeBaseSha: base, registry: next,
+    message: `chore: update alpha to ${c.version}\n\n${prKey('alpha')}`,
+  });
+  objectFixture.calls.length = 0;
+  const branch = generationBranch('alpha', base, c);
+  let openPr = null;
+  const calls = [];
+  const api = async (method, path, body) => {
+    calls.push({ method, path, body });
+    if (method === 'GET' && path === '/git/ref/heads/proposals') return { object: { sha: base } };
+    if (method === 'GET' && decodeURIComponent(path) === `/git/ref/heads/${branch}`) return { object: { sha: prepared.sha } };
+    if (method === 'GET' && path.startsWith('/pulls?state=open')) return openPr ? [openPr] : [];
+    if (method === 'GET' && path.startsWith('/pulls?state=closed')) return [];
+    if (method === 'GET' && path === `/commits/${prepared.sha}`) return { author: { login: BOT }, committer: { login: BOT } };
+    if (method === 'GET' && path === '/pulls/1/commits?per_page=100&page=1') return [{ sha: prepared.sha, author: { login: BOT }, committer: { login: BOT } }];
+    if (method === 'GET' && path === '/pulls/1/files?per_page=100&page=1') return [{ filename: 'hosts/profile/releases.json' }];
+    if (method === 'GET' && path.includes(`/contents/hosts/profile/releases.json?ref=${prepared.sha}`)) return { content: Buffer.from(JSON.stringify(next)).toString('base64') };
+    if (method === 'GET' && path.includes(`/contents/hosts/profile/releases.json?ref=${base}`)) return { content: Buffer.from(JSON.stringify(data)).toString('base64') };
+    if (method === 'GET' && path.startsWith(`/compare/${base}...${prepared.sha}`)) return { merge_base_commit: { sha: base } };
+    if (method === 'POST' && path === '/pulls') {
+      openPr = {
+        number: 1, html_url: 'https://github.test/pr/1', user: { login: BOT }, body: body.body,
+        base: { ref: body.base, sha: base },
+        head: { ref: body.head, sha: prepared.sha, repo: { full_name: repository } },
+      };
+      throw new TypeError('simulated response loss after PR create');
+    }
+    return objectFixture.api(method, path, body);
+  };
+  const result = await maintainOne({ repository, token: 'unused', baseSha: base, registry: data, name: 'alpha', candidate: c, api });
+  assert.equal(result.state, 'DONE');
+  assert.equal(result.recovery, 'REF_READY_NO_PR');
+  assert.equal(result.prEffect.state, 'CONFIRMED_DONE');
+  assert.equal(result.prEffect.sends, 1);
+  assert.equal(calls.filter(({ method, path }) => method === 'POST' && path === '/pulls').length, 1);
+  assert.equal(calls.filter(({ method, path }) => method === 'POST' && path.startsWith('/git/')).length, 0);
+  assert.equal(calls.filter(({ method }) => method === 'PATCH' || method === 'DELETE').length, 0);
+});
+
+test('closed-unmerged or foreign same-candidate ref holds with mutation zero', async () => {
+  const repository = 'roccho-dev/windows';
+  const base = '3'.repeat(40);
+  const c = candidate('1.2.4', hex('d'));
+  const branch = generationBranch('alpha', base, c);
+  for (const mode of ['closed-unmerged', 'foreign-ref']) {
+    const objectFixture = new GitObjectFixture(base);
+    const calls = [];
+    const api = async (method, path, body) => {
+      calls.push({ method, path, body });
+      if (method === 'GET' && path.startsWith('/pulls?state=open')) return [];
+      if (method === 'GET' && decodeURIComponent(path) === `/git/ref/heads/${branch}`) return { object: { sha: '9'.repeat(40) } };
+      if (method === 'GET' && path.startsWith('/pulls?state=closed')) return mode === 'closed-unmerged'
+        ? [{ number: 9, merged_at: null, head: { ref: branch, sha: '9'.repeat(40) } }] : [];
+      return objectFixture.api(method, path, body);
+    };
+    await assert.rejects(
+      inspectExistingBotPr({ api, repository, baseBranch: 'proposals', baseSha: base, registry: registry(), name: 'alpha', candidate: c }),
+      mode === 'closed-unmerged' ? /closed PR evidence/ : /foreign or stale/,
+      mode,
+    );
+    assert.equal(calls.filter(({ method }) => ['POST', 'PATCH', 'DELETE'].includes(method)).length, 0, mode);
+  }
+});
+
+test('newer candidate is not blocked by an older closed generation ref', async () => {
+  const repository = 'roccho-dev/windows';
+  const base = '3'.repeat(40);
+  const oldCandidate = candidate('1.2.4', hex('d'));
+  const newerCandidate = candidate('1.2.5', hex('e'));
+  const oldBranch = generationBranch('alpha', base, oldCandidate);
+  const newBranch = generationBranch('alpha', base, newerCandidate);
+  const api = async (method, path) => {
+    if (method === 'GET' && path.startsWith('/pulls?state=open')) return [];
+    if (method === 'GET' && decodeURIComponent(path) === `/git/ref/heads/${newBranch}`) return null;
+    if (method === 'GET' && decodeURIComponent(path) === `/git/ref/heads/${oldBranch}`) return { object: { sha: '9'.repeat(40) } };
+    throw new Error(`unexpected ${method} ${path}`);
+  };
+  const result = await inspectExistingBotPr({
+    api, repository, baseBranch: 'proposals', baseSha: base, registry: registry(),
+    name: 'alpha', candidate: newerCandidate,
+  });
+  assert.equal(result.exists, false);
+  assert.equal(result.refReady, false);
+  assert.equal(result.branch, newBranch);
+  assert.notEqual(oldBranch, newBranch);
 });
 
 const BOT = 'github-actions[bot]';
@@ -574,11 +674,13 @@ test('planApiEffect fails closed on author, marker, actor, lease, preimage, path
   assert.equal(prKey('alpha'), 'cli-release:alpha');
 });
 
-test('native Git graph: generation candidate has only A pin delta for merge/squash/rebase', async () => {
+test('native Git graph: candidate-specific generation has one A pin delta for merge/squash/rebase', async () => {
   const { execFileSync } = await import('node:child_process');
   const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
+  const firstCandidate = candidate('1.2.4', hex('d'));
+  const secondCandidate = candidate('1.2.5', hex('e'));
   for (const mode of ['merge', 'squash', 'rebase']) {
     const dir = mkdtempSync(join(tmpdir(), 'watch-git-'));
     const git = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 'bot', GIT_AUTHOR_EMAIL: 'bot@example.org', GIT_COMMITTER_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.org' } }).trim();
@@ -586,21 +688,24 @@ test('native Git graph: generation candidate has only A pin delta for merge/squa
     try {
       git('init', '-q', '-b', 'proposals'); commit('1');
       const firstA = git('rev-parse', 'HEAD');
-      git('checkout', '-qb', generationBranch('alpha', firstA)); commit('2');
+      const firstBranch = generationBranch('alpha', firstA, firstCandidate);
+      git('checkout', '-qb', firstBranch); commit('2');
       git('checkout', '-q', 'proposals');
-      if (mode === 'merge') git('merge', '--no-ff', '-qm', 'adopt', generationBranch('alpha', firstA));
-      if (mode === 'squash') { git('merge', '--squash', generationBranch('alpha', firstA)); git('commit', '-qm', 'adopt'); }
-      if (mode === 'rebase') { git('checkout', '-q', generationBranch('alpha', firstA)); git('rebase', '-q', 'proposals'); git('checkout', '-q', 'proposals'); git('merge', '--ff-only', generationBranch('alpha', firstA)); }
+      if (mode === 'merge') git('merge', '--no-ff', '-qm', 'adopt', firstBranch);
+      if (mode === 'squash') { git('merge', '--squash', firstBranch); git('commit', '-qm', 'adopt'); }
+      if (mode === 'rebase') { git('checkout', '-q', firstBranch); git('rebase', '-q', 'proposals'); git('checkout', '-q', 'proposals'); git('merge', '--ff-only', firstBranch); }
       const nextA = git('rev-parse', 'HEAD');
-      git('checkout', '-qb', generationBranch('alpha', nextA)); commit('3');
-      assert.equal(git('rev-list', '--count', `proposals..${generationBranch('alpha', nextA)}`), '1');
-      assert.equal(git('diff', '--name-only', `proposals..${generationBranch('alpha', nextA)}`), 'pin');
+      const nextBranch = generationBranch('alpha', nextA, secondCandidate);
+      git('checkout', '-qb', nextBranch); commit('3');
+      assert.equal(git('rev-list', '--count', `proposals..${nextBranch}`), '1');
+      assert.equal(git('diff', '--name-only', `proposals..${nextBranch}`), 'pin');
       git('checkout', '-q', 'proposals');
-      if (mode === 'merge') git('merge', '--no-ff', '-qm', 'adopt2', generationBranch('alpha', nextA));
-      if (mode === 'squash') { git('merge', '--squash', generationBranch('alpha', nextA)); git('commit', '-qm', 'adopt2'); }
-      if (mode === 'rebase') { git('checkout', '-q', generationBranch('alpha', nextA)); git('rebase', '-q', 'proposals'); git('checkout', '-q', 'proposals'); git('merge', '--ff-only', generationBranch('alpha', nextA)); }
+      if (mode === 'merge') git('merge', '--no-ff', '-qm', 'adopt2', nextBranch);
+      if (mode === 'squash') { git('merge', '--squash', nextBranch); git('commit', '-qm', 'adopt2'); }
+      if (mode === 'rebase') { git('checkout', '-q', nextBranch); git('rebase', '-q', 'proposals'); git('checkout', '-q', 'proposals'); git('merge', '--ff-only', nextBranch); }
       assert.equal(git('show', 'HEAD:pin'), '3');
       assert.equal(git('cat-file', '-t', firstA), 'commit');
+      assert.equal(git('cat-file', '-t', firstBranch), 'commit');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }
 });
@@ -613,7 +718,7 @@ test('canonical A moves after immutable objects: no ref or PR write', async () =
   const api = async (method, path, body) => {
     calls.push({ method, path, body });
     if (method === 'GET' && path.startsWith('/pulls?state=open')) return [];
-    if (method === 'GET' && path === `/git/ref/heads/${encodeURIComponent(generationBranch('alpha', base))}`) return null;
+    if (method === 'GET' && path === `/git/ref/heads/${encodeURIComponent(generationBranch('alpha', base, candidate('1.2.4')))}`) return null;
     if (method === 'GET' && path === '/git/ref/heads/proposals') return { object: { sha: ++reads > 1 ? moved : base } };
     return fixture.api(method, path, body);
   };
@@ -622,33 +727,58 @@ test('canonical A moves after immutable objects: no ref or PR write', async () =
   assert.equal(calls.filter(({ method, path }) => method === 'POST' && path === '/git/commits').length, 1);
 });
 
-test('PR response-loss cannot admit a moved branch or mismatched base', async () => {
-  const fixture = new ProtocolFixture();
-  const api = githubClient(fixture.repository, 'token', fixture.fetch);
-  const branch = generationBranch('alpha', '3'.repeat(40));
+test('PR creation preflight rejects known base or generation mismatch with POST zero', async () => {
+  const base = '3'.repeat(40);
   const expectedHead = '1'.repeat(40);
-  fixture.refs.set(branch, '2'.repeat(40));
-  const result = await reconcilePrCreate({ api, repository: fixture.repository, baseBranch: 'proposals', baseSha: '3'.repeat(40), branch, name: 'alpha', title: 'update', body: prMarker('alpha'), expectedHead, expectedRegistry: registry() });
-  assert.notEqual(result.state, 'CONFIRMED_DONE');
-  assert.equal(fixture.calls.filter(({ method, path }) => method === 'POST' && path === '/pulls').length, 1);
+  const c = candidate('1.2.4', hex('d'));
+  for (const mismatch of ['base', 'head']) {
+    const fixture = new ProtocolFixture();
+    const api = githubClient(fixture.repository, 'token', fixture.fetch);
+    const branch = generationBranch('alpha', base, c);
+    fixture.refs.set('proposals', mismatch === 'base' ? '4'.repeat(40) : base);
+    fixture.refs.set(branch, mismatch === 'head' ? '2'.repeat(40) : expectedHead);
+    const result = await reconcilePrCreate({
+      api, repository: fixture.repository, baseBranch: 'proposals', baseSha: base,
+      branch, name: 'alpha', title: 'update', body: prMarker('alpha'),
+      expectedHead, expectedRegistry: registry(),
+    });
+    assert.equal(result.state, 'PARTIAL_OR_FAILED', mismatch);
+    assert.equal(result.sends, 0, mismatch);
+    assert.equal(fixture.calls.filter(({ method, path }) => method === 'POST' && path === '/pulls').length, 0, mismatch);
+  }
 });
 
-test('mixed author/committer on PR commits or head is RED', async () => {
-  const base = '2'.repeat(40), head = '1'.repeat(40), branch = generationBranch('alpha', base);
+test('PR commit and head require present bot author and committer; mixed or missing is RED', async () => {
+  const base = '2'.repeat(40), head = '1'.repeat(40);
+  const c = candidate('1.2.4', hex('d'));
+  const branch = generationBranch('alpha', base, c);
   const data = registry();
-  const next = applyPin(data, 'alpha', candidate('1.2.4'));
-  for (const mixedAt of ['page', 'head']) {
+  const next = applyPin(data, 'alpha', c);
+  const cases = [
+    ['page-author-missing', { pageAuthor: null }],
+    ['page-committer-missing', { pageCommitter: null }],
+    ['head-author-missing', { headAuthor: null }],
+    ['head-committer-missing', { headCommitter: null }],
+    ['page-mixed', { pageCommitter: 'human' }],
+    ['head-mixed', { headCommitter: 'human' }],
+  ];
+  for (const [label, change] of cases) {
+    const actor = (login) => login === null ? null : { login: login ?? BOT };
     const api = async (method, path) => {
       if (path.startsWith('/pulls?state=open')) return [{ number: 7, user: { login: BOT }, body: prMarker('alpha'), base: { ref: 'proposals', sha: base }, head: { ref: branch, sha: head, repo: { full_name: 'roccho-dev/windows' } } }];
       if (decodeURIComponent(path) === `/git/ref/heads/${branch}`) return { object: { sha: head } };
-      if (path.startsWith('/pulls/7/commits?')) return [{ author: { login: BOT }, committer: { login: mixedAt === 'page' ? 'human' : BOT } }];
-      if (path === `/commits/${head}`) return { author: { login: BOT }, committer: { login: mixedAt === 'head' ? 'human' : BOT } };
+      if (path.startsWith('/pulls/7/commits?')) return [{ author: actor(change.pageAuthor), committer: actor(change.pageCommitter) }];
+      if (path === `/commits/${head}`) return { author: actor(change.headAuthor), committer: actor(change.headCommitter) };
       if (path.startsWith('/pulls/7/files?')) return [{ filename: 'hosts/profile/releases.json' }];
       if (path.includes(`ref=${head}`)) return { content: Buffer.from(JSON.stringify(next)).toString('base64') };
       if (path.includes(`ref=${base}`)) return { content: Buffer.from(JSON.stringify(data)).toString('base64') };
       if (path.startsWith('/compare/')) return { merge_base_commit: { sha: base } };
       throw new Error(`unexpected ${method} ${path}`);
     };
-    await assert.rejects(inspectExistingBotPr({ api, repository: 'roccho-dev/windows', baseBranch: 'proposals', baseSha: base, registry: data, name: 'alpha' }), /foreign/);
+    await assert.rejects(
+      inspectExistingBotPr({ api, repository: 'roccho-dev/windows', baseBranch: 'proposals', baseSha: base, registry: data, name: 'alpha', candidate: c }),
+      /author differs|committer differs/,
+      label,
+    );
   }
 });
