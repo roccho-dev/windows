@@ -601,8 +601,8 @@ jobs:
             test "$NIX_REMOTE" = daemon
             hello > /dev/null
             test "$(readlink /nix/var/nix/profiles/own-dev)" = own-dev-2-link
-            test "$(codex --version)" = "codex-cli 0.157.1"
-            test "$(claude --version)" = "2.1.283 (Claude Code)"
+            test "$(codex --version)" = "codex-cli $(release-version codex)"
+            test "$(claude --version)" = "$(release-version claude) (Claude Code)"
             gh --version | grep -qE "^gh version 2\.96\.0( |$)"
             test "$(cat ~/own-home-marker)" = home && test ! -e /work/repos/own-home-marker
             cd /work/repos/p && git rev-parse HEAD
@@ -671,8 +671,8 @@ jobs:
                 test -z "${GH_CONFIG_DIR-}"
                 test "$(gh config get git_protocol -h github.com)" = ssh
                 test "$NIX_REMOTE" = daemon
-                test "$(codex --version)" = "codex-cli 0.157.1"
-                test "$(claude --version)" = "2.1.283 (Claude Code)"
+                test "$(codex --version)" = "codex-cli $(release-version codex)"
+                test "$(claude --version)" = "$(release-version claude) (Claude Code)"
                 test "$(readlink /nix/var/nix/profiles/own-dev)" = own-dev-1-link
                 test ! -e /work/repos/.auth
                 nix build --impure --no-link --expr "derivation { name = \"own-mig\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; args = [ \"-c\" \"echo ok > \$out\" ]; }" >/dev/null'

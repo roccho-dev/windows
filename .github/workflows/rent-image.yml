@@ -1034,9 +1034,9 @@ jobs:
             env -i HOME=/home/dev /bin/git ls-remote --exit-code https://github.com/roccho-dev/windows.git HEAD >/dev/null'
           "${ssh_cmd[@]}" gh --version > "$key_dir/gh"
           grep -qE '^gh version 2\.96\.0( |$)' "$key_dir/gh"
-          test "$("${ssh_cmd[@]}" codex --version)" = 'codex-cli 0.157.1'
+          test "$("${ssh_cmd[@]}" codex --version)" = "codex-cli $("${ssh_cmd[@]}" release-version codex)"
           if "${ssh_cmd[@]}" 'command -v tailscale || command -v tailscaled'; then echo 'tailscale reachable to dev' >&2; exit 1; fi
-          test "$("${ssh_cmd[@]}" claude --version)" = '2.1.283 (Claude Code)'
+          test "$("${ssh_cmd[@]}" claude --version)" = "$("${ssh_cmd[@]}" release-version claude) (Claude Code)"
           docker exec rent-smoke /bin/stat -c '%a %u %n' /home/dev /var/lib/rent/cloudflared /var/lib/rent/cloudflared/token /var/lib/rent/ssh \
             /var/lib/rent/ssh/ssh_host_ed25519_key /var/lib/rent/ssh/authorized_keys \
             /var/lib/rent/dev/codex /var/lib/rent/dev/claude /var/lib/rent/dev/claude.json > "$key_dir/modes"
