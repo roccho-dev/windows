@@ -7,8 +7,14 @@
       "versionScheme": "semver",
       "platform": "x86_64-unknown-linux-musl",
       "assetSelector": "codex-package-x86_64-unknown-linux-musl.tar.gz",
-      "verifyKind": "github-asset-digest",
-      "packageShape": "codex-musl-tar"
+      "verifyKind": "sigstore-bundle",
+      "packageShape": "codex-musl-tar",
+      "proof": {
+        "kind": "sigstore-bundle",
+        "assetSuffix": ".sigstore",
+        "certificateIdentityPrefix": "https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v",
+        "certificateOidcIssuer": "https://token.actions.githubusercontent.com"
+      }
     },
     "pin": {
       "version": "0.157.1",
@@ -23,8 +29,15 @@
       "versionScheme": "semver",
       "platform": "linux-x64",
       "assetSelector": "claude",
-      "verifyKind": "manifest-sha256",
-      "packageShape": "single-glibc-executable"
+      "verifyKind": "gpg-signed-manifest",
+      "packageShape": "single-glibc-executable",
+      "proof": {
+        "kind": "gpg-signed-manifest",
+        "manifestName": "manifest.json",
+        "signatureName": "manifest.json.sig",
+        "keyUrl": "https://downloads.claude.ai/keys/claude-code.asc",
+        "keyFingerprint": "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"
+      }
     },
     "pin": {
       "version": "2.1.283",

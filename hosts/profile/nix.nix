@@ -34,13 +34,17 @@ ${releaseVersionCases}      *) echo "release-version: unknown CLI ''${1:-}" >&2;
 in
 assert builtins.attrNames releaseDefinitions == [ "claude" "codex" ];
 assert builtins.isAttrs releaseDefinitions.codex.contract;
+assert builtins.isAttrs releaseDefinitions.codex.contract.proof;
 assert builtins.isAttrs releaseDefinitions.codex.pin;
 assert builtins.isAttrs releaseDefinitions.claude.contract;
+assert builtins.isAttrs releaseDefinitions.claude.contract.proof;
 assert builtins.isAttrs releaseDefinitions.claude.pin;
 assert claudeContract.sourceKind == "claude-manifest";
 assert claudeContract.channel == "stable";
 assert claudeContract.versionScheme == "semver";
-assert claudeContract.verifyKind == "manifest-sha256";
+assert claudeContract.verifyKind == "gpg-signed-manifest";
+assert claudeContract.proof.kind == "gpg-signed-manifest";
+assert claudeContract.proof.keyFingerprint == "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE";
 assert claudeContract.packageShape == "single-glibc-executable";
 pkgs.buildEnv {
   name = "dev-profile";

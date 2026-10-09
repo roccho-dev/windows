@@ -2,12 +2,14 @@
 
 assert builtins.isAttrs definition;
 assert builtins.isAttrs definition.contract;
+assert builtins.isAttrs definition.contract.proof;
 assert builtins.isAttrs definition.pin;
 assert definition.contract.sourceKind == "github-release";
 assert definition.contract.channel == "stable";
 assert definition.contract.versionScheme == "semver";
 assert definition.contract.platform == "x86_64-unknown-linux-musl";
-assert definition.contract.verifyKind == "github-asset-digest";
+assert definition.contract.verifyKind == "sigstore-bundle";
+assert definition.contract.proof.kind == "sigstore-bundle";
 assert definition.contract.packageShape == "codex-musl-tar";
 let
   inherit (definition) contract pin;
