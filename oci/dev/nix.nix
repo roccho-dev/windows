@@ -150,7 +150,7 @@ rec {
                 # becomes the program, so only stdin, stdout and stderr, the exit status and signals are the program's own.
                 say "${announce}"
                 # shellcheck disable=SC2016
-                exec "$cu/env" -i PATH="$cu" HOME=/homeless-shelter LANG=C.UTF-8 ${childEnv} \
+                exec "$cu/env" -i PATH="$cu" HOME=/homeless-shelter LANG=C.UTF-8 SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt ${childEnv} \
                   ${pkgs.bash}/bin/bash -c 'IFS= read -r -u 3 JEV_API_KEY || true
                     for f in /proc/$$/fd/*; do
                       n=''${f##*/}
@@ -194,7 +194,7 @@ rec {
         name = "voice-ui-jev-dev";
         usage = "--envs-sha <40-hex> --apps-sha <40-hex> --port <1024-65535> [--host 127.0.0.1|0.0.0.0] | --formal --envs-sha <40-hex> --deploy-sha <40-hex> --deploy-provenance-sha256 <64-hex> --deploy-proof-sha256 <64-hex> --artifacts <absolute-dir> --port <1024-65535> [--host 127.0.0.1|0.0.0.0] [--post-limit <1-12>]";
         say = "1";
-        announce = "apps $apps_sha on $host:$port with PATH HOME LANG PORT HOST JEV_API_KEY";
+        announce = "apps $apps_sha on $host:$port with PATH HOME LANG PORT HOST SSL_CERT_FILE JEV_API_KEY";
         childEnv = ''PORT="$port" HOST="$host"'';
         parse = ''
           apps_remote=${q appsRemote}
@@ -350,7 +350,7 @@ rec {
         name = "ops-jev";
         usage = "--envs-sha <40-hex> --ops-sha <40-hex>";
         say = "2";
-        announce = "ops $ops_sha jev with PATH HOME LANG JEV_API_KEY";
+        announce = "ops $ops_sha jev with PATH HOME LANG SSL_CERT_FILE JEV_API_KEY";
         childEnv = "";
         parse = ''
           ops_remote=${q opsRemote}
