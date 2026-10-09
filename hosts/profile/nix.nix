@@ -5,13 +5,14 @@
 # declared by its own binding (hosts/profile/gh.nix), never derived from owner or the URL namespace.
 { pkgs, extra ? [], owner ? "roccho-dev" }:
 let
-  codex = import ../own/codex.nix { inherit pkgs; };
-  # Official Claude Code native build, pinned to platforms.linux-x64 of
-  # https://downloads.claude.ai/claude-code-releases/2.1.283/manifest.json (size 241556664).
-  claudeVersion = "2.1.283";
+  releasePins = builtins.fromJSON (builtins.readFile ./releases.json);
+  releaseVersions = builtins.mapAttrs (_: release: release.version) releasePins;
+  codex = import ../own/codex.nix { inherit pkgs; release = releasePins.codex; };
+  claudeRelease = releasePins.claude;
+  # Official Claude Code native build, pinned to the manifest's platforms.linux-x64 asset.
   claudeBin = pkgs.fetchurl {
-    url = "https://downloads.claude.ai/claude-code-releases/${claudeVersion}/linux-x64/claude";
-    sha256 = "1859583ce32920595c61ef868bee52e1b1594f7486db209935e01f1e5e804ae2";
+    url = "https://downloads.claude.ai/claude-code-releases/${claudeRelease.version}/linux-x64/claude";
+    sha256 = claudeRelease.sha256;
   };
   # The glibc build runs through the pinned glibc loader, as the fixed W runtime runs it; updates are off.
   claude = pkgs.writeShellScriptBin "claude" ''
@@ -21,9 +22,16 @@ let
   # gh is the shared principal-routing wrapper, with the profile's Git credential helper (#8-C).
   github = import ./gh.nix { inherit pkgs owner; };
 in
+assert builtins.isAttrs releasePins.codex;
+assert builtins.isString releasePins.codex.version;
+assert builtins.isString releasePins.codex.sha256;
+assert builtins.isAttrs releasePins.claude;
+assert builtins.isString releasePins.claude.version;
+assert builtins.isString releasePins.claude.sha256;
 pkgs.buildEnv {
   name = "dev-profile";
   paths = (with pkgs; [ bash coreutils diffutils findutils gnugrep gnused gnutar gzip nix git openssh ])
     ++ [ github.wrapper github.helper codex claude ] ++ extra;
   pathsToLink = [ "/bin" ];
+  passthru = { inherit releaseVersions; };
 }

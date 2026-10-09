@@ -1,0 +1,10 @@
+{
+  "codex": {
+    "version": "0.157.1",
+    "sha256": "0e211868c9fd73cb49ad35ac675b5eafdf6b9f453df8a493df980c59a590fe5f"
+  },
+  "claude": {
+    "version": "2.1.283",
+    "sha256": "1859583ce32920595c61ef868bee52e1b1594f7486db209935e01f1e5e804ae2"
+  }
+}
