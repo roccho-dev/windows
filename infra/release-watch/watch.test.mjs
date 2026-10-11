@@ -863,10 +863,11 @@ test('native Git graph: candidate-specific generation has one A pin delta for me
   }
 });
 
-test('canonical A moves before commit POST: commit/ref/PR write zero', async () => {
+test('canonical A moves before commit POST: receipt says stopped before POST and commit/ref/PR write zero', async () => {
   const base = '3'.repeat(40), moved = '4'.repeat(40);
   const fixture = new GitObjectFixture(base);
   const calls = [];
+  const objectReceipts = [];
   let reads = 0;
   const api = async (method, path, body) => {
     calls.push({ method, path, body });
@@ -875,7 +876,22 @@ test('canonical A moves before commit POST: commit/ref/PR write zero', async () 
     if (method === 'GET' && path === '/git/ref/heads/proposals') return { object: { sha: ++reads > 1 ? moved : base } };
     return fixture.api(method, path, body);
   };
-  await assert.rejects(maintainOne({ repository: 'roccho-dev/windows', token: 'unused', baseSha: base, registry: registry(), name: 'alpha', candidate: candidate('1.2.4'), api }), /canonical A moved/);
+  await assert.rejects(
+    maintainOne({
+      repository: 'roccho-dev/windows', token: 'unused', baseSha: base,
+      registry: registry(), name: 'alpha', candidate: candidate('1.2.4'),
+      api, objectReceipts,
+    }),
+    /candidate commit: pre-send guard failed: canonical A moved/,
+  );
+  const commitReceipt = objectReceipts.find((receipt) => receipt.label === 'candidate commit');
+  assert.equal(commitReceipt.post.attempted, false);
+  assert.equal(commitReceipt.post.responseSha, null);
+  assert.equal(commitReceipt.post.error, null);
+  assert.equal(commitReceipt.afterGET, null);
+  assert.equal(commitReceipt.finalState, 'STOPPED_BEFORE_POST');
+  assert.match(commitReceipt.failure, /pre-send guard failed: canonical A moved/);
+  assert.doesNotMatch(commitReceipt.failure, /POST failed or response was lost/);
   assert.equal(calls.filter(({ method, path }) => method === 'PATCH' || method === 'DELETE' || method === 'POST' && ['/git/refs', '/pulls'].includes(path)).length, 0);
   assert.equal(calls.filter(({ method, path }) => method === 'POST' && path === '/git/commits').length, 0);
 });

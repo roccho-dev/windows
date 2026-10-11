@@ -694,7 +694,7 @@ function receiptFailure(error) {
 
 async function reconcileImmutableObject({
   label, method = 'POST', path, expectedSha, observe, mutate,
-  objectReceipts, allowAcknowledgedUnknown = false,
+  objectReceipts, allowAcknowledgedUnknown = false, beforeMutate = null,
 }) {
   const receipt = {
     label, method, path, expectedSha,
@@ -722,6 +722,15 @@ async function reconcileImmutableObject({
     receipt.finalState = before.state;
     receipt.failure = `${label}: before GET ${before.state}`;
     fail(receipt.failure);
+  }
+
+  if (beforeMutate) {
+    try { await beforeMutate(); }
+    catch (error) {
+      receipt.finalState = 'STOPPED_BEFORE_POST';
+      receipt.failure = `${label}: pre-send guard failed: ${receiptFailure(error)}`;
+      fail(receipt.failure);
+    }
   }
 
   receipt.post.attempted = true;
@@ -805,10 +814,8 @@ export async function createImmutableCommit({
   const commitReceipt = await reconcileImmutableObject({
     label: 'candidate commit', path: '/git/commits', expectedSha: plan.commitSha,
     observe: observeCommit,
-    mutate: async () => {
-      if (beforeCommit) await beforeCommit();
-      return api('POST', '/git/commits', plan.commitBody);
-    },
+    beforeMutate: beforeCommit,
+    mutate: () => api('POST', '/git/commits', plan.commitBody),
     objectReceipts,
   });
 
