@@ -40,7 +40,19 @@ let
     rev = "9e6603324e5d7691dd06675c3267e887ce1e8915";
     hash = "sha256-2oqzs9GMtCyXY26fDnmtH7dwCFYx2GbF5LFKN5TRtz8=";
   };
-  cdpTty = pkgs.callPackage "${opsSrc}/packages/cdp-tty" { };
+  # Windows consumes the pinned runtime only. Rendering/input proof stays with the cdp-tty provider and is not an
+  # OCI/CLI completion gate here.
+  cdpTty = (pkgs.callPackage "${opsSrc}/packages/cdp-tty" { }).overrideAttrs (_: {
+    outputs = [ "out" ];
+    doCheck = false;
+    nativeCheckInputs = [ ];
+    installPhase = ''
+      runHook preInstall
+      mkdir -p "$out/bin"
+      cp cdp-tty "$out/bin/"
+      runHook postInstall
+    '';
+  });
   fontConfig = pkgs.makeFontsConf {
     fontDirectories = [ pkgs.dejavu_fonts pkgs.noto-fonts-cjk-sans ];
   };
