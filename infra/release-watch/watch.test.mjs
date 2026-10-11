@@ -146,6 +146,43 @@ class GitObjectFixture {
   };
 }
 
+function githubObjectView(fixture, {
+  hideCreatedTree = false,
+  messageView = (message) => message,
+  shaView = (sha) => sha,
+  contentsMode = 'exact',
+} = {}) {
+  return async (method, path, body) => {
+    if (method === 'GET' && path.startsWith('/git/trees/')) {
+      const sha = path.slice('/git/trees/'.length);
+      if (hideCreatedTree && fixture.objects.trees.has(sha)) {
+        fixture.calls.push({ method, path, body });
+        return null;
+      }
+    }
+    if (method === 'GET' && path.startsWith('/git/commits/')) {
+      const value = await fixture.api(method, path, body);
+      if (!value || typeof value.message !== 'string') return value;
+      return { ...value, sha: shaView(value.sha), message: messageView(value.message) };
+    }
+    if (method === 'GET' && path.startsWith('/contents/hosts/profile/releases.json?')) {
+      fixture.calls.push({ method, path, body });
+      const ref = new URLSearchParams(path.split('?')[1]).get('ref');
+      if (!fixture.objects.commits.has(ref) || contentsMode === 'missing') return null;
+      const [blobSha, blob] = [...fixture.objects.blobs.entries()].at(-1) ?? [];
+      if (!blobSha || !blob) return null;
+      return {
+        sha: contentsMode === 'wrong-sha' ? '9'.repeat(40) : blobSha,
+        encoding: 'base64',
+        content: contentsMode === 'wrong-bytes'
+          ? Buffer.from('wrong registry bytes').toString('base64')
+          : blob.content,
+      };
+    }
+    return fixture.api(method, path, body);
+  };
+}
+
 function jsonResponse(value, status = 200) {
   return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
 }
@@ -474,14 +511,17 @@ test('object POST response loss stops the phase; later deterministic readback ne
   assert.equal(laterReceipts[0].post.attempted, false);
 });
 
-test('tree exact POST receipt plus after-GET 404 advances once to exact commit and confirms the full immutable chain', async () => {
+test('raw tree 404 closes only through exact commit contents while preserving the direct 404 receipt', async () => {
   const base = '3'.repeat(40);
   const fixture = new GitObjectFixture(base);
-  fixture.delayTreeVisibilityUntilCommit();
   const receipts = [];
   let leaseChecks = 0;
+  const api = githubObjectView(fixture, {
+    hideCreatedTree: true,
+    messageView: (message) => message.endsWith('\n') ? message.slice(0, -1) : message,
+  });
   const result = await createImmutableCommit({
-    api: fixture.api,
+    api,
     parentShas: [base],
     treeBaseSha: base,
     registry: registry(),
@@ -501,11 +541,78 @@ test('tree exact POST receipt plus after-GET 404 advances once to exact commit a
   assert.equal(tree.path, '/git/trees');
   assert.equal(tree.post.responseSha, tree.expectedSha);
   assert.equal(tree.afterGET.state, 'CONFIRMED_NOT_DONE');
-  assert.equal(tree.chainGET.state, 'CONFIRMED_DONE');
-  assert.equal(tree.finalState, 'CONFIRMED_DONE');
+  assert.equal(tree.chainGET.state, 'CONFIRMED_NOT_DONE');
+  assert.equal(tree.contentsGET.state, 'CONFIRMED_VIA_COMMIT_CONTENTS');
+  assert.equal(tree.contentsGET.actualSha, receipts.find((receipt) => receipt.label === 'registry blob').expectedSha);
+  assert.equal(tree.finalState, 'CONFIRMED_VIA_COMMIT_CONTENTS');
   assert.equal(tree.failure, null);
   assert.equal(commit.post.responseSha, commit.expectedSha);
   assert.equal(commit.afterGET.state, 'CONFIRMED_DONE');
+  assert.equal(commit.chainGET.state, 'CONFIRMED_DONE');
+});
+
+test('commit GET may omit exactly one terminal LF but internal, extra-LF or SHA differences remain RED', async () => {
+  const cases = [
+    ['omitted-terminal-lf', (message) => message.endsWith('\n') ? message.slice(0, -1) : message, (sha) => sha, true],
+    ['internal-difference', (message) => message.replace('deterministic', 'different'), (sha) => sha, false],
+    ['extra-terminal-lf', (message) => `${message}\n`, (sha) => sha, false],
+    ['sha-difference', (message) => message, () => '9'.repeat(40), false],
+  ];
+  for (const [label, messageView, shaView, admitted] of cases) {
+    const base = '3'.repeat(40);
+    const fixture = new GitObjectFixture(base);
+    const api = githubObjectView(fixture, { messageView, shaView });
+    const input = {
+      api, parentShas: [base], treeBaseSha: base, registry: registry(),
+      message: 'chore: deterministic commit message',
+    };
+    if (admitted) {
+      const result = await createImmutableCommit(input);
+      assert.match(result.sha, /^[0-9a-f]{40}$/, label);
+    } else {
+      await assert.rejects(createImmutableCommit(input), /candidate commit: PARTIAL_OR_FAILED/, label);
+    }
+  }
+});
+
+test('contents closure mismatch or 404 stops before ref and PR without object resend', async () => {
+  const repository = 'roccho-dev/windows';
+  for (const mode of ['missing', 'wrong-sha', 'wrong-bytes']) {
+    const base = '3'.repeat(40);
+    const fixture = new GitObjectFixture(base);
+    const receipts = [];
+    const calls = [];
+    const c = candidate('1.2.4', hex('d'));
+    const branch = generationBranch('alpha', base, c);
+    const objectApi = githubObjectView(fixture, {
+      hideCreatedTree: true,
+      messageView: (message) => message.endsWith('\n') ? message.slice(0, -1) : message,
+      contentsMode: mode,
+    });
+    const api = async (method, path, body) => {
+      calls.push({ method, path, body });
+      if (method === 'GET' && path.startsWith('/pulls?state=open')) return [];
+      if (method === 'GET' && decodeURIComponent(path) === `/git/ref/heads/${branch}`) return null;
+      if (method === 'GET' && path === '/git/ref/heads/proposals') return { object: { sha: base } };
+      return objectApi(method, path, body);
+    };
+    await assert.rejects(
+      maintainOne({
+        repository, token: 'unused', baseSha: base, registry: registry(),
+        name: 'alpha', candidate: c, api, objectReceipts: receipts,
+      }),
+      /immutable tree closure/,
+      mode,
+    );
+    assert.equal(calls.filter(({ method, path }) => method === 'POST' && path === '/git/trees').length, 1, mode);
+    assert.equal(calls.filter(({ method, path }) => method === 'POST' && path === '/git/commits').length, 1, mode);
+    assert.equal(calls.filter(({ method, path }) => method === 'POST' && path === '/git/refs').length, 0, mode);
+    assert.equal(calls.filter(({ method, path }) => method === 'PATCH' && path.startsWith('/git/refs/')).length, 0, mode);
+    assert.equal(calls.filter(({ method, path }) => method === 'POST' && path === '/pulls').length, 0, mode);
+    const tree = receipts.find((receipt) => receipt.label === 'registry tree');
+    assert.equal(tree.chainGET.state, 'CONFIRMED_NOT_DONE', mode);
+    assert.equal(tree.contentsGET.state, mode === 'missing' ? 'CONFIRMED_NOT_DONE' : 'PARTIAL_OR_FAILED', mode);
+  }
 });
 
 test('tree POST response loss or response SHA mismatch stops before commit', async () => {
