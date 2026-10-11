@@ -653,12 +653,17 @@ async function planImmutableCommit({ api, parentShas, treeBaseSha, registry, mes
   return { baseCommit, registryBytes, blobSha, treeSha, date, normalizedMessage, author, committer, commitBody, commitSha };
 }
 
+function commitMessageMatchesPlan(actual, expected) {
+  return actual === expected
+    || typeof actual === 'string' && !actual.endsWith('\n') && `${actual}\n` === expected;
+}
+
 function commitMatchesPlan(commit, plan) {
   if (!commit) return false;
   const parents = (commit.parents ?? []).map((parent) => parent.sha);
   return commit.sha === plan.commitSha && commit.tree?.sha === plan.treeSha
     && JSON.stringify(parents) === JSON.stringify(plan.commitBody.parents)
-    && commit.message === plan.normalizedMessage
+    && commitMessageMatchesPlan(commit.message, plan.normalizedMessage)
     && commit.author?.name === plan.author.name && commit.author?.email === plan.author.email
     && normalizedGitDate(commit.author?.date) === plan.date
     && commit.committer?.name === plan.committer.name && commit.committer?.email === plan.committer.email
@@ -702,6 +707,7 @@ async function reconcileImmutableObject({
     post: { attempted: false, responseSha: null, error: null },
     afterGET: null,
     chainGET: null,
+    contentsGET: null,
     finalState: null,
     failure: null,
   };
@@ -794,6 +800,99 @@ export async function createImmutableCommit({
     const done = commitMatchesPlan(commit, plan);
     return { state: done ? 'CONFIRMED_DONE' : 'PARTIAL_OR_FAILED', actualSha: commit?.sha ?? null };
   };
+  const observeRegistryContentsAtCommit = async () => {
+    try {
+      const file = await api('GET', `/contents/${REGISTRY_PATH}?ref=${encodeURIComponent(plan.commitSha)}`);
+      if (file === null) return { state: 'CONFIRMED_NOT_DONE', actualSha: null };
+      if (file?.sha !== plan.blobSha || file?.encoding !== 'base64' || typeof file.content !== 'string') {
+        return { state: 'PARTIAL_OR_FAILED', actualSha: file?.sha ?? null };
+      }
+      const actual = Buffer.from(file.content.replace(/\n/g, ''), 'base64');
+      const done = gitObjectSha('blob', actual) === plan.blobSha && actual.equals(plan.registryBytes);
+      return {
+        state: done ? 'CONFIRMED_VIA_COMMIT_CONTENTS' : 'PARTIAL_OR_FAILED',
+        actualSha: file.sha,
+        ref: plan.commitSha,
+        path: REGISTRY_PATH,
+      };
+    } catch (error) {
+      return { state: 'STILL_UNKNOWN', actualSha: null, error: receiptFailure(error) };
+    }
+  };
+
+  const readPreflight = async (observe) => {
+    try { return await observe(); }
+    catch (error) { return { state: 'STILL_UNKNOWN', actualSha: null, error: receiptFailure(error) }; }
+  };
+  const commitPreflight = await readPreflight(observeCommit);
+  if (commitPreflight.state !== 'CONFIRMED_NOT_DONE') {
+    const readOnlyReceipt = ({ label, path, expectedSha, observation }) => ({
+      state: observation.state,
+      sends: 0,
+      receipt: {
+        label, method: 'POST', path, expectedSha,
+        beforeGET: observation,
+        post: { attempted: false, responseSha: null, error: null },
+        afterGET: null,
+        chainGET: observation,
+        contentsGET: null,
+        finalState: observation.state,
+        failure: null,
+      },
+    });
+    if (commitPreflight.state !== 'CONFIRMED_DONE') {
+      const commitReceipt = readOnlyReceipt({
+        label: 'candidate commit', path: '/git/commits', expectedSha: plan.commitSha,
+        observation: commitPreflight,
+      });
+      commitReceipt.receipt.failure = `candidate commit preflight ${commitPreflight.state}`;
+      objectReceipts.push(commitReceipt.receipt);
+      fail(commitReceipt.receipt.failure);
+    }
+
+    const blobPreflight = await readPreflight(observeBlob);
+    const treePreflight = await readPreflight(observeTree);
+    const contentsPreflight = await observeRegistryContentsAtCommit();
+    const blobReceipt = readOnlyReceipt({
+      label: 'registry blob', path: '/git/blobs', expectedSha: plan.blobSha,
+      observation: blobPreflight,
+    });
+    const treeReceipt = readOnlyReceipt({
+      label: 'registry tree', path: '/git/trees', expectedSha: plan.treeSha,
+      observation: treePreflight,
+    });
+    const commitReceipt = readOnlyReceipt({
+      label: 'candidate commit', path: '/git/commits', expectedSha: plan.commitSha,
+      observation: commitPreflight,
+    });
+    treeReceipt.receipt.contentsGET = contentsPreflight;
+    objectReceipts.push(blobReceipt.receipt, treeReceipt.receipt, commitReceipt.receipt);
+
+    if (blobPreflight.state !== 'CONFIRMED_DONE') {
+      blobReceipt.receipt.failure = `immutable blob preflight ${blobPreflight.state}`;
+      fail(blobReceipt.receipt.failure);
+    }
+    if (!['CONFIRMED_DONE', 'CONFIRMED_NOT_DONE'].includes(treePreflight.state)) {
+      treeReceipt.receipt.failure = `immutable tree preflight ${treePreflight.state}`;
+      fail(treeReceipt.receipt.failure);
+    }
+    if (contentsPreflight.state !== 'CONFIRMED_VIA_COMMIT_CONTENTS') {
+      treeReceipt.receipt.finalState = contentsPreflight.state;
+      treeReceipt.receipt.failure = `immutable tree contents preflight ${contentsPreflight.state}`;
+      fail(treeReceipt.receipt.failure);
+    }
+
+    blobReceipt.receipt.finalState = 'CONFIRMED_DONE';
+    commitReceipt.receipt.finalState = 'CONFIRMED_DONE';
+    treeReceipt.state = treePreflight.state === 'CONFIRMED_DONE'
+      ? 'CONFIRMED_DONE' : 'CONFIRMED_VIA_COMMIT_CONTENTS';
+    treeReceipt.receipt.finalState = treeReceipt.state;
+    return {
+      sha: plan.commitSha,
+      receipts: { blob: blobReceipt, tree: treeReceipt, commit: commitReceipt },
+      objectReceipts,
+    };
+  }
 
   const blobReceipt = await reconcileImmutableObject({
     label: 'registry blob', path: '/git/blobs', expectedSha: plan.blobSha,
@@ -827,18 +926,45 @@ export async function createImmutableCommit({
   blobReceipt.receipt.chainGET = chain.blob;
   treeReceipt.receipt.chainGET = chain.tree;
   commitReceipt.receipt.chainGET = chain.commit;
-  for (const [kind, observation] of Object.entries(chain)) {
+
+  let treeClosure = chain.tree;
+  const exactCommitAcknowledged = commitReceipt.receipt.post.attempted
+    && commitReceipt.receipt.post.responseSha === plan.commitSha
+    && commitReceipt.state === 'CONFIRMED_DONE'
+    && chain.commit.state === 'CONFIRMED_DONE';
+  if (chain.tree.state === 'CONFIRMED_NOT_DONE'
+      && treeReceipt.state === 'POST_ACKNOWLEDGED_READBACK_UNKNOWN'
+      && exactCommitAcknowledged) {
+    treeClosure = await observeRegistryContentsAtCommit();
+    treeReceipt.receipt.contentsGET = treeClosure;
+  }
+
+  for (const [kind, observation] of Object.entries({ blob: chain.blob, commit: chain.commit })) {
     if (observation.state !== 'CONFIRMED_DONE') {
-      const target = { blob: blobReceipt, tree: treeReceipt, commit: commitReceipt }[kind].receipt;
+      const target = { blob: blobReceipt, commit: commitReceipt }[kind].receipt;
       target.finalState = observation.state;
       target.failure = `immutable ${kind} chain readback ${observation.state}`;
       fail(target.failure);
     }
   }
-  for (const receipt of [blobReceipt.receipt, treeReceipt.receipt, commitReceipt.receipt]) {
-    receipt.finalState = 'CONFIRMED_DONE';
-    receipt.failure = null;
+  if (chain.tree.state !== 'CONFIRMED_DONE' && treeClosure.state !== 'CONFIRMED_VIA_COMMIT_CONTENTS') {
+    treeReceipt.receipt.finalState = treeClosure.state;
+    treeReceipt.receipt.failure = `immutable tree closure ${treeClosure.state}`;
+    fail(treeReceipt.receipt.failure);
   }
+
+  blobReceipt.receipt.finalState = 'CONFIRMED_DONE';
+  blobReceipt.receipt.failure = null;
+  commitReceipt.receipt.finalState = 'CONFIRMED_DONE';
+  commitReceipt.receipt.failure = null;
+  if (chain.tree.state === 'CONFIRMED_DONE') {
+    treeReceipt.state = 'CONFIRMED_DONE';
+    treeReceipt.receipt.finalState = 'CONFIRMED_DONE';
+  } else {
+    treeReceipt.state = 'CONFIRMED_VIA_COMMIT_CONTENTS';
+    treeReceipt.receipt.finalState = 'CONFIRMED_VIA_COMMIT_CONTENTS';
+  }
+  treeReceipt.receipt.failure = null;
   return {
     sha: plan.commitSha,
     receipts: { blob: blobReceipt, tree: treeReceipt, commit: commitReceipt },
