@@ -1,40 +1,81 @@
-name: release watch
+name: release watch V2 finite caller
 
 on:
-  pull_request:
-    branches: [proposals]
-    paths:
-      - hosts/profile/releases.json
-      - hosts/profile/nix.nix
-      - hosts/own/codex.nix
-      - infra/release-watch/watch.mjs
-      - infra/release-watch/watch.test.mjs
-      - .github/workflows/release-watch.yml
-      - flake.nix
-  schedule:
-    - cron: '17 3 * * *'
   workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type V2-CODEX-C1-C2 after P fixes the accepted canonical source and finite window
+        required: true
+        type: string
+      source_sha:
+        description: Exact accepted canonical proposals commit
+        required: true
+        type: string
+      source_tree:
+        description: Exact tree of source_sha
+        required: true
+        type: string
+      window_start_epoch:
+        description: Inclusive UTC epoch for the bounded mutation window
+        required: true
+        type: string
+      window_end_epoch:
+        description: Exclusive UTC epoch for the bounded mutation window
+        required: true
+        type: string
 
 permissions:
   contents: read
   pull-requests: read
 
 concurrency:
-  group: release-watch-${{ github.event.pull_request.number || github.ref }}
+  group: release-watch-refs/heads/proposals
   cancel-in-progress: false
 
 jobs:
-  verify:
+  codex-v2-actual-cover:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/proposal/cli-release-watch-20261009' &&
+      github.run_attempt == 1 &&
+      inputs.confirm == 'V2-CODEX-C1-C2'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      SOURCE_TREE: ${{ inputs.source_tree }}
+      TRANSPORT_BRANCH: proposal/cli-release-watch-20261009
+      BASE_BRANCH: proposals
+      WINDOW_START_EPOCH: ${{ inputs.window_start_epoch }}
+      WINDOW_END_EPOCH: ${{ inputs.window_end_epoch }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.source_sha }}
           persist-credentials: false
           fetch-depth: 0
+      - name: Bind finite transport to immutable canonical S
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = "refs/heads/$TRANSPORT_BRANCH"
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          [[ $SOURCE_SHA =~ ^[0-9a-f]{40}$ ]]
+          [[ $SOURCE_TREE =~ ^[0-9a-f]{40}$ ]]
+          [[ $WINDOW_START_EPOCH =~ ^[0-9]{10}$ ]]
+          [[ $WINDOW_END_EPOCH =~ ^[0-9]{10}$ ]]
+          test "$WINDOW_START_EPOCH" -lt "$WINDOW_END_EPOCH"
+          test $((WINDOW_END_EPOCH - WINDOW_START_EPOCH)) -le 3600
+          now=$(date -u +%s)
+          test "$now" -ge "$WINDOW_START_EPOCH"
+          test "$now" -lt "$WINDOW_END_EPOCH"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$SOURCE_TREE"
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
-      - name: Build locked proof tools
+      - name: Build existing locked proof tools from S
         id: tools
         run: |
           set -euo pipefail
@@ -51,58 +92,601 @@ jobs:
           test -x "$tools/bin/gpg"
           echo "cosign=$tools/bin/cosign" >> "$GITHUB_OUTPUT"
           echo "gpg=$tools/bin/gpg" >> "$GITHUB_OUTPUT"
-      - name: Verify contract, protocol and actual official selected bytes
-        env:
-          RELEASE_WATCH_COSIGN: ${{ steps.tools.outputs.cosign }}
-          RELEASE_WATCH_GPG: ${{ steps.tools.outputs.gpg }}
-        run: |
-          set -euo pipefail
-          node --test infra/release-watch/watch.test.mjs
-          watcher=$(node infra/release-watch/watch.mjs validate hosts/profile/releases.json)
-          nix_versions=$(nix eval --json .#releaseVersions --no-write-lock-file)
-          test "$watcher" = "$nix_versions"
-          node infra/release-watch/watch.mjs resolve hosts/profile/releases.json | tee release-proof.json
-          printf 'source %s\nreleaseVersions %s\n' "$(git rev-parse HEAD)" "$nix_versions" >> "$GITHUB_STEP_SUMMARY"
-          cat release-proof.json >> "$GITHUB_STEP_SUMMARY"
-
-  propose:
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/proposals'
-    needs: verify
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-          fetch-depth: 0
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
-      - name: Build locked proof tools
-        id: tools
-        run: |
-          set -euo pipefail
-          tools=$(nix build --impure --no-link --print-out-paths --expr '
-            let
-              flake = builtins.getFlake (toString ./.);
-              pkgs = flake.inputs.nixpkgs.legacyPackages.x86_64-linux;
-            in pkgs.buildEnv {
-              name = "release-proof-tools";
-              paths = [ pkgs.cosign pkgs.gnupg ];
-            }
-          ')
-          echo "cosign=$tools/bin/cosign" >> "$GITHUB_OUTPUT"
-          echo "gpg=$tools/bin/gpg" >> "$GITHUB_OUTPUT"
-      - name: Resolve, prove and maintain one draft PR per CLI
+      - name: Execute one bounded Codex CREATE ADVANCE RESUME sequence
         env:
           GITHUB_TOKEN: ${{ github.token }}
           RELEASE_WATCH_COSIGN: ${{ steps.tools.outputs.cosign }}
           RELEASE_WATCH_GPG: ${{ steps.tools.outputs.gpg }}
         run: |
           set -euo pipefail
-          checkout_sha=$(git rev-parse HEAD)
-          test "$checkout_sha" = "$GITHUB_SHA"
-          RELEASE_WATCH_CHECKOUT_SHA="$checkout_sha" \
-            node infra/release-watch/watch.mjs propose hosts/profile/releases.json | tee -a "$GITHUB_STEP_SUMMARY"
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { appendFile, readFile } from 'node:fs/promises';
+          import path from 'node:path';
+          import { pathToFileURL } from 'node:url';
+
+          const core = await import(pathToFileURL(path.resolve('infra/release-watch/watch.mjs')).href);
+          const {
+            bindCanonicalInput,
+            compareVersions,
+            generationBranch,
+            githubClient,
+            listAll,
+            maintainOne,
+            prMarker,
+            resolveCandidate,
+          } = core;
+
+          const required = (name) => {
+            const value = process.env[name];
+            if (!value) throw new Error(`missing ${name}`);
+            return value;
+          };
+
+          const REPOSITORY = required('GITHUB_REPOSITORY');
+          const TOKEN = required('GITHUB_TOKEN');
+          const SOURCE_SHA = required('SOURCE_SHA');
+          const SOURCE_TREE = required('SOURCE_TREE');
+          const TRANSPORT_SHA = required('GITHUB_SHA');
+          const BASE_BRANCH = required('BASE_BRANCH');
+          const REGISTRY_PATH = 'hosts/profile/releases.json';
+          const CLI = 'codex';
+          const BOT = 'github-actions[bot]';
+          const C1_RELEASE_API = 'https://api.github.com/repos/openai/codex/releases/405921402';
+          const LATEST_API = 'https://api.github.com/repos/openai/codex/releases/latest';
+          const C1 = Object.freeze({
+            releaseId: 405921402,
+            tag: 'rust-v0.161.0',
+            version: '0.161.0',
+            assetId: 619114673,
+            assetName: 'codex-package-x86_64-unknown-linux-musl.tar.gz',
+            assetDigest: 'sha256:04d8ab9dbcb9df0edf3c67dca5072a374babfdf762a9bc4ae649ae140b8e2cf0',
+            assetUrl: 'https://github.com/openai/codex/releases/download/rust-v0.161.0/codex-package-x86_64-unknown-linux-musl.tar.gz',
+            proofAssetId: 619114628,
+            proofAssetName: 'codex-package-x86_64-unknown-linux-musl.tar.gz.sigstore',
+            proofAssetDigest: 'sha256:4b472c3d007cae15a5923c74354c9a2695dfa2a96188245a601c45e622d75175',
+            proofAssetUrl: 'https://github.com/openai/codex/releases/download/rust-v0.161.0/codex-package-x86_64-unknown-linux-musl.tar.gz.sigstore',
+          });
+
+          const isMutation = (method) => ['POST', 'PATCH', 'PUT', 'DELETE'].includes(method);
+          const allowedMutation = (method, apiPath) =>
+            method === 'POST' && ['/git/blobs', '/git/trees', '/git/commits', '/git/refs', '/pulls'].includes(apiPath)
+            || method === 'PATCH' && apiPath.startsWith('/git/refs/heads/');
+
+          function publicReceipt(value, apiPath) {
+            if (value === null || value === undefined) return null;
+            if (Array.isArray(value)) {
+              return {
+                count: value.length,
+                items: value.slice(0, 100).map((item) => ({
+                  number: item?.number ?? null,
+                  sha: item?.sha ?? null,
+                  filename: item?.filename ?? null,
+                  author: item?.author?.login ?? null,
+                  committer: item?.committer?.login ?? null,
+                  base: item?.base ? { ref: item.base.ref ?? null, sha: item.base.sha ?? null } : null,
+                  head: item?.head ? {
+                    ref: item.head.ref ?? null,
+                    sha: item.head.sha ?? null,
+                    repo: item.head.repo?.full_name ?? null,
+                  } : null,
+                })),
+              };
+            }
+            if (apiPath.startsWith('/contents/')) {
+              return { path: value.path ?? REGISTRY_PATH, sha: value.sha ?? null, encoding: value.encoding ?? null, size: value.size ?? null };
+            }
+            if (value.object?.sha) return { ref: value.ref ?? null, sha: value.object.sha };
+            if (value.merge_base_commit?.sha) return { mergeBase: value.merge_base_commit.sha };
+            if (value.number) {
+              return {
+                number: value.number,
+                url: value.html_url ?? null,
+                user: value.user?.login ?? null,
+                base: { ref: value.base?.ref ?? null, sha: value.base?.sha ?? null },
+                head: { ref: value.head?.ref ?? null, sha: value.head?.sha ?? null, repo: value.head?.repo?.full_name ?? null },
+                marker: String(value.body ?? '').includes(prMarker(CLI)),
+                draft: value.draft ?? null,
+              };
+            }
+            if (value.sha) {
+              return {
+                sha: value.sha,
+                tree: value.tree?.sha ?? value.commit?.tree?.sha ?? null,
+                parents: (value.parents ?? []).map((parent) => parent.sha),
+                author: value.author?.login ?? value.author?.name ?? null,
+                committer: value.committer?.login ?? value.committer?.name ?? null,
+              };
+            }
+            return { kind: typeof value };
+          }
+
+          const rawApi = githubClient(REPOSITORY, TOKEN);
+          const apiCalls = [];
+          let sequence = 0;
+          const api = async (method, apiPath, body) => {
+            if (isMutation(method) && !allowedMutation(method, apiPath)) {
+              throw new Error(`forbidden mutation endpoint ${method} ${apiPath}`);
+            }
+            const record = {
+              sequence: ++sequence,
+              method,
+              path: apiPath,
+              mutation: isMutation(method),
+            };
+            if (record.mutation) {
+              const now = Math.floor(Date.now() / 1000);
+              assert.ok(
+                now >= Number(process.env.WINDOW_START_EPOCH)
+                  && now < Number(process.env.WINDOW_END_EPOCH),
+                `mutation window closed before ${method} ${apiPath}`,
+              );
+            }
+            try {
+              const result = await rawApi(method, apiPath, body);
+              record.receipt = publicReceipt(result, apiPath);
+              apiCalls.push(record);
+              return result;
+            } catch (error) {
+              record.error = String(error?.message ?? error).slice(0, 500);
+              apiCalls.push(record);
+              throw error;
+            }
+          };
+
+          const countMutations = (records) => {
+            const counts = {
+              total: 0, blob: 0, tree: 0, commit: 0,
+              refCreate: 0, refUpdate: 0, prCreate: 0, delete: 0, other: 0,
+            };
+            for (const item of records) {
+              if (!item.mutation) continue;
+              counts.total += 1;
+              let classified = false;
+              if (item.method === 'POST' && item.path === '/git/blobs') { counts.blob += 1; classified = true; }
+              if (item.method === 'POST' && item.path === '/git/trees') { counts.tree += 1; classified = true; }
+              if (item.method === 'POST' && item.path === '/git/commits') { counts.commit += 1; classified = true; }
+              if (item.method === 'POST' && item.path === '/git/refs') { counts.refCreate += 1; classified = true; }
+              if (item.method === 'PATCH' && item.path.startsWith('/git/refs/heads/')) { counts.refUpdate += 1; classified = true; }
+              if (item.method === 'POST' && item.path === '/pulls') { counts.prCreate += 1; classified = true; }
+              if (item.method === 'DELETE') { counts.delete += 1; classified = true; }
+              if (!classified) counts.other += 1;
+            }
+            return counts;
+          };
+
+          function assertCompleteLedger(label, counts, expected) {
+            for (const key of ['blob', 'tree', 'commit']) {
+              assert.ok(counts[key] === 0 || counts[key] === 1, `${label}: ${key} must be 0..1`);
+            }
+            for (const key of ['refCreate', 'refUpdate', 'prCreate', 'delete', 'other']) {
+              assert.equal(counts[key], expected[key], `${label}: ${key}`);
+            }
+            assert.equal(
+              counts.total,
+              counts.blob + counts.tree + counts.commit + counts.refCreate
+                + counts.refUpdate + counts.prCreate + counts.delete + counts.other,
+              `${label}: mutation total differs from enumerated endpoints`,
+            );
+            assert.equal(counts.total, expected.total(counts), `${label}: total`);
+            return counts;
+          }
+
+          async function registryAt(ref) {
+            const file = await api('GET', `/contents/${REGISTRY_PATH}?ref=${encodeURIComponent(ref)}`);
+            assert.equal(file?.encoding, 'base64');
+            return JSON.parse(Buffer.from(file.content, 'base64').toString('utf8'));
+          }
+
+          const binds = [];
+          async function bind(label) {
+            const localRegistry = JSON.parse(await readFile(REGISTRY_PATH, 'utf8'));
+            const canonical = await bindCanonicalInput({
+              api,
+              baseBranch: BASE_BRANCH,
+              checkoutSha: SOURCE_SHA,
+              localRegistry,
+            });
+            assert.equal(canonical.baseSha, SOURCE_SHA);
+            binds.push({ label, source: canonical.baseSha, versions: Object.fromEntries(Object.entries(canonical.registry).map(([name, value]) => [name, value.pin.version])) });
+            return canonical;
+          }
+
+          function candidateMatches(pr, name) {
+            return String(pr.body ?? '').includes(prMarker(name))
+              || String(pr.head?.ref ?? '').startsWith(`bot/cli-release-${name}-g`);
+          }
+
+          async function allCliCandidateState(registry, label) {
+            const names = Object.keys(registry).sort();
+            const all = await listAll(
+              api,
+              `/pulls?state=open&base=${encodeURIComponent(BASE_BRANCH)}`,
+              { maxPages: 10, maxItems: 1000 },
+            );
+            const candidates = [];
+            for (const pr of all) {
+              const matches = names.filter((name) => candidateMatches(pr, name));
+              const releaseLike = String(pr.body ?? '').includes('<!-- cli-release:')
+                || String(pr.head?.ref ?? '').startsWith('bot/cli-release-');
+              if (releaseLike) assert.equal(matches.length, 1, `${label}: unregistered or ambiguous release-watch candidate`);
+              if (matches.length === 1) {
+                candidates.push({
+                  cli: matches[0],
+                  number: pr.number,
+                  draft: pr.draft ?? null,
+                  branch: pr.head?.ref ?? null,
+                  head: pr.head?.sha ?? null,
+                });
+              }
+            }
+            const counts = Object.fromEntries(names.map((name) => [
+              name,
+              candidates.filter((candidate) => candidate.cli === name).length,
+            ]));
+            return { label, names, counts, candidates };
+          }
+
+          function assertCandidateState(state, codexCount) {
+            for (const name of state.names) {
+              assert.equal(
+                state.counts[name],
+                name === CLI ? codexCount : 0,
+                `${state.label}: ${name} candidate count`,
+              );
+            }
+            assert.equal(
+              state.candidates.length,
+              codexCount,
+              `${state.label}: total release-watch candidate count`,
+            );
+            return state;
+          }
+
+          function selectedReleaseEvidence(release) {
+            assert.equal(release.draft, false);
+            assert.equal(release.prerelease, false);
+            const asset = (release.assets ?? []).find((item) => item.name === C1.assetName);
+            const proof = (release.assets ?? []).find((item) => item.name === C1.proofAssetName);
+            assert.ok(asset && proof, 'selected release assets are absent');
+            return {
+              releaseId: release.id,
+              tag: release.tag_name,
+              draft: release.draft,
+              prerelease: release.prerelease,
+              asset: { id: asset.id, name: asset.name, digest: asset.digest, url: asset.browser_download_url },
+              proofAsset: { id: proof.id, name: proof.name, digest: proof.digest, url: proof.browser_download_url },
+            };
+          }
+
+          async function mirroredJsonResponse(response, validate) {
+            const bytes = Buffer.from(await response.arrayBuffer());
+            if (response.ok) validate(JSON.parse(bytes.toString('utf8')));
+            return new Response(bytes, { status: response.status, statusText: response.statusText, headers: response.headers });
+          }
+
+          let c1MetadataRedirects = 0;
+          let c1Official;
+          const c1Fetch = async (url, options = {}) => {
+            const target = String(url);
+            const method = String(options.method ?? 'GET').toUpperCase();
+            if (target === LATEST_API) {
+              assert.equal(method, 'GET');
+              c1MetadataRedirects += 1;
+              return mirroredJsonResponse(await fetch(C1_RELEASE_API, options), (release) => {
+                c1Official = selectedReleaseEvidence(release);
+                assert.deepEqual(c1Official, {
+                  releaseId: C1.releaseId,
+                  tag: C1.tag,
+                  draft: false,
+                  prerelease: false,
+                  asset: { id: C1.assetId, name: C1.assetName, digest: C1.assetDigest, url: C1.assetUrl },
+                  proofAsset: { id: C1.proofAssetId, name: C1.proofAssetName, digest: C1.proofAssetDigest, url: C1.proofAssetUrl },
+                });
+              });
+            }
+            return fetch(url, options);
+          };
+
+          let c2LatestReads = 0;
+          let c2Official;
+          const c2Fetch = async (url, options = {}) => {
+            const target = String(url);
+            const method = String(options.method ?? 'GET').toUpperCase();
+            if (target === LATEST_API) {
+              assert.equal(method, 'GET');
+              c2LatestReads += 1;
+              return mirroredJsonResponse(await fetch(url, options), (release) => {
+                c2Official = selectedReleaseEvidence(release);
+              });
+            }
+            return fetch(url, options);
+          };
+
+          async function lifecycleSnapshot(label, expectedCandidate, expectedBranch) {
+            const sourceRegistry = await registryAt(SOURCE_SHA);
+            const candidateState = assertCandidateState(
+              await allCliCandidateState(sourceRegistry, label),
+              1,
+            );
+            const candidatePr = candidateState.candidates[0];
+            assert.equal(candidatePr.cli, CLI);
+            const pr = await api('GET', `/pulls/${candidatePr.number}`);
+            assert.equal(pr.user?.login, BOT);
+            assert.equal(pr.base?.ref, BASE_BRANCH);
+            assert.equal(pr.base?.sha, SOURCE_SHA);
+            assert.equal(pr.head?.repo?.full_name, REPOSITORY);
+            assert.ok(String(pr.body ?? '').includes(prMarker(CLI)));
+            assert.equal(pr.draft, true);
+            assert.equal(pr.head?.ref, expectedBranch);
+
+            const branch = pr.head.ref;
+            const ref = await api('GET', `/git/ref/heads/${encodeURIComponent(branch)}`);
+            assert.equal(ref?.object?.sha, pr.head.sha);
+            const head = ref.object.sha;
+
+            const associated = await api('GET', `/commits/${head}`);
+            assert.equal(associated.author?.login, BOT);
+            assert.equal(associated.committer?.login, BOT);
+            const raw = await api('GET', `/git/commits/${head}`);
+            const parents = (raw.parents ?? []).map((item) => item.sha);
+            const tree = raw.tree?.sha;
+            assert.match(tree ?? '', /^[0-9a-f]{40}$/);
+
+            const commits = await listAll(api, `/pulls/${pr.number}/commits`, { maxPages: 3, maxItems: 250 });
+            assert.ok(commits.length >= 1);
+            for (const commit of commits) {
+              assert.equal(commit.author?.login, BOT);
+              assert.equal(commit.committer?.login, BOT);
+            }
+
+            const files = await listAll(api, `/pulls/${pr.number}/files`, { maxPages: 30, maxItems: 3000 });
+            assert.deepEqual(files.map((file) => file.filename), [REGISTRY_PATH]);
+
+            const branchRegistry = await registryAt(head);
+            assert.deepEqual(branchRegistry[CLI].contract, sourceRegistry[CLI].contract);
+            assert.deepEqual(branchRegistry[CLI].pin, {
+              version: expectedCandidate.version,
+              contentHash: expectedCandidate.contentHash,
+            });
+            const normalized = structuredClone(sourceRegistry);
+            normalized[CLI].pin = structuredClone(branchRegistry[CLI].pin);
+            assert.deepEqual(branchRegistry, normalized);
+
+            const fromSource = await api('GET', `/compare/${encodeURIComponent(SOURCE_SHA)}...${encodeURIComponent(head)}`);
+            assert.equal(fromSource.merge_base_commit?.sha, SOURCE_SHA);
+
+            return {
+              label,
+              prNumber: pr.number,
+              prUrl: pr.html_url,
+              base: { branch: pr.base.ref, sha: pr.base.sha },
+              branch,
+              head,
+              tree,
+              parents,
+              actors: { author: associated.author.login, committer: associated.committer.login },
+              draft: pr.draft,
+              candidateState,
+              files: files.map((file) => file.filename),
+              pin: branchRegistry[CLI].pin,
+              mergeBaseFromSource: fromSource.merge_base_commit.sha,
+            };
+          }
+
+          const transportRef = await api('GET', `/git/ref/heads/${encodeURIComponent(process.env.TRANSPORT_BRANCH)}`);
+          assert.equal(transportRef?.object?.sha, TRANSPORT_SHA);
+          const transportCommit = await api('GET', `/git/commits/${TRANSPORT_SHA}`);
+          assert.match(transportCommit?.tree?.sha ?? '', /^[0-9a-f]{40}$/);
+          const canonicalCommit = await api('GET', `/git/commits/${SOURCE_SHA}`);
+          assert.equal(canonicalCommit.tree?.sha, SOURCE_TREE);
+
+          const firstBind = await bind('C1_CREATE');
+          const c1Candidate = await resolveCandidate(CLI, firstBind.registry[CLI], { fetchImpl: c1Fetch });
+          assert.equal(c1MetadataRedirects, 1);
+          assert.equal(c1Candidate.version, C1.version);
+          assert.equal(c1Candidate.contentHash, C1.assetDigest.slice('sha256:'.length));
+          assert.equal(c1Candidate.proof, true);
+          assert.equal(c1Candidate.sourceUrl, C1.assetUrl);
+          assert.equal(c1Candidate.proofReceipt?.identity, `https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/${C1.tag}`);
+          const expectedGenerationBranch = generationBranch(CLI, SOURCE_SHA, c1Candidate);
+          const prestate = assertCandidateState(
+            await allCliCandidateState(firstBind.registry, 'PRESTATE_ZERO'),
+            0,
+          );
+          const expectedGenerationRef = await api(
+            'GET',
+            `/git/ref/heads/${encodeURIComponent(expectedGenerationBranch)}`,
+          );
+          assert.equal(expectedGenerationRef, null, 'PRESTATE_ZERO: exact C1 generation ref must be absent');
+          prestate.expectedGenerationBranch = expectedGenerationBranch;
+          prestate.expectedGenerationRef = null;
+
+          const call1Start = apiCalls.length;
+          const create = await maintainOne({
+            repository: REPOSITORY,
+            token: TOKEN,
+            baseBranch: BASE_BRANCH,
+            baseSha: SOURCE_SHA,
+            registry: firstBind.registry,
+            name: CLI,
+            candidate: c1Candidate,
+            api,
+          });
+          assert.equal(create.decision?.action, 'CREATE');
+          assert.equal(create.state, 'DONE');
+          const call1Api = apiCalls.slice(call1Start);
+          const createLedger = assertCompleteLedger('CREATE', countMutations(call1Api), {
+            refCreate: 1, refUpdate: 0, prCreate: 1, delete: 0, other: 0,
+            total: (counts) => counts.blob + counts.tree + counts.commit + 2,
+          });
+          const h1 = await lifecycleSnapshot('C1_CREATE', c1Candidate, expectedGenerationBranch);
+          assert.deepEqual(h1.parents, [SOURCE_SHA]);
+          assert.equal(h1.branch, expectedGenerationBranch);
+          assert.equal(h1.draft, true);
+
+          const secondBind = await bind('C2_ADVANCE');
+          const c2Candidate = await resolveCandidate(CLI, secondBind.registry[CLI], { fetchImpl: c2Fetch });
+          assert.equal(c2LatestReads, 1);
+          assert.equal(c2Candidate.proof, true);
+          assert.ok(compareVersions(c2Candidate.version, c1Candidate.version) > 0, `latest ${c2Candidate.version} must be newer than ${c1Candidate.version}`);
+
+          const call2Start = apiCalls.length;
+          const advance = await maintainOne({
+            repository: REPOSITORY,
+            token: TOKEN,
+            baseBranch: BASE_BRANCH,
+            baseSha: SOURCE_SHA,
+            registry: secondBind.registry,
+            name: CLI,
+            candidate: c2Candidate,
+            api,
+          });
+          assert.equal(advance.decision?.action, 'ADVANCE');
+          assert.equal(advance.state, 'DONE');
+          const call2Api = apiCalls.slice(call2Start);
+          const advanceLedger = assertCompleteLedger('ADVANCE', countMutations(call2Api), {
+            refCreate: 0, refUpdate: 1, prCreate: 0, delete: 0, other: 0,
+            total: (counts) => counts.blob + counts.tree + counts.commit + 1,
+          });
+          const h2 = await lifecycleSnapshot('C2_ADVANCE', c2Candidate, expectedGenerationBranch);
+          assert.equal(h2.prNumber, h1.prNumber);
+          assert.equal(h2.branch, expectedGenerationBranch);
+          assert.equal(h2.branch, h1.branch);
+          assert.equal(h2.draft, true);
+          assert.deepEqual(h2.parents, [h1.head]);
+          const ff = await api('GET', `/compare/${encodeURIComponent(h1.head)}...${encodeURIComponent(h2.head)}`);
+          assert.equal(ff.merge_base_commit?.sha, h1.head);
+
+          const thirdBind = await bind('C2_RESUME_ZERO');
+          const call3Start = apiCalls.length;
+          const resume = await maintainOne({
+            repository: REPOSITORY,
+            token: TOKEN,
+            baseBranch: BASE_BRANCH,
+            baseSha: SOURCE_SHA,
+            registry: thirdBind.registry,
+            name: CLI,
+            candidate: c2Candidate,
+            api,
+          });
+          const call3Api = apiCalls.slice(call3Start);
+          assert.equal(resume.decision?.action, 'RESUME');
+          assert.equal(resume.effects, 0);
+          const resumeLedger = assertCompleteLedger('RESUME', countMutations(call3Api), {
+            refCreate: 0, refUpdate: 0, prCreate: 0, delete: 0, other: 0,
+            total: () => 0,
+          });
+          const h3 = await lifecycleSnapshot('C2_RESUME_ZERO', c2Candidate, expectedGenerationBranch);
+          assert.equal(h3.prNumber, h2.prNumber);
+          assert.equal(h3.branch, expectedGenerationBranch);
+          assert.equal(h3.branch, h2.branch);
+          assert.equal(h3.head, h2.head);
+          assert.equal(h3.draft, true);
+
+          const phaseTotal = Object.fromEntries(
+            Object.keys(createLedger).map((key) => [
+              key,
+              createLedger[key] + advanceLedger[key] + resumeLedger[key],
+            ]),
+          );
+          assert.deepEqual(countMutations(apiCalls), phaseTotal);
+
+          const runUrl = `${process.env.GITHUB_SERVER_URL}/${REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+          const publicLog = {
+            schema: 'windows-cli-release-v2-actual-cover.v1',
+            runUrl,
+            window: {
+              startEpoch: Number(process.env.WINDOW_START_EPOCH),
+              endEpochExclusive: Number(process.env.WINDOW_END_EPOCH),
+              start: new Date(Number(process.env.WINDOW_START_EPOCH) * 1000).toISOString(),
+              endExclusive: new Date(Number(process.env.WINDOW_END_EPOCH) * 1000).toISOString(),
+              attempt: Number(process.env.GITHUB_RUN_ATTEMPT),
+            },
+            transportDefinition: {
+              ref: process.env.GITHUB_REF,
+              sha: TRANSPORT_SHA,
+              tree: transportCommit.tree.sha,
+              parents: (transportCommit.parents ?? []).map((item) => item.sha),
+            },
+            canonicalSource: { branch: BASE_BRANCH, sha: SOURCE_SHA, tree: SOURCE_TREE },
+            prestate,
+            expectedGenerationBranch,
+            binds,
+            historicalC1: {
+              official: c1Official,
+              candidate: {
+                version: c1Candidate.version,
+                contentHash: c1Candidate.contentHash,
+                sourceUrl: c1Candidate.sourceUrl,
+                selectedBytes: c1Candidate.selectedBytes,
+                proof: c1Candidate.proofReceipt,
+              },
+            },
+            latestC2: {
+              official: c2Official,
+              candidate: {
+                version: c2Candidate.version,
+                contentHash: c2Candidate.contentHash,
+                sourceUrl: c2Candidate.sourceUrl,
+                selectedBytes: c2Candidate.selectedBytes,
+                proof: c2Candidate.proofReceipt,
+              },
+            },
+            create: { result: create, lifecycle: h1, mutations: createLedger },
+            advance: { result: advance, lifecycle: h2, ffMergeBase: ff.merge_base_commit.sha, mutations: advanceLedger },
+            resume: { result: resume, lifecycle: h3, mutations: resumeLedger },
+            invariants: {
+              samePr: h1.prNumber === h2.prNumber && h2.prNumber === h3.prNumber,
+              sameBranch: h1.branch === expectedGenerationBranch
+                && h2.branch === expectedGenerationBranch
+                && h3.branch === expectedGenerationBranch,
+              exactGenerationBranch: expectedGenerationBranch === generationBranch(CLI, SOURCE_SHA, c1Candidate),
+              draftTrue: h1.draft === true && h2.draft === true && h3.draft === true,
+              allCliPrestateZero: prestate.candidates.length === 0,
+              lifecycleCodexOneOthersZero: [h1, h2, h3].every((snapshot) =>
+                snapshot.candidateState.counts[CLI] === 1
+                  && snapshot.candidateState.names
+                    .filter((name) => name !== CLI)
+                    .every((name) => snapshot.candidateState.counts[name] === 0)),
+              h1ParentIsS: h1.parents.length === 1 && h1.parents[0] === SOURCE_SHA,
+              h2ParentIsH1: h2.parents.length === 1 && h2.parents[0] === h1.head,
+              normalFf: ff.merge_base_commit.sha === h1.head,
+              thirdCallMutationZero: resumeLedger.total === 0,
+              completeMutationLedger: JSON.stringify(countMutations(apiCalls)) === JSON.stringify(phaseTotal),
+              deleteZero: countMutations(apiCalls).delete === 0,
+              ciDispatchZero: apiCalls.every((item) => !item.path.includes('/actions/')),
+              mergePublishLiveZero: true,
+            },
+            mutationTotals: countMutations(apiCalls),
+            apiRecorder: apiCalls,
+          };
+
+          console.log(`V2_ACTUAL_COVER_PUBLIC ${JSON.stringify(publicLog, null, 2)}`);
+          const summary = [
+            '# V2 actual cover — Codex C1 CREATE → C2 ADVANCE → C2 RESUME',
+            '',
+            `- run: ${runUrl}`,
+            `- transport: \`${TRANSPORT_SHA}\` on \`${process.env.GITHUB_REF}\``,
+            `- canonical S: \`${SOURCE_SHA}\` / tree \`${SOURCE_TREE}\``,
+            `- C1: \`${c1Candidate.version}\` / \`${c1Candidate.contentHash}\``,
+            `- C2: \`${c2Candidate.version}\` / \`${c2Candidate.contentHash}\``,
+            `- PR: #${h2.prNumber} ${h2.prUrl}`,
+            `- branch: \`${h2.branch}\` (exact C1 generation identity)`,
+            `- draft: ${h2.draft}`,
+            `- all-CLI prestate: ${JSON.stringify(prestate.counts)}`,
+            `- H1: \`${h1.head}\` parent S`,
+            `- H2: \`${h2.head}\` parent H1 / normal FF`,
+            `- third call: RESUME / effects=0 / mutations=0`,
+            `- merge / CI dispatch / publish / live: 0`,
+            '',
+            '<details><summary>Public machine receipt</summary>',
+            '',
+            '```json',
+            JSON.stringify(publicLog, null, 2),
+            '```',
+            '</details>',
+            '',
+          ].join('\n');
+          await appendFile(process.env.GITHUB_STEP_SUMMARY, summary);
+          NODE
