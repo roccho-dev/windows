@@ -551,6 +551,98 @@ test('raw tree 404 closes only through exact commit contents while preserving th
   assert.equal(commit.chainGET.state, 'CONFIRMED_DONE');
 });
 
+test('second run preflights an existing exact commit and reaches ref with tree and commit POST zero', async () => {
+  const base = '3'.repeat(40);
+  const fixture = new GitObjectFixture(base);
+  const objectApi = githubObjectView(fixture, {
+    hideCreatedTree: true,
+    messageView: (message) => message.endsWith('\n') ? message.slice(0, -1) : message,
+  });
+  const input = {
+    api: objectApi,
+    parentShas: [base],
+    treeBaseSha: base,
+    registry: registry(),
+    message: 'chore: cross-run deterministic resume',
+  };
+
+  const first = await createImmutableCommit(input);
+  assert.match(first.sha, /^[0-9a-f]{40}$/);
+  fixture.calls.length = 0;
+
+  let refSha = null;
+  const calls = [];
+  const branch = 'bot/cross-run-resume';
+  const api = async (method, path, body) => {
+    calls.push({ method, path, body });
+    if (method === 'GET' && decodeURIComponent(path) === `/git/ref/heads/${branch}`) {
+      return refSha ? { object: { sha: refSha } } : null;
+    }
+    if (method === 'POST' && path === '/git/refs') {
+      refSha = body.sha;
+      return { ref: body.ref, object: { sha: body.sha } };
+    }
+    return objectApi(method, path, body);
+  };
+  const receipts = [];
+  const second = await createImmutableCommit({ ...input, api, objectReceipts: receipts });
+  assert.equal(second.sha, first.sha);
+  assert.equal(calls.filter(({ method, path }) => method === 'POST' && path === '/git/trees').length, 0);
+  assert.equal(calls.filter(({ method, path }) => method === 'POST' && path === '/git/commits').length, 0);
+  const tree = receipts.find((receipt) => receipt.label === 'registry tree');
+  const commit = receipts.find((receipt) => receipt.label === 'candidate commit');
+  assert.equal(tree.beforeGET.state, 'CONFIRMED_NOT_DONE');
+  assert.equal(tree.contentsGET.state, 'CONFIRMED_VIA_COMMIT_CONTENTS');
+  assert.equal(tree.finalState, 'CONFIRMED_VIA_COMMIT_CONTENTS');
+  assert.equal(tree.post.attempted, false);
+  assert.equal(commit.beforeGET.state, 'CONFIRMED_DONE');
+  assert.equal(commit.finalState, 'CONFIRMED_DONE');
+  assert.equal(commit.post.attempted, false);
+
+  const refEffect = await reconcileRef({ api, branch, expectedOldSha: null, newSha: second.sha, create: true });
+  assert.equal(refEffect.state, 'CONFIRMED_DONE');
+  assert.equal(refEffect.sends, 1);
+  assert.equal(calls.filter(({ method, path }) => method === 'POST' && path === '/git/refs').length, 1);
+});
+
+test('existing exact commit with missing blob or invalid contents stops before every mutation', async () => {
+  for (const mode of ['missing-blob', 'missing', 'wrong-sha', 'wrong-bytes']) {
+    const base = '3'.repeat(40);
+    const fixture = new GitObjectFixture(base);
+    const exactApi = githubObjectView(fixture, {
+      hideCreatedTree: true,
+      messageView: (message) => message.endsWith('\n') ? message.slice(0, -1) : message,
+    });
+    const input = {
+      api: exactApi,
+      parentShas: [base],
+      treeBaseSha: base,
+      registry: registry(),
+      message: 'chore: preflight mismatch stop',
+    };
+    const first = await createImmutableCommit(input);
+    assert.match(first.sha, /^[0-9a-f]{40}$/);
+    if (mode === 'missing-blob') fixture.objects.blobs.clear();
+    fixture.calls.length = 0;
+    const api = githubObjectView(fixture, {
+      hideCreatedTree: true,
+      messageView: (message) => message.endsWith('\n') ? message.slice(0, -1) : message,
+      contentsMode: mode === 'missing-blob' ? 'exact' : mode,
+    });
+    const receipts = [];
+    await assert.rejects(
+      createImmutableCommit({ ...input, api, objectReceipts: receipts }),
+      mode === 'missing-blob' ? /immutable blob preflight/ : /immutable tree contents preflight/,
+      mode,
+    );
+    assert.equal(fixture.calls.filter(({ method }) => ['POST', 'PATCH', 'DELETE'].includes(method)).length, 0, mode);
+    assert.equal(fixture.calls.filter(({ path }) => path === '/git/refs' || path === '/pulls').length, 0, mode);
+    const commit = receipts.find((receipt) => receipt.label === 'candidate commit');
+    assert.equal(commit.beforeGET.state, 'CONFIRMED_DONE', mode);
+    assert.equal(commit.post.attempted, false, mode);
+  }
+});
+
 test('commit GET may omit exactly one terminal LF but internal, extra-LF or SHA differences remain RED', async () => {
   const cases = [
     ['omitted-terminal-lf', (message) => message.endsWith('\n') ? message.slice(0, -1) : message, (sha) => sha, true],

@@ -820,6 +820,80 @@ export async function createImmutableCommit({
     }
   };
 
+  const readPreflight = async (observe) => {
+    try { return await observe(); }
+    catch (error) { return { state: 'STILL_UNKNOWN', actualSha: null, error: receiptFailure(error) }; }
+  };
+  const commitPreflight = await readPreflight(observeCommit);
+  if (commitPreflight.state !== 'CONFIRMED_NOT_DONE') {
+    const readOnlyReceipt = ({ label, path, expectedSha, observation }) => ({
+      state: observation.state,
+      sends: 0,
+      receipt: {
+        label, method: 'POST', path, expectedSha,
+        beforeGET: observation,
+        post: { attempted: false, responseSha: null, error: null },
+        afterGET: null,
+        chainGET: observation,
+        contentsGET: null,
+        finalState: observation.state,
+        failure: null,
+      },
+    });
+    if (commitPreflight.state !== 'CONFIRMED_DONE') {
+      const commitReceipt = readOnlyReceipt({
+        label: 'candidate commit', path: '/git/commits', expectedSha: plan.commitSha,
+        observation: commitPreflight,
+      });
+      commitReceipt.receipt.failure = `candidate commit preflight ${commitPreflight.state}`;
+      objectReceipts.push(commitReceipt.receipt);
+      fail(commitReceipt.receipt.failure);
+    }
+
+    const blobPreflight = await readPreflight(observeBlob);
+    const treePreflight = await readPreflight(observeTree);
+    const contentsPreflight = await observeRegistryContentsAtCommit();
+    const blobReceipt = readOnlyReceipt({
+      label: 'registry blob', path: '/git/blobs', expectedSha: plan.blobSha,
+      observation: blobPreflight,
+    });
+    const treeReceipt = readOnlyReceipt({
+      label: 'registry tree', path: '/git/trees', expectedSha: plan.treeSha,
+      observation: treePreflight,
+    });
+    const commitReceipt = readOnlyReceipt({
+      label: 'candidate commit', path: '/git/commits', expectedSha: plan.commitSha,
+      observation: commitPreflight,
+    });
+    treeReceipt.receipt.contentsGET = contentsPreflight;
+    objectReceipts.push(blobReceipt.receipt, treeReceipt.receipt, commitReceipt.receipt);
+
+    if (blobPreflight.state !== 'CONFIRMED_DONE') {
+      blobReceipt.receipt.failure = `immutable blob preflight ${blobPreflight.state}`;
+      fail(blobReceipt.receipt.failure);
+    }
+    if (!['CONFIRMED_DONE', 'CONFIRMED_NOT_DONE'].includes(treePreflight.state)) {
+      treeReceipt.receipt.failure = `immutable tree preflight ${treePreflight.state}`;
+      fail(treeReceipt.receipt.failure);
+    }
+    if (contentsPreflight.state !== 'CONFIRMED_VIA_COMMIT_CONTENTS') {
+      treeReceipt.receipt.finalState = contentsPreflight.state;
+      treeReceipt.receipt.failure = `immutable tree contents preflight ${contentsPreflight.state}`;
+      fail(treeReceipt.receipt.failure);
+    }
+
+    blobReceipt.receipt.finalState = 'CONFIRMED_DONE';
+    commitReceipt.receipt.finalState = 'CONFIRMED_DONE';
+    treeReceipt.state = treePreflight.state === 'CONFIRMED_DONE'
+      ? 'CONFIRMED_DONE' : 'CONFIRMED_VIA_COMMIT_CONTENTS';
+    treeReceipt.receipt.finalState = treeReceipt.state;
+    return {
+      sha: plan.commitSha,
+      receipts: { blob: blobReceipt, tree: treeReceipt, commit: commitReceipt },
+      objectReceipts,
+    };
+  }
+
   const blobReceipt = await reconcileImmutableObject({
     label: 'registry blob', path: '/git/blobs', expectedSha: plan.blobSha,
     observe: observeBlob,
