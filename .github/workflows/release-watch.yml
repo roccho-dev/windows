@@ -12,7 +12,7 @@ on:
       - .github/workflows/release-watch.yml
       - flake.nix
   schedule:
-    - cron: '17 3 * * *'
+    - cron: '0 21 * * 5'
   workflow_dispatch:
 
 permissions:
