@@ -17,8 +17,8 @@
       }
     },
     "pin": {
-      "version": "0.157.1",
-      "contentHash": "0e211868c9fd73cb49ad35ac675b5eafdf6b9f453df8a493df980c59a590fe5f"
+      "version": "0.161.0",
+      "contentHash": "04d8ab9dbcb9df0edf3c67dca5072a374babfdf762a9bc4ae649ae140b8e2cf0"
     }
   },
   "claude": {
