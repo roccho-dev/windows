@@ -385,6 +385,7 @@ export async function reconcileEffect({ observe, mutate }) {
   try { after = await observe(); } catch { after = 'STILL_UNKNOWN'; }
   if (after === 'CONFIRMED_DONE') return { state: after, sends: 1, mutationError: mutationError?.message ?? null };
   if (mutationError && after === 'CONFIRMED_NOT_DONE') return { state: 'PARTIAL_OR_FAILED', sends: 1, mutationError: mutationError.message };
+  if (after === 'CONFIRMED_NOT_DONE') return { state: 'STILL_UNKNOWN', sends: 1, mutationError: null };
   return { state: after, sends: 1, mutationError: mutationError?.message ?? null };
 }
 
