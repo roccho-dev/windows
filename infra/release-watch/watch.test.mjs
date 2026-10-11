@@ -73,6 +73,9 @@ class GitObjectFixture {
     this.calls = [];
     this.objects = { blobs: new Map(), trees: new Map(), commits: new Map() };
     this.unknownOnce = new Set();
+    this.hiddenTrees = new Set();
+    this.hideTreeUntilCommit = false;
+    this.responseShaOverride = new Map();
     this.date = '2026-10-09T00:00:00.000Z';
     this.rootEntries = [
       { path: 'README.md', mode: '100644', type: 'blob', sha: 'd'.repeat(40) },
@@ -88,6 +91,8 @@ class GitObjectFixture {
     ];
   }
   failAfterApply(kind) { this.unknownOnce.add(kind); }
+  delayTreeVisibilityUntilCommit() { this.hideTreeUntilCommit = true; }
+  returnWrongSha(kind, sha = '9'.repeat(40)) { this.responseShaOverride.set(kind, sha); }
   maybeThrow(kind) {
     if (!this.unknownOnce.delete(kind)) return;
     throw new TypeError(`simulated timeout after ${kind}`);
@@ -111,15 +116,20 @@ class GitObjectFixture {
       const sha = testGitObjectSha('blob', bytes);
       this.objects.blobs.set(sha, { sha, encoding: 'base64', content: body.content });
       this.maybeThrow('blob');
-      return { sha };
+      return { sha: this.responseShaOverride.get('blob') ?? sha };
     }
-    if (method === 'GET' && path.startsWith('/git/trees/')) return this.objects.trees.get(path.slice('/git/trees/'.length)) ?? null;
+    if (method === 'GET' && path.startsWith('/git/trees/')) {
+      const sha = path.slice('/git/trees/'.length);
+      if (this.hiddenTrees.has(sha)) return null;
+      return this.objects.trees.get(sha) ?? null;
+    }
     if (method === 'POST' && path === '/git/trees') {
       const blobSha = body.tree[0].sha;
       const sha = this.expectedRoot(blobSha);
       this.objects.trees.set(sha, { sha, truncated: false, tree: [] });
+      if (this.hideTreeUntilCommit) this.hiddenTrees.add(sha);
       this.maybeThrow('tree');
-      return { sha };
+      return { sha: this.responseShaOverride.get('tree') ?? sha };
     }
     if (method === 'GET' && path.startsWith('/git/commits/')) return this.objects.commits.get(path.slice('/git/commits/'.length)) ?? null;
     if (method === 'POST' && path === '/git/commits') {
@@ -128,8 +138,9 @@ class GitObjectFixture {
         sha, tree: { sha: body.tree }, parents: body.parents.map((parent) => ({ sha: parent })),
         message: body.message, author: body.author, committer: body.committer,
       });
+      this.hiddenTrees.delete(body.tree);
       this.maybeThrow('commit');
-      return { sha };
+      return { sha: this.responseShaOverride.get('commit') ?? sha };
     }
     throw new Error(`unexpected object API ${method} ${path}`);
   };
@@ -431,36 +442,135 @@ test('canonical movement immediately before first effect stops with blob/tree/co
   assert.equal(calls.filter((call) => ['POST', 'PATCH', 'DELETE'].includes(call.method)).length, 0);
 });
 
-test('blob/tree/commit success with lost responses is read back once and never replayed', async () => {
+test('object POST response loss stops the phase; later deterministic readback never resends the completed object', async () => {
   const base = '3'.repeat(40);
   const fixture = new GitObjectFixture(base);
   fixture.failAfterApply('blob');
-  fixture.failAfterApply('tree');
-  fixture.failAfterApply('commit');
+  const receipts = [];
   const input = {
     api: fixture.api,
     parentShas: [base],
     treeBaseSha: base,
     registry: registry(),
     message: 'chore: deterministic object receipt',
+    objectReceipts: receipts,
   };
-  const first = await createImmutableCommit(input);
-  assert.deepEqual({
-    blob: first.receipts.blob.sends,
-    tree: first.receipts.tree.sends,
-    commit: first.receipts.commit.sends,
-  }, { blob: 1, tree: 1, commit: 1 });
-  const posts = fixture.calls.filter((call) => call.method === 'POST').length;
-  assert.equal(posts, 3);
+  await assert.rejects(createImmutableCommit(input), /registry blob: POST failed or response was lost/);
+  assert.equal(fixture.calls.filter((call) => call.method === 'POST' && call.path === '/git/blobs').length, 1);
+  assert.equal(fixture.calls.filter((call) => call.method === 'POST' && call.path !== '/git/blobs').length, 0);
+  assert.equal(receipts[0].post.attempted, true);
+  assert.match(receipts[0].post.error, /simulated timeout/);
+  assert.equal(receipts[0].finalState, 'PARTIAL_OR_FAILED');
 
-  const second = await createImmutableCommit(input);
-  assert.equal(second.sha, first.sha);
-  assert.deepEqual({
-    blob: second.receipts.blob.sends,
-    tree: second.receipts.tree.sends,
-    commit: second.receipts.commit.sends,
-  }, { blob: 0, tree: 0, commit: 0 });
-  assert.equal(fixture.calls.filter((call) => call.method === 'POST').length, posts);
+  fixture.calls.length = 0;
+  const laterReceipts = [];
+  const completed = await createImmutableCommit({ ...input, objectReceipts: laterReceipts });
+  assert.match(completed.sha, /^[0-9a-f]{40}$/);
+  assert.deepEqual(
+    fixture.calls.filter((call) => call.method === 'POST').map((call) => call.path),
+    ['/git/trees', '/git/commits'],
+  );
+  assert.equal(laterReceipts[0].finalState, 'CONFIRMED_DONE');
+  assert.equal(laterReceipts[0].post.attempted, false);
+});
+
+test('tree exact POST receipt plus after-GET 404 advances once to exact commit and confirms the full immutable chain', async () => {
+  const base = '3'.repeat(40);
+  const fixture = new GitObjectFixture(base);
+  fixture.delayTreeVisibilityUntilCommit();
+  const receipts = [];
+  let leaseChecks = 0;
+  const result = await createImmutableCommit({
+    api: fixture.api,
+    parentShas: [base],
+    treeBaseSha: base,
+    registry: registry(),
+    message: 'chore: causal immutable closure',
+    objectReceipts: receipts,
+    beforeCommit: async () => { leaseChecks += 1; },
+  });
+  assert.match(result.sha, /^[0-9a-f]{40}$/);
+  assert.equal(leaseChecks, 1);
+  assert.deepEqual(
+    fixture.calls.filter((call) => call.method === 'POST').map((call) => call.path),
+    ['/git/blobs', '/git/trees', '/git/commits'],
+  );
+  const tree = receipts.find((receipt) => receipt.label === 'registry tree');
+  const commit = receipts.find((receipt) => receipt.label === 'candidate commit');
+  assert.equal(tree.method, 'POST');
+  assert.equal(tree.path, '/git/trees');
+  assert.equal(tree.post.responseSha, tree.expectedSha);
+  assert.equal(tree.afterGET.state, 'CONFIRMED_NOT_DONE');
+  assert.equal(tree.chainGET.state, 'CONFIRMED_DONE');
+  assert.equal(tree.finalState, 'CONFIRMED_DONE');
+  assert.equal(tree.failure, null);
+  assert.equal(commit.post.responseSha, commit.expectedSha);
+  assert.equal(commit.afterGET.state, 'CONFIRMED_DONE');
+});
+
+test('tree POST response loss or response SHA mismatch stops before commit', async () => {
+  for (const mode of ['response-loss', 'sha-mismatch']) {
+    const base = '3'.repeat(40);
+    const fixture = new GitObjectFixture(base);
+    const receipts = [];
+    if (mode === 'response-loss') fixture.failAfterApply('tree');
+    else fixture.returnWrongSha('tree');
+    await assert.rejects(
+      createImmutableCommit({
+        api: fixture.api,
+        parentShas: [base],
+        treeBaseSha: base,
+        registry: registry(),
+        message: `chore: ${mode}`,
+        objectReceipts: receipts,
+      }),
+      mode === 'response-loss' ? /POST failed or response was lost/ : /POST response sha differs/,
+    );
+    assert.equal(fixture.calls.filter((call) => call.method === 'POST' && call.path === '/git/trees').length, 1, mode);
+    assert.equal(fixture.calls.filter((call) => call.method === 'POST' && call.path === '/git/commits').length, 0, mode);
+    const tree = receipts.find((receipt) => receipt.label === 'registry tree');
+    assert.equal(tree.finalState, 'PARTIAL_OR_FAILED', mode);
+    assert.equal(tree.method, 'POST', mode);
+    assert.equal(tree.path, '/git/trees', mode);
+    assert.match(tree.expectedSha, /^[0-9a-f]{40}$/, mode);
+  }
+});
+
+test('commit failure or unknown stops before ref and PR with partial object evidence', async () => {
+  const repository = 'roccho-dev/windows';
+  const base = '3'.repeat(40);
+  const fixture = new GitObjectFixture(base);
+  fixture.delayTreeVisibilityUntilCommit();
+  fixture.failAfterApply('commit');
+  const calls = [];
+  const receipts = [];
+  const c = candidate('1.2.4', hex('d'));
+  const branch = generationBranch('alpha', base, c);
+  const api = async (method, path, body) => {
+    calls.push({ method, path, body });
+    if (method === 'GET' && path.startsWith('/pulls?state=open')) return [];
+    if (method === 'GET' && decodeURIComponent(path) === `/git/ref/heads/${branch}`) return null;
+    if (method === 'GET' && path === '/git/ref/heads/proposals') return { object: { sha: base } };
+    return fixture.api(method, path, body);
+  };
+  await assert.rejects(
+    maintainOne({
+      repository, token: 'unused', baseSha: base, registry: registry(),
+      name: 'alpha', candidate: c, api, objectReceipts: receipts,
+    }),
+    /candidate commit: POST failed or response was lost/,
+  );
+  assert.equal(calls.filter(({ method, path }) => method === 'POST' && path === '/git/refs').length, 0);
+  assert.equal(calls.filter(({ method, path }) => method === 'PATCH' && path.startsWith('/git/refs/')).length, 0);
+  assert.equal(calls.filter(({ method, path }) => method === 'POST' && path === '/pulls').length, 0);
+  const commit = receipts.find((receipt) => receipt.label === 'candidate commit');
+  assert.equal(commit.method, 'POST');
+  assert.equal(commit.path, '/git/commits');
+  assert.match(commit.expectedSha, /^[0-9a-f]{40}$/);
+  assert.equal(commit.post.attempted, true);
+  assert.match(commit.post.error, /simulated timeout/);
+  assert.equal(commit.finalState, 'PARTIAL_OR_FAILED');
+  assert.match(commit.failure, /POST failed or response was lost/);
 });
 
 test('existing deterministic blob and tree resume at the missing commit with object resend zero', async () => {
@@ -753,7 +863,7 @@ test('native Git graph: candidate-specific generation has one A pin delta for me
   }
 });
 
-test('canonical A moves after immutable objects: no ref or PR write', async () => {
+test('canonical A moves before commit POST: commit/ref/PR write zero', async () => {
   const base = '3'.repeat(40), moved = '4'.repeat(40);
   const fixture = new GitObjectFixture(base);
   const calls = [];
@@ -767,7 +877,7 @@ test('canonical A moves after immutable objects: no ref or PR write', async () =
   };
   await assert.rejects(maintainOne({ repository: 'roccho-dev/windows', token: 'unused', baseSha: base, registry: registry(), name: 'alpha', candidate: candidate('1.2.4'), api }), /canonical A moved/);
   assert.equal(calls.filter(({ method, path }) => method === 'PATCH' || method === 'DELETE' || method === 'POST' && ['/git/refs', '/pulls'].includes(path)).length, 0);
-  assert.equal(calls.filter(({ method, path }) => method === 'POST' && path === '/git/commits').length, 1);
+  assert.equal(calls.filter(({ method, path }) => method === 'POST' && path === '/git/commits').length, 0);
 });
 
 test('PR creation preflight rejects known base or generation mismatch with POST zero', async () => {
