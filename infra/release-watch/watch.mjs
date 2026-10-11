@@ -688,54 +688,162 @@ async function inspectPreparedCandidateRef({ api, refSha, baseSha, registry, nam
   return { registry: preparedRegistry, plan, pointers };
 }
 
-async function requireObjectReceipt(label, effect) {
-  const result = await reconcileEffect(effect);
-  if (result.state !== 'CONFIRMED_DONE') fail(`${label}: ${result.state}`);
-  return result;
+function receiptFailure(error) {
+  return String(error?.message ?? error).slice(0, 500);
 }
 
-export async function createImmutableCommit({ api, parentShas, treeBaseSha, registry, message }) {
+async function reconcileImmutableObject({
+  label, method = 'POST', path, expectedSha, observe, mutate,
+  objectReceipts, allowAcknowledgedUnknown = false, beforeMutate = null,
+}) {
+  const receipt = {
+    label, method, path, expectedSha,
+    beforeGET: null,
+    post: { attempted: false, responseSha: null, error: null },
+    afterGET: null,
+    chainGET: null,
+    finalState: null,
+    failure: null,
+  };
+  objectReceipts.push(receipt);
+
+  const read = async () => {
+    try { return await observe(); }
+    catch (error) { return { state: 'STILL_UNKNOWN', actualSha: null, error: receiptFailure(error) }; }
+  };
+
+  const before = await read();
+  receipt.beforeGET = before;
+  if (before.state === 'CONFIRMED_DONE') {
+    receipt.finalState = 'CONFIRMED_DONE';
+    return { state: 'CONFIRMED_DONE', sends: 0, receipt };
+  }
+  if (before.state !== 'CONFIRMED_NOT_DONE') {
+    receipt.finalState = before.state;
+    receipt.failure = `${label}: before GET ${before.state}`;
+    fail(receipt.failure);
+  }
+
+  if (beforeMutate) {
+    try { await beforeMutate(); }
+    catch (error) {
+      receipt.finalState = 'STOPPED_BEFORE_POST';
+      receipt.failure = `${label}: pre-send guard failed: ${receiptFailure(error)}`;
+      fail(receipt.failure);
+    }
+  }
+
+  receipt.post.attempted = true;
+  let created;
+  try { created = await mutate(); }
+  catch (error) {
+    receipt.post.error = receiptFailure(error);
+    receipt.afterGET = await read();
+    receipt.finalState = 'PARTIAL_OR_FAILED';
+    receipt.failure = `${label}: POST failed or response was lost`;
+    fail(`${receipt.failure}: ${receipt.post.error}`);
+  }
+  receipt.post.responseSha = created?.sha ?? null;
+  if (receipt.post.responseSha !== expectedSha) {
+    receipt.afterGET = await read();
+    receipt.finalState = 'PARTIAL_OR_FAILED';
+    receipt.failure = `${label}: POST response sha differs`;
+    fail(receipt.failure);
+  }
+
+  const after = await read();
+  receipt.afterGET = after;
+  if (after.state === 'CONFIRMED_DONE') {
+    receipt.finalState = 'CONFIRMED_DONE';
+    return { state: 'CONFIRMED_DONE', sends: 1, receipt };
+  }
+  if (allowAcknowledgedUnknown && after.state === 'CONFIRMED_NOT_DONE') {
+    receipt.finalState = 'POST_ACKNOWLEDGED_READBACK_UNKNOWN';
+    receipt.failure = 'after GET returned 404 after exact POST response';
+    return { state: receipt.finalState, sends: 1, receipt };
+  }
+  receipt.finalState = after.state === 'CONFIRMED_NOT_DONE' ? 'STILL_UNKNOWN' : after.state;
+  receipt.failure = `${label}: ${receipt.finalState}`;
+  fail(receipt.failure);
+}
+
+export async function createImmutableCommit({
+  api, parentShas, treeBaseSha, registry, message,
+  objectReceipts = [], beforeCommit = null,
+}) {
   const plan = await planImmutableCommit({ api, parentShas, treeBaseSha, registry, message });
-  const blobReceipt = await requireObjectReceipt('registry blob', {
-    observe: async () => {
-      const blob = await api('GET', `/git/blobs/${plan.blobSha}`);
-      if (blob === null) return 'CONFIRMED_NOT_DONE';
-      if (blob?.encoding !== 'base64' || typeof blob.content !== 'string') return 'PARTIAL_OR_FAILED';
-      const actual = Buffer.from(blob.content.replace(/\n/g, ''), 'base64');
-      return gitObjectSha('blob', actual) === plan.blobSha && actual.equals(plan.registryBytes)
-        ? 'CONFIRMED_DONE' : 'PARTIAL_OR_FAILED';
-    },
-    mutate: async () => {
-      const created = await api('POST', '/git/blobs', { content: plan.registryBytes.toString('base64'), encoding: 'base64' });
-      if (created?.sha !== plan.blobSha) fail('registry blob response sha differs');
-    },
+  const observeBlob = async () => {
+    const blob = await api('GET', `/git/blobs/${plan.blobSha}`);
+    if (blob === null) return { state: 'CONFIRMED_NOT_DONE', actualSha: null };
+    if (blob?.encoding !== 'base64' || typeof blob.content !== 'string') {
+      return { state: 'PARTIAL_OR_FAILED', actualSha: blob?.sha ?? null };
+    }
+    const actual = Buffer.from(blob.content.replace(/\n/g, ''), 'base64');
+    const done = gitObjectSha('blob', actual) === plan.blobSha && actual.equals(plan.registryBytes);
+    return { state: done ? 'CONFIRMED_DONE' : 'PARTIAL_OR_FAILED', actualSha: done ? plan.blobSha : blob?.sha ?? null };
+  };
+  const observeTree = async () => {
+    const tree = await api('GET', `/git/trees/${plan.treeSha}`);
+    if (tree === null) return { state: 'CONFIRMED_NOT_DONE', actualSha: null };
+    const done = tree?.sha === plan.treeSha && tree.truncated !== true;
+    return { state: done ? 'CONFIRMED_DONE' : 'PARTIAL_OR_FAILED', actualSha: tree?.sha ?? null };
+  };
+  const observeCommit = async () => {
+    const commit = await api('GET', `/git/commits/${plan.commitSha}`);
+    if (commit === null) return { state: 'CONFIRMED_NOT_DONE', actualSha: null };
+    const done = commitMatchesPlan(commit, plan);
+    return { state: done ? 'CONFIRMED_DONE' : 'PARTIAL_OR_FAILED', actualSha: commit?.sha ?? null };
+  };
+
+  const blobReceipt = await reconcileImmutableObject({
+    label: 'registry blob', path: '/git/blobs', expectedSha: plan.blobSha,
+    observe: observeBlob,
+    mutate: () => api('POST', '/git/blobs', { content: plan.registryBytes.toString('base64'), encoding: 'base64' }),
+    objectReceipts,
   });
-  const treeReceipt = await requireObjectReceipt('registry tree', {
-    observe: async () => {
-      const tree = await api('GET', `/git/trees/${plan.treeSha}`);
-      return tree === null ? 'CONFIRMED_NOT_DONE'
-        : tree?.sha === plan.treeSha && tree.truncated !== true ? 'CONFIRMED_DONE' : 'PARTIAL_OR_FAILED';
-    },
-    mutate: async () => {
-      const created = await api('POST', '/git/trees', {
-        base_tree: plan.baseCommit.tree.sha,
-        tree: [{ path: REGISTRY_PATH, mode: '100644', type: 'blob', sha: plan.blobSha }],
-      });
-      if (created?.sha !== plan.treeSha) fail('registry tree response sha differs');
-    },
+  const treeReceipt = await reconcileImmutableObject({
+    label: 'registry tree', path: '/git/trees', expectedSha: plan.treeSha,
+    observe: observeTree,
+    mutate: () => api('POST', '/git/trees', {
+      base_tree: plan.baseCommit.tree.sha,
+      tree: [{ path: REGISTRY_PATH, mode: '100644', type: 'blob', sha: plan.blobSha }],
+    }),
+    objectReceipts,
+    allowAcknowledgedUnknown: true,
   });
-  const commitReceipt = await requireObjectReceipt('candidate commit', {
-    observe: async () => {
-      const commit = await api('GET', `/git/commits/${plan.commitSha}`);
-      if (commit === null) return 'CONFIRMED_NOT_DONE';
-      return commitMatchesPlan(commit, plan) ? 'CONFIRMED_DONE' : 'PARTIAL_OR_FAILED';
-    },
-    mutate: async () => {
-      const created = await api('POST', '/git/commits', plan.commitBody);
-      if (created?.sha !== plan.commitSha) fail('candidate commit response sha differs');
-    },
+  const commitReceipt = await reconcileImmutableObject({
+    label: 'candidate commit', path: '/git/commits', expectedSha: plan.commitSha,
+    observe: observeCommit,
+    beforeMutate: beforeCommit,
+    mutate: () => api('POST', '/git/commits', plan.commitBody),
+    objectReceipts,
   });
-  return { sha: plan.commitSha, receipts: { blob: blobReceipt, tree: treeReceipt, commit: commitReceipt } };
+
+  const chain = {
+    blob: await observeBlob(),
+    tree: await observeTree(),
+    commit: await observeCommit(),
+  };
+  blobReceipt.receipt.chainGET = chain.blob;
+  treeReceipt.receipt.chainGET = chain.tree;
+  commitReceipt.receipt.chainGET = chain.commit;
+  for (const [kind, observation] of Object.entries(chain)) {
+    if (observation.state !== 'CONFIRMED_DONE') {
+      const target = { blob: blobReceipt, tree: treeReceipt, commit: commitReceipt }[kind].receipt;
+      target.finalState = observation.state;
+      target.failure = `immutable ${kind} chain readback ${observation.state}`;
+      fail(target.failure);
+    }
+  }
+  for (const receipt of [blobReceipt.receipt, treeReceipt.receipt, commitReceipt.receipt]) {
+    receipt.finalState = 'CONFIRMED_DONE';
+    receipt.failure = null;
+  }
+  return {
+    sha: plan.commitSha,
+    receipts: { blob: blobReceipt, tree: treeReceipt, commit: commitReceipt },
+    objectReceipts,
+  };
 }
 
 export async function reconcileRef({ api, branch, expectedOldSha, newSha, create }) {
@@ -782,7 +890,7 @@ export async function reconcilePrCreate({ api, repository, baseBranch, baseSha, 
 
 export async function maintainOne({
   repository, token, baseBranch = BASE_BRANCH, baseSha, registry, name, candidate,
-  fetchImpl = fetch, api: apiOverride = null,
+  fetchImpl = fetch, api: apiOverride = null, objectReceipts = [],
 }) {
   const api = apiOverride ?? githubClient(repository, token, fetchImpl);
   const existing = await inspectExistingBotPr({ api, repository, baseBranch, baseSha, registry, name, candidate });
@@ -802,6 +910,8 @@ export async function maintainOne({
     commit = await createImmutableCommit({
       api, parentShas, treeBaseSha, registry: next,
       message: candidateCommitMessage(name, candidate.version),
+      objectReceipts,
+      beforeCommit: () => assertCanonicalLease({ api, baseBranch, baseSha }),
     });
     await assertCanonicalLease({ api, baseBranch, baseSha });
     refEffect = await reconcileRef({
