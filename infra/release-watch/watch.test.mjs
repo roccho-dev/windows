@@ -463,6 +463,33 @@ test('blob/tree/commit success with lost responses is read back once and never r
   assert.equal(fixture.calls.filter((call) => call.method === 'POST').length, posts);
 });
 
+test('existing deterministic blob and tree resume at the missing commit with object resend zero', async () => {
+  const base = '3'.repeat(40);
+  const fixture = new GitObjectFixture(base);
+  const input = {
+    api: fixture.api,
+    parentShas: [base],
+    treeBaseSha: base,
+    registry: registry(),
+    message: 'chore: deterministic object receipt',
+  };
+  const complete = await createImmutableCommit(input);
+  fixture.objects.commits.delete(complete.sha);
+  fixture.calls.length = 0;
+
+  const resumed = await createImmutableCommit(input);
+  assert.equal(resumed.sha, complete.sha);
+  assert.deepEqual({
+    blob: resumed.receipts.blob.sends,
+    tree: resumed.receipts.tree.sends,
+    commit: resumed.receipts.commit.sends,
+  }, { blob: 0, tree: 0, commit: 1 });
+  assert.deepEqual(
+    fixture.calls.filter((call) => call.method === 'POST').map((call) => call.path),
+    ['/git/commits'],
+  );
+});
+
 test('unknown-after-success ref create/update and PR create reconcile read-only with resend zero', async () => {
   const fixture = new ProtocolFixture();
   const api = githubClient(fixture.repository, 'token', fixture.fetch);
@@ -478,6 +505,22 @@ test('unknown-after-success ref create/update and PR create reconcile read-only 
   assert.equal(patches[0].path, '/git/refs/heads/bot%2Fcli-release-alpha');
   assert.deepEqual(patches[0].body, { sha: '2'.repeat(40), force: false });
   assert.equal(fixture.calls.filter((call) => call.method === 'POST' && call.path === '/pulls').length, 0);
+});
+
+test('post-mutation absence is UNKNOWN and later deterministic readback never resends', async () => {
+  let visible = false;
+  let mutations = 0;
+  const effect = {
+    observe: async () => visible ? 'CONFIRMED_DONE' : 'CONFIRMED_NOT_DONE',
+    mutate: async () => { mutations += 1; },
+  };
+  const first = await reconcileEffect(effect);
+  assert.deepEqual({ state: first.state, sends: first.sends }, { state: 'STILL_UNKNOWN', sends: 1 });
+  assert.equal(mutations, 1);
+  visible = true;
+  const second = await reconcileEffect(effect);
+  assert.deepEqual({ state: second.state, sends: second.sends }, { state: 'CONFIRMED_DONE', sends: 0 });
+  assert.equal(mutations, 1);
 });
 
 test('partial/unknown effects stop and never resend', async () => {
