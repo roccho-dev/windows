@@ -620,8 +620,8 @@
           grep -qF "$(jq -r .authorizedKeyEnv <<<"$spec")" ${own.start}/bin/own-start
           grep -qF "$mount/.ssh/authorized_keys" ${own.start}/bin/own-start
           # Xpra is not adopted: own-start neither names nor waits on it, and sshd and nix-daemon are the only
-          # essential services; the browsers stay outside, as before. Store hashes are dropped first (base32 can spell it),
-          # and the text is read whole before matching, so a read failure cannot pass for absence.
+          # essential services; the browsers stay outside the wait set as before. Store hashes are dropped first (base32
+          # can spell it), and the text is read whole before matching, so a read failure cannot pass for absence.
           # own-tools is not referenced here (that would build its closure in this check); the own smoke checks it.
           start=$(sed -E 's|/nix/store/[0-9a-z]{32}-|/nix/store/|g' ${own.start}/bin/own-start)
           case "''${start,,}" in *xpra*) echo 'own-start still names xpra' >&2; exit 1 ;; esac
