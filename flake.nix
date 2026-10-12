@@ -31,6 +31,14 @@
         spec = ownSpec;
         nixConf = rentNixConf;
       };
+      # Public fixed-input composition for external flake consumers. It reuses the production own/profile sources;
+      # credentials and mutable runtime state remain outside the image.
+      mkOwn = { owner ? ownOwner, extra ? [], tag ? "nix" }:
+        let
+          profile = import ./hosts/profile/nix.nix { inherit pkgs owner extra; };
+        in
+        (ownFor { inherit profile tag; }) // { inherit profile; };
+      # Keep the existing consumer explicit; the composition check proves the public default is the same derivation.
       own = ownFor { profile = import ./hosts/profile/nix.nix { inherit pkgs; owner = ownOwner; }; tag = "nix"; };
       dev = import ./oci/dev/nix.nix { inherit pkgs; };
       common = import ./hosts/common/nix.nix {
@@ -132,7 +140,7 @@
         [[ $project =~ ^[A-Za-z0-9_.-]+$ && $project != . && $project != .. ]] ||
           fail 'project must be one plain element'
         id=''${1:-}
-        [[ $id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] && [ "$#" -ge 2 ] ||
+        [[ $id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] && [ "$#" -ge 2 ] ||
           fail 'usage: rent-state-import [--compare] [--project <element>] <session-uuid> credentials|session|codex...'
         shift
         ${mountLib}
@@ -288,7 +296,7 @@
         volume_name "$repos" && volume_name "$statevol" && volume_name "$nixvol" ||
           { echo 'rent-mounts: set RENT_REPOS_VOLUME, RENT_STATE_VOLUME and RENT_NIX_VOLUME to volume names' >&2; exit 1; }
         volume_at /work/repos "$repos" rw || { echo "rent-mounts: /work/repos must be exactly volume $repos, rw" >&2; exit 1; }
-        volume_at "$state" "$statevol" rw || { echo "rent-mounts: $state must be exactly volume $statevol, rw" >&2; exit 1; }
+        volume_at "$state" "$statevol" rw || { echo "rent-mounts: $state must be exactly volume $statevol, writable" >&2; exit 1; }
         volume_at /nix "$nixvol" rw || { echo "rent-mounts: /nix must be exactly volume $nixvol, rw" >&2; exit 1; }
         if mounted /home/dev; then echo 'rent-mounts: /home/dev must not be a mount' >&2; exit 1; fi
         [ "$(volume_count)" = 3 ] || { echo 'rent-mounts: exactly three volumes are allowed' >&2; exit 1; }
@@ -467,7 +475,7 @@
               printf 'root:x:0:0:root:/root:/bin/sh\nsshd:x:74:74:sshd:/var/empty:/bin/sh\ndev:x:1000:1000:Development user:/home/dev:/bin/sh\n'
               for i in 1 2 3 4 5 6 7 8; do printf 'nixbld%s:x:%s:30000:Nix build user:/var/empty:/bin/sh\n' $i $((30000 + i)); done
             } > etc/passwd
-            printf 'root:x:0:\nsshd:x:74:\ndev:x:1000:\nnixbld:x:30000:nixbld1,nixbld2,nixbld3,nixbld4,nixbld5,nixbld6,nixbld7,nixbld8\n' > etc/group
+            printf 'root:x:0:\nsshd:x:74:\ndev:x:1000:1000:Development user:/home/dev:/bin/sh\nnixbld:x:30000:nixbld1,nixbld2,nixbld3,nixbld4,nixbld5,nixbld6,nixbld7,nixbld8\n' > etc/group
             cp ${rentNixConf} etc/nix/nix.conf
             ln -s ${roots} etc/rent-nix-roots
             # Default CA path, so TLS works in sessions that do not inherit SSL_CERT_FILE.
@@ -499,13 +507,11 @@
       '';
     in {
       inherit releaseVersions;
+      lib.${system}.mkOwn = mkOwn;
       packages.${system} = {
         own-image = own.image;
-        # CI only, never published: the same own definition plus one profile package, to prove seed-on-upgrade.
-        own-image-next = (ownFor {
-          profile = import ./hosts/profile/nix.nix { inherit pkgs; owner = ownOwner; extra = [ pkgs.hello ]; };
-          tag = "next";
-        }).image;
+        # CI only, never published: the public composition plus one profile package proves seed-on-upgrade.
+        own-image-next = (mkOwn { extra = [ pkgs.hello ]; tag = "next"; }).image;
         rent-image = mkRent { profile = rentProfile; tag = "nix"; };
         release-profile = rentProfile;
         # CI only, never published: the published definition with the tunnel stub, for local SSH/state/#8 proofs.
@@ -532,6 +538,24 @@
         program = "${githubRoot.app}/bin/github-root";
       };
       checks.${system} = {
+        own-composition =
+          let
+            publicDefault = mkOwn {};
+            publicExtended = mkOwn { extra = [ pkgs.hello ]; tag = "next"; };
+            directExtended = ownFor {
+              profile = import ./hosts/profile/nix.nix { inherit pkgs; owner = ownOwner; extra = [ pkgs.hello ]; };
+              tag = "next";
+            };
+          in
+          assert publicDefault.image.drvPath == own.image.drvPath;
+          assert publicExtended.image.drvPath == directExtended.image.drvPath;
+          pkgs.runCommand "own-composition-check" {} ''
+            set -eu
+            test "$(${publicDefault.profile}/bin/codex --version)" = "codex-cli ${releaseVersions.codex}"
+            test "$(${publicExtended.profile}/bin/codex --version)" = "codex-cli ${releaseVersions.codex}"
+            ${publicExtended.profile}/bin/hello >/dev/null
+            touch $out
+          '';
         release-watch = pkgs.runCommand "release-watch-check" {
           nativeBuildInputs = [ pkgs.nodejs_22 pkgs.git ];
           expected = builtins.toJSON releaseVersions;
