@@ -350,7 +350,7 @@
         dir 755 1000:1000 /home/dev/.config
         link() {
           if [ -L "$2" ]; then
-            [ "$(readlink "$2")" = "$1" ] || { echo "$2 does not point to $1" >&2; exit 1
+            [ "$(readlink "$2")" = "$1" ] || { echo "$2 does not point to $1" >&2; exit 1; }
           elif [ -e "$2" ]; then
             echo "$2 exists and is not a link to $1" >&2; exit 1
           else
@@ -411,7 +411,7 @@
             (pkgs.lib.concatMapStrings (p: "${p}\n") [ pkgs.cacert profile rentTools start ]);
           closure = pkgs.closureInfo { rootPaths = [ roots ]; };
           # Seed or upgrade a rent /nix volume from this image, while no container uses it: copy missing store paths
-          # (each appears only complete), register them, set the rent-dev profile, then the GC root, last.
+          # (each appears only complete), register the closure, set the rent-dev profile, then the GC root, last.
           seed = pkgs.writeShellScriptBin "rent-nix-seed" ''
             set -eu
             export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.nix pkgs.util-linux ]}
@@ -620,8 +620,8 @@
           grep -qF "$(jq -r .authorizedKeyEnv <<<"$spec")" ${own.start}/bin/own-start
           grep -qF "$mount/.ssh/authorized_keys" ${own.start}/bin/own-start
           # Xpra is not adopted: own-start neither names nor waits on it, and sshd and nix-daemon are the only
-          # essential services; the browsers stay outside the wait set as before. Store hashes are dropped first (base32
-          # can spell it), and the text is read whole before matching, so a read failure cannot pass for absence.
+          # essential services; the browsers stay outside, as before. Store hashes are dropped first (base32 can spell it),
+          # and the text is read whole before matching, so a read failure cannot pass for absence.
           # own-tools is not referenced here (that would build its closure in this check); the own smoke checks it.
           start=$(sed -E 's|/nix/store/[0-9a-z]{32}-|/nix/store/|g' ${own.start}/bin/own-start)
           case "''${start,,}" in *xpra*) echo 'own-start still names xpra' >&2; exit 1 ;; esac
