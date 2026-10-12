@@ -140,7 +140,7 @@
         [[ $project =~ ^[A-Za-z0-9_.-]+$ && $project != . && $project != .. ]] ||
           fail 'project must be one plain element'
         id=''${1:-}
-        [[ $id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] && [ "$#" -ge 2 ] ||
+        [[ $id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] && [ "$#" -ge 2 ] ||
           fail 'usage: rent-state-import [--compare] [--project <element>] <session-uuid> credentials|session|codex...'
         shift
         ${mountLib}
@@ -296,7 +296,7 @@
         volume_name "$repos" && volume_name "$statevol" && volume_name "$nixvol" ||
           { echo 'rent-mounts: set RENT_REPOS_VOLUME, RENT_STATE_VOLUME and RENT_NIX_VOLUME to volume names' >&2; exit 1; }
         volume_at /work/repos "$repos" rw || { echo "rent-mounts: /work/repos must be exactly volume $repos, rw" >&2; exit 1; }
-        volume_at "$state" "$statevol" rw || { echo "rent-mounts: $state must be exactly volume $statevol, writable" >&2; exit 1; }
+        volume_at "$state" "$statevol" rw || { echo "rent-mounts: $state must be exactly volume $statevol, rw" >&2; exit 1; }
         volume_at /nix "$nixvol" rw || { echo "rent-mounts: /nix must be exactly volume $nixvol, rw" >&2; exit 1; }
         if mounted /home/dev; then echo 'rent-mounts: /home/dev must not be a mount' >&2; exit 1; fi
         [ "$(volume_count)" = 3 ] || { echo 'rent-mounts: exactly three volumes are allowed' >&2; exit 1; }
@@ -475,7 +475,7 @@
               printf 'root:x:0:0:root:/root:/bin/sh\nsshd:x:74:74:sshd:/var/empty:/bin/sh\ndev:x:1000:1000:Development user:/home/dev:/bin/sh\n'
               for i in 1 2 3 4 5 6 7 8; do printf 'nixbld%s:x:%s:30000:Nix build user:/var/empty:/bin/sh\n' $i $((30000 + i)); done
             } > etc/passwd
-            printf 'root:x:0:\nsshd:x:74:\ndev:x:1000:1000:Development user:/home/dev:/bin/sh\nnixbld:x:30000:nixbld1,nixbld2,nixbld3,nixbld4,nixbld5,nixbld6,nixbld7,nixbld8\n' > etc/group
+            printf 'root:x:0:\nsshd:x:74:\ndev:x:1000:\nnixbld:x:30000:nixbld1,nixbld2,nixbld3,nixbld4,nixbld5,nixbld6,nixbld7,nixbld8\n' > etc/group
             cp ${rentNixConf} etc/nix/nix.conf
             ln -s ${roots} etc/rent-nix-roots
             # Default CA path, so TLS works in sessions that do not inherit SSL_CERT_FILE.
@@ -495,8 +495,7 @@
       rentProfileFor = extra: import ./hosts/profile/nix.nix { inherit pkgs; extra = rentExtras ++ extra; };
       rentProfile = rentProfileFor [];
       releaseVersions = rentProfile.releaseVersions;
-      # CI only, never published: stands in for cloudflared under the exact argv rent-start uses, so local SSH, state
-      # and #8 continuity can run without Cloudflare. A synthetic token proves nothing about Cloudflare itself.
+      # CI only, never published: stands in for cloudflared under the exact argv rent-start uses, so local SSH/state/#8 proofs.
       rentTunnelStub = pkgs.writeShellScriptBin "cloudflared" ''
         [ "$*" = 'tunnel --no-autoupdate run --token-file ${rentToken}' ] || { echo "tunnel stub: unexpected argv" >&2; exit 2; }
         [ -r ${rentToken} ] || { echo 'tunnel stub: token file unreadable' >&2; exit 3; }
