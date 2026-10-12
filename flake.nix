@@ -350,7 +350,7 @@
         dir 755 1000:1000 /home/dev/.config
         link() {
           if [ -L "$2" ]; then
-            [ "$(readlink "$2")" = "$1" ] || { echo "$2 does not point to $1" >&2; exit 1; }
+            [ "$(readlink "$2")" = "$1" ] || { echo "$2 does not point to $1" >&2; exit 1
           elif [ -e "$2" ]; then
             echo "$2 exists and is not a link to $1" >&2; exit 1
           else
@@ -411,7 +411,7 @@
             (pkgs.lib.concatMapStrings (p: "${p}\n") [ pkgs.cacert profile rentTools start ]);
           closure = pkgs.closureInfo { rootPaths = [ roots ]; };
           # Seed or upgrade a rent /nix volume from this image, while no container uses it: copy missing store paths
-          # (each appears only complete), register the closure, set the rent-dev profile, then the GC root, last.
+          # (each appears only complete), register them, set the rent-dev profile, then the GC root, last.
           seed = pkgs.writeShellScriptBin "rent-nix-seed" ''
             set -eu
             export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.nix pkgs.util-linux ]}
@@ -495,7 +495,8 @@
       rentProfileFor = extra: import ./hosts/profile/nix.nix { inherit pkgs; extra = rentExtras ++ extra; };
       rentProfile = rentProfileFor [];
       releaseVersions = rentProfile.releaseVersions;
-      # CI only, never published: stands in for cloudflared under the exact argv rent-start uses, so local SSH/state/#8 proofs.
+      # CI only, never published: stands in for cloudflared under the exact argv rent-start uses, so local SSH, state
+      # and #8 continuity can run without Cloudflare. A synthetic token proves nothing about Cloudflare itself.
       rentTunnelStub = pkgs.writeShellScriptBin "cloudflared" ''
         [ "$*" = 'tunnel --no-autoupdate run --token-file ${rentToken}' ] || { echo "tunnel stub: unexpected argv" >&2; exit 2; }
         [ -r ${rentToken} ] || { echo 'tunnel stub: token file unreadable' >&2; exit 3; }
