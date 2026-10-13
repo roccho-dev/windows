@@ -315,7 +315,7 @@ jobs:
           home=(-v own-smoke-home:/home/dev); work=(-v own-smoke-work:/work/repos); nixv=(--mount "$(nixm own-smoke-nix)")
           seed() { docker run --rm -v "own-smoke-$2:/seed" -e "OWN_NIX_VOLUME=own-smoke-$2" "$1" /bin/own-nix-seed; }
           # Every name, size and mtime under the nix volume: "nothing written" is an exact comparison.
-          listing() { docker run --rm -v own-smoke-nix:/n "$image" /bin/bash -c 'cd /n && find . -printf "%p %s %T@\n" | LC_ALL=C sort | sha256sum'; }
+          listing() { docker run --rm -v "own-smoke-${1:-nix}:/n" "$image" /bin/bash -c 'cd /n && find . -printf "%p %s %T@\n" | LC_ALL=C sort | sha256sum'; }
           # The seed copies exactly the image's GC-rooted closure, so no store entry's name (after its hash) may name Xpra.
           # The listing is read whole first (a failed read ends the step) and must show the seeded roots; the match then
           # runs on that text, so neither a read failure nor an early-exiting reader can pass for absence.
@@ -343,7 +343,33 @@ jobs:
           no_xpra_store fresh
           test "$(docker run --rm -v own-smoke-nix:/n "$image" /bin/ls -A /n | tr '\n' ' ')" = 'store var ' || fail 'unexpected top-level entries'
           seed "$image" nix | grep -qxF "own-nix-seed ok volume=own-smoke-nix roots=$roots copied=0" || fail 'reseed was not a no-op'
-          test "$(docker run --rm -v own-smoke-nix:/n "$image" /bin/bash -c 'test ! -e /n/var/nix/profiles/own-dev && test ! -L /n/var/nix/profiles/own-dev; echo absent')" = absent || fail 'base seed selected apps'
+          test "$(docker run --rm -v own-smoke-nix:/n "$image" /bin/bash -euc 'test ! -e /n/var/nix/profiles/own-dev; test ! -L /n/var/nix/profiles/own-dev; echo absent')" = absent || fail 'base seed selected apps'
+          # Selector absence is fresh only when the native profile state is genuinely absent and owned.
+          seed "$image" empty >/dev/null
+          empty_ids=(-e OWN_HOME_VOLUME=own-smoke-home -e OWN_WORK_VOLUME=own-smoke-work -e OWN_NIX_VOLUME=own-smoke-empty)
+          for kind in orphan residue symlink owner; do
+            docker run --rm -v own-smoke-empty:/n "$image" /bin/bash -euc '
+              p=/n/var/nix/profiles; install -d -m 755 "$p"
+              case $1 in
+                orphan) ln -s /nix/store/00000000000000000000000000000000-orphan "$p/own-dev-1-link" ;;
+                residue) ln -s own-dev-1-link "$p/.own-dev.new" ;;
+                symlink) rmdir "$p"; ln -s /n/var "$p" ;;
+                owner) chown 1000:1000 "$p" ;;
+              esac' -- "$kind"
+            before=$(listing empty)
+            if seed "$image" empty > "$d/out" 2>&1; then fail "fresh accepted $kind profile residue"; fi
+            grep -qF 'foreign, invalid or incompatible retained generation; unchanged' "$d/out" || fail "wrong $kind profile refusal"
+            test "$(listing empty)" = "$before" || fail "$kind profile refusal wrote"
+            refuse 'own-profile: foreign, invalid or incompatible retained generation; unchanged' "${home[@]}" "${work[@]}" --mount "$(nixm own-smoke-empty)" "${empty_ids[@]}"
+            docker run --rm -v own-smoke-empty:/n "$image" /bin/bash -euc '
+              p=/n/var/nix/profiles
+              case $1 in
+                orphan) rm -- "$p/own-dev-1-link" ;;
+                residue) rm -- "$p/.own-dev.new" ;;
+                symlink) rm -- "$p"; install -d -m 755 "$p" ;;
+                owner) chown 0:0 "$p" ;;
+              esac' -- "$kind"
+          done
           # An interrupted copy leaves its staging directory: the seed refuses, writes nothing and never deletes it.
           docker run --rm -v own-smoke-nix:/n "$image" /bin/bash -c 'install -d -m 700 /n/.own-seed.interrupt && echo foreign > /n/.own-seed.interrupt/partial'
           before=$(listing)

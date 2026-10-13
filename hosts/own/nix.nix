@@ -14,8 +14,22 @@ let
   # into the image store. Foreign/interrupted generations and a different legacy H_B refuse before seed writes.
   profileLib = ''
     check_profile() {
-      local root=$1 d="$1/var/nix/profiles" g target paths p
+      local root=$1 d="$1/var/nix/profiles" g target paths p mode
+      for p in "$root/var" "$root/var/nix" "$d"; do
+        [ ! -L "$p" ] || return 1
+        if [ -e "$p" ]; then
+          [ -d "$p" ] && [ "$(stat -c %u "$p")" = 0 ] || return 1
+          mode=$(stat -c %a "$p") || return 1
+          (( (8#$mode & 0022) == 0 )) || return 1
+        fi
+      done
+      for p in "$d"/.own-dev*; do
+        [ ! -e "$p" ] && [ ! -L "$p" ] || return 1
+      done
       if [ ! -e "$d/own-dev" ] && [ ! -L "$d/own-dev" ]; then
+        for p in "$d"/own-dev-*; do
+          [ ! -e "$p" ] && [ ! -L "$p" ] || return 1
+        done
         echo 'own-profile: base-admin-ready apps=absent auth=unverified'; return 0
       fi
       [ -d "$d" ] && [ ! -L "$d" ] && [ "$(stat -c %u "$d")" = 0 ] || return 1
