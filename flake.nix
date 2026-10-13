@@ -31,6 +31,14 @@
         spec = ownSpec;
         nixConf = rentNixConf;
       };
+      # Public fixed-input composition for external flake consumers. It reuses the production own/profile sources;
+      # credentials and mutable runtime state remain outside the image.
+      mkOwn = { owner ? ownOwner, extra ? [], tag ? "nix" }:
+        let
+          profile = import ./hosts/profile/nix.nix { inherit pkgs owner extra; };
+        in
+        (ownFor { inherit profile tag; }) // { inherit profile; };
+      # Keep the existing consumer explicit; the composition check proves the public default is the same derivation.
       own = ownFor { profile = import ./hosts/profile/nix.nix { inherit pkgs; owner = ownOwner; }; tag = "nix"; };
       dev = import ./oci/dev/nix.nix { inherit pkgs; };
       common = import ./hosts/common/nix.nix {
@@ -499,13 +507,11 @@
       '';
     in {
       inherit releaseVersions;
+      lib.${system}.mkOwn = mkOwn;
       packages.${system} = {
         own-image = own.image;
-        # CI only, never published: the same own definition plus one profile package, to prove seed-on-upgrade.
-        own-image-next = (ownFor {
-          profile = import ./hosts/profile/nix.nix { inherit pkgs; owner = ownOwner; extra = [ pkgs.hello ]; };
-          tag = "next";
-        }).image;
+        # CI only, never published: the public composition plus one profile package proves seed-on-upgrade.
+        own-image-next = (mkOwn { extra = [ pkgs.hello ]; tag = "next"; }).image;
         rent-image = mkRent { profile = rentProfile; tag = "nix"; };
         release-profile = rentProfile;
         # CI only, never published: the published definition with the tunnel stub, for local SSH/state/#8 proofs.
@@ -532,6 +538,24 @@
         program = "${githubRoot.app}/bin/github-root";
       };
       checks.${system} = {
+        own-composition =
+          let
+            publicDefault = mkOwn {};
+            publicExtended = mkOwn { extra = [ pkgs.hello ]; tag = "next"; };
+            directExtended = ownFor {
+              profile = import ./hosts/profile/nix.nix { inherit pkgs; owner = ownOwner; extra = [ pkgs.hello ]; };
+              tag = "next";
+            };
+          in
+          assert publicDefault.image.drvPath == own.image.drvPath;
+          assert publicExtended.image.drvPath == directExtended.image.drvPath;
+          pkgs.runCommand "own-composition-check" {} ''
+            set -eu
+            test "$(${publicDefault.profile}/bin/codex --version)" = "codex-cli ${releaseVersions.codex}"
+            test "$(${publicExtended.profile}/bin/codex --version)" = "codex-cli ${releaseVersions.codex}"
+            ${publicExtended.profile}/bin/hello >/dev/null
+            touch $out
+          '';
         release-watch = pkgs.runCommand "release-watch-check" {
           nativeBuildInputs = [ pkgs.nodejs_22 pkgs.git ];
           expected = builtins.toJSON releaseVersions;
