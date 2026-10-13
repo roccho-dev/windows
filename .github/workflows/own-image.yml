@@ -353,7 +353,7 @@ jobs:
               case $1 in
                 orphan) ln -s /nix/store/00000000000000000000000000000000-orphan "$p/own-dev-1-link" ;;
                 residue) ln -s own-dev-1-link "$p/.own-dev.new" ;;
-                symlink) rmdir "$p"; ln -s /n/var "$p" ;;
+                symlink) test ! -e "$p.ci-prior" && test ! -L "$p.ci-prior"; mv "$p" "$p.ci-prior"; ln -s /n/var "$p" ;;
                 owner) chown 1000:1000 "$p" ;;
               esac' -- "$kind"
             before=$(listing empty)
@@ -366,7 +366,7 @@ jobs:
               case $1 in
                 orphan) rm -- "$p/own-dev-1-link" ;;
                 residue) rm -- "$p/.own-dev.new" ;;
-                symlink) rm -- "$p"; install -d -m 755 "$p" ;;
+                symlink) rm -- "$p"; mv "$p.ci-prior" "$p" ;;
                 owner) chown 0:0 "$p" ;;
               esac' -- "$kind"
           done

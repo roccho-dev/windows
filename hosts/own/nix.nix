@@ -9,7 +9,8 @@ let
   # Written once into a seeded own /nix volume; nothing else may be seeded or run as own's store.
   marker = "windows-own-nix v1";
   cert = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
-  # Read-only native generation validation. Fresh B is admin-ready without apps; neither start nor seed selects T.
+  # No profile selection: validate retained generations using native store metadata. Nix may initialize its own
+  # store metadata while querying; it never chooses/replaces a profile here. Fresh B is admin-ready without apps.
   # ROOT may be /seed: use the retained DB and map logical store paths to that volume without following them
   # into the image store. Foreign/interrupted generations and a different legacy H_B refuse before seed writes.
   profileLib = ''
