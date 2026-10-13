@@ -310,3 +310,12 @@ flowchart TD
 
 本書と既存source/契約に実際の不一致があれば、最新Userの目的・許可を基準にその一点を是正する。
 説明だけでproduct sourceの意味や秘密の所有権を変更しない。
+
+
+## 7. ツールprofile更新分離の設計課題
+
+[Issue #85](https://github.com/roccho-dev/windows/issues/85)で、OCI基盤とツールprofile更新の分離を議論する。
+現行はimage内の固定参照と起動時profile再設定により、更新がOCI交換へ結合する。
+期待は、同一flakeを正本に、OCIを据え置いたprofile更新・rollbackと、再起動/再作成後の必要状態保持。
+repo分割は前提にしない。新規R/Wの独立案・反証・完成形dirtree・数式・有限検証は子Draft PR本文を議論面とする。
+本節は課題の記録であり、実装・新更新経路・実機適用の完成を主張しない。
