@@ -2,10 +2,11 @@
 , envsRemote ? "https://github.com/roccho-org/envs"
 , identity ? "/work/repos/.auth/roccho-dev/age/oci-dev.key"
 , agentDir ? "/home/dev/.pi/agent-oci-dev"
+, bindingId ? "opencode-go.oci-dev"
+, target ? { repository = "roccho-dev/windows"; host = "oci-dev"; kind = "pi_auth_command"; }
 }:
 let
   version = "1.0.4";
-  bindingId = "opencode-go.oci-dev";
 
   upstream = pkgs.stdenvNoCC.mkDerivation {
     pname = "pi";
@@ -46,6 +47,7 @@ let
       remote=${pkgs.lib.escapeShellArg envsRemote}
       identity=${pkgs.lib.escapeShellArg identity}
       binding=${pkgs.lib.escapeShellArg bindingId}
+      expected_target=${pkgs.lib.escapeShellArg (builtins.toJSON target)}
       cu=${pkgs.coreutils}/bin
       git=${pkgs.git}/bin/git
       jq=${pkgs.jq}/bin/jq
@@ -106,12 +108,12 @@ let
         || fail "binding is absent on current proposals"
       [ "$binding_at" = "$binding_now" ] || fail "binding changed after envs revision"
 
-      printf '%s\n' "$binding_at" | "$jq" -e --arg id "$binding" "
+      printf '%s\n' "$binding_at" | "$jq" -e --arg id "$binding" --argjson target "$expected_target" "
         .id == \$id
         and .kind == \"envs.authCapability.v1\"
         and .capability == \"opencode-go\"
         and .source_key == \"OPENCODE_API_KEY\"
-        and .target == {\"repository\":\"roccho-dev/windows\",\"host\":\"oci-dev\",\"kind\":\"pi_auth_command\"}
+        and .target == \$target
         and (.ciphertext | type == \"string\")
       " >/dev/null || fail "binding meaning differs"
 
