@@ -682,6 +682,10 @@ jobs:
           test "$(docker exec own-smoke /bin/readlink /nix/var/nix/profiles/own-dev)" = "$selected_before" || fail 'untrusted writer changed selection'
           if docker exec own-smoke /bin/nix build "github:roccho-dev/windows/$source#absent-own-proof" --no-link --no-write-lock-file; then fail 'invalid realization succeeded'; fi
           test "$(docker exec own-smoke /bin/readlink /nix/var/nix/profiles/own-dev)" = "$selected_before" || fail 'failed realization changed selection'
+          # Prepare synthetic state as its declared user before any app consumer can create home directories.
+          "${ssh_cmd[@]}" 'set -eu; test "$(id -u)" = 1000; install -d -m 700 ~/.codex ~/.pi/own-ci; test "$(stat -c %u:%g ~/.codex)" = 1000:1000; test "$(stat -c %u:%g ~/.pi/own-ci)" = 1000:1000; printf synthetic-codex > ~/.codex/ci-marker; printf synthetic-auth > ~/.codex/auth.json; printf synthetic-pi > ~/.pi/own-ci/session-marker; chmod 600 ~/.codex/ci-marker ~/.codex/auth.json ~/.pi/own-ci/session-marker'
+          app_state() { docker exec own-smoke /bin/bash -euc 'cd /home/dev; sha256sum .codex/ci-marker .codex/auth.json .pi/own-ci/session-marker; stat -c "%n %u:%g %a" .codex/ci-marker .codex/auth.json .pi/own-ci/session-marker'; }
+          state_before=$(app_state)
           consumer='set -eu
             p=/nix/var/nix/profiles/own-dev
             for app in codex codex-code-mode-host claude pi; do
@@ -699,9 +703,7 @@ jobs:
           docker exec own-smoke /bin/bash -lc "$consumer"
           "${ssh_cmd[@]}" "$consumer"
           "${ssh_cmd[@]}" 'bash -l' <<<"$consumer"
-          "${ssh_cmd[@]}" 'set -eu; install -d -m 700 ~/.codex ~/.pi/own-ci; printf synthetic-codex > ~/.codex/ci-marker; printf synthetic-auth > ~/.codex/auth.json; printf synthetic-pi > ~/.pi/own-ci/session-marker; chmod 600 ~/.codex/ci-marker ~/.codex/auth.json ~/.pi/own-ci/session-marker'
-          app_state() { docker exec own-smoke /bin/bash -euc 'cd /home/dev; sha256sum .codex/ci-marker .codex/auth.json .pi/own-ci/session-marker; stat -c "%n %u:%g %a" .codex/ci-marker .codex/auth.json .pi/own-ci/session-marker'; }
-          state_before=$(app_state)
+          test "$(app_state)" = "$state_before" || fail 'initial app consumers changed known synthetic state'
           "${ssh_cmd[@]}" 'set -eu
             echo home > ~/own-home-marker
             git init -q /work/repos/p && cd /work/repos/p
