@@ -13,12 +13,14 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       launcher_only: ${{ steps.scope.outputs.launcher_only }}
+      own_tool_only: ${{ steps.scope.outputs.own_tool_only }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
           fetch-depth: 0
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
       - id: scope
         env:
           EVENT: ${{ github.event_name }}
@@ -39,13 +41,29 @@ jobs:
             if [ "$owner" = true ] && [ "$unrelated" = false ]; then echo true; else echo false; fi
           }
           launcher_only=false
+          own_tool_only=false
           if [ "$EVENT" = push ] || [ "$EVENT" = pull_request ]; then
             [[ $BEFORE =~ ^[0-9a-f]{40}$ && $BEFORE != 0000000000000000000000000000000000000000 ]] || { echo 'RED: missing comparison base' >&2; exit 1; }
             test "$(git rev-parse HEAD)" = "$EXPECTED" || { echo 'RED: source head mismatch' >&2; exit 1; }
             changes=$(git diff --name-only "$BEFORE" "$EXPECTED") || { echo 'RED: changed paths unavailable' >&2; exit 1; }
             launcher_only=$(classify "$changes")
+            # A path is only a candidate. The actual before/after B drv must also be identical.
+            candidate=true
+            while IFS= read -r path; do
+              case "$path" in
+                hosts/profile/releases.json|hosts/profile/nix.nix|hosts/own/codex.nix|oci/dev/pi.nix) ;;
+                *) candidate=false ;;
+              esac
+            done <<< "$changes"
+            if [ "$candidate" = true ] && [ -n "$changes" ]; then
+              old_drv=$(nix eval --raw "git+file://$PWD?rev=$BEFORE#own-image.drvPath" --no-write-lock-file)
+              new_drv=$(nix eval --raw .#own-image.drvPath --no-write-lock-file)
+              if [ "$old_drv" = "$new_drv" ]; then own_tool_only=true; fi
+              printf 'own B before %s\nown B after %s\ntool-only %s\n' "$old_drv" "$new_drv" "$own_tool_only" >> "$GITHUB_STEP_SUMMARY"
+            fi
           fi
           echo "launcher_only=$launcher_only" >> "$GITHUB_OUTPUT"
+          echo "own_tool_only=$own_tool_only" >> "$GITHUB_OUTPUT"
 
   own:
     needs: scope
@@ -55,7 +73,8 @@ jobs:
       packages: write
     uses: ./.github/workflows/own-image.yml
     with:
-      publish: ${{ github.event_name == 'push' && github.ref == 'refs/heads/proposals' }}
+      publish: ${{ github.event_name == 'push' && github.ref == 'refs/heads/proposals' && needs.scope.outputs.own_tool_only != 'true' }}
+      tool_only: ${{ needs.scope.outputs.own_tool_only == 'true' }}
     secrets: inherit
 
   rent:

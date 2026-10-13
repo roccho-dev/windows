@@ -8,6 +8,11 @@ on:
         required: false
         type: boolean
         default: false
+      tool_only:
+        description: App-only source with independently equal before/after own B derivations
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   build-test:
@@ -38,6 +43,30 @@ jobs:
           printf 'source %s\ndrvPath %s\nworkflow blob %s\n' "$sha" "$drv" "$(git rev-parse HEAD:.github/workflows/own-image.yml)" >> "$GITHUB_STEP_SUMMARY"
       - name: Evaluate flake checks
         run: nix flake check --no-write-lock-file --print-build-logs
+      - name: Realize own tools and prove native generations without building the base image
+        run: |
+          set -euo pipefail
+          core=$(nix build .#own-core --no-link --print-out-paths --no-write-lock-file)
+          t0=$(nix build .#own-profile --no-link --print-out-paths --no-write-lock-file)
+          t1=$(nix build .#own-profile-next --no-link --print-out-paths --no-write-lock-file)
+          legacy=$(nix build .#own-profile-legacy --no-link --print-out-paths --no-write-lock-file)
+          p=$RUNNER_TEMP/own-native-profile
+          test ! -e "$p" && test ! -L "$p"
+          export PATH="$core/bin:$p/bin:$PATH"
+          nix-env --profile "$p" --set "$legacy"
+          nix-env --profile "$p" --set "$t0"
+          nix-env --profile "$p" --set "$t1"
+          "$p/bin/hello" >/dev/null
+          nix-env --profile "$p" --rollback
+          test "$(readlink -e "$p")" = "$t0"
+          nix-env --profile "$p" --list-generations
+          test "$(readlink -e "$p/bin/git-credential-github-roccho-dev")" = "$(readlink -e "$core/bin/git-credential-github-roccho-dev")"
+          test "$(dirname "$(readlink -e "$p/bin/codex")")" = "$(dirname "$(readlink -e "$p/bin/codex-code-mode-host")")"
+          test "$(command -v nix)" = "$core/bin/nix"
+          test "$(command -v gh)" = "$core/bin/gh"
+          PI_CODING_AGENT_DIR=$RUNNER_TEMP/own-pi-state "$p/bin/pi" --version
+          test ! -e "$RUNNER_TEMP/own-pi-state/auth.json"
+          echo 'PASS own T realization, native legacy/set/update/rollback, fixed H_B, core precedence and paired package' >> "$GITHUB_STEP_SUMMARY"
       # The same production gh outputs under another target's helper name, without an image, on this disposable runner:
       # bind and routing reach only the declared principal's slot (synthetic token), whatever the repository namespace.
       - name: Alternate credential owner through the production gh outputs (CI only, synthetic token)
@@ -239,11 +268,13 @@ jobs:
           }
           $global:LASTEXITCODE = 0
       - name: Build actual own OCI image and the CI-only upgrade image
+        if: ${{ !inputs.tool_only }}
         run: nix build .#own-image .#own-image-next --no-write-lock-file --print-build-logs
       # The completed own B2 interaction trial is not rerun here; its step text stays in history (own-image.yml at
       # 21b31e1) with its passing runs. This checks own adoption without Xpra: a fresh start, a successful same-image
       # restart and a recreation on the same volumes, each with strict SSH and the three loopback CDP pages.
       - name: Seed, lock, restart and recreation with short SSH/Nix/CDP checks (no real logins)
+        if: ${{ !inputs.tool_only }}
         shell: bash
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -284,7 +315,7 @@ jobs:
           home=(-v own-smoke-home:/home/dev); work=(-v own-smoke-work:/work/repos); nixv=(--mount "$(nixm own-smoke-nix)")
           seed() { docker run --rm -v "own-smoke-$2:/seed" -e "OWN_NIX_VOLUME=own-smoke-$2" "$1" /bin/own-nix-seed; }
           # Every name, size and mtime under the nix volume: "nothing written" is an exact comparison.
-          listing() { docker run --rm -v own-smoke-nix:/n "$image" /bin/bash -c 'cd /n && find . -printf "%p %s %T@\n" | LC_ALL=C sort | sha256sum'; }
+          listing() { docker run --rm -v "own-smoke-${1:-nix}:/n" "$image" /bin/bash -c 'cd /n && find . -printf "%p %s %T@\n" | LC_ALL=C sort | sha256sum'; }
           # The seed copies exactly the image's GC-rooted closure, so no store entry's name (after its hash) may name Xpra.
           # The listing is read whole first (a failed read ends the step) and must show the seeded roots; the match then
           # runs on that text, so neither a read failure nor an early-exiting reader can pass for absence.
@@ -306,12 +337,39 @@ jobs:
           if docker run --rm --mount "$(nixm own-smoke-empty)" "$image" > "$d/out" 2>&1; then fail 'started on an empty /nix'; fi
           test -z "$(docker run --rm -v own-smoke-empty:/e "$image" /bin/ls -A /e)" || fail 'an empty /nix was written'
 
-          # Fresh seed: store, DB, profile and GC root; no lock file (the lock is the volume root); a rerun copies 0.
+          # Fresh seed creates B only. No selected app generation or bound-auth readiness is inferred.
           roots=$(docker run --rm "$image" /bin/readlink /etc/own-nix-roots)
           seed "$image" nix | grep -qE "^own-nix-seed ok volume=own-smoke-nix roots=$roots copied=[1-9][0-9]*$" || fail 'fresh seed'
           no_xpra_store fresh
           test "$(docker run --rm -v own-smoke-nix:/n "$image" /bin/ls -A /n | tr '\n' ' ')" = 'store var ' || fail 'unexpected top-level entries'
           seed "$image" nix | grep -qxF "own-nix-seed ok volume=own-smoke-nix roots=$roots copied=0" || fail 'reseed was not a no-op'
+          test "$(docker run --rm -v own-smoke-nix:/n "$image" /bin/bash -euc 'test ! -e /n/var/nix/profiles/own-dev; test ! -L /n/var/nix/profiles/own-dev; echo absent')" = absent || fail 'base seed selected apps'
+          # Selector absence is fresh only when the native profile state is genuinely absent and owned.
+          seed "$image" empty >/dev/null
+          empty_ids=(-e OWN_HOME_VOLUME=own-smoke-home -e OWN_WORK_VOLUME=own-smoke-work -e OWN_NIX_VOLUME=own-smoke-empty)
+          for kind in orphan residue symlink owner; do
+            docker run --rm -v own-smoke-empty:/n "$image" /bin/bash -euc '
+              p=/n/var/nix/profiles; install -d -m 755 "$p"
+              case $1 in
+                orphan) ln -s /nix/store/00000000000000000000000000000000-orphan "$p/own-dev-1-link" ;;
+                residue) ln -s own-dev-1-link "$p/.own-dev.new" ;;
+                symlink) test ! -e "$p.ci-prior" && test ! -L "$p.ci-prior"; mv "$p" "$p.ci-prior"; ln -s /n/var "$p" ;;
+                owner) chown 1000:1000 "$p" ;;
+              esac' -- "$kind"
+            before=$(listing empty)
+            if seed "$image" empty > "$d/out" 2>&1; then fail "fresh accepted $kind profile residue"; fi
+            grep -qF 'foreign, invalid or incompatible retained generation; unchanged' "$d/out" || fail "wrong $kind profile refusal"
+            test "$(listing empty)" = "$before" || fail "$kind profile refusal wrote"
+            refuse 'own-profile: foreign, invalid or incompatible retained generation; unchanged' "${home[@]}" "${work[@]}" --mount "$(nixm own-smoke-empty)" "${empty_ids[@]}"
+            docker run --rm -v own-smoke-empty:/n "$image" /bin/bash -euc '
+              p=/n/var/nix/profiles
+              case $1 in
+                orphan) rm -- "$p/own-dev-1-link" ;;
+                residue) rm -- "$p/.own-dev.new" ;;
+                symlink) rm -- "$p"; mv "$p.ci-prior" "$p" ;;
+                owner) chown 0:0 "$p" ;;
+              esac' -- "$kind"
+          done
           # An interrupted copy leaves its staging directory: the seed refuses, writes nothing and never deletes it.
           docker run --rm -v own-smoke-nix:/n "$image" /bin/bash -c 'install -d -m 700 /n/.own-seed.interrupt && echo foreign > /n/.own-seed.interrupt/partial'
           before=$(listing)
@@ -570,6 +628,82 @@ jobs:
           # The host key is pinned from the home volume, never accepted anew.
           printf '[127.0.0.1]:2223 %s\n' "$(docker exec own-smoke /bin/cat /home/dev/.ssh/ssh_host_ed25519_key.pub | cut -d' ' -f1,2)" > "$d/known_hosts"
           ssh_ready
+          # B-native public fixed tarball fetch works before the configured helper locator exists.
+          docker exec own-smoke /bin/bash -euc 'test ! -e /nix/var/nix/profiles/own-dev; test -x /bin/gh; test ! -x /bin/codex'
+          source=$(git rev-parse HEAD)
+          docker exec own-smoke /bin/nix flake metadata "github:roccho-dev/windows/$source" --no-write-lock-file --json >/dev/null
+          t0=$(nix eval --raw .#own-profile --no-write-lock-file)
+          t1=$(nix eval --raw .#own-profile-next --no-write-lock-file)
+          legacy_profile=$(nix eval --raw .#own-profile-legacy --no-write-lock-file)
+          # Native store transport on this ephemeral runner only, never a real own volume or credential.
+          nix-store --export $(nix-store --query --requisites "$t0" "$t1" "$legacy_profile") |
+            docker exec -i own-smoke /bin/nix-store --import >/dev/null
+          got=$(docker exec own-smoke /bin/nix build "github:roccho-dev/windows/$source#own-profile" --no-link --print-out-paths --no-write-lock-file)
+          test "$got" = "$t0" || fail 'public fixed source realized a different T'
+          # The controller owns a coordinated quiet interval: supported apps and children are absent and no
+          # app launch runs concurrently with these sole UID0 native profile operations. Native set is not a gate.
+          native_set() {
+            local uid expected got cli host closure
+            uid=$(docker exec own-smoke /bin/id -u) || return 1
+            test "$uid" = 0 || return 1
+            # Docker requires the PID column to translate the host process inventory into this container.
+            procs=$(docker top own-smoke -eo pid,args) || return 1
+            [[ $procs == *own-start* && $procs == *sshd* && $procs == *nix-daemon* ]] || return 1
+            if grep -qE '/bin/(codex|codex-code-mode-host|claude|pi)( |$)|/share/pi/pi( |$)' <<<"$procs"; then return 1; fi
+            expected=$(docker exec own-smoke /bin/readlink -e /bin/git-credential-github-roccho-dev) || return 1
+            got=$(docker exec own-smoke /bin/readlink -e "$1/bin/git-credential-github-roccho-dev") || return 1
+            test "$expected" = "$got" || return 1
+            cli=$(docker exec own-smoke /bin/readlink -e "$1/bin/codex") || return 1
+            host=$(docker exec own-smoke /bin/readlink -e "$1/bin/codex-code-mode-host") || return 1
+            test "${cli%/*}" = "${host%/*}" || return 1
+            docker exec own-smoke /bin/test -x "$cli" || return 1
+            docker exec own-smoke /bin/test -x "$host" || return 1
+            closure=$(docker exec own-smoke /bin/nix-store --query --requisites "$1") || return 1
+            docker exec own-smoke /bin/nix-store --check-validity $closure || return 1
+            docker exec own-smoke /bin/nix-env --profile /nix/var/nix/profiles/own-dev --set "$1"
+          }
+          native_set "$legacy_profile"
+          native_set "$t0"
+          test "$(docker exec own-smoke /bin/readlink /nix/var/nix/profiles/own-dev)" = own-dev-2-link || fail 'native legacy migration'
+          selected_before=$(docker exec own-smoke /bin/readlink /nix/var/nix/profiles/own-dev)
+          # A conservative live-app observation refuses, and the process exits by itself; no kill is introduced.
+          # Keep a real shell parent and child alive; an argv0-renamed multi-call coreutils sleep can exit early.
+          docker exec -d own-smoke /bin/bash -c 'exec -a /bin/codex /bin/bash -c "sleep 4; :"'
+          for _ in {1..20}; do
+            observed=$(docker top own-smoke -eo pid,args) || fail 'active fixture observation UNKNOWN'
+            grep -qF '/bin/codex -c' <<<"$observed" && break
+            sleep 0.1
+          done
+          grep -qF '/bin/codex -c' <<<"$observed" || fail 'active parent fixture did not remain running'
+          if native_set "$t1"; then fail 'selected while an app parent is active'; fi
+          test "$(docker exec own-smoke /bin/readlink /nix/var/nix/profiles/own-dev)" = "$selected_before" || fail 'active refusal changed selection'
+          sleep 5
+          if docker exec -u 1000 own-smoke /bin/nix-env --profile /nix/var/nix/profiles/own-dev --set "$t1"; then fail 'dev became a profile writer'; fi
+          test "$(docker exec own-smoke /bin/readlink /nix/var/nix/profiles/own-dev)" = "$selected_before" || fail 'untrusted writer changed selection'
+          if docker exec own-smoke /bin/nix build "github:roccho-dev/windows/$source#absent-own-proof" --no-link --no-write-lock-file; then fail 'invalid realization succeeded'; fi
+          test "$(docker exec own-smoke /bin/readlink /nix/var/nix/profiles/own-dev)" = "$selected_before" || fail 'failed realization changed selection'
+          # Prepare synthetic state as its declared user before any app consumer can create home directories.
+          "${ssh_cmd[@]}" 'set -eu; test "$(id -u)" = 1000; install -d -m 700 ~/.codex ~/.pi/own-ci; test "$(stat -c %u:%g ~/.codex)" = 1000:1000; test "$(stat -c %u:%g ~/.pi/own-ci)" = 1000:1000; printf synthetic-codex > ~/.codex/ci-marker; printf synthetic-auth > ~/.codex/auth.json; printf synthetic-pi > ~/.pi/own-ci/session-marker; chmod 600 ~/.codex/ci-marker ~/.codex/auth.json ~/.pi/own-ci/session-marker'
+          app_state() { docker exec own-smoke /bin/bash -euc 'cd /home/dev; sha256sum .codex/ci-marker .codex/auth.json .pi/own-ci/session-marker; stat -c "%n %u:%g %a" .codex/ci-marker .codex/auth.json .pi/own-ci/session-marker'; }
+          state_before=$(app_state)
+          consumer='set -eu
+            p=/nix/var/nix/profiles/own-dev
+            for app in codex codex-code-mode-host claude pi; do
+              test "$(readlink -e /bin/$app)" = "$(readlink -e $p/bin/$app)"
+              test -x /bin/$app
+            done
+            test "$(dirname "$(readlink -e /bin/codex)")" = "$(dirname "$(readlink -e /bin/codex-code-mode-host)")"
+            test "$(command -v gh)" = /bin/gh
+            test "$(command -v nix)" = /bin/nix
+            codex --version
+            timeout 10 codex-code-mode-host --help </dev/null >/dev/null
+            PI_PACKAGE_DIR=/absent PI_CODING_AGENT_DIR=/home/dev/.pi/own-ci pi --version
+            test ! -e /home/dev/.pi/agent-oci-dev'
+          docker exec own-smoke /bin/bash -c "$consumer"
+          docker exec own-smoke /bin/bash -lc "$consumer"
+          "${ssh_cmd[@]}" "$consumer"
+          "${ssh_cmd[@]}" 'bash -l' <<<"$consumer"
+          test "$(app_state)" = "$state_before" || fail 'initial app consumers changed known synthetic state'
           "${ssh_cmd[@]}" 'set -eu
             echo home > ~/own-home-marker
             git init -q /work/repos/p && cd /work/repos/p
@@ -605,19 +739,50 @@ jobs:
           display
           docker stop -t 30 own-smoke >/dev/null
 
-          # Package addition by definition: seed the next image, recreate on the same volumes, short SSH/Nix check.
-          seed "$next" nix | grep -qE "^own-nix-seed ok volume=own-smoke-nix roots=.* copied=[1-9][0-9]*$" || fail 'upgrade seed'
+          # Tool update changes only a native generation, with B identity unchanged and no seed/image build.
+          # No running context means UNKNOWN for activation; no native profile operation is attempted.
+          if native_set "$t1"; then fail 'selected with no observable running context'; fi
+          docker start own-smoke >/dev/null
+          gate 2
+          native_set "$t1"
+          docker exec own-smoke /bin/bash -c "$consumer"
+          test "$(app_state)" = "$state_before" || fail 'update changed native app state'
+          selected=$(docker exec own-smoke /bin/readlink /nix/var/nix/profiles/own-dev)
+          test "$selected" = own-dev-3-link || fail 'native update'
+          docker exec own-smoke /bin/nix-env --profile /nix/var/nix/profiles/own-dev --rollback
+          test "$(docker exec own-smoke /bin/readlink /nix/var/nix/profiles/own-dev)" = own-dev-2-link || fail 'native rollback'
+          docker restart own-smoke >/dev/null
+          gate 3
+          test "$(docker exec own-smoke /bin/readlink /nix/var/nix/profiles/own-dev)" = own-dev-2-link || fail 'restart reselected highest generation'
+          docker exec own-smoke /bin/bash -c "$consumer"
+          test "$(app_state)" = "$state_before" || fail 'rollback or restart changed native app state'
+          native_set "$t1"
+          docker exec own-smoke /bin/nix-store --gc >/dev/null
+          docker exec own-smoke /bin/nix-store --check-validity "$t0" "$t1" "$legacy_profile"
+          docker stop -t 30 own-smoke >/dev/null
+          # Foreign native-profile shape is retained. Both seed and start refuse before selecting an image default.
+          docker run --rm -v own-smoke-nix:/n "$image" /bin/bash -euc 'ln -sfn "$1" /n/var/nix/profiles/own-dev' -- "$t0"
+          before=$(listing)
+          if seed "$image" nix > "$d/out" 2>&1; then fail 'seed accepted a foreign profile shape'; fi
+          test "$(listing)" = "$before" || fail 'foreign profile refusal wrote'
+          docker start own-smoke >/dev/null
+          test "$(docker wait own-smoke)" != 0 || fail 'start accepted a foreign profile shape'
+          docker logs own-smoke 2>&1 | grep -qF 'foreign, invalid or incompatible retained generation; unchanged' || fail 'foreign generation refusal missing'
+          docker run --rm -v own-smoke-nix:/n "$image" /bin/bash -euc 'ln -sfn own-dev-3-link /n/var/nix/profiles/own-dev'
+          seed "$next" nix | grep -qE "^own-nix-seed ok volume=own-smoke-nix roots=.* copied=0$" || fail 'base reseed should not copy or reselect T'
           no_xpra_store next
           old_id=$(docker inspect --format '{{.Id}}' own-smoke)
           docker rm own-smoke >/dev/null
           run "$next"
           test "$(docker inspect --format '{{.Id}}' own-smoke)" != "$old_id" || fail 'not a new container'
           ssh_ready
+          docker exec own-smoke /bin/bash -c "$consumer"
+          test "$(app_state)" = "$state_before" || fail 'recreation changed native app state'
           "${ssh_cmd[@]}" 'set -eu
             test "$(id -un)" = dev
             test "$NIX_REMOTE" = daemon
             hello > /dev/null
-            test "$(readlink /nix/var/nix/profiles/own-dev)" = own-dev-2-link
+            test "$(readlink /nix/var/nix/profiles/own-dev)" = own-dev-3-link
             test "$(codex --version)" = "codex-cli $(release-version codex)"
             test "$(claude --version)" = "$(release-version claude) (Claude Code)"
             gh --version | grep -qE "^gh version 2\.96\.0( |$)"
