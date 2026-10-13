@@ -646,7 +646,8 @@ jobs:
             local uid expected got cli host closure
             uid=$(docker exec own-smoke /bin/id -u) || return 1
             test "$uid" = 0 || return 1
-            procs=$(docker top own-smoke -eo args) || return 1
+            # Docker requires the PID column to translate the host process inventory into this container.
+            procs=$(docker top own-smoke -eo pid,args) || return 1
             [[ $procs == *own-start* && $procs == *sshd* && $procs == *nix-daemon* ]] || return 1
             if grep -qE '/bin/(codex|codex-code-mode-host|claude|pi)( |$)|/share/pi/pi( |$)' <<<"$procs"; then return 1; fi
             expected=$(docker exec own-smoke /bin/readlink -e /bin/git-credential-github-roccho-dev) || return 1
