@@ -325,6 +325,8 @@ fresh seedはBのstore/DB/marker/rootsだけを整え、アプリprofileを選�
 active/UNKNOWNなら選択せず既存generationを保持する。native set自身がquietを保証するとは扱わず、勝手なkillや新gateを置かない。
 初回はB-native Nixの `github:roccho-dev/windows/<accepted revision>#own-profile` でpublic fixed sourceからTをrealizeし、
 actual出力へ `nix-env --profile /nix/var/nix/profiles/own-dev --set <T>` を行う。旧世代はnative rollback/GC rootとして保持する。
+選択前にactual T closureのvalidity、Bと同じresolved helper、同packageのCodex/host、対応ABI/consumerを検査する。
+own-devの世代形状・root ownership・legacy helper不一致、active/UNKNOWN又は取得失敗は切替前の拒否とし、旧世代を保つ。
 network/private/closure/権限不足は未readyのまま保全し、既存ownerへ返す。新auth route、秘密移送、whole HOME rollbackは追加しない。
 Piはimmutable `PI_PACKAGE_DIR` のみを設定し、callerの `PI_CODING_AGENT_DIR` とnative defaultを保持する。
 

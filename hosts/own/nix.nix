@@ -30,7 +30,7 @@ let
         [ -d "$root/store/''${target##*/}" ] || return 1
         [ "$(readlink "$root/store/''${target##*/}/bin/git-credential-github-${core.credentialOwner}")" = \
           '${core.github.helper}/bin/git-credential-github-${core.credentialOwner}' ] || return 1
-        paths=$(nix-store --store "local?state=$root/var/nix" --query --requisites "$target") || return 1
+        paths=$(nix-store --store "local?real=$root/store&state=$root/var/nix" --query --requisites "$target") || return 1
         while read -r p; do [ -e "$root/store/''${p##*/}" ] || [ -L "$root/store/''${p##*/}" ] || return 1; done <<< "$paths"
       done
       echo "own-profile: selected=$(readlink "$d/own-dev") auth=unverified"
