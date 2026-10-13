@@ -667,7 +667,14 @@ jobs:
           test "$(docker exec own-smoke /bin/readlink /nix/var/nix/profiles/own-dev)" = own-dev-2-link || fail 'native legacy migration'
           selected_before=$(docker exec own-smoke /bin/readlink /nix/var/nix/profiles/own-dev)
           # A conservative live-app observation refuses, and the process exits by itself; no kill is introduced.
-          docker exec -d own-smoke /bin/bash -c 'exec -a /bin/codex /bin/sleep 4'
+          # Keep a real shell parent and child alive; an argv0-renamed multi-call coreutils sleep can exit early.
+          docker exec -d own-smoke /bin/bash -c 'exec -a /bin/codex /bin/bash -c "sleep 4; :"'
+          for _ in {1..20}; do
+            observed=$(docker top own-smoke -eo pid,args) || fail 'active fixture observation UNKNOWN'
+            grep -qF '/bin/codex -c' <<<"$observed" && break
+            sleep 0.1
+          done
+          grep -qF '/bin/codex -c' <<<"$observed" || fail 'active parent fixture did not remain running'
           if native_set "$t1"; then fail 'selected while an app parent is active'; fi
           test "$(docker exec own-smoke /bin/readlink /nix/var/nix/profiles/own-dev)" = "$selected_before" || fail 'active refusal changed selection'
           sleep 5
