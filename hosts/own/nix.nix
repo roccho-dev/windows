@@ -175,10 +175,11 @@ let
     [ "$(cat /nix/var/own-nix 2>/dev/null)" = '${marker}' ] || { echo 'own-nix: /nix is not a seeded own /nix volume' >&2; exit 1; }
     [ "$(readlink "/nix/var/nix/gcroots/own/''${roots##*/}")" = "$roots" ] ||
       { echo "own-nix: this image is not seeded into $nixvol; run own-nix-seed first" >&2; exit 1; }
-    # shellcheck disable=SC2046
-    nix-store --check-validity "$roots" $(cat "$roots") || { echo 'own-nix: seeded paths are not valid' >&2; exit 1; }
+    # Reject foreign profile geometry before native Nix opens/initializes its metadata directories.
     ${profileLib}
     check_profile /nix || { echo 'own-profile: foreign, invalid or incompatible retained generation; unchanged' >&2; exit 1; }
+    # shellcheck disable=SC2046
+    nix-store --check-validity "$roots" $(cat "$roots") || { echo 'own-nix: seeded paths are not valid' >&2; exit 1; }
     echo "own-mounts ok home=$homevol work=$workvol nix=$nixvol"
     # A new, empty work volume becomes dev's; existing content is never chowned, copied or moved.
     if [ -z "$(ls -A ${work})" ]; then chown 1000:1000 ${work}; fi
