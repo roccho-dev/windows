@@ -25,9 +25,9 @@
         imageFrom = "CI-only alternate target fixture";
       };
       ciAlt = import ./hosts/common/nix.nix { inherit pkgs; source = "uncommitted"; ownBinding = ciAltBinding; };
-      # own on the same common dev profile as rent; the generic mountLib and multi-user nix.conf are shared, unchanged.
-      ownFor = { profile, tag }: import ./hosts/own/nix.nix {
-        inherit pkgs profile tag mountLib;
+      # B receives only core/service inputs, never the current T or its app pins.
+      ownFor = { core, tag }: import ./hosts/own/nix.nix {
+        inherit pkgs core tag mountLib;
         spec = ownSpec;
         nixConf = rentNixConf;
       };
@@ -35,11 +35,12 @@
       # credentials and mutable runtime state remain outside the image.
       mkOwn = { owner ? ownOwner, extra ? [], tag ? "nix" }:
         let
-          profile = import ./hosts/profile/nix.nix { inherit pkgs owner extra; };
+          core = import ./hosts/profile/nix.nix { inherit pkgs owner; mode = "core"; };
+          profile = import ./hosts/profile/nix.nix { inherit pkgs owner extra; mode = "own"; };
         in
-        (ownFor { inherit profile tag; }) // { inherit profile; };
+        (ownFor { inherit core tag; }) // { inherit core profile; };
       # Keep the existing consumer explicit; the composition check proves the public default is the same derivation.
-      own = ownFor { profile = import ./hosts/profile/nix.nix { inherit pkgs; owner = ownOwner; }; tag = "nix"; };
+      own = mkOwn {};
       dev = import ./oci/dev/nix.nix { inherit pkgs; };
       common = import ./hosts/common/nix.nix {
         inherit pkgs;
@@ -510,7 +511,12 @@
       lib.${system}.mkOwn = mkOwn;
       packages.${system} = {
         own-image = own.image;
-        # CI only, never published: the public composition plus one profile package proves seed-on-upgrade.
+        own-core = own.core;
+        own-profile = own.profile;
+        own-profile-next = (mkOwn { extra = [ pkgs.hello ]; }).profile;
+        # The existing legacy profile is an explicit migration input, never seeded by B.
+        own-profile-legacy = import ./hosts/profile/nix.nix { inherit pkgs; owner = ownOwner; };
+        # CI only: a second base tag for same-volume recreation, independent of the extra tool.
         own-image-next = (mkOwn { extra = [ pkgs.hello ]; tag = "next"; }).image;
         rent-image = mkRent { profile = rentProfile; tag = "nix"; };
         release-profile = rentProfile;
@@ -543,17 +549,29 @@
             publicDefault = mkOwn {};
             publicExtended = mkOwn { extra = [ pkgs.hello ]; tag = "next"; };
             directExtended = ownFor {
-              profile = import ./hosts/profile/nix.nix { inherit pkgs; owner = ownOwner; extra = [ pkgs.hello ]; };
+              core = import ./hosts/profile/nix.nix { inherit pkgs; owner = ownOwner; mode = "core"; };
               tag = "next";
             };
           in
           assert publicDefault.image.drvPath == own.image.drvPath;
           assert publicExtended.image.drvPath == directExtended.image.drvPath;
+          assert (mkOwn { extra = [ pkgs.hello ]; }).image.drvPath == own.image.drvPath;
+          assert publicDefault.core.drvPath == publicExtended.core.drvPath;
           pkgs.runCommand "own-composition-check" {} ''
             set -eu
             test "$(${publicDefault.profile}/bin/codex --version)" = "codex-cli ${releaseVersions.codex}"
             test "$(${publicExtended.profile}/bin/codex --version)" = "codex-cli ${releaseVersions.codex}"
             ${publicExtended.profile}/bin/hello >/dev/null
+            test "$(readlink -e ${publicDefault.profile}/bin/git-credential-github-${ownOwner})" = \
+              "$(readlink -e ${publicDefault.core}/bin/git-credential-github-${ownOwner})"
+            test "$(readlink -e ${publicExtended.profile}/bin/git-credential-github-${ownOwner})" = \
+              "$(readlink -e ${publicDefault.core}/bin/git-credential-github-${ownOwner})"
+            # CLI and host are one official package, with no selected-generation lookup between them.
+            test "$(dirname "$(readlink -e ${publicDefault.profile}/bin/codex)")" = \
+              "$(dirname "$(readlink -e ${publicDefault.profile}/bin/codex-code-mode-host)")"
+            ${publicDefault.profile}/bin/pi --version >/dev/null
+            grep -qF '${publicDefault.profile.piUpstream}/share/pi' ${publicDefault.profile.ownPiEntry}/bin/pi
+            if grep -qF 'PI_CODING_AGENT_DIR' ${publicDefault.profile.ownPiEntry}/bin/pi; then exit 1; fi
             touch $out
           '';
         release-watch = pkgs.runCommand "release-watch-check" {

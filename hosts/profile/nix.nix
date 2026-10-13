@@ -3,8 +3,11 @@
 # nothing is installed into a host by hand. `extra` supplies role tools and the CI upgrade proof. `owner` only names the
 # profile's stable Git credential helper (own: its Binding; rent keeps the default); each repository's principal is
 # declared by its own binding (hosts/profile/gh.nix), never derived from owner or the URL namespace.
-{ pkgs, extra ? [], owner ? "roccho-dev" }:
+{ pkgs, extra ? [], owner ? "roccho-dev", mode ? "legacy" }:
 let
+  # Core(L_B, owner) never evaluates an app pin. The default retains rent/dev's existing profile.
+  github = import ./gh.nix { inherit pkgs owner; };
+  corePaths = with pkgs; [ bash coreutils diffutils findutils gnugrep gnused gnutar gzip nix git openssh ];
   releaseDefinitions = builtins.fromJSON (builtins.readFile ./releases.json);
   releaseVersions = builtins.mapAttrs (_: definition: definition.pin.version) releaseDefinitions;
   codex = import ../own/codex.nix { inherit pkgs; definition = releaseDefinitions.codex; };
@@ -29,9 +32,23 @@ let
 ${releaseVersionCases}      *) echo "release-version: unknown CLI ''${1:-}" >&2; exit 2 ;;
     esac
   '';
-  # gh is the shared principal-routing wrapper, with the profile's Git credential helper (#8-C).
-  github = import ./gh.nix { inherit pkgs owner; };
+  # Only the immutable upstream is consumed; own never evaluates the dev credential resolver/launcher.
+  pi = import ../../oci/dev/pi.nix { inherit pkgs; };
+  ownPiEntry = pkgs.runCommand "own-pi-entry-${pi.version}" {
+    nativeBuildInputs = [ pkgs.makeWrapper ];
+  } ''
+    mkdir -p "$out/bin"
+    makeWrapper ${pi.upstream}/bin/pi-upstream "$out/bin/pi" \
+      --set PI_PACKAGE_DIR ${pi.upstream}/share/pi
+  '';
 in
+assert builtins.elem mode [ "legacy" "core" "own" ];
+if mode == "core" then pkgs.buildEnv {
+  name = "own-core";
+  paths = corePaths ++ [ github.wrapper github.helper ];
+  pathsToLink = [ "/bin" ];
+  passthru = { inherit github; credentialOwner = owner; };
+} else
 assert builtins.attrNames releaseDefinitions == [ "claude" "codex" ];
 assert builtins.isAttrs releaseDefinitions.codex.contract;
 assert builtins.isAttrs releaseDefinitions.codex.contract.proof;
@@ -47,9 +64,10 @@ assert claudeContract.proof.kind == "gpg-signed-manifest";
 assert claudeContract.proof.keyFingerprint == "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE";
 assert claudeContract.packageShape == "single-glibc-executable";
 pkgs.buildEnv {
-  name = "dev-profile";
-  paths = (with pkgs; [ bash coreutils diffutils findutils gnugrep gnused gnutar gzip nix git openssh ])
-    ++ [ github.wrapper github.helper codex claude releaseVersion ] ++ extra;
+  name = if mode == "own" then "own-tool-profile" else "dev-profile";
+  # Every supported own generation anchors the identical H_B at the existing absolute helper locator.
+  paths = (if mode == "own" then [ github.helper ownPiEntry ] else corePaths ++ [ github.wrapper github.helper ])
+    ++ [ codex claude releaseVersion ] ++ extra;
   pathsToLink = [ "/bin" ];
-  passthru = { inherit releaseDefinitions releaseVersions; };
+  passthru = { inherit releaseDefinitions releaseVersions github ownPiEntry; piUpstream = pi.upstream; };
 }

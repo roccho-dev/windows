@@ -312,10 +312,22 @@ flowchart TD
 説明だけでproduct sourceの意味や秘密の所有権を変更しない。
 
 
-## 7. ツールprofile更新分離の設計課題
+## 7. ツールprofile更新分離（Issue #85）
 
 [Issue #85](https://github.com/roccho-dev/windows/issues/85)で、OCI基盤とツールprofile更新の分離を議論する。
-現行はimage内の固定参照と起動時profile再設定により、更新がOCI交換へ結合する。
-期待は、同一flakeを正本に、OCIを据え置いたprofile更新・rollbackと、再起動/再作成後の必要状態保持。
-repo分割は前提にしない。新規R/Wの独立案・反証・完成形dirtree・数式・有限検証は子Draft PR本文を議論面とする。
-本節は課題の記録であり、実装・新更新経路・実機適用の完成を主張しない。
+基盤Bは `mkOwn(...).core` とサービスだけを入力にし、`mkOwn(...).profile` は独立したアプリTを返す。
+`own-profile` はCodex/paired host、Claude、既存Pi upstreamのnative entry、固定B由来helperを含む。
+shared profileのdefaultはlegacyのまま。own imageの `/bin` はcoreを先に置き、appはselected世代へのstable linkを使う。
+fresh seedはBのstore/DB/marker/rootsだけを整え、アプリprofileを選択しない。BaseAdminReadyとAppsReady/BoundAuthReadyを区別する。
+既存generationはstart/reseed/restart/recreateで保持する。foreign/壊れたgenerationや異なるhelperは保全して拒否する。
+
+許可されたUID0 controllerは、supported appsと子processがいない協調quiet intervalを確立し、その間の新launchを止める。
+active/UNKNOWNなら選択せず既存generationを保持する。native set自身がquietを保証するとは扱わず、勝手なkillや新gateを置かない。
+初回はB-native Nixの `github:roccho-dev/windows/<accepted revision>#own-profile` でpublic fixed sourceからTをrealizeし、
+actual出力へ `nix-env --profile /nix/var/nix/profiles/own-dev --set <T>` を行う。旧世代はnative rollback/GC rootとして保持する。
+network/private/closure/権限不足は未readyのまま保全し、既存ownerへ返す。新auth route、秘密移送、whole HOME rollbackは追加しない。
+Piはimmutable `PI_PACKAGE_DIR` のみを設定し、callerの `PI_CODING_AGENT_DIR` とnative defaultを保持する。
+
+compatible tool差分は実before/after own B drv一致も確認してown image build/publishを省く。rent/devの検証は維持する。
+初回のB変更はimage buildと既存Docker/SSH/Nix/CDP/bind/state検証、native世代/Pi/paired consumer検証を必要とする。
+公開source・current CI・ephemeral proof・独立R合成の成立はPR86のactual証拠で判断する。実own適用、merge/close、User受入は別境界である。

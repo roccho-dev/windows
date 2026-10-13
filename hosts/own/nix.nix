@@ -1,6 +1,6 @@
 # own on the common dev profile (Issue #8-B): home state, work and a writable own /nix are three named volumes.
 # mountLib and nixConf are the flake's generic mountinfo gate and multi-user nix.conf, passed in unchanged.
-{ pkgs, spec, mountLib, nixConf, profile, tag ? "nix" }:
+{ pkgs, spec, mountLib, nixConf, core, tag ? "nix" }:
 
 assert spec.nixMount == "/nix";
 let
@@ -9,28 +9,31 @@ let
   # Written once into a seeded own /nix volume; nothing else may be seeded or run as own's store.
   marker = "windows-own-nix v1";
   cert = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
-  # set_profile ROOT TARGET: ROOT/var/nix/profiles/own-dev -> TARGET through a new generation link, unless it already
-  # is. Older generations stay as rollback targets and GC roots.
+  # Read-only native generation validation. Fresh B is admin-ready without apps; neither start nor seed selects T.
+  # ROOT may be /seed: use the retained DB and map logical store paths to that volume without following them
+  # into the image store. Foreign/interrupted generations and a different legacy H_B refuse before seed writes.
   profileLib = ''
-    set_profile() {
-      local d="$1/var/nix/profiles" g n=0
-      install -d -m 755 "$d"
-      if [ -L "$d/own-dev" ]; then
-        g=$(readlink "$d/own-dev")
-        [[ $g =~ ^own-dev-[0-9]+-link$ ]] && [ -L "$d/$g" ] || { echo "$d/own-dev is not a generation link" >&2; exit 1; }
-        [ "$(readlink "$d/$g")" != "$2" ] || return 0
-      elif [ -e "$d/own-dev" ]; then
-        echo "$d/own-dev exists and is not a link" >&2; exit 1
+    check_profile() {
+      local root=$1 d="$1/var/nix/profiles" g target paths p
+      if [ ! -e "$d/own-dev" ] && [ ! -L "$d/own-dev" ]; then
+        echo 'own-profile: base-admin-ready apps=absent auth=unverified'; return 0
       fi
+      [ -d "$d" ] && [ ! -L "$d" ] && [ "$(stat -c %u "$d")" = 0 ] || return 1
+      [ -L "$d/own-dev" ] && [ "$(stat -c %u "$d/own-dev")" = 0 ] || return 1
+      g=$(readlink "$d/own-dev")
+      [[ $g =~ ^own-dev-[0-9]+-link$ ]] && [ -L "$d/$g" ] || return 1
       for g in "$d"/own-dev-*-link; do
-        [ -L "$g" ] || continue
-        g=''${g##*/own-dev-}; g=''${g%-link}
-        [ "$g" -le "$n" ] || n=$g
+        [ -L "$g" ] && [ "$(stat -c %u "$g")" = 0 ] || return 1
+        [[ ''${g##*/} =~ ^own-dev-[0-9]+-link$ ]] || return 1
+        target=$(readlink "$g")
+        [[ $target =~ ^/nix/store/[0-9a-z]{32}-[^/]+$ ]] || return 1
+        [ -d "$root/store/''${target##*/}" ] || return 1
+        [ "$(readlink "$root/store/''${target##*/}/bin/git-credential-github-${core.credentialOwner}")" = \
+          '${core.github.helper}/bin/git-credential-github-${core.credentialOwner}' ] || return 1
+        paths=$(nix-store --store "local?state=$root/var/nix" --query --requisites "$target") || return 1
+        while read -r p; do [ -e "$root/store/''${p##*/}" ] || [ -L "$root/store/''${p##*/}" ] || return 1; done <<< "$paths"
       done
-      n=$((n + 1))
-      ln -s "$2" "$d/own-dev-$n-link"
-      ln -sfn "own-dev-$n-link" "$d/.own-dev.new"
-      mv -T "$d/.own-dev.new" "$d/own-dev"
+      echo "own-profile: selected=$(readlink "$d/own-dev") auth=unverified"
     }
   '';
   # Squash-merge commit of ops PR #426 (merged 2026-09-26T05:36:11Z into default branch `proposals`; not in `main`).
@@ -67,7 +70,7 @@ let
     PermitRootLogin no
     AllowUsers dev
     UsePAM no
-    SetEnv SSL_CERT_FILE=${cert} NIX_SSL_CERT_FILE=${cert} NIX_REMOTE=daemon GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+    SetEnv SSL_CERT_FILE=${cert} NIX_SSL_CERT_FILE=${cert} NIX_REMOTE=daemon GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null PATH=/bin:/usr/bin:/nix/var/nix/profiles/own-dev/bin
     PidFile /tmp/own-sshd.pid
     Subsystem sftp internal-sftp
   '';
@@ -160,7 +163,7 @@ let
     # shellcheck disable=SC2046
     nix-store --check-validity "$roots" $(cat "$roots") || { echo 'own-nix: seeded paths are not valid' >&2; exit 1; }
     ${profileLib}
-    set_profile /nix ${profile}
+    check_profile /nix || { echo 'own-profile: foreign, invalid or incompatible retained generation; unchanged' >&2; exit 1; }
     echo "own-mounts ok home=$homevol work=$workvol nix=$nixvol"
     # A new, empty work volume becomes dev's; existing content is never chowned, copied or moved.
     if [ -z "$(ls -A ${work})" ]; then chown 1000:1000 ${work}; fi
@@ -198,7 +201,7 @@ let
   };
   # The GC-rooted runtime seeded into the own /nix volume; own-nix-seed is not among them (it runs only against the
   # image's own store with the volume at /seed).
-  roots = pkgs.writeText "own-nix-roots" (pkgs.lib.concatMapStrings (p: "${p}\n") [ pkgs.cacert profile tools start ]);
+  roots = pkgs.writeText "own-nix-roots" (pkgs.lib.concatMapStrings (p: "${p}\n") [ pkgs.cacert core tools start ]);
   closure = pkgs.closureInfo { rootPaths = [ roots ]; };
   # Seed or upgrade an own /nix volume from this image under the volume-root lock, so never while own or another seed
   # uses it: copy missing store paths (each appears only complete), register them, set the profile, GC root last.
@@ -226,6 +229,8 @@ let
     for t in /seed/.own-seed-tmp /seed/.own-seed.*; do
       if [ -e "$t" ] || [ -L "$t" ]; then fail "$t is left from an interrupted seed; not deleting it"; fi
     done
+    ${profileLib}
+    check_profile /seed || fail 'foreign, invalid or incompatible retained generation; unchanged'
     install -d -m 1775 -o 0 -g 30000 /seed/store
     tmp=$(mktemp -d /seed/.own-seed.XXXXXXXX)
     [ -z "$(ls -A "$tmp")" ] || fail "$tmp is not empty"
@@ -240,8 +245,6 @@ let
     rmdir "$tmp"
     # Paths are logical /nix/store names; only the database lives under /seed here.
     nix-store --store 'local?state=/seed/var/nix' --load-db < ${closure}/registration
-    ${profileLib}
-    set_profile /seed ${profile}
     install -d -m 755 /seed/var/nix/gcroots/own
     ln -sfn ${roots} /seed/var/nix/gcroots/own/.new
     mv -T /seed/var/nix/gcroots/own/.new /seed/var/nix/gcroots/own/${baseNameOf roots}
@@ -251,7 +254,7 @@ let
     Cmd = [ "${start}/bin/own-start" ];
     # SSH sessions (sshConfig SetEnv) and default exec read no global or system Git configuration: credentials come
     # only from a repository's own binding to the owner helper (#8-C).
-    Env = [ "HOME=${home}" "PATH=/bin:/usr/bin" "SSL_CERT_FILE=${cert}" "GIT_CONFIG_NOSYSTEM=1" "GIT_CONFIG_GLOBAL=/dev/null" ];
+    Env = [ "HOME=${home}" "PATH=/bin:/usr/bin:/nix/var/nix/profiles/own-dev/bin" "SSL_CERT_FILE=${cert}" "GIT_CONFIG_NOSYSTEM=1" "GIT_CONFIG_GLOBAL=/dev/null" ];
     ExposedPorts."${toString spec.sshPort}/tcp" = {};
     # No Volumes: an image-declared volume would silently satisfy a missing mount.
     Labels."org.opencontainers.image.source" = "https://github.com/roccho-dev/windows";
@@ -262,9 +265,9 @@ in
   image = pkgs.dockerTools.buildLayeredImage {
     name = spec.imageRepository;
     inherit tag config;
-    contents = [ pkgs.cacert profile tools start seed ];
+    contents = [ pkgs.cacert core tools start seed ];
     extraCommands = ''
-      mkdir -p etc/nix .${home} tmp var/empty
+      mkdir -p bin etc/nix .${home} tmp var/empty
       {
         printf 'root:x:0:0:root:/root:/bin/sh\nsshd:x:74:74:sshd:/var/empty:/bin/sh\ndev:x:1000:1000:Development user:${home}:/bin/sh\n'
         for i in 1 2 3 4 5 6 7 8; do printf 'nixbld%s:x:%s:30000:Nix build user:/var/empty:/bin/sh\n' $i $((30000 + i)); done
@@ -272,7 +275,10 @@ in
       printf 'root:x:0:\nsshd:x:74:\ndev:x:1000:\nnixbld:x:30000:nixbld1,nixbld2,nixbld3,nixbld4,nixbld5,nixbld6,nixbld7,nixbld8\n' > etc/group
       cp ${nixConf} etc/nix/nix.conf
       ln -s ${roots} etc/own-nix-roots
-      touch etc/profile
+      printf 'export PATH=/bin:/usr/bin:/nix/var/nix/profiles/own-dev/bin\n' > etc/profile
+      for app in codex codex-code-mode-host claude pi release-version; do
+        ln -s /nix/var/nix/profiles/own-dev/bin/$app bin/$app
+      done
       chmod 1777 tmp
     '';
   };
