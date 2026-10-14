@@ -176,6 +176,28 @@ actual_bound_o=$(observe_ro)
 [ "$actual_bound_o" = "selection=SELECTED generation=rent-dev-1-link store=$t0 proof=geometry-only" ] ||
   fail 'bound q effect did not read back the actual T0'
 [ "$(state_snapshot)" = "$snapshot" ] || fail 'bound T changed auth/session/repo'
+[ "$(docker inspect --format '{{.Image}}' "$c")" = "$image" ] ||
+  fail 'bound T-only selection changed the base OCI image'
+# A finite test receipt is derived from the ACTUAL post-write readback and the
+# SAME preflight q/Host/store. It is a shell variable, not a runtime ledger.
+bound_receipt=$(python3 - "$preflight" "$before_o" "$actual_bound_o" "$t0" "$bound_q" <<'PY'
+import json,sys
+intent=json.loads(sys.argv[1])
+before,after,selected,q=sys.argv[2:]
+assert intent["proposed_q"]==q and intent["candidate_store"]==selected
+assert intent["effect"]=="FORBIDDEN" and intent["admission"]=="NOT_ADMITTED"
+assert before=="selection=ABSENT proof=geometry-only"
+assert after=="selection=SELECTED generation=rent-dev-1-link store="+selected+" proof=geometry-only"
+print(json.dumps({"kind":"ci-rent-bound-observation.v0","attempt":"ci-rent-bound-1",
+                  "proposed_q":q,"target_ref":intent["target_ref"],
+                  "host_ref":intent["host_ref"],"unit_ref":intent["unit_ref"],
+                  "before":before,"after":after,"store":selected,
+                  "admission":"NOT_ADMITTED","target_effect_authorized":False,
+                  "result":"SOURCE_CI_READBACK_ONLY"},sort_keys=True))
+PY
+) || fail 'bound actual O/readback attempt did not match q'
+[[ $bound_receipt == *'"result": "SOURCE_CI_READBACK_ONLY"'* ]] ||
+  fail 'missing bounded SOURCE attempt evidence'
 # A lost receipt is UNKNOWN, not success or automatic NOOP. Re-read O but
 # never perform an equivalent second write; a preflight retry must be denied.
 if bound_preflight "$t0" "$bound_q" ci-host-rent-1 ci-session-1 UNKNOWN "$actual_bound_o" >/dev/null 2>&1; then
@@ -183,6 +205,9 @@ if bound_preflight "$t0" "$bound_q" ci-host-rent-1 ci-session-1 UNKNOWN "$actual
 fi
 [ "$(observe_ro)" = "$actual_bound_o" ] ||
   fail 'UNKNOWN reconciliation read mutated the selected Tool'
+# Simulate losing the caller's in-memory CI receipt; selection must remain
+# observed, but retry cannot fabricate an additional successful effect.
+unset bound_receipt
 echo 'PASS: proposed D/q/Host binding -> actual OCI O -> exact T0 Nix selector -> readback; wrong q/T/Host/scope/B/UNKNOWN refused'
 case "$(observe)" in
   "selection=SELECTED generation=rent-dev-1-link store=$t0 proof=geometry-only") ;;
