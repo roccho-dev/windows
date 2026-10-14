@@ -33,10 +33,11 @@
       };
       # Public fixed-input composition for external flake consumers. It reuses the production own/profile sources;
       # credentials and mutable runtime state remain outside the image.
-      mkOwn = { owner ? ownOwner, extra ? [], tag ? "nix" }:
+      # piTarget optionally binds the own T's `pi` to one exact envs Pi target (see oci/dev/pi.nix); B never sees it.
+      mkOwn = { owner ? ownOwner, extra ? [], tag ? "nix", piTarget ? null }:
         let
           core = import ./hosts/profile/nix.nix { inherit pkgs owner; mode = "core"; };
-          profile = import ./hosts/profile/nix.nix { inherit pkgs owner extra; mode = "own"; };
+          profile = import ./hosts/profile/nix.nix { inherit pkgs owner extra piTarget; mode = "own"; };
         in
         (ownFor { inherit core tag; }) // { inherit core profile; };
       # Keep the existing consumer explicit; the composition check proves the public default is the same derivation.
@@ -572,6 +573,90 @@
             ${publicDefault.profile}/bin/pi --version >/dev/null
             grep -qF '${publicDefault.profile.piUpstream}/share/pi' ${publicDefault.profile.ownPiEntry}/bin/pi
             if grep -qF 'PI_CODING_AGENT_DIR' ${publicDefault.profile.ownPiEntry}/bin/pi; then exit 1; fi
+            touch $out
+          '';
+        # The Pi binding gate with expected id/target fixed independently of each tested row; the oci-dev default and
+        # its launcher meaning are kept, and a target-bound own T changes only its `pi`, never B or the default T.
+        pi-target =
+          let
+            ociTarget = { repository = "roccho-dev/windows"; host = "oci-dev"; kind = "pi_auth_command"; };
+            ownTarget = {
+              bindingId = "opencode-go.versapro-own-oci";
+              target = { repository = "roccho-dev/resources"; host = "versapro-own-oci"; kind = "pi_auth_command"; };
+              identity = "/work/repos/.auth/roccho-dev/age/versapro-own-oci.key";
+              agentDir = "/home/dev/.pi/agent-versapro-own-oci";
+            };
+            defaultPi = import ./oci/dev/pi.nix { inherit pkgs; };
+            ownPi = import ./oci/dev/pi.nix ({ inherit pkgs; } // ownTarget);
+            bound = mkOwn { piTarget = ownTarget; };
+          in
+          assert defaultPi.bindingId == "opencode-go.oci-dev" && defaultPi.target == ociTarget;
+          assert ownPi.bindingGate == defaultPi.bindingGate;
+          assert ownPi.upstream.drvPath == defaultPi.upstream.drvPath;
+          assert bound.image.drvPath == own.image.drvPath;
+          assert bound.core.drvPath == own.core.drvPath;
+          assert bound.profile.drvPath != own.profile.drvPath;
+          # The bound T's age init is the existing bounded tool over exactly this target identity; default T has none.
+          assert bound.profile.ownAgeInit.drvPath == (dev.jevTools {
+            envsRemote = "https://github.com/roccho-dev/envs";
+            appsRemote = "https://github.com/roccho-dev/apps";
+            opsRemote = "https://github.com/roccho-dev/ops";
+            inherit (ownTarget) identity;
+          }).init.drvPath;
+          assert bound.profile.ownAgeInit.drvPath != dev.jev.init.drvPath;
+          assert !(own.profile ? ownAgeInit);
+          pkgs.runCommand "pi-target-check" {
+            nativeBuildInputs = [ pkgs.jq ];
+            gate = defaultPi.bindingGate;
+            oci = builtins.toJSON ociTarget;
+            own = builtins.toJSON ownTarget.target;
+          } ''
+            set -eu
+            row() { # id target [jq update]
+              jq -cn --arg id "$1" --argjson t "$2" '{id: $id, kind: "envs.authCapability.v1",
+                capability: "opencode-go", source_key: "OPENCODE_API_KEY", target: $t,
+                ciphertext: "ciphertexts/test.sops.yaml"}' | jq -c "''${3:-.}"
+            }
+            accepts() { # expected-id expected-target row
+              printf '%s\n' "$3" | jq -e --arg id "$1" --argjson target "$2" "$gate" >/dev/null
+            }
+            refuse() { if accepts "$@"; then echo "pi-target: accepted $3" >&2; exit 1; fi; }
+            oid=opencode-go.oci-dev; vid=opencode-go.versapro-own-oci
+            accepts "$oid" "$oci" "$(row "$oid" "$oci")"
+            accepts "$vid" "$own" "$(row "$vid" "$own")"
+            # Cross target and cross id, each direction.
+            refuse "$oid" "$oci" "$(row "$oid" "$own")"
+            refuse "$vid" "$own" "$(row "$vid" "$oci")"
+            refuse "$vid" "$own" "$(row "$oid" "$own")"
+            refuse "$oid" "$oci" "$(row "$vid" "$oci")"
+            for k in repository host kind; do
+              refuse "$vid" "$own" "$(row "$vid" "$own" ".target.$k = \"other\"")"
+              refuse "$vid" "$own" "$(row "$vid" "$own" "del(.target.$k)")"
+            done
+            refuse "$vid" "$own" "$(row "$vid" "$own" '.target.extra = "value"')"
+            refuse "$vid" "$own" "$(row "$vid" "$own" '.target.host = "\" or true #"')"
+            refuse "$vid" "$own" "$(row "$vid" "$own" '.capability = "jev-api"')"
+            refuse "$vid" "$own" "$(row "$vid" "$own" '.source_key = "JEV_API_KEY"')"
+            refuse "$vid" "$own" "$(row "$vid" "$own" '.kind = "process_env"')"
+            refuse "$vid" "$own" "$(row "$vid" "$own" '.ciphertext = null')"
+            # Each build embeds only its own binding, target, identity and agent directory.
+            grep -qE "^ *binding='?$vid'?$" ${ownPi.resolver}/bin/pi-opencode-go-key
+            grep -qE "^ *binding='?$oid'?$" ${defaultPi.resolver}/bin/pi-opencode-go-key
+            grep -qF '${ownTarget.identity}' ${ownPi.resolver}/bin/pi-opencode-go-key
+            grep -qF '${ownTarget.agentDir}' ${ownPi.launcher}/bin/pi
+            if grep -qF oci-dev ${ownPi.resolver}/bin/pi-opencode-go-key ${ownPi.launcher}/bin/pi; then exit 1; fi
+            # The bound own T exposes the target launcher as `pi`; its version path still reaches the same upstream.
+            test "$(readlink -e ${bound.profile}/bin/pi)" = "$(readlink -e ${ownPi.launcher}/bin/pi)"
+            ${bound.profile}/bin/pi --version >/dev/null
+            test "$(${bound.profile}/bin/codex --version)" = "codex-cli ${releaseVersions.codex}"
+            # The bound T creates only this target's identity; the default own T and B carry no age init.
+            init=$(readlink -e ${bound.profile}/bin/jev-age-init)
+            test "$init" = "$(readlink -e ${bound.profile.ownAgeInit}/bin/jev-age-init)"
+            grep -qE "^ *identity='?${ownTarget.identity}'?$" "$init"
+            if grep -qF oci-dev.key "$init"; then exit 1; fi
+            test ! -e ${own.profile}/bin/jev-age-init
+            test ! -e ${own.core}/bin/jev-age-init
+            if "$init" --force >/dev/null 2>&1; then echo 'pi-target: init accepted an argument' >&2; exit 1; fi
             touch $out
           '';
         release-watch = pkgs.runCommand "release-watch-check" {
