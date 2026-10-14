@@ -86,6 +86,48 @@
           mv -T "$d/.rent-dev.new" "$d/rent-dev"
         }
       '';
+      # B-only rent does not select a T generation. Check retained native/legacy links before seed/start writes;
+      # an empty volume is admin-ready with no apps. All generations must retain the same declared GH helper.
+      profileCheck = core: ''
+        check_profile() {
+          local root=$1 d="$1/var/nix/profiles" g target paths p mode
+          for p in "$root/var" "$root/var/nix" "$d"; do
+            [ ! -L "$p" ] || return 1
+            if [ -e "$p" ]; then
+              [ -d "$p" ] && [ "$(stat -c %u "$p")" = 0 ] || return 1
+              mode=$(stat -c %a "$p") || return 1
+              (( (8#$mode & 0022) == 0 )) || return 1
+            fi
+          done
+          for p in "$d"/.rent-dev*; do
+            [ ! -e "$p" ] && [ ! -L "$p" ] || return 1
+          done
+          if [ ! -e "$d/rent-dev" ] && [ ! -L "$d/rent-dev" ]; then
+            for p in "$d"/rent-dev-*; do
+              [ ! -e "$p" ] && [ ! -L "$p" ] || return 1
+            done
+            echo 'rent-profile: base-admin-ready apps=absent auth=unverified'; return 0
+          fi
+          [ -d "$d" ] && [ ! -L "$d" ] && [ "$(stat -c %u "$d")" = 0 ] || return 1
+          [ -L "$d/rent-dev" ] && [ "$(stat -c %u "$d/rent-dev")" = 0 ] || return 1
+          g=$(readlink "$d/rent-dev")
+          [[ $g =~ ^rent-dev-[0-9]+-link$ ]] && [ -L "$d/$g" ] || return 1
+          for g in "$d"/rent-dev-*-link; do
+            [ -L "$g" ] && [ "$(stat -c %u "$g")" = 0 ] || return 1
+            [[ ''${g##*/} =~ ^rent-dev-[0-9]+-link$ ]] || return 1
+            target=$(readlink "$g")
+            [[ $target =~ ^/nix/store/[0-9a-z]{32}-[^/]+$ ]] || return 1
+            [ -d "$root/store/''${target##*/}" ] || return 1
+            [ "$(readlink "$root/store/''${target##*/}/bin/git-credential-github-${core.credentialOwner}")" = \
+              '${core.github.helper}/bin/git-credential-github-${core.credentialOwner}' ] || return 1
+            paths=$(nix-store --store "local?real=$root/store&state=$root/var/nix" --query --requisites "$target") || return 1
+            while read -r p; do
+              [ -e "$root/store/''${p##*/}" ] || [ -L "$root/store/''${p##*/}" ] || return 1
+            done <<< "$paths"
+          done
+          echo "rent-profile: selected=$(readlink "$d/rent-dev") auth=unverified"
+        }
+      '';
       # The one mount authority: this container's own /proc/self/mountinfo, read within 10 s. A named volume is a
       # mount whose root ends in /volumes/<name>/_data, as WSLC and Docker both report; WSLC inspect Mounts is not used.
       mountLib = ''
@@ -285,7 +327,7 @@
       # PID 1: fail closed on mounts, the seeded store and the tunnel token file, lay out state, then supervise nix-daemon,
       # cloudflared and sshd until any exits or TERM. It runs from the /nix volume, so an unseeded volume cannot start it.
       # tunnel is the cloudflared package; only the CI-only stub image passes anything else.
-      rentStart = devProfile: tunnel: pkgs.writeShellScriptBin "rent-start" ''
+      rentStart = { core ? null, profile ? null, tunnel }: pkgs.writeShellScriptBin "rent-start" ''
         set -eu
         export PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.gnugrep pkgs.openssh pkgs.nix pkgs.util-linux ]}
         state=${rentState}
@@ -315,11 +357,22 @@
           { echo "rent-nix: /nix is not a seeded rent /nix volume" >&2; exit 1; }
         [ "$(readlink "/nix/var/nix/gcroots/rent/''${roots##*/}")" = "$roots" ] ||
           { echo "rent-nix: this image is not seeded into $nixvol; run rent-nix-seed first" >&2; exit 1; }
+        # Refuse foreign or interrupted profile geometry before opening store metadata; B never picks a T.
+        ${if core != null then ''
+          ${profileCheck core}
+          check_profile /nix || { echo 'rent-profile: foreign, invalid or incompatible retained generation; unchanged' >&2; exit 1; }
+        '' else ""}
         # shellcheck disable=SC2046
         nix-store --check-validity "$roots" $(cat "$roots") || { echo 'rent-nix: seeded paths are not valid' >&2; exit 1; }
-        ${profileLib}
-        set_profile /nix ${devProfile}
-        echo "rent-nix ok roots=$roots profile=$(readlink /nix/var/nix/profiles/rent-dev)"
+        ${if profile != null then ''
+          ${profileLib}
+          set_profile /nix ${profile}
+        '' else ""}
+        if [ -L /nix/var/nix/profiles/rent-dev ]; then
+          echo "rent-nix ok roots=$roots profile=$(readlink /nix/var/nix/profiles/rent-dev)"
+        else
+          echo "rent-nix ok roots=$roots profile=absent"
+        fi
         # The one tunnel secret slot, placed by envs: checked before any service, never read, printed or hashed here.
         # Its content is an opaque token that cloudflared alone judges.
         token=${rentToken}
@@ -403,13 +456,15 @@
         cleanup
         exit 1
       '';
-      # One rent image per dev profile. The runtime paths are the GC-rooted closure seeded into the rent /nix volume;
-      # rent-nix-seed is not among them, because it runs only against the image's own store with the volume at /seed.
-      mkRent = { profile, tag, tunnel ? pkgs.cloudflared }:
+      # Legacy rent-image still seeds its combined profile. B-only rent-base-image contains no app profile:
+      # its image/start/seed/roots closure depends on Core, Services and tunnel, never T or release pins.
+      mkRent = { profile ? null, core ? null, tag, tunnel ? pkgs.cloudflared }:
+        assert (profile == null) != (core == null);
         let
-          start = rentStart profile tunnel;
+          runtime = if core == null then profile else core;
+          start = rentStart { inherit core profile tunnel; };
           roots = pkgs.writeText "rent-nix-roots"
-            (pkgs.lib.concatMapStrings (p: "${p}\n") [ pkgs.cacert profile rentTools start ]);
+            (pkgs.lib.concatMapStrings (p: "${p}\n") [ pkgs.cacert runtime rentTools start ]);
           closure = pkgs.closureInfo { rootPaths = [ roots ]; };
           # Seed or upgrade a rent /nix volume from this image, while no container uses it: copy missing store paths
           # (each appears only complete), register the closure, set the rent-dev profile, then the GC root, last.
@@ -441,6 +496,11 @@
               install -d -m 755 /seed/var
               printf '%s\n' '${rentNixMarker}' > /seed/var/rent-nix
             fi
+            # Retained legacy or native generations must be compatible; B-only never selects a Tool generation.
+            ${if core != null then ''
+              ${profileCheck core}
+              check_profile /seed || fail 'foreign, invalid or incompatible retained generation; unchanged'
+            '' else ""}
             # An interrupted copy leaves its staging directory; it is never reused or deleted: refuse until inspected.
             for t in /seed/.rent-seed-tmp /seed/.rent-seed.*; do
               if [ -e "$t" ] || [ -L "$t" ]; then fail "$t is left from an interrupted seed; not deleting it"; fi
@@ -459,8 +519,10 @@
             rmdir "$tmp"
             # Paths are logical /nix/store names; only the database lives under /seed here.
             nix-store --store 'local?state=/seed/var/nix' --load-db < ${closure}/registration
-            ${profileLib}
-            set_profile /seed ${profile}
+            ${if profile != null then ''
+              ${profileLib}
+              set_profile /seed ${profile}
+            '' else ""}
             install -d -m 755 /seed/var/nix/gcroots/rent
             ln -sfn ${roots} /seed/var/nix/gcroots/rent/.new
             mv -T /seed/var/nix/gcroots/rent/.new /seed/var/nix/gcroots/rent/${baseNameOf roots}
@@ -469,7 +531,7 @@
         in pkgs.dockerTools.buildLayeredImage {
           name = "ghcr.io/roccho-dev/windows-rent";
           inherit tag;
-          contents = [ pkgs.cacert profile rentTools start seed ];
+          contents = [ pkgs.cacert runtime rentTools start seed ];
           extraCommands = ''
             mkdir -p etc/ssl/certs etc/nix home/dev tmp var/empty
             {
@@ -479,6 +541,15 @@
             printf 'root:x:0:\nsshd:x:74:\ndev:x:1000:\nnixbld:x:30000:nixbld1,nixbld2,nixbld3,nixbld4,nixbld5,nixbld6,nixbld7,nixbld8\n' > etc/group
             cp ${rentNixConf} etc/nix/nix.conf
             ln -s ${roots} etc/rent-nix-roots
+            ${if core != null then ''
+              mkdir -p bin
+              printf 'export PATH=/nix/var/nix/profiles/rent-dev/bin:/bin:/usr/bin\n' > etc/profile
+              # Noninteractive SSH may set a fixed PATH. These entrypoints follow only the selected native T.
+              for app in codex claude release-version python3 uv; do
+                [ ! -e "bin/$app" ] && [ ! -L "bin/$app" ] || exit 1
+                ln -s "/nix/var/nix/profiles/rent-dev/bin/$app" "bin/$app"
+              done
+            '' else ""}
             # Default CA path, so TLS works in sessions that do not inherit SSL_CERT_FILE.
             ln -s ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt .${rentCert}
             chmod 1777 tmp
@@ -487,14 +558,27 @@
           config = {
             Cmd = [ "${start}/bin/rent-start" ];
             # Default exec reads no global or system Git configuration, as SSH sessions (hosts/rent/nix.nix) (#8-C).
-            Env = [ "HOME=/home/dev" "PATH=/bin:/usr/bin" "SSL_CERT_FILE=${rentCert}" "GIT_CONFIG_NOSYSTEM=1" "GIT_CONFIG_GLOBAL=/dev/null" ];
+            Env = [ "HOME=/home/dev" "PATH=${if core != null then "/nix/var/nix/profiles/rent-dev/bin:/bin:/usr/bin" else "/bin:/usr/bin"}" "SSL_CERT_FILE=${rentCert}" "GIT_CONFIG_NOSYSTEM=1" "GIT_CONFIG_GLOBAL=/dev/null" ];
             ExposedPorts."2222/tcp" = {};
             Labels."org.opencontainers.image.source" = "https://github.com/roccho-dev/windows";
           };
         };
       rentExtras = with pkgs; [ python313 uv ];
       rentProfileFor = extra: import ./hosts/profile/nix.nix { inherit pkgs; extra = rentExtras ++ extra; };
-      rentProfile = rentProfileFor [];
+      rentProfile = rentProfileFor []; # Legacy release-profile and the published combined image are unchanged.
+      rentCore = import ./hosts/profile/nix.nix { inherit pkgs; mode = "rent-core"; };
+      rentToolProfileFor = extra: import ./hosts/profile/nix.nix {
+        inherit pkgs;
+        extra = rentExtras ++ extra;
+        mode = "rent";
+      };
+      # Fixed-input B/T composition for staged rent adoption. No target selection, secret or state is recorded here.
+      mkRentPair = { extra ? [], tag ? "base", tunnel ? pkgs.cloudflared }: {
+        core = rentCore;
+        profile = rentToolProfileFor extra;
+        image = mkRent { core = rentCore; inherit tag tunnel; };
+      };
+      rentPair = mkRentPair {};
       releaseVersions = rentProfile.releaseVersions;
       # CI only, never published: stands in for cloudflared under the exact argv rent-start uses, so local SSH, state
       # and #8 continuity can run without Cloudflare. A synthetic token proves nothing about Cloudflare itself.
@@ -519,7 +603,11 @@
         # CI only: a second base tag for same-volume recreation, independent of the extra tool.
         own-image-next = (mkOwn { extra = [ pkgs.hello ]; tag = "next"; }).image;
         rent-image = mkRent { profile = rentProfile; tag = "nix"; };
-        release-profile = rentProfile;
+        release-profile = rentProfile; # Old public/migration ABI; activation cutover is a separate gate.
+        rent-base-image = rentPair.image;
+        rent-core = rentPair.core;
+        rent-tool-profile = rentPair.profile;
+        rent-tool-profile-next = (mkRentPair { extra = [ pkgs.hello ]; }).profile;
         # CI only, never published: the published definition with the tunnel stub, for local SSH/state/#8 proofs.
         rent-image-stub = mkRent { profile = rentProfile; tag = "stub"; tunnel = rentTunnelStub; };
         # CI only, never published: the stub image plus one package, to prove seed-on-upgrade and rollback.
@@ -544,6 +632,30 @@
         program = "${githubRoot.app}/bin/github-root";
       };
       checks.${system} = {
+        # Actual fixed-input composition: changing T/extra must not change B's drv.
+        # Existing rent-image remains combined for its existing smoke/Windows consumers; no live cutover here.
+        rent-composition =
+          let
+            current = mkRentPair {};
+            next = mkRentPair { extra = [ pkgs.hello ]; };
+          in
+          assert current.image.drvPath == next.image.drvPath;
+          assert current.core.drvPath == next.core.drvPath;
+          assert current.profile.drvPath != next.profile.drvPath;
+          pkgs.runCommand "rent-composition-check" {} ''
+            set -eu
+            test "$(${current.profile}/bin/codex --version)" = "codex-cli ${releaseVersions.codex}"
+            test "$(${next.profile}/bin/codex --version)" = "codex-cli ${releaseVersions.codex}"
+            test "$(readlink -e ${current.profile}/bin/git-credential-github-roccho-dev)" = \
+              "$(readlink -e ${current.core}/bin/git-credential-github-roccho-dev)"
+            test "$(readlink -e ${next.profile}/bin/git-credential-github-roccho-dev)" = \
+              "$(readlink -e ${current.core}/bin/git-credential-github-roccho-dev)"
+            test -x ${current.core}/bin/nix && test -x ${current.core}/bin/gh
+            test -x ${current.profile}/bin/python3 && test -x ${current.profile}/bin/uv
+            test ! -e ${current.core}/bin/codex && test ! -L ${current.core}/bin/codex
+            ${next.profile}/bin/hello >/dev/null
+            touch "$out"
+          '';
         own-composition =
           let
             publicDefault = mkOwn {};
