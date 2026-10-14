@@ -58,6 +58,15 @@ launch() {
   [ "$ok" = 1 ] || fail 'base-only OCI did not become service-ready'
 }
 launch
+# Read O using only ordinary shell and filesystem evidence; no Nix daemon query or write.
+observe() { docker exec -i -u 1000:1000 "$c" /bin/bash -s < hosts/rent/read-selected.sh; }
+observe_ro() {
+  docker run --rm -i --network none -v "$nixvol:/nix:ro" "$image" /bin/bash -s < hosts/rent/read-selected.sh
+}
+[ "$(observe)" = 'selection=ABSENT proof=geometry-only' ] ||
+  fail 'fresh B was not observed as Tool-absent'
+[ "$(observe_ro)" = 'selection=ABSENT proof=geometry-only' ] ||
+  fail 'readonly volume observation of empty B failed'
 [ ! -e /work ] || fail 'CI proof ran with a live /work mount'
 initial=$(docker exec "$c" /bin/bash -euc '
   test ! -e /nix/var/nix/profiles/rent-dev && test ! -L /nix/var/nix/profiles/rent-dev
@@ -111,6 +120,11 @@ state_snapshot() {
 snapshot=$(state_snapshot)
 native_set "$t0"
 selection "$t0"
+case "$(observe)" in
+  "selection=SELECTED generation=rent-dev-1-link store=$t0 proof=geometry-only") ;;
+  *) fail 'T0 observed generation does not match selected T0' ;;
+esac
+test "$(observe)" = "$(observe_ro)" || fail 'running/readonly observation disagrees'
 if docker exec -u 1000:1000 "$c" /bin/nix-env --profile /nix/var/nix/profiles/rent-dev --set "$t1"; then
   fail 'untrusted dev selected a root-owned profile'
 fi
@@ -134,6 +148,10 @@ selection "$t0"
 sleep 5
 native_set "$t1"
 selection "$t1"
+case "$(observe)" in
+  "selection=SELECTED generation=rent-dev-2-link store=$t1 proof=geometry-only") ;;
+  *) fail 'T1 selected geometry mismatch' ;;
+esac
 docker exec "$c" /bin/test -x /nix/var/nix/profiles/rent-dev/bin/hello || fail 'T1 extra missing'
 docker exec "$c" /nix/var/nix/profiles/rent-dev/bin/hello >/dev/null
 [ "$(state_snapshot)" = "$snapshot" ] || fail 'T-only generation update changed auth/session/repository'
@@ -142,6 +160,10 @@ docker exec "$c" /bin/nix-env --profile /nix/var/nix/profiles/rent-dev --rollbac
 after=$(docker exec "$c" /bin/readlink /nix/var/nix/profiles/rent-dev)
 [ "$before" != "$after" ] || fail 'native rollback did not select an earlier generation'
 selection "$t0"
+case "$(observe)" in
+  "selection=SELECTED generation=rent-dev-1-link store=$t0 proof=geometry-only") ;;
+  *) fail 'rollback was not observed as T0' ;;
+esac
 # A restart and a recreation retain T0; B itself does not re-select the highest T.
 docker stop -t 30 "$c" >/dev/null
 if native_set "$t1"; then fail 'Tool switched with no observable running context'; fi
@@ -162,5 +184,86 @@ seed > "$evidence/seed"
 launch
 selection "$t1"
 [ "$(state_snapshot)" = "$snapshot" ] || fail 'recreation changed auth/session/repository'
+test "$(observe)" = "$(observe_ro)" || fail 'recreation changed observed selection geometry'
 docker exec "$c" /bin/nix-env --profile /nix/var/nix/profiles/rent-dev --list-generations
-echo 'PASS: SOURCE-only native T0->T1 selection, rejection/quiet, rollback, GC, restart/recreate and synthetic state retention'
+# Negative O-only fixtures run with the synthetic OCI stopped; each damaged preimage is retained
+# and each read must refuse without mutation. Repair is part of disposable test, not observer code.
+docker stop -t 30 "$c" >/dev/null
+profile_geometry() {
+  docker run --rm --network none -v "$nixvol:/nix:ro" "$image" /bin/bash -euc '
+    cd /nix
+    stat -c "%n|%a|%u|%g" var var/nix var/nix/profiles
+    find var/nix/profiles var/nix/gcroots -printf "%p|%y|%l|%m|%U|%G|%s|%T@\n" | LC_ALL=C sort
+    sha256sum var/rent-nix var/nix/db/db.sqlite' | sha256sum
+}
+assert_unknown_read_only() {
+  local expected=$1 before after rc=0 outcome
+  before=$(profile_geometry)
+  outcome=$(observe_ro 2>&1) || rc=$?
+  [ "$rc" = 2 ] && [[ $outcome == "rent-selection: UNKNOWN ("* ]] ||
+    fail "observer accepted $expected or returned unexpected result"
+  after=$(profile_geometry)
+  [ "$before" = "$after" ] || fail "observation mutated $expected profile or store metadata"
+}
+sel=$(docker run --rm --network none -v "$nixvol:/nix:ro" "$image" /bin/readlink /nix/var/nix/profiles/rent-dev)
+[[ $sel =~ ^rent-dev-[0-9]+-link$ ]] || fail 'invalid fixture preimage selection'
+docker run --rm --network none -v "$nixvol:/nix" "$image" /bin/ln -sfn /tmp/foreign /nix/var/nix/profiles/rent-dev
+assert_unknown_read_only 'foreign selected link'
+docker run --rm --network none -v "$nixvol:/nix" "$image" /bin/ln -sfn "$sel" /nix/var/nix/profiles/rent-dev
+docker run --rm --network none -v "$nixvol:/nix" "$image" /bin/ln -s /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-foreign /nix/var/nix/profiles/rent-dev-999-link
+assert_unknown_read_only 'invalid extra generation'
+docker run --rm --network none -v "$nixvol:/nix" "$image" /bin/rm /nix/var/nix/profiles/rent-dev-999-link
+docker run --rm --network none -v "$nixvol:/nix" "$image" /bin/ln -s /tmp/unfinished /nix/var/nix/profiles/.rent-dev.pending
+assert_unknown_read_only 'interrupted profile selector'
+docker run --rm --network none -v "$nixvol:/nix" "$image" /bin/rm /nix/var/nix/profiles/.rent-dev.pending
+docker run --rm --network none -v "$nixvol:/nix" "$image" /bin/rm /nix/var/nix/profiles/rent-dev
+assert_unknown_read_only 'orphan generations'
+docker run --rm --network none -v "$nixvol:/nix" "$image" /bin/ln -s "$sel" /nix/var/nix/profiles/rent-dev
+test "$(observe_ro)" = "selection=SELECTED generation=$sel store=$t1 proof=geometry-only" ||
+  fail 'valid selector was not restored in disposable fixture'
+
+# The B-only profileCheck also requires all three parent directories to be root-owned and not
+# group/other writable. The observer must never call this geometry SELECTED/ABSENT when B refuses.
+# Changes below touch only the disposable, stopped CI volume; all observations mount /nix read-only.
+assert_base_refuses_unsafe() {
+  local label=$1 before
+  before=$(profile_geometry)
+  if seed > "$evidence/seed" 2>&1; then fail "B-only seed accepted $label"; fi
+  grep -qF 'foreign, invalid or incompatible retained generation' "$evidence/seed" ||
+    fail "B-only seed refused $label for the wrong reason"
+  if docker run --rm "${mount_args[@]}" "$image" > "$evidence/seed" 2>&1; then
+    fail "B-only start accepted $label"
+  fi
+  grep -qF 'rent-profile: foreign, invalid or incompatible retained generation' "$evidence/seed" ||
+    fail "B-only start refused $label for the wrong reason"
+  [ "$(profile_geometry)" = "$before" ] || fail "B-only refusal wrote metadata for $label"
+}
+for spec in "var/nix/profiles 777" "var/nix 775" "var 777"; do
+  read -r relative unsafe_mode <<< "$spec"
+  before_mode=$(docker run --rm --network none -v "$nixvol:/nix:ro" "$image"     /bin/stat -c %a "/nix/$relative")
+  docker run --rm --network none -v "$nixvol:/nix" "$image"     /bin/chmod "$unsafe_mode" "/nix/$relative"
+  assert_unknown_read_only "selected parent $relative mode $unsafe_mode"
+  if [ "$relative" = var/nix/profiles ]; then
+    assert_base_refuses_unsafe 'SELECTED with world-writable profiles'
+  fi
+  docker run --rm --network none -v "$nixvol:/nix" "$image"     /bin/chmod "$before_mode" "/nix/$relative"
+  test "$(observe_ro)" = "selection=SELECTED generation=$sel store=$t1 proof=geometry-only" ||
+    fail "restored selected parent $relative was not observed"
+done
+
+# ABSENT is not safe merely because the active selector is missing: even with every generation
+# removed, an unsafe parent directory could let an untrusted user install a malicious selector.
+docker run --rm --network none -v "$nixvol:/nix" "$image" /bin/bash -euc '
+  d=/nix/var/nix/profiles
+  test -L "$d/rent-dev" && rm -- "$d/rent-dev"
+  for g in "$d"/rent-dev-*-link; do test -L "$g"; rm -- "$g"; done'
+test "$(observe_ro)" = 'selection=ABSENT proof=geometry-only' ||
+  fail 'fixture did not reach a valid ABSENT state before permission change'
+before_mode=$(docker run --rm --network none -v "$nixvol:/nix:ro" "$image"   /bin/stat -c %a /nix/var/nix/profiles)
+docker run --rm --network none -v "$nixvol:/nix" "$image" /bin/chmod 777 /nix/var/nix/profiles
+assert_unknown_read_only 'ABSENT with world-writable profiles'
+assert_base_refuses_unsafe 'ABSENT with world-writable profiles'
+docker run --rm --network none -v "$nixvol:/nix" "$image"   /bin/chmod "$before_mode" /nix/var/nix/profiles
+test "$(observe_ro)" = 'selection=ABSENT proof=geometry-only' ||
+  fail 'valid ABSENT was not restored after the isolated permission fixture'
+echo 'PASS: SOURCE-only native T0->T1, rollback/GC/recreate, read-only observation and unsafe parent modes refused for SELECTED/ABSENT'
