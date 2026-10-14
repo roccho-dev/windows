@@ -660,6 +660,13 @@ jobs:
       - name: Prove new Base-only OCI starts, retains Tool generations and refuses foreign state
         shell: bash
         run: bash hosts/rent/base-proof.sh result-3 result-4 result-1 result-2
+      - name: Prove native rent Tool selection, quiet refusal, rollback and retained state
+        shell: bash
+        run: |
+          set -euo pipefail
+          t0=$(nix build .#rent-tool-profile --no-link --print-out-paths --no-write-lock-file)
+          t1=$(nix build .#rent-tool-profile-next --no-link --print-out-paths --no-write-lock-file)
+          bash hosts/rent/native-proof.sh result-4 "$t0" "$t1"
       - name: Load and test tools, mounts, state, restart, and recreate
         shell: bash
         run: |
