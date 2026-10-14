@@ -120,7 +120,7 @@ bound_preflight() {
   local wanted=$1 q=$2 host=$3 scope=$4 prior=$5 observation=$6
   local base=${7:-ci:rent-base-only-B0}
   python3 hosts/rent/proposed-binding-proof.py "$binding" --mode preflight \
-    --candidate "$wanted" --q "$q" --host-ref "$host" --scope "$scope" \
+    --candidate "$wanted" --expected-store "$t0" --q "$q" --host-ref "$host" --scope "$scope" \
     --previous "$prior" --observation "$observation" --base "$base" \
     --launch ci:rent-start-S0 --config-binding ci:rent-binding-C0 \
     --state-contract ci:rent-state-K0
