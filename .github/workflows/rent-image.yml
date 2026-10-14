@@ -635,6 +635,9 @@ jobs:
           }
           # The fake's last exit code must not become this step's exit code.
           $global:LASTEXITCODE = 0
+      # Fail before any expensive Nix/OCI work if the CI-only F2 SUT is malformed.
+      - name: Parse native rent SOURCE fixture (no Host or Docker)
+        run: bash -n hosts/rent/native-proof.sh
       - uses: cachix/install-nix-action@v31
       - name: Build from locked Nix inputs
         env:
