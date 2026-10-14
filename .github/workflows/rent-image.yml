@@ -674,9 +674,11 @@ jobs:
           # verify the Git blob bytes too, not just a ref/body from the API.
           fixture=$(mktemp)
           trap 'rm -f "$fixture"' EXIT
-          curl -fsSL --max-time 25 \
-            'https://api.github.com/repos/roccho-org/envs/contents/checks/fixtures/host-tool-functional-binding.json?ref=a4e0b9499e02fc0c5cfaafddc0f99a65dfedea44' \
-            | jq -r '.content' | tr -d '\n' | base64 -d > "$fixture"
+          # Public immutable RAW Git object avoids anonymous REST rate limits
+          # on shared CI runner IPs. The exact Git blob below remains mandatory.
+          curl -fsSL --retry 3 --max-time 25 \
+            'https://raw.githubusercontent.com/roccho-org/envs/a4e0b9499e02fc0c5cfaafddc0f99a65dfedea44/checks/fixtures/host-tool-functional-binding.json' \
+            -o "$fixture"
           test "$(git hash-object "$fixture")" = cee080d45e3e7dea8d3c0a608dd2827659101d45
           python3 -m py_compile hosts/rent/proposed-binding-proof.py
           bash hosts/rent/native-proof.sh result-4 "$t0" "$t1" "$fixture"
