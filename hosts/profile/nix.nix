@@ -1,11 +1,11 @@
-# The one small development profile for own and rent (Issue #8). Codex and Claude Code are official releases pinned
-# by hash; every other package comes from the locked nixpkgs. Adding a package is a change here, CI, and a new image;
-# nothing is installed into a host by hand. `extra` supplies role tools and the CI upgrade proof. `owner` only names the
+# Shared fixed sources for legacy/dev, own and rent (Issue #88). Codex and Claude are pinned official releases;
+# all other packages come from the locked nixpkgs. Legacy keeps its combined image profile; own/rent B includes
+# only Core/Services, and their T profiles can be selected separately. `extra` is role tools and CI upgrade proof. `owner` only names the
 # profile's stable Git credential helper (own: its Binding; rent keeps the default); each repository's principal is
 # declared by its own binding (hosts/profile/gh.nix), never derived from owner or the URL namespace.
 { pkgs, extra ? [], owner ? "roccho-dev", mode ? "legacy" }:
 let
-  # Core(L_B, owner) never evaluates an app pin. The default retains rent/dev's existing profile.
+  # Core(L_B, owner) never evaluates an app pin. The default retains rent/dev's existing combined profile.
   github = import ./gh.nix { inherit pkgs owner; };
   corePaths = with pkgs; [ bash coreutils diffutils findutils gnugrep gnused gnutar gzip nix git openssh ];
   releaseDefinitions = builtins.fromJSON (builtins.readFile ./releases.json);
@@ -42,9 +42,9 @@ ${releaseVersionCases}      *) echo "release-version: unknown CLI ''${1:-}" >&2;
       --set PI_PACKAGE_DIR ${pi.upstream}/share/pi
   '';
 in
-assert builtins.elem mode [ "legacy" "core" "own" ];
-if mode == "core" then pkgs.buildEnv {
-  name = "own-core";
+assert builtins.elem mode [ "legacy" "core" "rent-core" "own" "rent" ];
+if builtins.elem mode [ "core" "rent-core" ] then pkgs.buildEnv {
+  name = if mode == "rent-core" then "rent-core" else "own-core";
   paths = corePaths ++ [ github.wrapper github.helper ];
   pathsToLink = [ "/bin" ];
   passthru = { inherit github; credentialOwner = owner; };
@@ -64,9 +64,11 @@ assert claudeContract.proof.kind == "gpg-signed-manifest";
 assert claudeContract.proof.keyFingerprint == "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE";
 assert claudeContract.packageShape == "single-glibc-executable";
 pkgs.buildEnv {
-  name = if mode == "own" then "own-tool-profile" else "dev-profile";
+  name = if mode == "own" then "own-tool-profile" else if mode == "rent" then "rent-tool-profile" else "dev-profile";
   # Every supported own generation anchors the identical H_B at the existing absolute helper locator.
-  paths = (if mode == "own" then [ github.helper ownPiEntry ] else corePaths ++ [ github.wrapper github.helper ])
+  paths = (if mode == "own" then [ github.helper ownPiEntry ]
+           else if mode == "rent" then [ github.helper ]
+           else corePaths ++ [ github.wrapper github.helper ])
     ++ [ codex claude releaseVersion ] ++ extra;
   pathsToLink = [ "/bin" ];
   passthru = { inherit releaseDefinitions releaseVersions github ownPiEntry; piUpstream = pi.upstream; };
