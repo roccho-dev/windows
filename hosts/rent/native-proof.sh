@@ -154,7 +154,7 @@ for mode in wrong-tool wrong-q wrong-host wrong-scope unknown-effect wrong-B; do
     wrong-host) args=("$t0" "$bound_q" ci-host-foreign ci-session-1 NONE "$before_o");;
     wrong-scope) args=("$t0" "$bound_q" ci-host-rent-1 ci-other-session NONE "$before_o");;
     unknown-effect) args=("$t0" "$bound_q" ci-host-rent-1 ci-session-1 UNKNOWN "$before_o");;
-    wrong-B) args=("$t0" "$bound_q" ci-host-rent-1 ci-session-1 NONE "$before_o" ci:other-B");;
+    wrong-B) args=("$t0" "$bound_q" ci-host-rent-1 ci-session-1 NONE "$before_o" ci:other-B);;
   esac
   if bound_preflight "${args[@]}" >/dev/null 2>&1; then
     fail "bounded SOURCE input $mode reached native mutation"
