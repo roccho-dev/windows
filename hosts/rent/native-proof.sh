@@ -61,7 +61,7 @@ launch
 # Read O using only ordinary shell and filesystem evidence; no Nix daemon query or write.
 observe() { docker exec -i -u 1000:1000 "$c" /bin/bash -s < hosts/rent/read-selected.sh; }
 observe_ro() {
-  docker run --rm --network none -v "$nixvol:/nix:ro" "$image" /bin/bash -s < hosts/rent/read-selected.sh
+  docker run --rm -i --network none -v "$nixvol:/nix:ro" "$image" /bin/bash -s < hosts/rent/read-selected.sh
 }
 [ "$(observe)" = 'selection=ABSENT proof=geometry-only' ] ||
   fail 'fresh B was not observed as Tool-absent'
