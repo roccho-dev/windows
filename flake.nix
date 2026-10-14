@@ -605,6 +605,8 @@
         rent-image = mkRent { profile = rentProfile; tag = "nix"; };
         release-profile = rentProfile; # Old public/migration ABI; activation cutover is a separate gate.
         rent-base-image = rentPair.image;
+        # CI-only: same B-only layout with an inert tunnel, never published or placed on a Host.
+        rent-base-image-stub = (mkRentPair { tag = "base-stub"; tunnel = rentTunnelStub; }).image;
         rent-core = rentPair.core;
         rent-tool-profile = rentPair.profile;
         rent-tool-profile-next = (mkRentPair { extra = [ pkgs.hello ]; }).profile;
