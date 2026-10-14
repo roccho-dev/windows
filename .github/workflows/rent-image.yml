@@ -635,6 +635,9 @@ jobs:
           }
           # The fake's last exit code must not become this step's exit code.
           $global:LASTEXITCODE = 0
+      # Fail before any expensive Nix/OCI work if the CI-only F2 SUT is malformed.
+      - name: Parse native rent SOURCE fixture (no Host or Docker)
+        run: bash -n hosts/rent/native-proof.sh
       - uses: cachix/install-nix-action@v31
       - name: Build from locked Nix inputs
         env:
@@ -660,13 +663,28 @@ jobs:
       - name: Prove new Base-only OCI starts, retains Tool generations and refuses foreign state
         shell: bash
         run: bash hosts/rent/base-proof.sh result-3 result-4 result-1 result-2
-      - name: Prove native rent Tool selection, quiet refusal, rollback and retained state
+      - name: Prove bound PROPOSED q/Host and actual native rent Tool/readonly O
         shell: bash
         run: |
           set -euo pipefail
+          # This child SOURCE branch changes tests only; exact Producer's flake
+          # and Tool definitions cannot drift from the reviewed #91 commit.
+          git diff --exit-code 355b038bcbe2b24a8ad0121f79b7cc4c72b76b3f HEAD -- \
+            flake.nix flake.lock hosts/profile/nix.nix hosts/profile/gh.nix hosts/profile/releases.json
           t0=$(nix build .#rent-tool-profile --no-link --print-out-paths --no-write-lock-file)
           t1=$(nix build .#rent-tool-profile-next --no-link --print-out-paths --no-write-lock-file)
-          bash hosts/rent/native-proof.sh result-4 "$t0" "$t1"
+          # Read ONLY one reviewed, unadmitted envs SOURCE binding. No token:
+          # verify the Git blob bytes too, not just a ref/body from the API.
+          fixture=$(mktemp)
+          trap 'rm -f "$fixture"' EXIT
+          # Public immutable RAW Git object avoids anonymous REST rate limits
+          # on shared CI runner IPs. The exact Git blob below remains mandatory.
+          curl -fsSL --retry 3 --max-time 25 \
+            'https://raw.githubusercontent.com/roccho-org/envs/a4e0b9499e02fc0c5cfaafddc0f99a65dfedea44/checks/fixtures/host-tool-functional-binding.json' \
+            -o "$fixture"
+          test "$(git hash-object "$fixture")" = cee080d45e3e7dea8d3c0a608dd2827659101d45
+          python3 -m py_compile hosts/rent/proposed-binding-proof.py
+          bash hosts/rent/native-proof.sh result-4 "$t0" "$t1" "$fixture"
       - name: Load and test tools, mounts, state, restart, and recreate
         shell: bash
         run: |

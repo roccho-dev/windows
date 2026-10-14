@@ -2,8 +2,9 @@
 # Disposable SOURCE proof for the fixed rent B-only OCI, not a live update controller.
 # CI alone owns the quiet window. Target version/admission, real credentials and WSLC are outside this proof.
 set -Eeuo pipefail
-[ "$#" = 3 ] || { echo 'usage: native-proof.sh BASE_STUB_ARCHIVE T0_STORE_PATH T1_STORE_PATH' >&2; exit 2; }
-archive=$1 t0=$2 t1=$3
+[ "$#" = 4 ] || { echo 'usage: native-proof.sh BASE_STUB_ARCHIVE T0_STORE_PATH T1_STORE_PATH FIXED_PROPOSED_BINDING_JSON' >&2; exit 2; }
+archive=$1 t0=$2 t1=$3 binding=$4
+[ -f "$binding" ] && [ ! -L "$binding" ] || { echo 'missing immutable public SOURCE fixture' >&2; exit 2; }
 [[ $t0 =~ ^/nix/store/[0-9a-z]{32}-[^/]+$ && $t1 =~ ^/nix/store/[0-9a-z]{32}-[^/]+$ ]] &&
   [ "$t0" != "$t1" ] || { echo 'expected two distinct immutable Nix Tool closures' >&2; exit 2; }
 p="rent-native-proof-$$"
@@ -73,6 +74,13 @@ initial=$(docker exec "$c" /bin/bash -euc '
   test ! -x /bin/codex && test -x /bin/nix && test -x /bin/gh
   printf "base-only\n"')
 [ "$initial" = base-only ] || fail 'unexpected initially selected Tool'
+# READ has its own scope: neither a previous UNKNOWN effect nor an admitted D
+# is a precondition for this disposable readonly observation.
+actual_o=$(observe_ro)
+bound_read=$(python3 hosts/rent/proposed-binding-proof.py /nonexistent-public-source-binding \
+  --mode read --observation "$actual_o") || fail 'synthetic READ failed'
+[[ $bound_read == *'"selection": "ABSENT"'* && $bound_read == *'"effect": "FORBIDDEN"'* ]] ||
+  fail 'readonly observation was promoted to an effect'
 # Transport the exact pre-built T closures, not an image rebuild or an implicit latest fetch.
 nix-store --export $(nix-store --query --requisites "$t0" "$t1") |
   docker exec -i "$c" /bin/nix-store --import > "$evidence/import"
@@ -99,6 +107,24 @@ native_set() {
   docker exec "$c" /bin/nix-store --check-validity $paths || return 1
   docker exec "$c" /bin/nix-env --profile /nix/var/nix/profiles/rent-dev --set "$desired"
 }
+# CI-only functional bridge: same proposed q/Host/scope goes from readonly O
+# to actual fixed closure selection. No admitted D, credential or Target GO.
+bound_q=$(python3 - "$binding" <<'PY'
+import json,sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    x=json.load(f)
+print(x["proposed_q"])
+PY
+)
+bound_preflight() {
+  local wanted=$1 q=$2 host=$3 scope=$4 prior=$5 observation=$6
+  local base=${7:-ci:rent-base-only-B0}
+  python3 hosts/rent/proposed-binding-proof.py "$binding" --mode preflight \
+    --candidate "$wanted" --expected-store "$t0" --q "$q" --host-ref "$host" --scope "$scope" \
+    --previous "$prior" --observation "$observation" --base "$base" \
+    --launch ci:rent-start-S0 --config-binding ci:rent-binding-C0 \
+    --state-contract ci:rent-state-K0
+}
 selection() {
   local want=$1
   [ "$(docker exec "$c" /bin/readlink -e /nix/var/nix/profiles/rent-dev)" = "$want" ] ||
@@ -118,8 +144,71 @@ state_snapshot() {
     stat -c "%n %u:%g %a" /var/lib/rent/dev/codex/auth.json /var/lib/rent/dev/claude/ci-session-marker'
 }
 snapshot=$(state_snapshot)
+# F2: negatives with the SAME exact proposed binding as envs F1. All deny
+# before any native_set, so the empty selector, image and state must persist.
+before_o=$(observe_ro)
+for mode in wrong-tool wrong-q wrong-host wrong-scope unknown-effect wrong-B; do
+  case "$mode" in
+    wrong-tool) args=("$t1" "$bound_q" ci-host-rent-1 ci-session-1 NONE "$before_o");;
+    wrong-q) args=("$t0" sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ci-host-rent-1 ci-session-1 NONE "$before_o");;
+    wrong-host) args=("$t0" "$bound_q" ci-host-foreign ci-session-1 NONE "$before_o");;
+    wrong-scope) args=("$t0" "$bound_q" ci-host-rent-1 ci-other-session NONE "$before_o");;
+    unknown-effect) args=("$t0" "$bound_q" ci-host-rent-1 ci-session-1 UNKNOWN "$before_o");;
+    wrong-B) args=("$t0" "$bound_q" ci-host-rent-1 ci-session-1 NONE "$before_o" ci:other-B);;
+  esac
+  if bound_preflight "${args[@]}" >/dev/null 2>&1; then
+    fail "bounded SOURCE input $mode reached native mutation"
+  fi
+  [ "$(observe_ro)" = "$before_o" ] && [ "$(state_snapshot)" = "$snapshot" ] ||
+    fail "bounded refusal $mode changed selection or auth/work state"
+done
+# The positive bound preflight is a non-executable candidate. The existing
+# native_set is the ONLY Nix mutation inside this disposable Docker CI process.
+preflight=$(bound_preflight "$t0" "$bound_q" ci-host-rent-1 ci-session-1 NONE "$before_o") ||
+  fail 'bound q/Host/unit/source material rejected actual first O'
+[[ $preflight == *'"stage": "SYNTHETIC_PROPOSED_DQ_PREFLIGHT_ONLY"'* &&
+   $preflight == *'"effect": "FORBIDDEN"'* &&
+   $preflight == *'"candidate_store": "'$t0'"'* ]] ||
+  fail 'bound candidate did not select the exact actual T0 closure'
 native_set "$t0"
 selection "$t0"
+actual_bound_o=$(observe_ro)
+[ "$actual_bound_o" = "selection=SELECTED generation=rent-dev-1-link store=$t0 proof=geometry-only" ] ||
+  fail 'bound q effect did not read back the actual T0'
+[ "$(state_snapshot)" = "$snapshot" ] || fail 'bound T changed auth/session/repo'
+[ "$(docker inspect --format '{{.Image}}' "$c")" = "$image" ] ||
+  fail 'bound T-only selection changed the base OCI image'
+# A finite test receipt is derived from the ACTUAL post-write readback and the
+# SAME preflight q/Host/store. It is a shell variable, not a runtime ledger.
+bound_receipt=$(python3 - "$preflight" "$before_o" "$actual_bound_o" "$t0" "$bound_q" <<'PY'
+import json,sys
+intent=json.loads(sys.argv[1])
+before,after,selected,q=sys.argv[2:]
+assert intent["proposed_q"]==q and intent["candidate_store"]==selected
+assert intent["effect"]=="FORBIDDEN" and intent["admission"]=="NOT_ADMITTED"
+assert before=="selection=ABSENT proof=geometry-only"
+assert after=="selection=SELECTED generation=rent-dev-1-link store="+selected+" proof=geometry-only"
+print(json.dumps({"kind":"ci-rent-bound-observation.v0","attempt":"ci-rent-bound-1",
+                  "proposed_q":q,"target_ref":intent["target_ref"],
+                  "host_ref":intent["host_ref"],"unit_ref":intent["unit_ref"],
+                  "before":before,"after":after,"store":selected,
+                  "admission":"NOT_ADMITTED","target_effect_authorized":False,
+                  "result":"SOURCE_CI_READBACK_ONLY"},sort_keys=True))
+PY
+) || fail 'bound actual O/readback attempt did not match q'
+[[ $bound_receipt == *'"result": "SOURCE_CI_READBACK_ONLY"'* ]] ||
+  fail 'missing bounded SOURCE attempt evidence'
+# A lost receipt is UNKNOWN, not success or automatic NOOP. Re-read O but
+# never perform an equivalent second write; a preflight retry must be denied.
+if bound_preflight "$t0" "$bound_q" ci-host-rent-1 ci-session-1 UNKNOWN "$actual_bound_o" >/dev/null 2>&1; then
+  fail 'unknown bound effect retried blindly'
+fi
+[ "$(observe_ro)" = "$actual_bound_o" ] ||
+  fail 'UNKNOWN reconciliation read mutated the selected Tool'
+# Simulate losing the caller's in-memory CI receipt; selection must remain
+# observed, but retry cannot fabricate an additional successful effect.
+unset bound_receipt
+echo 'PASS: proposed D/q/Host binding -> actual OCI O -> exact T0 Nix selector -> readback; wrong q/T/Host/scope/B/UNKNOWN refused'
 case "$(observe)" in
   "selection=SELECTED generation=rent-dev-1-link store=$t0 proof=geometry-only") ;;
   *) fail 'T0 observed generation does not match selected T0' ;;
