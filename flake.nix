@@ -596,6 +596,15 @@
           assert bound.image.drvPath == own.image.drvPath;
           assert bound.core.drvPath == own.core.drvPath;
           assert bound.profile.drvPath != own.profile.drvPath;
+          # The bound T's age init is the existing bounded tool over exactly this target identity; default T has none.
+          assert bound.profile.ownAgeInit.drvPath == (dev.jevTools {
+            envsRemote = "https://github.com/roccho-dev/envs";
+            appsRemote = "https://github.com/roccho-dev/apps";
+            opsRemote = "https://github.com/roccho-dev/ops";
+            inherit (ownTarget) identity;
+          }).init.drvPath;
+          assert bound.profile.ownAgeInit.drvPath != dev.jev.init.drvPath;
+          assert !(own.profile ? ownAgeInit);
           pkgs.runCommand "pi-target-check" {
             nativeBuildInputs = [ pkgs.jq ];
             gate = defaultPi.bindingGate;
@@ -640,6 +649,14 @@
             test "$(readlink -e ${bound.profile}/bin/pi)" = "$(readlink -e ${ownPi.launcher}/bin/pi)"
             ${bound.profile}/bin/pi --version >/dev/null
             test "$(${bound.profile}/bin/codex --version)" = "codex-cli ${releaseVersions.codex}"
+            # The bound T creates only this target's identity; the default own T and B carry no age init.
+            init=$(readlink -e ${bound.profile}/bin/jev-age-init)
+            test "$init" = "$(readlink -e ${bound.profile.ownAgeInit}/bin/jev-age-init)"
+            grep -qE "^ *identity='?${ownTarget.identity}'?$" "$init"
+            if grep -qF oci-dev.key "$init"; then exit 1; fi
+            test ! -e ${own.profile}/bin/jev-age-init
+            test ! -e ${own.core}/bin/jev-age-init
+            if "$init" --force >/dev/null 2>&1; then echo 'pi-target: init accepted an argument' >&2; exit 1; fi
             touch $out
           '';
         release-watch = pkgs.runCommand "release-watch-check" {

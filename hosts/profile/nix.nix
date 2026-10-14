@@ -45,8 +45,17 @@ ${releaseVersionCases}      *) echo "release-version: unknown CLI ''${1:-}" >&2;
   # A target-bound own uses the same Pi source and resolver with its own binding, identity and agent directory.
   ownPi = if piTarget == null then ownPiEntry
     else (import ../../oci/dev/pi.nix ({ inherit pkgs; } // piTarget)).launcher;
+  # The same bounded jev-age-init (absent-only, safe parent, public recipient only) over this target's identity, so the
+  # target creates its own key in place; only its init is used (remotes are the dev values, never reached by init).
+  ownAgeInit = ((import ../../oci/dev/nix.nix { inherit pkgs; }).jevTools {
+    envsRemote = "https://github.com/roccho-dev/envs";
+    appsRemote = "https://github.com/roccho-dev/apps";
+    opsRemote = "https://github.com/roccho-dev/ops";
+    inherit (piTarget) identity;
+  }).init;
 in
 assert piTarget == null || mode == "own";
+assert piTarget == null || piTarget ? identity;
 assert builtins.elem mode [ "legacy" "core" "own" ];
 if mode == "core" then pkgs.buildEnv {
   name = "own-core";
@@ -71,8 +80,10 @@ assert claudeContract.packageShape == "single-glibc-executable";
 pkgs.buildEnv {
   name = if mode == "own" then "own-tool-profile" else "dev-profile";
   # Every supported own generation anchors the identical H_B at the existing absolute helper locator.
-  paths = (if mode == "own" then [ github.helper ownPi ] else corePaths ++ [ github.wrapper github.helper ])
+  paths = (if mode == "own" then [ github.helper ownPi ] ++ pkgs.lib.optional (piTarget != null) ownAgeInit
+      else corePaths ++ [ github.wrapper github.helper ])
     ++ [ codex claude releaseVersion ] ++ extra;
   pathsToLink = [ "/bin" ];
-  passthru = { inherit releaseDefinitions releaseVersions github ownPiEntry ownPi; piUpstream = pi.upstream; };
+  passthru = { inherit releaseDefinitions releaseVersions github ownPiEntry ownPi; piUpstream = pi.upstream; }
+    // pkgs.lib.optionalAttrs (piTarget != null) { inherit ownAgeInit; };
 }
