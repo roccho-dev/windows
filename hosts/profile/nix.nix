@@ -3,7 +3,8 @@
 # nothing is installed into a host by hand. `extra` supplies role tools and the CI upgrade proof. `owner` only names the
 # profile's stable Git credential helper (own: its Binding; rent keeps the default); each repository's principal is
 # declared by its own binding (hosts/profile/gh.nix), never derived from owner or the URL namespace.
-{ pkgs, extra ? [], owner ? "roccho-dev", mode ? "legacy" }:
+# `piTarget` (own only) names one exact envs target for the existing Pi credential launcher; null keeps the plain entry.
+{ pkgs, extra ? [], owner ? "roccho-dev", mode ? "legacy", piTarget ? null }:
 let
   # Core(L_B, owner) never evaluates an app pin. The default retains rent/dev's existing profile.
   github = import ./gh.nix { inherit pkgs owner; };
@@ -41,7 +42,11 @@ ${releaseVersionCases}      *) echo "release-version: unknown CLI ''${1:-}" >&2;
     makeWrapper ${pi.upstream}/bin/pi-upstream "$out/bin/pi" \
       --set PI_PACKAGE_DIR ${pi.upstream}/share/pi
   '';
+  # A target-bound own uses the same Pi source and resolver with its own binding, identity and agent directory.
+  ownPi = if piTarget == null then ownPiEntry
+    else (import ../../oci/dev/pi.nix ({ inherit pkgs; } // piTarget)).launcher;
 in
+assert piTarget == null || mode == "own";
 assert builtins.elem mode [ "legacy" "core" "own" ];
 if mode == "core" then pkgs.buildEnv {
   name = "own-core";
@@ -66,8 +71,8 @@ assert claudeContract.packageShape == "single-glibc-executable";
 pkgs.buildEnv {
   name = if mode == "own" then "own-tool-profile" else "dev-profile";
   # Every supported own generation anchors the identical H_B at the existing absolute helper locator.
-  paths = (if mode == "own" then [ github.helper ownPiEntry ] else corePaths ++ [ github.wrapper github.helper ])
+  paths = (if mode == "own" then [ github.helper ownPi ] else corePaths ++ [ github.wrapper github.helper ])
     ++ [ codex claude releaseVersion ] ++ extra;
   pathsToLink = [ "/bin" ];
-  passthru = { inherit releaseDefinitions releaseVersions github ownPiEntry; piUpstream = pi.upstream; };
+  passthru = { inherit releaseDefinitions releaseVersions github ownPiEntry ownPi; piUpstream = pi.upstream; };
 }
