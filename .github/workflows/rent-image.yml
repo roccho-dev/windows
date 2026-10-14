@@ -652,9 +652,14 @@ jobs:
           else
             echo 'own image derivation base: unavailable for this event'
           fi
-          # result: the published image; result-1: its CI-only tunnel-stub twin; result-2: the stub twin plus one package.
-          nix build .#rent-image .#rent-image-stub .#rent-image-next --no-write-lock-file --print-build-logs
-          test -e result && test -e result-1 && test -e result-2
+          # Legacy results 0..2 retain their existing published/stub/next identities. B-only results 3..4
+          # are never published: true cloudflared image and its inert tunnel twin for isolated runtime proof.
+          nix build .#rent-image .#rent-image-stub .#rent-image-next .#rent-base-image .#rent-base-image-stub \
+            --no-write-lock-file --print-build-logs
+          for i in result result-1 result-2 result-3 result-4; do test -e "$i"; done
+      - name: Prove new Base-only OCI starts, retains Tool generations and refuses foreign state
+        shell: bash
+        run: bash hosts/rent/base-proof.sh result-3 result-4 result-1 result-2
       - name: Load and test tools, mounts, state, restart, and recreate
         shell: bash
         run: |
