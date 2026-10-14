@@ -192,7 +192,7 @@ docker stop -t 30 "$c" >/dev/null
 profile_geometry() {
   docker run --rm --network none -v "$nixvol:/nix:ro" "$image" /bin/bash -euc '
     cd /nix
-    find var/nix/profiles var/nix/gcroots -printf "%p|%y|%l|%s|%T@\\n" | LC_ALL=C sort
+    find var/nix/profiles var/nix/gcroots -printf "%p|%y|%l|%s|%T@\n" | LC_ALL=C sort
     sha256sum var/rent-nix var/nix/db/db.sqlite' | sha256sum
 }
 assert_unknown_read_only() {
