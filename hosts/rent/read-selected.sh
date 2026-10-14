@@ -22,6 +22,10 @@ for p in /nix/var /nix/var/nix "$dir"; do
   [ ! -L "$p" ] || unknown "profile parent symlink"
   if [ -e "$p" ]; then
     [ -d "$p" ] && [ "$(stat -c %u "$p")" = 0 ] || unknown "profile parent owner/type"
+    # Identical permission invariant to B-only flake.nix profileCheck: not writable by group/other.
+    mode=$(stat -c %a "$p") || unknown "profile parent mode unreadable"
+    [[ $mode =~ ^[0-7]{3,4}$ ]] || unknown "profile parent mode invalid"
+    (( (8#$mode & 0022) == 0 )) || unknown "profile parent writable by group/other"
   fi
 done
 for p in "$dir"/.rent-dev*; do
