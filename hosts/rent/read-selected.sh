@@ -11,7 +11,7 @@ while read -r _id _parent _dev root mp opts _rest; do
   [ "$mp" = /nix ] || continue
   count=$((count + 1))
   case "$root" in */volumes/*/_data) ;; *) unknown "foreign nix mount" ;; esac
-  case ",$opts," in *,rw,*) ;; *) unknown "nix mount not writable" ;; esac
+  case ",$opts," in *,rw,*|*,ro,*) ;; *) unknown "nix mount mode unavailable" ;; esac
 done < /proc/self/mountinfo
 [ "$count" -eq 1 ] || unknown "nix mount ambiguous"
 [ "$(cat /nix/var/rent-nix 2>/dev/null || true)" = "windows-rent-nix v1" ] ||
