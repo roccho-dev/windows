@@ -45,7 +45,7 @@ def read_only(observation):
             "target_noop": "UNPROVEN"}
 
 
-def preflight(binding, *, candidate, observation, q, host_ref, scope,
+def preflight(binding, *, candidate, expected_store, observation, q, host_ref, scope,
               previous, base, launch, config_binding, state_contract):
     if type(binding) is not dict or set(binding) != {
         "kind", "admission", "target_ref", "host_ref", "parent_ref",
@@ -69,7 +69,8 @@ def preflight(binding, *, candidate, observation, q, host_ref, scope,
                        sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     expected_q = "sha256:" + hashlib.sha256(canon.encode()).hexdigest()
     if (binding["proposed_q"] != expected_q or q != expected_q
-            or type(candidate) is not str or STORE.fullmatch(candidate) is None):
+            or type(candidate) is not str or STORE.fullmatch(candidate) is None
+            or candidate != expected_store):
         refuse("wrong q or real Nix Tool closure")
     if (host_ref != binding["host_ref"] or scope != binding["scope"]
             or binding["host_ref"] == binding["parent_ref"]
@@ -114,6 +115,7 @@ def main():
     p.add_argument("--mode", choices=("read", "preflight"), required=True)
     p.add_argument("--observation", required=True)
     p.add_argument("--candidate")
+    p.add_argument("--expected-store")
     p.add_argument("--q")
     p.add_argument("--host-ref")
     p.add_argument("--scope")
@@ -129,6 +131,7 @@ def main():
         else:
             source = json.loads(args.binding.read_text(encoding="utf-8"))
             result = preflight(source, candidate=args.candidate,
+                               expected_store=args.expected_store,
                                observation=args.observation, q=args.q,
                                host_ref=args.host_ref, scope=args.scope,
                                previous=args.previous, base=args.base,
