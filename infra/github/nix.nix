@@ -307,12 +307,23 @@ ENCRYPT
     git -C fx config credential.helper ""
     git -C fx config credential.useHttpPath true
     git -C fx config "credential.$u.helper" "$PWD/helper"
+    # As the real bind writes, the bound repository always names the declared username itself.
+    git -C fx config "credential.$u.username" roccho-dev
     cat >helper <<HELPER
 #!${pkgs.runtimeShell}
 [ "\$1" = get ] || exit 0
 cat "$PWD/answer"
 HELPER
     chmod +x helper
+    # A token from anywhere but the bound slot: answers both as a credential helper and as an askpass program.
+    cat >rogue <<ROGUE
+#!${pkgs.runtimeShell}
+case "\$1" in get) printf 'username=roccho-dev\npassword=fixture-token\n' ;; *[Pp]assword*) echo fixture-token ;; esac
+ROGUE
+    chmod +x rogue
+    git init -q fx2
+    git -C fx2 config remote.origin.url "$u"
+    git -C fx2 config credential.helper "$PWD/rogue"
     answer() {
       printf "$1" >answer
       if bound_token fx roccho-dev "$u" >out.log 2>err.log; then got=0; else got=1; fi
@@ -326,6 +337,18 @@ HELPER
     answer 'username=other-principal\npassword=fixture-token\n' 1 wrong-slot
     answer "" 1 missing-slot
     answer 'username=roccho-dev\n' 1 missing-token
+    # With the username already known, an empty slot must not fall back to a configured askpass, an injected
+    # helper or an inherited repository.
+    git -C fx config core.askPass "$PWD/rogue"
+    answer "" 1 config-askpass
+    git -C fx config --unset core.askPass
+    export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0= \
+      GIT_CONFIG_KEY_1=credential.helper GIT_CONFIG_VALUE_1="$PWD/rogue"
+    answer "" 1 injected-helper
+    unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1
+    export GIT_DIR=$PWD/fx2/.git
+    answer "" 1 inherited-repository
+    unset GIT_DIR
     git -C fx config remote.origin.url https://github.com/roccho-dev/other
     answer 'username=roccho-dev\npassword=fixture-token\n' 1 other-origin
     [ -z "$provider_token" ] || { echo 'github-root: failed lookup kept a token' >&2; exit 1; }
