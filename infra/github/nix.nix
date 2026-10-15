@@ -127,6 +127,35 @@ let
       ($r.instances[0].attributes.id == "windows") and
       ($r.instances[0].attributes.name == "windows"))
   '';
+  # The only principal source: the declared bound repository's existing Git credential helper slot. Both Git calls
+  # drop any inherited repository or config injection, read no system/global config and never prompt or askpass
+  # (the bound repository already names the username, so a fallback could otherwise supply the token). It sets
+  # provider_token for the caller and prints nothing; an unbound origin, missing slot, missing token or another
+  # principal fails closed.
+  credential = pkgs.writeText "github-root-bound-credential.sh" ''
+    bound_token() {
+      local src=$1 principal=$2 url=$3 cred
+      local -a g=(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY
+        -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_CONFIG -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT
+        -u GIT_EXEC_PATH -u GIT_ASKPASS -u SSH_ASKPASS
+        GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+        git -C "$src" -c core.askPass= -c credential.interactive=never)
+      provider_token=
+      [ "$("''${g[@]}" config --get remote.origin.url)" = "$url" ] || return 1
+      cred=$(printf 'url=%s\n\n' "$url" | "''${g[@]}" credential fill) || return 1
+      case $'\n'$cred$'\n' in
+        *$'\n'"username=$principal"$'\n'*) ;;
+        *) unset cred; return 1 ;;
+      esac
+      case $'\n'$cred in
+        *$'\n'password=?*) ;;
+        *) unset cred; return 1 ;;
+      esac
+      provider_token=''${cred#*$'\n'password=}
+      provider_token=''${provider_token%%$'\n'*}
+      unset cred
+    }
+  '';
   # Source is inert under CI: only --source-check runs without principals.
   # A future operational GO must prove existing native principal and custody.
   app = pkgs.writeShellScriptBin "github-root" ''
@@ -143,26 +172,26 @@ let
       plan|adopt) mode=$1 ;;
       *) fail 'only named plan/adopt modes; no generic apply/import route' ;;
     esac
-    [ -n "''${GITHUB_TOKEN:-}" ] && [ -n "''${SSH_PRIVATE_KEY:-}" ] ||
-      fail 'native provider and Git principals not bound'
-    # Native GitHub provider token stays shell-private outside OpenTofu.
-    provider_token=$GITHUB_TOKEN
+    # Inherited principals are never used; the token comes only from the declared bound repository.
+    unset GITHUB_TOKEN GH_TOKEN GITHUB_ENTERPRISE_TOKEN TF_ENCRYPTION SSH_PRIVATE_KEY
+    unset secret encryption_config provider_token
+    src=/work/repos/windows.git/.worktrees/host-own-ghinfra-runtime
+    repo_url=https://github.com/roccho-dev/windows
+    uid=$(id -u)
+    [ "$PWD" = "$src" ] && [ -f infra/github/main.tf ] ||
+      fail 'declared own source checkout not established'
+    . ${credential}
+    # Native GitHub token stays shell-private, reaching only the backend and OpenTofu children.
+    bound_token "$src" roccho-dev "$repo_url" ||
+      fail 'bound windows repository credential missing or not the declared roccho-dev principal'
     export -n provider_token
-    unset GITHUB_TOKEN GH_TOKEN GITHUB_ENTERPRISE_TOKEN TF_ENCRYPTION
-    unset secret encryption_config
-    [ "$(id -u)" = 0 ] &&
-      [ "$PWD" = /work/repos/windows ] &&
-      [ -f infra/github/main.tf ] ||
-      fail 'selected OCIdev UID0 and /work/repos/windows not established'
-    [ -f "$SSH_PRIVATE_KEY" ] && [ ! -L "$SSH_PRIVATE_KEY" ] ||
-      fail 'native Git principal file unavailable'
     dir=/work/repos/.auth/roccho-dev/opentofu
     key=$dir/github-windows.passphrase
     [ -d "$dir" ] && [ ! -L "$dir" ] &&
-      [ "$(stat -c '%u:%a' "$dir")" = 0:700 ] &&
+      [ "$(stat -c '%u:%a' "$dir")" = "$uid:700" ] &&
       [ -f "$key" ] && [ ! -L "$key" ] && [ -s "$key" ] &&
-      [ "$(stat -c '%u:%a' "$key")" = 0:600 ] ||
-      fail 'dedicated UID0 0700/0600 custody not proven'
+      [ "$(stat -c '%u:%a' "$key")" = "$uid:600" ] ||
+      fail 'dedicated custody not owned 0700/0600 by the effective UID'
     # Raw key is read through stdin only; never argv, public log or Windows file.
     secret=$(jq -Rs . < "$key")
     encryption_config="$(cat <<ENCRYPT
@@ -196,9 +225,10 @@ ENCRYPT
       rmdir -- "$tmp" 2>/dev/null || true
     }
     trap cleanup EXIT
-    env -u GITHUB_TOKEN -u GH_TOKEN -u GITHUB_ENTERPRISE_TOKEN -u TF_ENCRYPTION ${backend}/bin/terraform-backend-git --address "127.0.0.1:$port" >"$tmp/backend.log" 2>&1 &
+    # Upstream HTTPS basic auth needs GIT_USERNAME even for a token; a prefix assignment keeps the token out of argv.
+    GIT_USERNAME=x-access-token GITHUB_TOKEN="$provider_token" ${backend}/bin/terraform-backend-git --address "127.0.0.1:$port" >"$tmp/backend.log" 2>&1 &
     pid=$!
-    url="http://127.0.0.1:$port/?type=git&repository=git%40github.com%3Aroccho-dev%2Fwindows.git&ref=tofu-state&state=state%2Fgithub-windows.json"
+    url="http://127.0.0.1:$port/?type=git&repository=https%3A%2F%2Fgithub.com%2Froccho-dev%2Fwindows.git&ref=tofu-state&state=state%2Fgithub-windows.json"
     ready=0
     for round in $(seq 1 50); do
       kill -0 "$pid" 2>/dev/null || fail 'standard backend exited'
@@ -207,13 +237,13 @@ ENCRYPT
       sleep 0.2
     done
     [ "$ready" = 1 ] || fail 'transient loopback backend not ready'
-    if ! TF_ENCRYPTION="$encryption_config" GITHUB_TOKEN="$provider_token" tofu -chdir=/work/repos/windows/infra/github init -input=false -reconfigure -lockfile=readonly \
+    if ! TF_ENCRYPTION="$encryption_config" GITHUB_TOKEN="$provider_token" tofu -chdir="$src/infra/github" init -input=false -reconfigure -lockfile=readonly \
       -backend-config="address=$url" -backend-config="lock_address=$url" \
       -backend-config="unlock_address=$url" -backend-config="lock_method=LOCK" \
       -backend-config="unlock_method=UNLOCK" >"$tmp/init.log" 2>&1; then
       fail 'standard native init rejected; no fallback'
     fi
-    if ! TF_ENCRYPTION="$encryption_config" GITHUB_TOKEN="$provider_token" tofu -chdir=/work/repos/windows/infra/github plan -input=false -out="$tmp/plan" >"$tmp/plan.log" 2>&1; then
+    if ! TF_ENCRYPTION="$encryption_config" GITHUB_TOKEN="$provider_token" tofu -chdir="$src/infra/github" plan -input=false -out="$tmp/plan" >"$tmp/plan.log" 2>&1; then
       fail 'standard native plan rejected; no apply'
     fi
     # The existing plan mode remains read-only and rejects all importing.
@@ -221,7 +251,7 @@ ENCRYPT
     # I/B/K/G principal, inventory, custody, exclusive owner and review gates.
     guard=${planGuard}
     [ "$mode" = adopt ] && guard=${adoptionGuard}
-    if ! TF_ENCRYPTION="$encryption_config" tofu -chdir=/work/repos/windows/infra/github show -json "$tmp/plan" |
+    if ! TF_ENCRYPTION="$encryption_config" tofu -chdir="$src/infra/github" show -json "$tmp/plan" |
       jq -e -f "$guard" >/dev/null; then
       fail 'native plan not admissible for this mode; no apply'
     fi
@@ -231,13 +261,13 @@ ENCRYPT
     fi
     # Only the ONE reviewed, saved import plan: never auto-approve or replan.
     if ! TF_ENCRYPTION="$encryption_config" GITHUB_TOKEN="$provider_token" \
-      tofu -chdir=/work/repos/windows/infra/github apply -input=false -no-color "$tmp/plan" \
+      tofu -chdir="$src/infra/github" apply -input=false -no-color "$tmp/plan" \
       >"$tmp/apply.log" 2>&1; then
       fail 'native saved-plan adoption failed; reconcile UNKNOWN before retry'
     fi
     # State readback stays in an in-memory pipe, never a plaintext file/log.
     if ! TF_ENCRYPTION="$encryption_config" GITHUB_TOKEN="$provider_token" \
-      tofu -chdir=/work/repos/windows/infra/github state pull 2>"$tmp/readback.log" |
+      tofu -chdir="$src/infra/github" state pull 2>"$tmp/readback.log" |
       jq -e -f ${receiptGuard} >/dev/null; then
       fail 'native adoption receipt not proven; reconcile UNKNOWN'
     fi
@@ -245,20 +275,88 @@ ENCRYPT
   '';
   # No provider download/init, external Git ref or secret read in this check.
   check = pkgs.runCommand "github-root-source-check" {
-    nativeBuildInputs = [ pkgs.bash pkgs.opentofu pkgs.gnugrep pkgs.jq ];
+    nativeBuildInputs = [ pkgs.bash pkgs.opentofu pkgs.gnugrep pkgs.jq pkgs.git ];
   } ''
     set -eu
     tofu fmt -check -no-color ${./main.tf}
     bash -n ${app}/bin/github-root
+    bash -n ${credential}
     ${app}/bin/github-root --source-check >source-check.log
     grep -qF 'source-only check, no backend or provider' source-check.log
-    grep -qF 'unset GITHUB_TOKEN GH_TOKEN GITHUB_ENTERPRISE_TOKEN TF_ENCRYPTION' ${app}/bin/github-root
-    grep -qF 'env -u GITHUB_TOKEN -u GH_TOKEN -u GITHUB_ENTERPRISE_TOKEN -u TF_ENCRYPTION' ${app}/bin/github-root
+    grep -qF 'unset GITHUB_TOKEN GH_TOKEN GITHUB_ENTERPRISE_TOKEN TF_ENCRYPTION SSH_PRIVATE_KEY' ${app}/bin/github-root
+    grep -qF 'GIT_USERNAME=x-access-token GITHUB_TOKEN="$provider_token" ${backend}/bin/terraform-backend-git' ${app}/bin/github-root
+    grep -qF 'repository=https%3A%2F%2Fgithub.com%2Froccho-dev%2Fwindows.git' ${app}/bin/github-root
+    grep -qF 'bound_token "$src" roccho-dev "$repo_url"' ${app}/bin/github-root
     grep -qF 'TF_ENCRYPTION="$encryption_config" GITHUB_TOKEN="$provider_token" tofu' ${app}/bin/github-root
     if grep -qF 'export TF_ENCRYPTION=' ${app}/bin/github-root; then
       echo 'github-root: broad secret export' >&2
       exit 1
     fi
+    # Retired routes: no SSH principal, no fixed UID0 or old cwd, no token export or env-argv handoff.
+    for retired in '$SSH_PRIVATE_KEY' 'git%40github.com' '/work/repos/windows/' '= 0:700' '= 0:600' \
+      'id -u)" = 0' 'export GITHUB_TOKEN' 'export provider_token' 'env -u'; do
+      if grep -qF -- "$retired" ${app}/bin/github-root; then
+        echo "github-root: retired route present: $retired" >&2
+        exit 1
+      fi
+    done
+    # The bound credential source against a fixture repository: only the declared principal's slot for the
+    # declared origin yields a token, and nothing is printed. Wrong or missing slot and token are RED.
+    . ${credential}
+    export HOME=$PWD/home GIT_CONFIG_NOSYSTEM=1
+    mkdir -p home
+    u=https://github.com/roccho-dev/windows
+    git init -q fx
+    git -C fx config remote.origin.url "$u"
+    git -C fx config credential.helper ""
+    git -C fx config credential.useHttpPath true
+    git -C fx config "credential.$u.helper" "$PWD/helper"
+    # As the real bind writes, the bound repository always names the declared username itself.
+    git -C fx config "credential.$u.username" roccho-dev
+    cat >helper <<HELPER
+#!${pkgs.runtimeShell}
+[ "\$1" = get ] || exit 0
+cat "$PWD/answer"
+HELPER
+    chmod +x helper
+    # A token from anywhere but the bound slot: answers both as a credential helper and as an askpass program.
+    cat >rogue <<ROGUE
+#!${pkgs.runtimeShell}
+case "\$1" in get) printf 'username=roccho-dev\npassword=fixture-token\n' ;; *[Pp]assword*) echo fixture-token ;; esac
+ROGUE
+    chmod +x rogue
+    git init -q fx2
+    git -C fx2 config remote.origin.url "$u"
+    git -C fx2 config credential.helper "$PWD/rogue"
+    answer() {
+      printf "$1" >answer
+      if bound_token fx roccho-dev "$u" >out.log 2>err.log; then got=0; else got=1; fi
+      if [ "$got" != "$2" ] || [ -s out.log ] || grep -qF fixture-token err.log; then
+        echo "github-root: bound credential case $3 wrong" >&2
+        exit 1
+      fi
+    }
+    answer 'username=roccho-dev\npassword=fixture-token\n' 0 bound
+    [ "$provider_token" = fixture-token ] || { echo 'github-root: bound token not selected' >&2; exit 1; }
+    answer 'username=other-principal\npassword=fixture-token\n' 1 wrong-slot
+    answer "" 1 missing-slot
+    answer 'username=roccho-dev\n' 1 missing-token
+    # With the username already known, an empty slot must not fall back to a configured askpass, an injected
+    # helper or an inherited repository.
+    git -C fx config core.askPass "$PWD/rogue"
+    answer "" 1 config-askpass
+    git -C fx config --unset core.askPass
+    export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0= \
+      GIT_CONFIG_KEY_1=credential.helper GIT_CONFIG_VALUE_1="$PWD/rogue"
+    answer "" 1 injected-helper
+    unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1
+    export GIT_DIR=$PWD/fx2/.git
+    answer "" 1 inherited-repository
+    unset GIT_DIR
+    git -C fx config remote.origin.url https://github.com/roccho-dev/other
+    answer 'username=roccho-dev\npassword=fixture-token\n' 1 other-origin
+    [ -z "$provider_token" ] || { echo 'github-root: failed lookup kept a token' >&2; exit 1; }
+    echo 'github-root-source: bound credential fixtures passed'
     grep -qF 'zh:5dd05dee677f6ebdbed00cbb1b9be444ab2d1062d345cbc9ec50a47cb41b8622' ${./.terraform.lock.hcl}
     # Strict actual guard filter, synthetic plan only. No provider or remote I/O.
     cat >plan.json <<'PLAN'
