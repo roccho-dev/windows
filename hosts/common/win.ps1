@@ -1,7 +1,10 @@
 #requires -Version 5.1
 [CmdletBinding()]
 param(
-    [ValidateSet('Validate', 'Test', 'Apply', 'Restore', 'RestoreTest', 'Uninstall', 'RentSsh', 'RentSshTest', 'RentAccess', 'OwnSsh', 'OwnSshTest', 'QuickHttp', 'OwnLogon', 'OwnLogonTest', 'HostRemove', 'OwnResume', 'OwnResumeTest', 'PlatformRestore', 'PlatformTest')][string]$Mode = 'Validate',
+    [ValidateSet('Validate', 'Test', 'Apply', 'Restore', 'RestoreTest', 'Uninstall', 'RentSsh', 'RentSshTest', 'RentAccess', 'OwnSsh', 'OwnSshTest', 'QuickHttp', 'OwnLogon', 'OwnLogonTest', 'HostRemove', 'OwnResume', 'OwnResumeTest', 'PlatformRestore', 'PlatformTest', 'ClientSsh', 'ClientSshTest')][string]$Mode = 'Validate',
+    # ClientSsh/ClientSshTest only: an explicit public SSH Host fragment and its host key pins (opt-in; never discovered).
+    [string]$ClientConfig,
+    [string]$ClientKnownHosts,
     # RentAccess takes no argument: its only input is the Access client credential on redirected stdin.
     # RentSsh/RentSshTest only: the live binding, known only after envs and the first rent start. Nothing is guessed.
     [string]$Alias = 'windows-rent',
@@ -348,6 +351,10 @@ if ($Typography -and ($Mode -ne 'Apply' -or $PSBoundParameters.ContainsKey('Pack
 if ($ChromiumFonts -and ($Mode -ne 'Apply' -or $Typography -or $AppFonts -or $PSBoundParameters.ContainsKey('Packages'))) { throw '-ChromiumFonts is only for -Mode Apply, without -Packages, -Typography or -AppFonts.' }
 if ($AppFonts -and ($Mode -ne 'Apply' -or $Typography -or $PSBoundParameters.ContainsKey('Packages'))) { throw '-AppFonts is only for -Mode Apply, without -Packages or -Typography.' }
 if ($NocttyConfigOnly -and ($Mode -ne 'Apply' -or $Typography -or $ChromiumFonts -or $AppFonts -or $PSBoundParameters.ContainsKey('Packages'))) { throw '-NocttyConfig is only for -Mode Apply, without other scopes.' }
+if (($Mode -cin @('ClientSsh','ClientSshTest')) -ne ($PSBoundParameters.ContainsKey('ClientConfig') -and $PSBoundParameters.ContainsKey('ClientKnownHosts')) -or
+    ($Mode -cnotin @('ClientSsh','ClientSshTest') -and ($PSBoundParameters.ContainsKey('ClientConfig') -or $PSBoundParameters.ContainsKey('ClientKnownHosts')))) {
+    throw '-ClientConfig and -ClientKnownHosts are both required by, and only for, -Mode ClientSsh/ClientSshTest.'
+}
 # The desktop UI font face (a selected family, pack.py) set through ui-font.ahk by the locked interpreter package.
 $uiTypography = Get-Field $manifest 'typography'
 if ($null -ne $uiTypography -and (-not (Test-UiFontFace (Get-Field $uiTypography 'face')) -or (Get-Field $uiTypography 'script') -cne 'ui-font.ahk' -or
@@ -685,7 +692,8 @@ function IsHostEffect($Effect) {
     $own = Get-Field (OwnDeclared) 'ssh'
     $ownFiles = if ($own) { @(('config.before-' + $own.alias), ([string]$own.knownHosts -replace '^\.ssh/', '')) } else { @() }
     return @(@('config','config.before-windows-rent','windows-rent\config','windows-rent\known_hosts',
-        'windows-rent\access','windows-own\config') + $ownFiles | Where-Object { (Join-Path $ssh $_) -eq $target }).Count -gt 0
+        'windows-rent\access','windows-own\config','windows-client\config','windows-client\known_hosts') + $ownFiles |
+        Where-Object { (Join-Path $ssh $_) -eq $target }).Count -gt 0
 }
 
 function OwnTaskName([string]$Target) { 'windows-own-logon-' + $Target.Substring('task:windows-own-logon:'.Length) }
@@ -886,7 +894,8 @@ function HostPrefix([string]$Config, [string]$Backup, [string]$Line, [switch]$Ch
 
 function SshConfigFiles([string]$Directory) {
     # Finite supported Includes only. Match exec is never evaluated by a supposedly read-only -G probe.
-    $paths = @((Join-Path $Directory 'config'),(Join-Path $Directory 'windows-rent\config'),(Join-Path $Directory 'windows-own\config'))
+    $paths = @((Join-Path $Directory 'config'),(Join-Path $Directory 'windows-rent\config'),(Join-Path $Directory 'windows-own\config'),
+        (Join-Path $Directory 'windows-client\config'))
     $result = @()
     foreach ($path in $paths) {
         AssertPlainPath $path
@@ -899,7 +908,7 @@ function SshConfigFiles([string]$Directory) {
             if ($directive.keyword -ceq 'match') { throw 'SSH Match is not evaluated by this scoped writer.' }
             if ($directive.keyword -ceq 'include') {
                 if ($path -ne $paths[0] -or -not $directive.value -or @($directive.value.Split([char[]]@(' ',"`t","`r"),[StringSplitOptions]::RemoveEmptyEntries) |
-                    Where-Object { $_ -cnotin @('windows-rent/config','windows-own/config') }).Count) { throw 'SSH Include has an unknown/recursive path; preserved.' }
+                    Where-Object { $_ -cnotin @('windows-rent/config','windows-own/config','windows-client/config') }).Count) { throw 'SSH Include has an unknown/recursive path; preserved.' }
             }
         }
         $result += [ordered]@{ path = $path; text = $text }
@@ -1021,7 +1030,9 @@ function HostSsh([switch]$Test, [switch]$Local) {
         } else { $null = HostFileState $effect } # all refusals before first deployment
     }
     $config = Join-Path $directory 'config'
+    # Legacy stays two paths; a master already moved by the explicit ClientSsh keeps its three-path line.
     $include = 'Include windows-rent/config windows-own/config'
+    if ((ObserveFile $config).exists -and [IO.File]::ReadAllText($config).StartsWith($include + " windows-client/config`n")) { $include += ' windows-client/config' }
     if ($count -eq 0) { HostPrefix $config (Join-Path $directory 'config.before-windows-rent') $include -CheckOnly }
     if ($count -eq 0 -and (ObserveFile $config).exists -and
         (ObserveFile (Join-Path $directory 'config.before-windows-rent')).exists -and
@@ -1040,6 +1051,125 @@ function HostSsh([switch]$Test, [switch]$Local) {
     if (-not $Local -and -not (Test-EffectStateEqual 'tree-extracted' (HostTreeEffect $clientDirectory $clientFiles).desired (ObserveTree $clientDirectory))) { throw 'Pinned cloudflared client or rent launcher differs.' }
     [ordered]@{ alias = $name; configured = $true; client = $clientExe; launcher = (Join-Path $clientDirectory 'rent-access.ps1')
         credential = 'RentAccess stdin slot; never written here'; authenticationProof = 'unproven'; rebootProof = 'unproven' }
+}
+
+# The explicit public client declaration: LF-terminated printable ASCII Host blocks of a fixed keyword set, each strict,
+# batch, identity-only and pinned through the one owned known_hosts slot; exactly one ed25519 pin per HostKeyAlias.
+function ClientSshInput([string]$Profile) {
+    $text = @{}
+    foreach ($pair in @(@('fragment',$ClientConfig),@('pins',$ClientKnownHosts))) {
+        $path = [IO.Path]::GetFullPath($pair[1])
+        AssertPlainPath $path -Required
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -gt 65536) { throw "Client SSH $($pair[0]) is not a file of at most 64 KiB." }
+        # ISO-8859-1 maps every byte to one character: a BOM, CR, NUL or any non-ASCII byte fails the pattern.
+        $text[$pair[0]] = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($path))
+        if ($text[$pair[0]] -cnotmatch '^(?:[\t -~]*\n)+\z') { throw "Client SSH $($pair[0]) is not LF-terminated printable ASCII lines." }
+    }
+    $blocks = [ordered]@{}; $current = $null
+    foreach ($line in $text.fragment.TrimEnd("`n").Split("`n")) {
+        $directive = Get-SshDirective $line
+        if ($null -eq $directive) { if ($line -cmatch '^[ \t]*(#.*)?\z') { continue }; throw 'Client SSH fragment has an unparsed line.' }
+        if ($directive.value -cnotmatch '^[!-~]+\z' -or $directive.value.Contains('"')) { throw 'Client SSH values are one unquoted token.' }
+        if ($directive.keyword -ceq 'host') {
+            if ($directive.value -cnotmatch '^[a-z0-9][a-z0-9.-]*\z' -or $blocks.Contains($directive.value)) { throw 'Client SSH Host is not one new plain alias.' }
+            $current = $directive.value; $blocks[$current] = @{}; continue
+        }
+        if ($null -eq $current -or $directive.keyword -cnotin @('hostname','user','port','proxyjump','hostkeyalias','identityfile','identitiesonly',
+            'stricthostkeychecking','userknownhostsfile','updatehostkeys','batchmode') -or $blocks[$current].ContainsKey($directive.keyword)) { throw 'Client SSH fragment has an unsupported or repeated keyword.' }
+        $blocks[$current][$directive.keyword] = $directive.value
+    }
+    if (-not $blocks.Count) { throw 'Client SSH fragment declares no Host.' }
+    $pins = @{}
+    foreach ($line in $text.pins.TrimEnd("`n").Split("`n")) {
+        if ($line -cnotmatch '^([a-z0-9][A-Za-z0-9.-]*) ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}\z' -or $pins.ContainsKey($Matches[1])) { throw 'Client SSH pins are not one ed25519 line per host key alias.' }
+        $pins[$Matches[1]] = $true
+    }
+    foreach ($name in $blocks.Keys) {
+        $block = $blocks[$name]
+        if ($block['hostname'] -cnotmatch '^[A-Za-z0-9.:-]+\z' -or $block['user'] -cnotmatch '^[a-z_][a-z0-9_-]*\z' -or
+            ($block.ContainsKey('port') -and $block.port -cnotmatch '^[1-9][0-9]{0,4}\z') -or -not $pins.ContainsKey([string]$block['hostkeyalias']) -or
+            $block['identitiesonly'] -cne 'yes' -or $block['stricthostkeychecking'] -cne 'yes' -or $block['batchmode'] -cne 'yes' -or
+            $block['userknownhostsfile'] -cne '~/.ssh/windows-client/known_hosts' -or ($block.ContainsKey('updatehostkeys') -and $block.updatehostkeys -cne 'no') -or
+            ($block.ContainsKey('proxyjump') -and ($block.proxyjump -ceq $name -or -not $blocks.Contains($block.proxyjump))) -or
+            [string]$block['identityfile'] -cnotlike '~/.ssh/*') { throw "Client SSH Host $name is not strict, batch, identity-only, pinned and self-contained." }
+        $identity = SshPath $block.identityfile $Profile
+        AssertPlainPath $identity
+        # An existing key is referenced, never created here.
+        if (-not $identity.StartsWith((Join-Path $Profile '.ssh\')) -or -not (Test-Path -LiteralPath $identity -PathType Leaf)) { throw 'Client SSH identity is not an existing file under ~/.ssh.' }
+        $block.identity = $identity
+    }
+    foreach ($name in $blocks.Keys) {
+        $hop = $name
+        for ($i = 0; $blocks[$hop].ContainsKey('proxyjump'); $i++) { if ($i -ge $blocks.Count) { throw 'Client SSH ProxyJump chain is cyclic.' }; $hop = $blocks[$hop].proxyjump }
+    }
+    if (@($blocks.Values | ForEach-Object { $_.hostkeyalias } | Sort-Object -Unique).Count -ne $pins.Count) { throw 'Client SSH pins have a line for no declared host key alias.' }
+    [ordered]@{ fragment = $text.fragment; pins = $text.pins; blocks = $blocks }
+}
+# The master's one owned Include line: 'client' (the three-path line), 'legacy' (the two-path line, proven undoable)
+# or 'none'. Any other owned line is refused.
+function ClientPrefixState([string]$Config, [string]$Line) {
+    $legacy = 'Include windows-rent/config windows-own/config'
+    foreach ($kind in 'prefix-inserted','file-created') {
+        $open = @(OpenAttempt ($kind + ':' + $Config.ToUpperInvariant()))
+        if (-not $open.Count) { continue }
+        $owned = [string](Get-Field $open[0].desired 'line')
+        # A master created whole by the owner records only its bytes.
+        foreach ($candidate in $legacy,$Line) { if ($kind -ceq 'file-created' -and (HostHash ([Text.UTF8Encoding]::new($false).GetBytes($candidate + "`n"))) -ceq $open[0].desired.sha256) { $owned = $candidate } }
+        if ($owned -ceq $Line) { return @{ state = 'client' } }
+        if ($owned -ceq $legacy) { return @{ state = 'legacy'; plan = (HostUndoPlan $open) } }
+        throw 'SSH master carries another owned line; preserved.'
+    }
+    @{ state = 'none' }
+}
+# ClientSsh (explicit opt-in): the declared public fragment and pins become the owned windows-client slot, and the
+# master's one owned Include line moves from the legacy two paths to three, so ~/.ssh/config (the file Codex App
+# reads) resolves the aliases. Legacy RentSsh/OwnSsh keep writing two paths. Every refusal precedes the first write;
+# an interruption between the legacy undo and the new line leaves the original master, and a rerun completes.
+function HostClientSsh([switch]$Test) {
+    $null = HostCaller
+    $profile = HostProfile
+    $directory = Join-Path $profile '.ssh'
+    $ssh = Join-Path ([Environment]::SystemDirectory) 'OpenSSH\ssh.exe'
+    AssertPlainPath $ssh -Required
+    $declared = ClientSshInput $profile
+    $config = Join-Path $directory 'config'; $backup = Join-Path $directory 'config.before-windows-rent'
+    $fragment = Join-Path $directory 'windows-client\config'; $knownHosts = Join-Path $directory 'windows-client\known_hosts'
+    AssertOwnedSsh @($config,$fragment,$knownHosts) -Test:$Test
+    $others = @(SshConfigFiles $directory | Where-Object { $_.path -ne $fragment })
+    foreach ($name in $declared.blocks.Keys) { if (SshDeclaredCount $others $name -Creating) { throw 'Client SSH alias is declared outside the client slot; preserved.' } }
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    foreach ($pair in @(@($fragment,$declared.fragment),@($knownHosts,$declared.pins))) {
+        AssertPlainPath $pair[0]
+        $effect = FileEffect $pair[0] (HostHash $utf8.GetBytes($pair[1]))
+        if ($Test) {
+            if (-not (Test-EffectStateEqual 'file-created' $effect.desired (ObserveFile $effect.target))) { throw 'Client SSH slot differs from the declaration; pending.' }
+        } else { $null = HostFileState $effect }
+    }
+    $line = 'Include windows-rent/config windows-own/config windows-client/config'
+    $prefix = ClientPrefixState $config $line
+    if ($Test) { if ($prefix.state -cne 'client') { throw 'Client SSH Include is not installed; pending.' } }
+    elseif ($prefix.state -ceq 'none') { HostPrefix $config $backup $line -CheckOnly }
+    if (-not $Test) {
+        ConvergeHostBytes $fragment $utf8.GetBytes($declared.fragment)
+        ConvergeHostBytes $knownHosts $utf8.GetBytes($declared.pins)
+        if ($prefix.state -ceq 'legacy') { UndoHostEffect $prefix.plan }
+        HostPrefix $config $backup $line
+    }
+    $null = SshConfigFiles $directory
+    foreach ($name in $declared.blocks.Keys) {
+        $block = $declared.blocks[$name]; $values = SshEffective $ssh $name
+        $want = @{ hostname = $block.hostname; user = $block.user; port = $(if ($block.ContainsKey('port')) { $block.port } else { '22' })
+            hostkeyalias = $block.hostkeyalias; proxyjump = $(if ($block.ContainsKey('proxyjump')) { $block.proxyjump } else { 'none' })
+            stricthostkeychecking = 'true'; batchmode = 'yes'; identitiesonly = 'yes' }
+        foreach ($key in $want.Keys) {
+            $got = @(if ($values.ContainsKey($key)) { $values[$key] })
+            if (-not ($want[$key] -ceq 'none' -and -not $got.Count) -and ($got.Count -ne 1 -or $got[0] -ine $want[$key])) { throw "Client SSH alias $name resolves a different $key." }
+        }
+        if (@($values.identityfile).Count -ne 1 -or (SshPath $values.identityfile[0] $profile) -ne $block.identity -or
+            @($values.userknownhostsfile).Count -ne 1 -or (SshPath $values.userknownhostsfile[0] $profile) -ne $knownHosts) { throw "Client SSH alias $name resolves a different identity or known_hosts." }
+    }
+    [ordered]@{ mode = $Mode; aliases = @($declared.blocks.Keys); include = $line; configured = $true; recordsWritten = $script:recordsWritten
+        authenticationProof = 'unproven'; appProof = 'unproven' }
 }
 
 # The Access client credential slot (#14): one owner-only file, exactly '<client id>LF<client secret>LF', each line
@@ -3687,7 +3817,7 @@ function Uninstall {
 
 $script:runIdentity = RunIdentity
 try {
-    if ($Mode -cin @('RentSsh','RentSshTest','RentAccess','OwnSsh','OwnSshTest','OwnLogon','OwnLogonTest','HostRemove','QuickHttp')) {
+    if ($Mode -cin @('RentSsh','RentSshTest','RentAccess','OwnSsh','OwnSshTest','OwnLogon','OwnLogonTest','HostRemove','QuickHttp','ClientSsh','ClientSshTest')) {
         $null = HostCaller
         if ($Mode -ceq 'QuickHttp') { QuickHttp; return }
         $test = $Mode.EndsWith('Test')
@@ -3699,6 +3829,8 @@ try {
             'RentAccess' { RentAccess }
             'OwnSsh' { HostSsh -Local }
             'OwnSshTest' { HostSsh -Local -Test }
+            'ClientSsh' { HostClientSsh }
+            'ClientSshTest' { HostClientSsh -Test }
             'OwnLogon' { HostLogon }
             'OwnLogonTest' { HostLogon -Test }
             'HostRemove' { HostRemove }

@@ -1529,7 +1529,7 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
         'ObserveFile','ObserveTree','ObserveHostEffect','ObserveOwnTask','ResolveOwnTaskTriggerUser','OwnTaskName','OwnTaskEffect','OwnTaskXml','RegisterOwnTask','ConvergeOwnTask',
         'HostTreeEffect','InstallHostTree','Classify','HostHash','WriteHostTemp','HostFileState','ConvergeHostBytes','HostPrefix','FileEffect','CreateOwnedFile',
         'HostUndoPlan','UndoHostEffect','HostRemove','HostLogon','AssertPlainPath','HostProfile','AssertHostRuntimeStreams',
-        'OwnResume','OwnInspect','OwnInfo','OwnSshReady','SshConfigFiles','SshDeclaredCount','SshEffective','SshPath','AssertSshEffective','AssertOwnedSsh','HostSsh','Invoke-Native','QuickHttp','HostTreeReferences',
+        'OwnResume','OwnInspect','OwnInfo','OwnSshReady','SshConfigFiles','SshDeclaredCount','SshEffective','SshPath','AssertSshEffective','AssertOwnedSsh','HostSsh','ClientSshInput','ClientPrefixState','HostClientSsh','Invoke-Native','QuickHttp','HostTreeReferences',
         'OwnerOnlySecurity','NewOwnerOnlyFile','OwnerOnlyProblem','RentProxyCommand','RentAccessSlot','Get-RentAccessProblem','PlaceRentAccess'
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'win.ps1'),[ref]$null,[ref]$null)
     foreach ($definition in $ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cin $names},$false)) {
@@ -1712,11 +1712,15 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
     function Invoke-Native([string]$Exe,[string[]]$Arguments,[int]$Seconds,[int[]]$AcceptedExitCodes=@(0),[switch]$Result,[switch]$PlatformOperation) {
         if ($Exe -eq (Join-Path ([Environment]::SystemDirectory) 'OpenSSH\ssh.exe')) {
             if ($Arguments.Count -ne 4 -or $Arguments[0] -cne '-F' -or
-                $Arguments[1] -ne (Join-Path (HostProfile) '.ssh\config') -or
-                $Arguments[2] -cne '-G' -or $Arguments[3] -cne 'windows-rent') { throw 'Unexpected SSH fixture argv.' }
+                $Arguments[1] -ne (Join-Path (HostProfile) '.ssh\config') -or $Arguments[2] -cne '-G') { throw 'Unexpected SSH fixture argv.' }
             $fragmentPath=Join-Path (HostProfile) '.ssh\windows-rent\config'
+            if ($Arguments[3] -cne 'windows-rent') {
+                # Client values are ~-relative: the disposable profile stands in for the native user's home.
+                $fragmentPath=Join-Path $Scratch 'client-G.config'
+                [IO.File]::WriteAllText($fragmentPath,[IO.File]::ReadAllText((Join-Path (HostProfile) '.ssh\windows-client\config')).Replace('~/',(HostProfile).Replace('\','/')+'/'))
+            }
             AssertPlainPath $fragmentPath -Required
-            $PSBoundParameters['Arguments']=[string[]]@('-F',$fragmentPath,'-G','windows-rent')
+            $PSBoundParameters['Arguments']=[string[]]@('-F',$fragmentPath,'-G',$Arguments[3])
             $script:sshFragmentParses++
         }
         & $script:hostNativeInvoke @PSBoundParameters
@@ -1745,6 +1749,64 @@ function HostPrimitiveProof([string]$Root, [string]$Scratch, [switch]$NativeTask
     [IO.File]::WriteAllBytes($fragment,$fragmentBytes)
     Must ((Get-Item -LiteralPath $ssh.launcher).Directory.FullName -eq (Get-Item -LiteralPath $ssh.client).Directory.FullName -and
         [IO.File]::ReadAllText($fragment).Contains('ProxyCommand ' + (RentProxyCommand $ssh.launcher) + "`n")) 'Rent alias runs the packaged launcher beside the pinned client'
+    Must ([IO.File]::ReadAllText($master) -ceq ($include+"`n"+[Text.Encoding]::UTF8.GetString($original))) 'legacy RentSsh still writes the two-path line'
+
+    # ClientSsh: the explicit opt-in client slot, synthetic aliases and pins only. The owned two-path line becomes the
+    # three-path line over the same original bytes; every refusal precedes any record or write.
+    $clientLine=$include+' windows-client/config'
+    $ClientConfig=Join-Path $Scratch 'client-input.config'; $ClientKnownHosts=Join-Path $Scratch 'client-input.known_hosts'
+    [IO.File]::WriteAllText((Join-Path $profile '.ssh\client-ci-identity'),'fixture; never authenticates')
+    $pin='ssh-ed25519 '+[Convert]::ToBase64String([byte[]](@(0,0,0,11)+[Text.Encoding]::ASCII.GetBytes('ssh-ed25519')+@(0,0,0,32)+(1..32)))
+    function ClientBlock([string]$Name,[string]$Endpoint) { "Host $Name`n$Endpoint  IdentityFile ~/.ssh/client-ci-identity`n  IdentitiesOnly yes`n  StrictHostKeyChecking yes`n  UserKnownHostsFile ~/.ssh/windows-client/known_hosts`n  UpdateHostKeys no`n  BatchMode yes`n" }
+    $clientText=(ClientBlock 'ci-first' "  HostName 192.0.2.10`n  User root`n  HostKeyAlias ci-first-Pin`n")+
+        (ClientBlock 'ci-oci' "  HostName 127.0.0.1`n  Port 2223`n  User dev`n  ProxyJump ci-first`n  HostKeyAlias ci-oci`n")
+    $pinsText="ci-first-Pin $pin`nci-oci $pin`n"
+    function ClientInput([string]$Text,[string]$Pins) { [IO.File]::WriteAllText($ClientConfig,$Text); [IO.File]::WriteAllText($ClientKnownHosts,$Pins) }
+    $legacyBytes=[IO.File]::ReadAllBytes($master); $mark=$script:nextSeq
+    ClientInput $clientText $pinsText
+    Refused { HostClientSsh -Test } '*pending*'
+    foreach ($bad in @(
+        @((([string][char]0xFEFF)+$clientText),$pinsText),@($clientText.Replace("`n","`r`n"),$pinsText),@(("Include other`n"+$clientText),$pinsText),
+        @(("Match all`n"+$clientText),$pinsText),@(($clientText+"  ProxyCommand none`n"),$pinsText),@($clientText.Replace('Host ci-oci','Host ci-*'),$pinsText),
+        @($clientText.Replace('StrictHostKeyChecking yes','StrictHostKeyChecking accept-new'),$pinsText),@($clientText.Replace('BatchMode yes','BatchMode no'),$pinsText),
+        @($clientText.Replace('~/.ssh/windows-client/known_hosts','~/.ssh/known_hosts'),$pinsText),@($clientText.Replace('ProxyJump ci-first','ProxyJump windows-rent'),$pinsText),
+        @($clientText.Replace('client-ci-identity','client-ci-missing'),$pinsText),@($clientText,"ci-oci $pin`n"),@($clientText,($pinsText+"ci-oci $pin`n")),
+        @($clientText,($pinsText+"ci-other $pin`n")),@($clientText,$pinsText.Replace('ssh-ed25519 AAAA','ssh-rsa AAAA')))) {
+        ClientInput $bad[0] $bad[1]
+        Refused { HostClientSsh } 'Client SSH *'
+    }
+    ClientInput $clientText.Replace("  User root`n","  User root`n  ProxyJump ci-oci`n") $pinsText
+    Refused { HostClientSsh } '*ProxyJump chain is cyclic*'
+    ClientInput $clientText.Replace('ci-first','windows-rent') $pinsText.Replace('ci-first','windows-rent')
+    Refused { HostClientSsh } '*declared outside the client slot*'
+    ClientInput $clientText $pinsText
+    [IO.File]::AppendAllText($master,"# user drift`n")
+    Refused { HostClientSsh } '*Owned SSH file/prefix is changed*'
+    [IO.File]::WriteAllBytes($master,$legacyBytes); [IO.File]::WriteAllText($backup,'changed')
+    Refused { HostClientSsh } '*backup is missing, changed or unowned*'
+    [IO.File]::WriteAllBytes($backup,$original)
+    Must ($script:nextSeq -eq $mark -and (HostHash ([IO.File]::ReadAllBytes($master))) -ceq (HostHash $legacyBytes) -and
+        -not (Test-Path -LiteralPath (Join-Path $profile '.ssh\windows-client'))) 'every ClientSsh refusal precedes any record or write'
+    $client=HostClientSsh
+    Must ([IO.File]::ReadAllText($master) -ceq ($clientLine+"`n"+[Text.Encoding]::UTF8.GetString($original)) -and
+        (@($client.aliases) -join ',') -ceq 'ci-first,ci-oci') 'explicit ClientSsh moves the owned line to three paths over the original bytes'
+    $mark=$script:nextSeq; $null=HostClientSsh; $null=HostClientSsh -Test; $null=HostSsh; $null=HostSsh -Test
+    Must ($script:nextSeq -eq $mark) 'ClientSsh repeat and legacy RentSsh after the transition are no-ops'
+    $clientFragment=Join-Path $profile '.ssh\windows-client\config'
+    [IO.File]::AppendAllText($clientFragment,"# user drift`n")
+    Refused { HostClientSsh -Test } '*Owned SSH file/prefix is changed*'
+    [IO.File]::WriteAllText($clientFragment,$clientText)
+    ClientInput $clientText $pinsText.Replace('ci-oci ','ci-oci  ')
+    Refused { HostClientSsh } 'Client SSH pins*'
+    ClientInput $clientText.Replace('2223','2224') $pinsText
+    Refused { HostClientSsh } '*remove the owned scope before rebinding*'
+    ClientInput $clientText $pinsText
+    Must ($script:nextSeq -eq $mark) 'read-only Test and changed declarations write nothing'
+    # Interrupted after the legacy undo, before the three-path line: the original master, Test pending, a rerun completes.
+    UndoHostEffect (HostUndoPlan @(OpenAttempt $prefixId))
+    Refused { HostClientSsh -Test } '*pending*'
+    $null=HostClientSsh
+    Must ([IO.File]::ReadAllText($master).StartsWith($clientLine+"`nHost nixos-vm")) 'interrupted transition completes on rerun'
 
     # RentAccess (#14): the owner-only Access client slot through the same host ledger, synthetic values only. The
     # integrity record stays in the ledger; no answer, refusal or log line carries a value or its SHA-256.
@@ -1948,7 +2010,35 @@ static class Child { static int Main(string[] args) {
     }
     function HostTreeReferences { } # no foreign task/process on these disposable fixture trees
     $null=HostRemove
-    Must ((HostHash ([IO.File]::ReadAllBytes($master))) -ceq (HostHash $original) -and -not (Test-Path -LiteralPath $fragment)) 'scoped production removal keeps unrelated alias and returns original prefix bytes'
+    Must ((HostHash ([IO.File]::ReadAllBytes($master))) -ceq (HostHash $original) -and -not (Test-Path -LiteralPath $fragment) -and
+        -not (Test-Path -LiteralPath $clientFragment) -and -not (Test-Path -LiteralPath (Join-Path $profile '.ssh\windows-client\known_hosts'))) 'scoped production removal keeps unrelated alias and returns original prefix bytes'
+    # ClientSsh over a master with no owned line: an unowned backup refuses with no write, then a plain three-path prefix.
+    [IO.File]::WriteAllText($backup,'unowned backup'); $mark=$script:nextSeq
+    Refused { HostClientSsh } '*SSH file is foreign or changed*'
+    Must ($script:nextSeq -eq $mark -and -not (Test-Path -LiteralPath $clientFragment)) 'no-line ClientSsh refuses an unowned backup before any write'
+    [IO.File]::Delete($backup)
+    $null=HostClientSsh; $mark=$script:nextSeq; $null=HostClientSsh; $null=HostClientSsh -Test
+    Must ([IO.File]::ReadAllText($master) -ceq ($clientLine+"`n"+[Text.Encoding]::UTF8.GetString($original)) -and $script:nextSeq -eq $mark) 'no-line master gets the three-path prefix once'
+    $null=HostRemove
+    Must ((HostHash ([IO.File]::ReadAllBytes($master))) -ceq (HostHash $original)) 'no-line ClientSsh removal returns the original master'
+    # A master the owner created whole with the legacy line: drift refuses; the move undoes (deletes) it and creates the
+    # three-path master. Interrupted there, no master exists: Test is pending, a rerun creates it.
+    [IO.File]::Delete($master)
+    HostPrefix $master $backup $include
+    [IO.File]::AppendAllText($master,"# user drift`n"); $mark=$script:nextSeq
+    Refused { HostClientSsh } '*Owned SSH file/prefix is changed*'
+    Must ($script:nextSeq -eq $mark) 'created-master drift refuses before any write'
+    [IO.File]::WriteAllText($master,$include+"`n")
+    $null=HostClientSsh; $mark=$script:nextSeq; $null=HostClientSsh; $null=HostClientSsh -Test
+    Must ([IO.File]::ReadAllText($master) -ceq ($clientLine+"`n") -and $script:nextSeq -eq $mark) 'owner-created legacy master moves to a created three-path master once'
+    UndoHostEffect (HostUndoPlan @(OpenAttempt ('file-created:'+$master.ToUpperInvariant())))
+    Must (-not (Test-Path -LiteralPath $master)) 'interrupted created-master move leaves no master'
+    Refused { HostClientSsh -Test } '*pending*'
+    $null=HostClientSsh
+    Must ([IO.File]::ReadAllText($master) -ceq ($clientLine+"`n")) 'interrupted created-master move completes on rerun'
+    $null=HostRemove
+    Must (-not (Test-Path -LiteralPath $master) -and -not (Test-Path -LiteralPath $clientFragment)) 'created-master removal returns its original absence'
+    [IO.File]::WriteAllBytes($master,$original)
 
     # Native deployment result may be old/new/unknown. Recovery is production
     # Get-EffectAttempt and scoped undo, never an independent in-memory model.
@@ -3114,6 +3204,8 @@ if (@($uiBase.Values) -ccontains $uiFace) { throw "Proof requires no UI font slo
 MustReject { Win51 @('-Mode', 'Validate', '-Typography') } '-Typography is only for -Mode Apply*'
 MustReject { Win51 @('-Mode', 'Apply', '-Typography', '-Packages', 'AutoHotkey') } '-Typography is only for -Mode Apply*'
 MustReject { Win51 @('-Mode', 'Apply', '-AppFonts', '-Typography') } '-AppFonts is only for -Mode Apply*'
+MustReject { Win51 @('-Mode', 'ClientSsh', '-ClientConfig', 'x') } '-ClientConfig and -ClientKnownHosts are both required*'
+MustReject { Win51 @('-Mode', 'RentSsh', '-ClientConfig', 'x', '-ClientKnownHosts', 'y') } '-ClientConfig and -ClientKnownHosts are both required*'
 # -AppFonts alone touches only a present app's fonts: here (no app) nothing at all.
 $mark = LastSeq
 $appOnly = Win51 @('-Mode', 'Apply', '-AppFonts')
