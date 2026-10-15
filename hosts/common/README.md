@@ -381,6 +381,79 @@ OCI Linux private-key path is never used as a Windows identity. The unrelated
 `nixos-vm` alias is preserved. The existing native Windows OpenSSH client is used;
 if it is missing the adapter refuses, rather than adding another distribution.
 
+**Client aliases (opt-in).** `ClientSsh` / `ClientSshTest` place an explicitly
+supplied public SSH declaration where Codex App can find it. Codex App reads only
+`~/.ssh/config` and its Includes. Nothing here discovers or generates aliases or keys:
+
+```powershell
+.\win.ps1 -Mode ClientSsh -ClientConfig <Host fragment> -ClientKnownHosts <pins>
+.\win.ps1 -Mode ClientSshTest -ClientConfig <Host fragment> -ClientKnownHosts <pins>  # read-only
+```
+
+Both inputs are LF-terminated printable ASCII (no BOM or CR), at most 64 KiB each.
+The fragment has only `Host` blocks, each naming one new plain alias. A block may use
+only `HostName`, `User`, `Port`, `ProxyJump`, `HostKeyAlias`, `IdentityFile`,
+`IdentitiesOnly`, `StrictHostKeyChecking`, `UserKnownHostsFile`, `UpdateHostKeys`
+and `BatchMode`. The following are refused:
+
+- `Include`, `Match`, `ProxyCommand` or a wildcard;
+- anything other than `StrictHostKeyChecking yes`, `BatchMode yes` and
+  `IdentitiesOnly yes`;
+- a `UserKnownHostsFile` other than `~/.ssh/windows-client/known_hosts`;
+- an `IdentityFile` that is not an existing file under `~/.ssh` (it is never created);
+- a `ProxyJump` to an alias outside the fragment.
+
+The pins file holds exactly one `<HostKeyAlias> ssh-ed25519 <key>` line per declared
+host key alias and nothing else. An alias already declared in any other inspected
+SSH file is refused. Both inputs become owned `file-created` effects:
+`~/.ssh/windows-client/{config,known_hosts}`.
+
+The master's one owned Include line then moves from
+`Include windows-rent/config windows-own/config` to the three-path line
+`Include windows-rent/config windows-own/config windows-client/config`. This is
+the only change to the master. When the owned line is the legacy two-path prefix,
+it is first undone to its exact owned backup, and the three-path line is inserted
+over the same original bytes. A master that the owner created whole (only the
+legacy line) is undone, which deletes it, and a three-path master is created. With
+no owned line, the line is inserted as a normal prefix.
+
+The input and ownership checks refuse before any record or write. They cover
+invalid inputs (including a cyclic `ProxyJump` chain), an alias collision, a changed
+master or slot, an unowned or changed backup, another owned line, and changed
+declared bytes (remove the owned scope before rebinding). The final
+`ssh -F ~/.ssh/config -G` check is a postcondition after convergence. If it fails,
+the owned state stays as written for a rerun or `HostRemove`.
+
+An interruption between the undo and the new line leaves the original prior bytes:
+the master without any owned Include line, so the rent and own aliases do not
+resolve either until the rerun. For an owner-created master, no master exists then.
+`ClientSshTest` reports either state pending, and a rerun completes it. The same
+declaration again writes nothing. `ClientSshTest` writes nothing and passes only
+when both slots are exact, the three-path line is owned and
+`ssh -F ~/.ssh/config -G` resolves every alias to the declared endpoint, key,
+pins slot and strict batch settings.
+
+Without `ClientSsh`, `RentSsh` / `OwnSsh` still write the two-path line. On a
+moved master they keep the three-path line. `HostRemove` undoes the client slot with
+the other host effects and returns the exact prior master.
+
+Installed versions from before this mode do not accept the three-path line, and not
+all of them refuse it before writing:
+
+- Their `RentSsh`/`OwnSsh` (and Test) and `HostRemove` refuse it.
+- Their `OwnLogon` switches the logon Task first. It then fails in runtime collection
+  (`CollectHostRuntime` → `HostTreeReferences` → `SshConfigFiles`), which is a
+  partial effect.
+
+So before the move, the operator must establish in the normative record that no
+pre-`ClientSsh` `OwnLogon`, `HostRemove`, `RentSsh` or `OwnSsh` runs afterwards.
+Authentication, App use and any live host change remain separately authorized.
+
+CI proves the slot and the transition in a disposable profile. Its native `ssh -G`
+reads the generated fragment directly, with `~/` mapped to that profile. Resolution
+through the real master's relative Include is proved only on the real home, at
+adoption.
+
 ### G6I3 host recovery (#8 / #14)
 
 This slice reuses the seven common source files and the single CI distribution.
@@ -478,6 +551,7 @@ public Quick endpoint has been established by this slice.
 | Artifact / four-file runtime | compiler subset/inventory; native early refusals; default-stream copy | trusted exact CI archive before application |
 | Task lifecycle | production old/new/unknown failure, version chain, undo; disposable native descriptor register/export/remove | final remote adoption, real logon/reboot, cold WSLC behavior and console UX |
 | SSH configuration | native generated-fragment parsing; production prefix backup/interruption/drift/undo; existing local alias compatibility | real-home relative Include integration; local g6i3-own strict SSH and Codex after logon; host→rent Access permitted/denied behavior |
+| Client aliases (`ClientSsh`) | synthetic fragment/pins through the production ledger in PowerShell 7 and 5.1: input (incl. cyclic jump)/collision/drift/backup refusals with no record or write; two-to-three-path move over the original bytes, from no owned line and from an owner-created master; repeat and legacy `RentSsh` no-ops; read-only Test; interrupted moves completed by rerun; `HostRemove` to the exact prior master or absence; real Windows OpenSSH `-G` of the generated slot (not through the master Include) | normative exclusion of pre-`ClientSsh` `OwnLogon`/`HostRemove`/`RentSsh`/`OwnSsh`; real-home master Include resolution at adoption; strict SSH and Codex App use of the declared aliases |
 | Access client slot and launcher | synthetic owner-only slot through the ledger in PowerShell 7 and 5.1 (create, repeat, scoped-undo rotation, three interruptions, foreign/same-length/ACL/temp refusal); launcher with a native test child: byte-exact duplex, EOF, separate stderr, exit code, exact argv and `TUNNEL_*`, no value in command lines; real OpenSSH `-T`/`-tt` reach it with bytes both ways; real pinned client starts from it without printing values; an isolated debug control shows the values become request headers | envs' real placement; provider acceptance and service-only denial; no-browser on rejection; stored-token fallback; packaged Windows Codex reading the alias, slot and ledger |
 | Quick | fixed argv and environment/origin negatives; no publication | approved existing HTTP response and actual temporary public response |
 | Tail retirement | no stop/uninstall in source or CI | actual noninteractive **rentR→G6I3→own OCI Nix gh** alternative route plus required SSH/Codex/reboot paths |
