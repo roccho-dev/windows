@@ -127,18 +127,22 @@ let
       ($r.instances[0].attributes.id == "windows") and
       ($r.instances[0].attributes.name == "windows"))
   '';
-  # The only principal source: the declared bound repository's existing Git credential helper slot, read with no
-  # system/global config, prompt or askpass. It sets provider_token for the caller and prints nothing; an unbound
-  # origin, missing slot, missing token or another principal fails closed.
+  # The only principal source: the declared bound repository's existing Git credential helper slot. Both Git calls
+  # drop any inherited repository or config injection, read no system/global config and never prompt or askpass
+  # (the bound repository already names the username, so a fallback could otherwise supply the token). It sets
+  # provider_token for the caller and prints nothing; an unbound origin, missing slot, missing token or another
+  # principal fails closed.
   credential = pkgs.writeText "github-root-bound-credential.sh" ''
     bound_token() {
       local src=$1 principal=$2 url=$3 cred
+      local -a g=(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY
+        -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_CONFIG -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT
+        -u GIT_EXEC_PATH -u GIT_ASKPASS -u SSH_ASKPASS
+        GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+        git -C "$src" -c core.askPass= -c credential.interactive=never)
       provider_token=
-      [ "$(GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -C "$src" config --get remote.origin.url)" = "$url" ] ||
-        return 1
-      cred=$(printf 'url=%s\n\n' "$url" |
-        env -u GIT_ASKPASS -u SSH_ASKPASS GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-          git -C "$src" -c credential.interactive=never credential fill) || return 1
+      [ "$("''${g[@]}" config --get remote.origin.url)" = "$url" ] || return 1
+      cred=$(printf 'url=%s\n\n' "$url" | "''${g[@]}" credential fill) || return 1
       case $'\n'$cred$'\n' in
         *$'\n'"username=$principal"$'\n'*) ;;
         *) unset cred; return 1 ;;
