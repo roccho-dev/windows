@@ -559,6 +559,18 @@ assert docker("exec",container,"/bin/bash","-euc",
 print("PASS: same real OCI/Nix receiver READ->CHANGE->RECORD-only->ROLLBACK; "
       "pre-effect refusal zero, post-send CHANGE/RECORD/ROLLBACK UNKNOWN no replay, "
       "Base/state unchanged")
+# P3: invoke the actual envs #103 caller in THIS Python process against
+# THIS SAME disposable receiver + Docker/Nix Port. The separate script fetches
+# immutable public SOURCE files by fixed SHA and verifies Git blob bytes.
+import runpy
+runpy.run_path("hosts/rent/caller-receiver-proof.py", run_name="__main__",
+               init_globals={
+                   "P2_ACTUAL": port, "P2_RECEIVER": receiver, "P2_BINDING": binding,
+                   "P2_BINDING_PATH": source_path, "P2_DOCKER": docker,
+                   "P2_REQUEST": request, "P2_GRANT": grant, "P2_BOUND": bound,
+                   "P2_CONTAINER": container, "P2_T0": t0, "P2_T1": t1,
+                   "P2_Q": q, "P2_REV": rev, "P2_IMAGE": image, "P2_STATE": state,
+               })
 PY
 # Negative O-only fixtures run with the synthetic OCI stopped; each damaged preimage is retained
 # and each read must refuse without mutation. Repair is part of disposable test, not observer code.
