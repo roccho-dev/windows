@@ -1,0 +1,59 @@
+name: opencode-deepseek-v4.1-free
+
+on:
+  pull_request:
+    paths:
+      - hosts/profile/nix.nix
+      - hosts/profile/opencode.nix
+      - .github/workflows/opencode-dsv41.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opencode-dsv41-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  free-model-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+      - name: Build the actual own Tool profile (no second CLI installation)
+        run: nix build .#own-profile --no-write-lock-file --print-build-logs --out-link oc-host-profile
+      - name: Prove OpenCode 2 executes the exact free model, not a paid fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          executable="$PWD/oc-host-profile/bin/opencode"
+          test "$("$executable" --version)" = "opencode v2.0.30"
+          tmp=$(mktemp -d)
+          mkdir -p "$tmp/home" "$tmp/config/opencode" "$tmp/data" "$tmp/cache" "$tmp/project"
+          printf '%s\n' '{"update":"disable","warming":false}' > "$tmp/config/opencode/opencode.json"
+          # A fresh isolated HOME and empty project guarantee that neither host credentials,
+          # OpenCode Go bindings nor unrelated project instructions are reused.
+          # No API key, token, subscription, fallback provider or paid model is supplied.
+          (
+            cd "$tmp/project"
+            env -i HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+              XDG_CACHE_HOME="$tmp/cache" PATH="$PATH" TERM=dumb \
+              timeout 180 "$executable" run --standalone \
+              --model opencode/deepseek-v4.1-flash-free --format json \
+              'Reply with exactly the text DSV41_CI_FREE_OK, with nothing else.' \
+              > "$tmp/events.jsonl" 2> "$tmp/error.log"
+          ) || {
+            echo 'RED: OpenCode 2 / DeepSeek V4.1 Flash Free live response failed' >&2
+            sed -E 's/(api[_-]?key|token|password)[=:][^ ]+/\1=[redacted]/Ig' "$tmp/error.log" >&2
+            exit 1
+          }
+          # Only a generated assistant text event counts: not an echoed prompt, model listing,
+          # zero exit, a mocked response, or a different provider's output.
+          jq -s -e '[.[] | select(.type == "text" and (.part.text | type == "string")) | .part.text] |
+            join("") | gsub("[[:space:]]"; "") == "DSV41_CI_FREE_OK"' "$tmp/events.jsonl" >/dev/null
+          printf '%s\n' 'PASS: pinned OpenCode 2.0.30, actual free-model text response' >> "$GITHUB_STEP_SUMMARY"

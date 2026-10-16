@@ -34,6 +34,7 @@ ${releaseVersionCases}      *) echo "release-version: unknown CLI ''${1:-}" >&2;
     esac
   '';
   # Only the immutable upstream is consumed; own never evaluates the dev credential resolver/launcher.
+  opencode = import ./opencode.nix { inherit pkgs; };
   pi = import ../../oci/dev/pi.nix { inherit pkgs; };
   ownPiEntry = pkgs.runCommand "own-pi-entry-${pi.version}" {
     nativeBuildInputs = [ pkgs.makeWrapper ];
@@ -82,7 +83,7 @@ pkgs.buildEnv {
   # Every supported own generation anchors the identical H_B at the existing absolute helper locator.
   paths = (if mode == "own" then [ github.helper ownPi ] ++ pkgs.lib.optional (piTarget != null) ownAgeInit
       else corePaths ++ [ github.wrapper github.helper ])
-    ++ [ codex claude releaseVersion ] ++ extra;
+    ++ [ codex claude opencode releaseVersion ] ++ extra;
   pathsToLink = [ "/bin" ];
   passthru = { inherit releaseDefinitions releaseVersions github ownPiEntry ownPi; piUpstream = pi.upstream; }
     // pkgs.lib.optionalAttrs (piTarget != null) { inherit ownAgeInit; };
