@@ -7,7 +7,6 @@ Its immutable public source inputs are content-addressed Git blobs.
 """
 from __future__ import annotations
 
-import base64
 import copy
 import hashlib
 import json
@@ -70,7 +69,7 @@ def proof():
     same_image, state_before = P2_IMAGE, P2_STATE
     assert actual.fixture_only is True
     assert actual.kind == "windows.syntheticDisposableNixTransport.v0"
-    assert blob(json.dumps(binding, indent=2).encode()) or binding["proposed_q"] == q
+    assert binding["proposed_q"] == q
     # The already-reviewed CI loader fetched this exact F1 Git blob to $binding.
     f1_bytes = Path(P2_BINDING_PATH).read_bytes()
     assert blob(f1_bytes) == F1_BLOB
