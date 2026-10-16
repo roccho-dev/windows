@@ -39,6 +39,8 @@ rec {
           say,
           announce,
           childEnv,
+          secretName ? "JEV_API_KEY",
+          cipherPath ? "ciphertexts/dev-jev-api.oci-dev.sops.yaml",
         }:
         pkgs.writeShellApplication {
           inherit name;
@@ -50,7 +52,7 @@ rec {
                 identity=${q identity}
                 cu=${pkgs.coreutils}/bin
                 grep=${pkgs.gnugrep}/bin/grep
-                cipher_path=ciphertexts/dev-jev-api.oci-dev.sops.yaml
+                cipher_path=${cipherPath}
                 usage() {
                   echo "usage: ${name} ${usage}" >&2
                   exit 2
@@ -117,8 +119,8 @@ rec {
                 cipher=$work/cipher.yaml
                 git_ -C "$repo" cat-file blob "$at" > "$cipher"
                 fields=$("$grep" -E '^[^[:space:]#][^:]*:' "$cipher" | "$cu/cut" -d: -f1 | "$cu/sort" | "$cu/tr" '\n' ' ')
-                [ "$fields" = "JEV_API_KEY sops " ] || fail "the ciphertext fields differ"
-                "$grep" -q '^JEV_API_KEY: ENC\[AES256_GCM,' "$cipher" || fail "the ciphertext is not SOPS-encrypted"
+                [ "$fields" = "${secretName} sops " ] || fail "the ciphertext fields differ"
+                "$grep" -q '^${secretName}: ENC\[AES256_GCM,' "$cipher" || fail "the ciphertext is not SOPS-encrypted"
                 recipients=$("$grep" -E '^[[:space:]]*-?[[:space:]]*recipient:[[:space:]]*age1[0-9a-z]+[[:space:]]*$' "$cipher" \
                   | "$grep" -oE 'age1[0-9a-z]+' || true)
                 { [ -n "$recipients" ] && [ "$(echo "$recipients" | "$cu/wc" -l)" -eq 1 ]; } \
@@ -136,7 +138,7 @@ rec {
                 say "built $program"
 
                 say "decrypt envs $envs_sha ciphertext $at recipient $recipients"
-                key=$(SOPS_AGE_KEY_FILE=$identity ${pkgs.sops}/bin/sops --decrypt --input-type yaml --extract '["JEV_API_KEY"]' \
+                key=$(SOPS_AGE_KEY_FILE=$identity ${pkgs.sops}/bin/sops --decrypt --input-type yaml --extract '["${secretName}"]' \
                   "$cipher" 2>/dev/null < /dev/null) || fail "decryption failed"
                 [ -n "$key" ] || fail "the decrypted key is empty"
                 { [ "''${#key}" -le 4096 ] && [[ $key != *$'\n'* ]]; } || fail "the decrypted key is not one short line"
@@ -151,15 +153,44 @@ rec {
                 say "${announce}"
                 # shellcheck disable=SC2016
                 exec "$cu/env" -i PATH="$cu" HOME=/homeless-shelter LANG=C.UTF-8 SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt ${childEnv} \
-                  ${pkgs.bash}/bin/bash -c 'IFS= read -r -u 3 JEV_API_KEY || true
+                  ${pkgs.bash}/bin/bash -c 'IFS= read -r -u 3 ${secretName} || true
                     for f in /proc/$$/fd/*; do
                       n=''${f##*/}
                       if [[ $n =~ ^[0-9]+$ ]] && [ "$n" -gt 2 ] && [ -e "$f" ]; then exec {n}<&-; fi
                     done
-                    unset f n; export JEV_API_KEY; exec env -u PWD -u SHLVL -u OLDPWD -- "$0" "$@"' \
+                    unset f n; export ${secretName}; exec env -u PWD -u SHLVL -u OLDPWD -- "$0" "$@"' \
                   "$program" "''${program_args[@]}" 3<<< "$key"
           '';
         };
+      # The command and credential are build-time literals, never caller-selected operands.
+      mkOps = { name, command, secretName, cipherPath }: mkLaunch {
+        inherit name secretName cipherPath;
+        usage = "--envs-sha <40-hex> --ops-sha <40-hex>";
+        say = "2";
+        announce = "ops $ops_sha ${command} with PATH HOME LANG SSL_CERT_FILE ${secretName}";
+        childEnv = "";
+        parse = ''
+          ops_remote=${q opsRemote}
+          envs_sha="" ops_sha=""
+          [ "$#" -eq 4 ] || usage
+          while [ "$#" -gt 0 ]; do
+            case "$1" in
+              --envs-sha) [ -z "$envs_sha" ] || usage; envs_sha=$2 ;;
+              --ops-sha) [ -z "$ops_sha" ] || usage; ops_sha=$2 ;;
+              *) usage ;;
+            esac
+            shift 2
+          done
+          [[ $envs_sha =~ ^[0-9a-f]{40}$ && $ops_sha =~ ^[0-9a-f]{40}$ ]] || usage
+        '';
+        build = ''
+          out=$(nix_ build --no-link --print-out-paths "git+$ops_remote?rev=$ops_sha#packages.x86_64-linux.jev") \
+            || fail "cannot build the ops jev package"
+          [ "$(printf '%s\n' "$out" | "$cu/wc" -l)" -eq 1 ] || fail "the ops jev package is not one output"
+          program=$out/bin/${command}
+          { [ -f "$program" ] && [ -x "$program" ]; } || fail "the ops jev package has no bin/${command}"
+        '';
+      };
     in
     {
       # Creates the target identity once: fixed path, safe parent, exclusive create, public recipient output only.
@@ -346,33 +377,18 @@ rec {
       };
       # Runs the exact ops Jev CLI once: the caller's stdin is its request, its single stdout line is the result, and
       # the launcher's own messages go to stderr. Only the fixed package output; no attribute, program or argument choice.
-      ops = mkLaunch {
+      ops = mkOps {
         name = "ops-jev";
-        usage = "--envs-sha <40-hex> --ops-sha <40-hex>";
-        say = "2";
-        announce = "ops $ops_sha jev with PATH HOME LANG SSL_CERT_FILE JEV_API_KEY";
-        childEnv = "";
-        parse = ''
-          ops_remote=${q opsRemote}
-          envs_sha="" ops_sha=""
-          [ "$#" -eq 4 ] || usage
-          while [ "$#" -gt 0 ]; do
-            case "$1" in
-              --envs-sha) [ -z "$envs_sha" ] || usage; envs_sha=$2 ;;
-              --ops-sha) [ -z "$ops_sha" ] || usage; ops_sha=$2 ;;
-              *) usage ;;
-            esac
-            shift 2
-          done
-          [[ $envs_sha =~ ^[0-9a-f]{40}$ && $ops_sha =~ ^[0-9a-f]{40}$ ]] || usage
-        '';
-        build = ''
-          out=$(nix_ build --no-link --print-out-paths "git+$ops_remote?rev=$ops_sha#packages.x86_64-linux.jev") \
-            || fail "cannot build the ops jev package"
-          [ "$(printf '%s\n' "$out" | "$cu/wc" -l)" -eq 1 ] || fail "the ops jev package is not one output"
-          program=$out/bin/jev
-          { [ -f "$program" ] && [ -x "$program" ]; } || fail "the ops jev package has no bin/jev"
-        '';
+        command = "jev";
+        secretName = "JEV_API_KEY";
+        cipherPath = "ciphertexts/dev-jev-api.oci-dev.sops.yaml";
+      };
+      # Explicitly built when needed; not added to an own/rent/dev global profile.
+      typellm = mkOps {
+        name = "ops-typellm";
+        command = "typellm";
+        secretName = "TYPELLM_API_KEY";
+        cipherPath = "ciphertexts/dev-typellm-api.oci-dev.sops.yaml";
       };
     };
   jev = jevTools {
