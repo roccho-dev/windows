@@ -292,8 +292,10 @@ subject=dict(target_ref=binding["target_ref"],host_ref=binding["host_ref"],
              unit_ref=binding["unit_ref"],scope=binding["scope"],
              actor_ref="ci-fixed-W",work_ref="ci-rent-source-SUT",
              attempt_ref="ci-rent-source-1",route_ref="ci-only-route")
-def grant(step,**updates):
-    g=dict(kind="envs.syntheticStageGrant.v0",**subject,step=step,
+def grant(granted_step,**updates):
+    # Use a distinct positional variable so an intentionally invalid
+    # grant_over={"step":"RECORD"} reaches the receiver rather than raising.
+    g=dict(kind="envs.syntheticStageGrant.v0",**subject,step=granted_step,
            permit=True,issuer_fixture="ci-independent-source-issuer")
     g.update(updates)
     return g
@@ -325,7 +327,13 @@ class Actual:
     def __init__(self):
         self.reads=self.selects=self.records=self.rollbacks=0
         self.fail_after_write=False
+        self.fail_before_write=False
+        self.fail_record_ack=False
         self.reader=Path("hosts/rent/read-selected.sh").read_text(encoding="utf-8")
+    def expected_producer_store(self):
+        # $t0 is the actual immutable F1 Nix-built Tool-only output,
+        # independent of caller-proposed store/desired/q.
+        return t0
     def observe(self):
         self.reads+=1
         try:
@@ -381,12 +389,18 @@ class Actual:
             return False
     def select(self,store):
         self.selects+=1
+        if self.fail_before_write:
+            raise RuntimeError("CI synthetic write acknowledgement unknown before Nix")
         docker("exec",container,"/bin/nix-env","--profile",
                "/nix/var/nix/profiles/rent-dev","--set",store)
         if self.fail_after_write:
             raise RuntimeError("CI synthetic acknowledgement lost after real Nix write")
     def record(self,receipt):
         self.records+=1
+        if self.fail_record_ack:
+            raise RuntimeError("CI record stored but acknowledgement lost")
+        # This is a disposable transport ACK, not a Target receipt or ledger.
+        return "CI_ONLY_RECORD_NO_TARGET_LEDGER"
     def rollback(self,preimage):
         assert preimage in (t0,t1)
         self.rollbacks+=1
@@ -404,6 +418,11 @@ def call(action,*,req_over=None,grant_over=None,bound_over=None,receipt=None):
     req=request(action,**(req_over or {}))
     g=grant(step,**(grant_over or {}))
     b=bound(**(bound_over or {}))
+    if req["attempt_ref"] != subject["attempt_ref"]:
+        # Explicit CI issuer grants a separate exact attempt. Do NOT rebind
+        # other mutated subject fields, such as an unapproved route.
+        g["attempt_ref"]=req["attempt_ref"]
+        b["read_grant"]["attempt_ref"]=req["attempt_ref"]
     return receiver.receive_step(req,g,b,port,receipt=receipt)
 def check(ref,stage,**kwargs):
     result=call(ref,**kwargs)
@@ -422,6 +441,12 @@ assert got["observation"]["store_path"]==t1 and port.selects==0
 check("CHANGE","REFUSED_PRE_EFFECT",grant_over={"step":"RECORD"})
 check("CHANGE","REFUSED_PRE_EFFECT",req_over={"route_ref":"ci-other-route"})
 check("CHANGE","REFUSED_PRE_EFFECT",req_over={"requested_store":t1})
+# R B: q/material unchanged while both caller-owned desired and request
+# point at t1 (the other VALID closure). Independently built F1 says t0.
+bad_d=bound()["desired"]
+bad_d["store_path"]=t1
+check("CHANGE","REFUSED_PRE_EFFECT",req_over={"requested_store":t1},
+      bound_over={"desired":bad_d})
 assert port.selects==0 and port.records==0 and port.rollbacks==0
 issued=check("CHANGE","TOOL_CHANGE_READBACK_CANDIDATE")["issued_receipt"]
 assert issued and issued["selected"]==t0 and issued["preimage"]==t1
@@ -451,6 +476,10 @@ assert port.rollbacks==1 and port.observe()["store_path"]==t1
 check("ROLLBACK","REFUSED_PRE_EFFECT",
       bound_over={"previous_state":"CONFIRMED"},receipt=issued)
 assert port.rollbacks==1
+# R C: ROLLBACK must not erase the consumed-attempt tombstone. The same
+# attempt, now with old T1 selected and previous_state reset, may NOT select.
+check("CHANGE","REFUSED_PRE_EFFECT")
+assert port.selects==1 and port.observe()["store_path"]==t1
 # Simulate a real Nix write followed by lost acknowledgement: UNKNOWN, never
 # retry an equivalent change in this disposable instance. CI cleanup is explicit.
 port.fail_after_write=True
@@ -462,6 +491,35 @@ check("CHANGE","REFUSED_PRE_EFFECT",
 assert port.selects==2
 docker("exec",container,"/bin/nix-env","--profile",
        "/nix/var/nix/profiles/rent-dev","--rollback") # CI teardown, NOT receiver retry
+assert port.observe()["store_path"]==t1
+# R C: when an invoked select fails before an actual Nix write, the OLD O
+# remains visible but that same attempt must still never be replayed.
+port.fail_after_write=False
+port.fail_before_write=True
+check("CHANGE","UNKNOWN_AFTER_SEND_NO_REPLAY",
+      req_over={"attempt_ref":"ci-rent-source-3"})
+assert port.selects==3 and port.observe()["store_path"]==t1
+port.fail_before_write=False
+check("CHANGE","REFUSED_PRE_EFFECT",
+      req_over={"attempt_ref":"ci-rent-source-3"})
+assert port.selects==3 and port.observe()["store_path"]==t1
+# R A: RECORD ACK loss can follow a real CI-only record side effect. The
+# same attempt's second RECORD must not call transport.record again.
+issued4=check("CHANGE","TOOL_CHANGE_READBACK_CANDIDATE",
+              req_over={"attempt_ref":"ci-rent-source-4"})["issued_receipt"]
+assert issued4["selected"]==t0 and port.selects==4
+port.fail_record_ack=True
+check("RECORD","UNKNOWN_AFTER_SEND_NO_REPLAY",
+      req_over={"attempt_ref":"ci-rent-source-4"},
+      bound_over={"previous_state":"CONFIRMED"},receipt=issued4)
+assert port.records==2
+port.fail_record_ack=False
+check("RECORD","REFUSED_PRE_EFFECT",
+      req_over={"attempt_ref":"ci-rent-source-4"},
+      bound_over={"previous_state":"CONFIRMED"},receipt=issued4)
+assert port.records==2 and port.selects==4
+docker("exec",container,"/bin/nix-env","--profile",
+       "/nix/var/nix/profiles/rent-dev","--rollback") # CI teardown only
 assert port.observe()["store_path"]==t1
 assert docker("inspect","-f","{{.Image}}",container)==image
 assert docker("exec",container,"/bin/bash","-euc",
