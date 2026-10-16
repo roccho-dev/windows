@@ -178,7 +178,10 @@ def proof():
                     return "SYNTHETIC_ROLLBACK_NOT_NEW_D_SUCCESS"
 
             bridge = SamePortBridge()
+            # P1 envs judge() demands this explicit CI-only synthetic admission
+            # shape; it is never an accepted D, Target permit, or P2 receiver D.
             desired = {"kind": "envs.syntheticDesired.v0",
+                       "admission": "SYNTHETIC_ADMITTED",
                        "target_ref":ref["target_ref"], "proposed_q": q,
                        "material": copy.deepcopy(binding["material"]),
                        "revision":rev, "store_path":t0}
@@ -254,18 +257,18 @@ def proof():
                 assert bad["stage"] == "REFUSED_SOURCE_OR_AUTHORITY"
                 inert(bad)
             assert (actual.selects, actual.records, actual.rollbacks) == original_counts
-            # Diagnostic only: preserve the exact SOURCE require() decision,
-            # print the finite refusal reason without adding any action/grant.
-            base_require = entry_source.require
-            def traced_require(accepted, why):
-                if not accepted:
-                    print("P3_CURRENT_P1_REFUSAL:", why, flush=True)
-                return base_require(accepted, why)
-            entry_source.require = traced_require
-            try:
-                effect = call("CHANGE")
-            finally:
-                entry_source.require = base_require
+            # The old P3 envs-caller D lacked admission; reproduce the exact
+            # shape refusal with the SAME receiver/Port and zero selector effects.
+            malformed_d = copy.deepcopy(desired)
+            del malformed_d["admission"]
+            before_shape = (actual.selects, actual.records, actual.rollbacks)
+            rejected_shape = call("CHANGE", desired_override=malformed_d)
+            assert rejected_shape["stage"] == "REFUSED_SOURCE_OR_AUTHORITY", rejected_shape
+            inert(rejected_shape)
+            assert (actual.selects, actual.records, actual.rollbacks) == before_shape
+            # Then use the correctly shaped CI-only D through the actual envs
+            # source_step -> sole P2 receiver -> identical real OCI/Nix Port.
+            effect = call("CHANGE")
             assert effect["stage"] == "SYNTHETIC_READBACK_CANDIDATE_NOT_SUCCESS", effect
             issued = effect["issued_receipt"]
             assert issued is actual._receiver_issued["ci-p3-1"][0]
