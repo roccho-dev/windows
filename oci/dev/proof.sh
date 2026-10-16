@@ -47,12 +47,14 @@ jev_clear() {
   fi
   for r in envs apps ops neg; do if [ -e "$fx/$r/.git" ]; then git_clear "$fx/$r" || return 1; fi; done
   plain "$fx/envs/side" && plain "$fx/envs/ciphertexts/dev-jev-api.oci-dev.sops.yaml" &&
+    plain "$fx/envs/ciphertexts/dev-typellm-api.oci-dev.sops.yaml" &&
     empty "$fx/envs/ciphertexts" && empty "$fx/envs" &&
     plain "$fx/apps/flake.nix" && plain "$fx/apps/flake.lock" && empty "$fx/apps" &&
     plain "$fx/ops/flake.nix" && plain "$fx/ops/flake.lock" && empty "$fx/ops" &&
     plain "$fx/neg/file" && empty "$fx/neg" &&
     plain "$fx/age/oci-dev.key" && plain "$fx/age/kept" && empty "$fx/age" &&
-    plain "$fx/launch.out" && plain "$fx/ops.out" && plain "$fx/ops.err" && plain "$fx/scratch-clear.sh" &&
+    plain "$fx/launch.out" && plain "$fx/ops.out" && plain "$fx/ops.err" &&
+    plain "$fx/typellm.out" && plain "$fx/typellm.err" && plain "$fx/scratch-clear.sh" &&
     empty "$fx/tmp" && empty "$fx"
 }
 # Everything the Pi source proof creates under $evidence/pi. It shares the generic fixture Git cleanup above.
@@ -96,11 +98,15 @@ jev_proof() {
   mkdir "$fx"
 
   # Production: exactly the three bounded tools on the profile, the four real constants, no raw crypto binary.
-  local profile prod_launch prod_init prod_ops
+  local profile prod_launch prod_init prod_ops prod_typellm prod_typed
   profile=$("${nx[@]}" build --no-link --print-out-paths --no-write-lock-file .#dev-profile)
   prod_launch=$(readlink -f "$profile/bin/voice-ui-jev-dev")
   prod_init=$(readlink -f "$profile/bin/jev-age-init")
   prod_ops=$(readlink -f "$profile/bin/ops-jev")
+  prod_typellm=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "(import ./oci/dev/nix.nix { pkgs = $pkgs; }).jev.typellm")/bin/ops-typellm
+  prod_typed=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "(import ./oci/dev/nix.nix { pkgs = $pkgs; }).jev.typedLaunch")/bin/voice-ui-typed-dev
+  test ! -e "$profile/bin/ops-typellm"
+  test ! -e "$profile/bin/voice-ui-typed-dev"
   for raw in sops age age-keygen jev; do test ! -e "$profile/bin/$raw"; done
   sed -E 's/^[[:space:]]*//' "$prod_launch" | grep -xF "envs_remote=https://github.com/roccho-dev/envs" >/dev/null
   sed -E 's/^[[:space:]]*//' "$prod_launch" | grep -xF "apps_remote=https://github.com/roccho-dev/apps" >/dev/null
@@ -110,20 +116,24 @@ jev_proof() {
   sed -E 's/^[[:space:]]*//' "$prod_ops" | grep -xF "ops_remote=https://github.com/roccho-dev/ops" >/dev/null
   sed -E 's/^[[:space:]]*//' "$prod_ops" | grep -xF "identity=/work/repos/.auth/roccho-dev/age/oci-dev.key" >/dev/null
   if grep -qE '^[[:space:]]*(apps_remote|port|host)=' "$prod_ops"; then echo 'ops-jev carries apps constants' >&2; return 1; fi
-  if grep -qE '^[[:space:]]*set -(x|o xtrace)' "$prod_launch" "$prod_init" "$prod_ops"; then echo 'a jev tool enables xtrace' >&2; return 1; fi
+  if grep -qE '^[[:space:]]*set -(x|o xtrace)' "$prod_launch" "$prod_init" "$prod_ops" "$prod_typellm" "$prod_typed"; then echo 'a provider tool enables xtrace' >&2; return 1; fi
 
   # Fixture instance: the same source with only the four constants changed.
-  local tools launch init ops
+  local tools launch init ops typellm typed
   tools="(import ./oci/dev/nix.nix { pkgs = $pkgs; }).jevTools {
     envsRemote = \"file://$fx/envs\"; appsRemote = \"file://$fx/apps\"; opsRemote = \"file://$fx/ops\";
     identity = \"$fx/age/oci-dev.key\"; }"
   launch=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($tools).launch")/bin/voice-ui-jev-dev
   init=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($tools).init")/bin/jev-age-init
   ops=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($tools).ops")/bin/ops-jev
+  typellm=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($tools).typellm")/bin/ops-typellm
+  typed=$("${nx[@]}" build --impure --no-link --print-out-paths --expr "($tools).typedLaunch")/bin/voice-ui-typed-dev
   same() { grep -vE '^[[:space:]]*(envs_remote|apps_remote|ops_remote|identity)=' "$1" | sha256sum; }
   test "$(same "$launch")" = "$(same "$prod_launch")"
   test "$(same "$init")" = "$(same "$prod_init")"
   test "$(same "$ops")" = "$(same "$prod_ops")"
+  test "$(same "$typellm")" = "$(same "$prod_typellm")"
+  test "$(same "$typed")" = "$(same "$prod_typed")"
   test "$launch" != "$prod_launch"
   test "$init" != "$prod_init"
   test "$ops" != "$prod_ops"
@@ -243,6 +253,25 @@ for (const tool of tools) {
   assert.equal(actual.extra, null); assert.equal(actual.dir, null);
 }
 console.log('PASS compiled child public CA: closed names, one fixed certificate file, caller SSL ignored, FD3 synthetic key unchanged; fixture only, no Auth/Jev/TLS claim');
+JS
+  # Execute the exact compiled preload with a synthetic fetch, never an upstream provider or real credential.
+  "$node" --input-type=module - "$prod_typed" <<'JS'
+import fs from 'node:fs';import assert from 'node:assert/strict';import {pathToFileURL} from 'node:url';
+const source=fs.readFileSync(process.argv[2],'utf8');
+const file=source.match(/NODE_OPTIONS="--import=([^" ]+)"/)?.[1];assert(file);
+process.env.VOICE_UI_JEV_LIMIT='2';process.env.VOICE_UI_TYPELLM_LIMIT='1';
+let calls=0;
+globalThis.fetch=async(_input,init)=>{calls++;assert.equal(init.redirect,'error');return {synthetic:true};};
+await import(pathToFileURL(file));
+for(const [url,method] of [['https://other.invalid','POST'],['https://api.typellm.ai/v1/generate','GET']])
+ await assert.rejects(fetch(url,{method}),/provider_boundary/);
+assert.equal(calls,0);
+const jev='https://api.typesafe.ai/v1/systemone',type='https://api.typellm.ai/v1/generate';
+await Promise.all([fetch(jev,{method:'POST'}),fetch(jev,{method:'POST'}),fetch(type,{method:'POST'})]);
+await assert.rejects(fetch(jev,{method:'POST'}),/provider_budget/);
+await assert.rejects(fetch(type,{method:'POST'}),/provider_budget/);
+assert.equal(calls,3);
+console.log('PASS exact dual-provider budget preload: separate2/1 caps, concurrent sends reserved before fetch, rejected boundary0, overflow0, redirect:error; synthetic only');
 JS
   # Formal rejection must precede identity, ciphertext, network and child access.
   # The supplied C tuple's real positive case is a separate final-operand proof.
@@ -438,6 +467,11 @@ JS
           echo "home $HOME $([ -e "$HOME" ] && echo present || echo absent)"
           echo "key $(printf %s "$JEV_API_KEY" | sha256sum | cut -d' ' -f1)"
           case "$(tr '\0' ' ' < /proc/$$/cmdline)" in *"$JEV_API_KEY"*) echo "argv key" ;; *) echo "argv clean" ;; esac
+          if [ -n "$TYPELLM_API_KEY" ]; then
+            echo "typekey $(printf %s "$TYPELLM_API_KEY" | sha256sum | cut -d' ' -f1)"
+            echo "limits $VOICE_UI_JEV_LIMIT $VOICE_UI_TYPELLM_LIMIT"
+            case "$(tr '\0' ' ' < /proc/$$/cmdline)" in *"$TYPELLM_API_KEY"*) echo "typeargv key" ;; *) echo "typeargv clean" ;; esac
+          fi
         } > /tmp/voice-ui-jev-proof-$PORT
       ''}";
     };
@@ -463,8 +497,9 @@ NIX
   ops_flake=$(cat <<'NIX'
 {
   inputs.nixpkgs.url = "path:NIXPKGS";
-  outputs = { nixpkgs, ... }: {
-    packages.x86_64-linux.jev = nixpkgs.legacyPackages.x86_64-linux.writeShellScriptBin "jev" ''
+  outputs = { nixpkgs, ... }: let
+    pkgs = nixpkgs.legacyPackages.x86_64-linux;
+    probe = ''
       ls -1 /proc/$$/fd > /tmp/ops-jev-proof.fds
       input=$(cat)
       names=$(tr '\0' '\n' < /proc/$$/environ | cut -d= -f1 | sort | tr '\n' ' ')
@@ -476,6 +511,12 @@ NIX
         "$names" "$home" "$(ulimit -c)" "$key" "$req" "$argv"
       case "$input" in *'"exit":3'*) exit 3 ;; esac
     '';
+  in {
+    packages.x86_64-linux.jev = pkgs.symlinkJoin { name = "provider-proof-stubs"; paths = [
+      (pkgs.writeShellScriptBin "jev" probe)
+      (pkgs.writeShellScriptBin "typellm" (builtins.replaceStrings [ "JEV_API_KEY" "ops-jev" ]
+        [ "TYPELLM_API_KEY" "ops-typellm" ] probe))
+    ]; };
   };
 }
 NIX
@@ -614,6 +655,70 @@ NIX
   chmod 0644 "$fx/age/oci-dev.key"; ops_as red "$request" "${ops_args[@]}"; chmod 0600 "$fx/age/oci-dev.key"
   rm -f "$ops_fds"
   test -z "$(ls -A "$fx/tmp")"
+  # TypeLLM uses the same compiled boundary with a different, fixed credential and command. It must not inherit Jev.
+  local type_key="fixture-type-$RANDOM$RANDOM" type_cipher="$fx/envs/ciphertexts/dev-typellm-api.oci-dev.sops.yaml"
+  local type_good type_stale type_out="$fx/typellm.out" type_err="$fx/typellm.err" type_fds=/tmp/ops-typellm-proof.fds
+  type_encrypt() {
+    printf '{"TYPELLM_API_KEY":"%s"}\n' "$type_key" \
+      | SOPS_AGE_RECIPIENTS="$1" "$sops" --encrypt --input-type json --output-type yaml /dev/stdin
+  }
+  type_encrypt "$recipient" > "$type_cipher"; type_stale=$(commit type-stale)
+  type_encrypt "$recipient" > "$type_cipher"; type_good=$(commit type-current)
+  type_as() {
+    local expect=$1 input=$2 code=0
+    shift 2
+    rm -f "$type_fds"
+    printf '%s' "$input" | env TMPDIR="$fx/tmp" GH_TOKEN=parent-leak JEV_API_KEY=parent-jev TYPELLM_API_KEY=parent-type \
+      NODE_OPTIONS=--invalid-option SOPS_AGE_KEY_FILE=/nonexistent SHELLOPTS=xtrace \
+      "$typellm" "$@" > "$type_out" 2> "$type_err" 7< /dev/null 9< /dev/null || code=$?
+    if grep -qF "$type_key" "$type_out" "$type_err" || grep -qF "$key" "$type_out" "$type_err"; then
+      echo 'a key reached TypeLLM output' >&2; return 1
+    fi
+    case $expect in
+      pass | exit3) [ "$code" -eq "$([ "$expect" = pass ] && echo 0 || echo 3)" ] && [ "$(wc -l < "$type_out")" -eq 1 ] && [ -e "$type_fds" ] ;;
+      red) [ "$code" -ne 0 ] && [ ! -s "$type_out" ] && [ ! -e "$type_fds" ] ;;
+    esac || { cat "$type_err" >&2; echo "ops-typellm: expected $expect, exit $code" >&2; return 1; }
+  }
+  local type_args=(--envs-sha "$type_good" --ops-sha "$ops_good")
+  type_as pass "$request" "${type_args[@]}"
+  test "$(cat "$type_out")" = "{\"names\":\"HOME LANG PATH SSL_CERT_FILE TYPELLM_API_KEY \",\"home\":\"/homeless-shelter absent\",\"core\":\"0\",\"key\":\"$(printf %s "$type_key" | sha256sum | cut -d' ' -f1)\",\"request\":\"$(printf %s "$request" | sha256sum | cut -d' ' -f1)\",\"argv\":\"clean\"}"
+  only_stdio "$type_fds"
+  test "$(grep -n 'ops-typellm: built ' "$type_err" | cut -d: -f1)" -lt "$(grep -n 'ops-typellm: decrypt ' "$type_err" | cut -d: -f1)"
+  type_as exit3 '{"exit":3}' "${type_args[@]}"
+  type_as red "$request" "${type_args[@]}" --secret JEV_API_KEY
+  type_as red "$request" --envs-sha "$type_stale" --ops-sha "$ops_good"
+  type_as red "$request" --envs-sha "$type_good" --ops-sha "$ops_bad"
+  if grep -q 'ops-typellm: decrypt' "$type_err"; then echo 'TypeLLM decrypted before build' >&2; return 1; fi
+  chmod 0644 "$fx/age/oci-dev.key"; type_as red "$request" "${type_args[@]}"; chmod 0600 "$fx/age/oci-dev.key"
+  type_encrypt "$other" > "$type_cipher"; type_good=$(commit type-other)
+  type_as red "$request" --envs-sha "$type_good" --ops-sha "$ops_good"
+  encrypt "$recipient" > "$type_cipher"; type_good=$(commit type-wrong-field)
+  type_as red "$request" --envs-sha "$type_good" --ops-sha "$ops_good"
+  type_encrypt "$recipient" > "$type_cipher"; printf 'note: plain\n' >> "$type_cipher"; type_good=$(commit type-extra-field)
+  type_as red "$request" --envs-sha "$type_good" --ops-sha "$ops_good"
+  rm -f "$type_fds"
+  test -z "$(ls -A "$fx/tmp")"
+  # The explicitly selected source-dev tool receives both fixed current ciphertexts, and no ambient key/options.
+  local ordinary_launch=$launch type_current
+  type_encrypt "$recipient" > "$type_cipher"; type_current=$(commit type-dual-current)
+  launch=$typed
+  local typed_args=(--envs-sha "$type_current" --apps-sha "$apps_good" --port "$port" --jev-limit 190 --typellm-limit 20)
+  launch_as pass "${typed_args[@]}"
+  test "$(head -n 1 "$marker")" = "names HOME HOST JEV_API_KEY LANG NODE_OPTIONS PATH PORT SSL_CERT_FILE TYPELLM_API_KEY VOICE_UI_JEV_LIMIT VOICE_UI_TYPELLM_LIMIT "
+  grep -qx "typekey $(printf %s "$type_key" | sha256sum | cut -d' ' -f1)" "$marker"
+  grep -qx 'limits 190 20' "$marker"; grep -qx 'typeargv clean' "$marker"
+  only_stdio "$marker.fds"
+  if grep -qF "$type_key" "$out" "$marker"; then echo 'TypeLLM key reached dual launch output' >&2; return 1; fi
+  launch_as red --envs-sha "$type_stale" --apps-sha "$apps_good" --port "$port" --jev-limit 190 --typellm-limit 20
+  launch_as red --envs-sha "$type_current" --apps-sha "$apps_good" --port "$port" --jev-limit 301 --typellm-limit 20
+  launch_as red --envs-sha "$type_current" --apps-sha "$apps_good" --port "$port" --jev-limit 190 --typellm-limit -1
+  launch_as red --formal "${typed_args[@]}"
+  launch_as red --envs-sha "$type_current" --apps-sha "$apps_bad" --port "$port" --jev-limit 190 --typellm-limit 20
+  if grep -q 'decrypt envs' "$out"; then echo 'dual launch decrypted before build' >&2; return 1; fi
+  encrypt "$recipient" > "$type_cipher"; type_current=$(commit type-dual-wrong-field)
+  launch_as red --envs-sha "$type_current" --apps-sha "$apps_good" --port "$port" --jev-limit 190 --typellm-limit 20
+  launch=$ordinary_launch
+  echo 'PASS TypeLLM handoffs: one fixed credential/CLI; dual fixed capabilities; closed child environment and stdio; current ciphertexts/recipient/field/build checks; explicit bounded process allowances; no real provider effect'
   # scratch_clear as built into the launcher: it removes exactly the scratch the launcher writes, and keeps and refuses
   # anything else (here a loose object and a foreign pack name).
   sed -n '/^[[:space:]]*scratch_clear() {$/,/^[[:space:]]*}$/p' "$launch" > "$fx/scratch-clear.sh"
