@@ -194,12 +194,21 @@ def proof():
 
             def call(action, *, attempt="ci-p3-1", authority_override=None,
                      stage_override=None, read_override=None,
-                     desired_override="CURRENT", prior="NONE", receipt=None):
+                     desired_override="CURRENT", prior="NONE", receipt=None,
+                     request_override=None):
                 reqsubject = dict(subject, attempt_ref=attempt)
                 bridge.attempt = attempt
                 req = {"kind": "envs.syntheticHostSourceRequest.v0", **reqsubject,
                        "action": action, "proposed_q": q,
                        "requested_store": None if action == "READ" else t0}
+                # Finite caller-request tampering ONLY; the independently
+                # reviewed P2 receiver, real Nix Port, grants and q stay fixed.
+                if request_override is not None:
+                    assert set(request_override) <= {
+                        "target_ref", "host_ref", "unit_ref", "proposed_q",
+                        "requested_store", "attempt_ref",
+                    }
+                    req.update(request_override)
                 rfact = facts("READ")
                 rfact.update({k:req[k] for k in ("target_ref", "actor_ref",
                                                 "work_ref", "attempt_ref")})
@@ -238,6 +247,37 @@ def proof():
                                        "/var/lib/rent/dev/claude/ci-session-marker "
                                        "/work/repos/proof-marker")
             original_counts = (actual.selects, actual.records, actual.rollbacks)
+
+            def real_port_snapshot():
+                # Only disposable CI Nix, image and opaque auth/work hashes.
+                return (
+                    actual.observe()["store_path"],
+                    docker("inspect", "-f", "{{.Image}}", container),
+                    docker("exec", container, "/bin/bash", "-euc",
+                           "sha256sum /var/lib/rent/dev/codex/auth.json "
+                           "/var/lib/rent/dev/claude/ci-session-marker "
+                           "/work/repos/proof-marker"),
+                )
+
+            def assert_real_refusal(action, *, expected="REFUSED_SOURCE_OR_AUTHORITY",
+                                    before_read=False, **overrides):
+                baseline = real_port_snapshot()
+                before = (actual.reads, actual.selects,
+                          actual.records, actual.rollbacks)
+                outcome = call(action, **overrides)
+                assert outcome["stage"] == expected, outcome
+                inert(outcome)
+                assert (actual.selects, actual.records, actual.rollbacks) == before[1:]
+                if before_read:
+                    # Foreign identity/material/attempt and revoked grant must
+                    # fail BEFORE the sole real receiver's observation.
+                    assert actual.reads == before[0]
+                else:
+                    # Copied-receipt checks may perform independent READ-only O.
+                    assert actual.reads >= before[0]
+                assert real_port_snapshot() == baseline
+                return outcome
+
             start_reads = actual.reads
             refused = call("READ", read_override={"permit": False},
                            desired_override=None, prior="UNKNOWN")
@@ -251,21 +291,29 @@ def proof():
             assert read["observation"]["store_path"] == t1
             inert(read)
 
-            for override in ({"permit":False}, {"step":"RECORD"},
+            for override in ({"permit":False}, {"permit":None},
+                             {"step":"RECORD"},
                              {"route_ref":"ci-invalid-route"}):
-                bad = call("CHANGE", stage_override=override)
-                assert bad["stage"] == "REFUSED_SOURCE_OR_AUTHORITY"
-                inert(bad)
+                assert_real_refusal("CHANGE", stage_override=override,
+                                    before_read=True)
+            bad_q = "sha256:" + "0" * 64
+            assert bad_q != q
+            for bad_request in (
+                {"target_ref": "pc7337-foreign"},
+                {"host_ref": "ci-foreign-host"},
+                {"unit_ref": "ci-foreign-unit"},
+                {"proposed_q": bad_q},
+                {"requested_store": "/nix/store/" + "c" * 32 + "-foreign-tool"},
+                {"attempt_ref": "ci-old-attempt"},
+            ):
+                assert_real_refusal("CHANGE", request_override=bad_request,
+                                    before_read=True)
             assert (actual.selects, actual.records, actual.rollbacks) == original_counts
-            # The old P3 envs-caller D lacked admission; reproduce the exact
-            # shape refusal with the SAME receiver/Port and zero selector effects.
+            # Reproduce the original P1 shape omission on the SAME real Port.
             malformed_d = copy.deepcopy(desired)
             del malformed_d["admission"]
-            before_shape = (actual.selects, actual.records, actual.rollbacks)
-            rejected_shape = call("CHANGE", desired_override=malformed_d)
-            assert rejected_shape["stage"] == "REFUSED_SOURCE_OR_AUTHORITY", rejected_shape
-            inert(rejected_shape)
-            assert (actual.selects, actual.records, actual.rollbacks) == before_shape
+            assert_real_refusal("CHANGE", desired_override=malformed_d)
+            assert (actual.selects, actual.records, actual.rollbacks) == original_counts
             # Then use the correctly shaped CI-only D through the actual envs
             # source_step -> sole P2 receiver -> identical real OCI/Nix Port.
             effect = call("CHANGE")
@@ -277,6 +325,9 @@ def proof():
             inert(effect)
 
             previous_confirmed = "CONFIRMED"
+            assert_real_refusal("RECORD", expected="REFUSED_PORT_PRECONDITION",
+                                prior=previous_confirmed,
+                                receipt=copy.deepcopy(issued))
             no_record = call("RECORD",prior=previous_confirmed, receipt=issued,
                              authority_override={"record":False})
             assert no_record["stage"] == "REFUSED_SOURCE_OR_AUTHORITY"
@@ -291,6 +342,9 @@ def proof():
             old = call("RECORD",prior=previous_confirmed, receipt=issued)
             assert old["stage"] == "REFUSED_PORT_PRECONDITION"
             assert actual.records == counts_before_record[1]+1
+            assert_real_refusal("ROLLBACK", expected="REFUSED_PORT_PRECONDITION",
+                                prior=previous_confirmed,
+                                receipt=copy.deepcopy(issued))
             denied = call("ROLLBACK",prior=previous_confirmed, receipt=issued,
                           authority_override={"rollback":False})
             assert denied["stage"] == "REFUSED_SOURCE_OR_AUTHORITY"
