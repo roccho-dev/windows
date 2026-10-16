@@ -41,6 +41,7 @@ rec {
           childEnv,
           secretName ? "JEV_API_KEY",
           cipherPath ? "ciphertexts/dev-jev-api.oci-dev.sops.yaml",
+          extraTypeLLM ? false,
         }:
         pkgs.writeShellApplication {
           inherit name;
@@ -96,7 +97,7 @@ rec {
                     if [ -L "$f" ] || [ ! -f "$f" ]; then return 1; fi
                     "$cu/rm" -f -- "$f"
                   done
-                  for f in "$work/cipher.yaml" "$repo/HEAD" "$repo/config" "$repo/FETCH_HEAD" "$repo/packed-refs" \
+                  for f in "$work/cipher.yaml" "$work/type.yaml" "$repo/HEAD" "$repo/config" "$repo/FETCH_HEAD" "$repo/packed-refs" \
                     "$repo/refs/heads/proposals"; do
                     if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then return 1; fi
                     "$cu/rm" -f -- "$f"
@@ -125,6 +126,20 @@ rec {
                   | "$grep" -oE 'age1[0-9a-z]+' || true)
                 { [ -n "$recipients" ] && [ "$(echo "$recipients" | "$cu/wc" -l)" -eq 1 ]; } \
                   || fail "the ciphertext must have exactly one recipient"
+                ${pkgs.lib.optionalString extraTypeLLM ''
+                  type_path=ciphertexts/dev-typellm-api.oci-dev.sops.yaml
+                  type_at=$(git_ -C "$repo" rev-parse -q --verify "$envs_sha:$type_path") || fail "no TypeLLM ciphertext at that envs commit"
+                  type_now=$(git_ -C "$repo" rev-parse -q --verify "proposals:$type_path") || fail "no current TypeLLM ciphertext"
+                  [ "$type_at" = "$type_now" ] || fail "that TypeLLM ciphertext is not current"
+                  type_cipher=$work/type.yaml
+                  git_ -C "$repo" cat-file blob "$type_at" > "$type_cipher"
+                  type_fields=$("$grep" -E '^[^[:space:]#][^:]*:' "$type_cipher" | "$cu/cut" -d: -f1 | "$cu/sort" | "$cu/tr" '\n' ' ')
+                  [ "$type_fields" = "TYPELLM_API_KEY sops " ] || fail "the TypeLLM ciphertext fields differ"
+                  "$grep" -q '^TYPELLM_API_KEY: ENC\[AES256_GCM,' "$type_cipher" || fail "TypeLLM is not SOPS-encrypted"
+                  type_recipient=$("$grep" -E '^[[:space:]]*-?[[:space:]]*recipient:[[:space:]]*age1[0-9a-z]+[[:space:]]*$' "$type_cipher" \
+                    | "$grep" -oE 'age1[0-9a-z]+' || true)
+                  [ "$type_recipient" = "$recipients" ] || fail "TypeLLM must have the same single target recipient"
+                ''}
 
                 # The identity: a regular 0600 file of this user whose recipient is the ciphertext's.
                 { [ -f "$identity" ] && [ ! -L "$identity" ]; } || fail "the target identity is missing"
@@ -142,6 +157,12 @@ rec {
                   "$cipher" 2>/dev/null < /dev/null) || fail "decryption failed"
                 [ -n "$key" ] || fail "the decrypted key is empty"
                 { [ "''${#key}" -le 4096 ] && [[ $key != *$'\n'* ]]; } || fail "the decrypted key is not one short line"
+                ${pkgs.lib.optionalString extraTypeLLM ''
+                  say "decrypt TypeLLM envs $envs_sha ciphertext $type_at recipient $recipients"
+                  type_key=$(SOPS_AGE_KEY_FILE=$identity ${pkgs.sops}/bin/sops --decrypt --input-type yaml --extract '["TYPELLM_API_KEY"]' \
+                    "$type_cipher" 2>/dev/null < /dev/null) || fail "TypeLLM decryption failed"
+                  { [ -n "$type_key" ] && [ "''${#type_key}" -le 4096 ] && [[ $type_key != *$'\n'* ]]; } || fail "the TypeLLM key is not one short line"
+                ''}
                 scratch_clear || fail "kept $work: unexpected scratch entries"
                 trap - EXIT
 
@@ -154,12 +175,13 @@ rec {
                 # shellcheck disable=SC2016
                 exec "$cu/env" -i PATH="$cu" HOME=/homeless-shelter LANG=C.UTF-8 SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt ${childEnv} \
                   ${pkgs.bash}/bin/bash -c 'IFS= read -r -u 3 ${secretName} || true
+                    ${pkgs.lib.optionalString extraTypeLLM "IFS= read -r -u 4 TYPELLM_API_KEY || true"}
                     for f in /proc/$$/fd/*; do
                       n=''${f##*/}
                       if [[ $n =~ ^[0-9]+$ ]] && [ "$n" -gt 2 ] && [ -e "$f" ]; then exec {n}<&-; fi
                     done
-                    unset f n; export ${secretName}; exec env -u PWD -u SHLVL -u OLDPWD -- "$0" "$@"' \
-                  "$program" "''${program_args[@]}" 3<<< "$key"
+                    unset f n; export ${secretName}${pkgs.lib.optionalString extraTypeLLM " TYPELLM_API_KEY"}; exec env -u PWD -u SHLVL -u OLDPWD -- "$0" "$@"' \
+                  "$program" "''${program_args[@]}" 3<<< "$key" ${pkgs.lib.optionalString extraTypeLLM ''4<<< "$type_key"''}
           '';
         };
       # The command and credential are build-time literals, never caller-selected operands.
@@ -191,52 +213,53 @@ rec {
           { [ -f "$program" ] && [ -x "$program" ]; } || fail "the ops jev package has no bin/${command}"
         '';
       };
-    in
-    {
-      # Creates the target identity once: fixed path, safe parent, exclusive create, public recipient output only.
-      init = pkgs.writeShellApplication {
-        name = "jev-age-init";
-        text = ''
-          set +o xtrace
-          umask 077
-          identity=${q identity}
-          cu=${pkgs.coreutils}/bin
-          fail() {
-            echo "jev-age-init: RED: $1" >&2
-            exit 1
+      # A single process's allocated budget. The run owner reserves these finite allowances before launch,
+      # journals stderr before each send and reconciles unused allowances only after the process has stopped.
+      # No credential, request body, provider response or caller-selected endpoint is written here.
+      providerBudget = pkgs.writeText "voice-ui-provider-budget.mjs" ''
+        import { writeSync } from "node:fs";
+        const allowed = {
+          "https://api.typesafe.ai/v1/systemone": "jev",
+          "https://api.typellm.ai/v1/generate": "typellm",
+        };
+        const limits = { jev: process.env.VOICE_UI_JEV_LIMIT, typellm: process.env.VOICE_UI_TYPELLM_LIMIT };
+        for (const name of Object.keys(limits)) {
+          const value = limits[name];
+          if (!/^(0|[1-9][0-9]{0,2})$/.test(value ?? "") || Number(value) > 300) throw Error("provider_budget_invalid");
+          limits[name] = Number(value);
+        }
+        const native = globalThis.fetch.bind(globalThis.fetch), sent = { jev: 0, typellm: 0 };
+        globalThis.fetch = (input, init = {}) => {
+          const url = typeof input === "string" ? input : input instanceof URL ? input.href : input?.url;
+          const provider = Object.hasOwn(allowed, url) ? allowed[url] : null, method = init.method ?? input?.method ?? "GET";
+          if (!provider || method !== "POST") return Promise.reject(Error("provider_boundary"));
+          if (sent[provider] >= limits[provider]) {
+            writeSync(2, "provider-budget-exhausted:" + provider + "\n");
+            return Promise.reject(Error("provider_budget"));
           }
-          [ "$#" -eq 0 ] || fail "takes no arguments"
-          { [ ! -e "$identity" ] && [ ! -L "$identity" ]; } || fail "the target identity exists and is never overwritten"
-          dir=$("$cu/dirname" "$identity")
-          "$cu/mkdir" -p "$dir"
-          { [ -d "$dir" ] && [ ! -L "$dir" ]; } || fail "the identity directory is not a real directory"
-          [ "$("$cu/stat" -c %u "$dir")" = "$("$cu/id" -u)" ] || fail "the identity directory is not owned by this user"
-          [ $(( 8#$("$cu/stat" -c %a "$dir") & 8#022 )) -eq 0 ] || fail "the identity directory is writable by others"
-          tmp=$("$cu/mktemp" "$dir/.identity.XXXXXX")
-          trap '"$cu/rm" -f "$tmp"' EXIT
-          ${pkgs.age}/bin/age-keygen 2>/dev/null > "$tmp" || fail "age-keygen failed"
-          # A hard link is created atomically and never replaces an existing file.
-          "$cu/ln" -T "$tmp" "$identity" 2>/dev/null || fail "the target identity exists and is never overwritten"
-          ${pkgs.age}/bin/age-keygen -y "$identity"
-        '';
-      };
-      # Starts the exact apps dev server in the foreground with JEV_API_KEY as the only secret in its environment.
-      launch = mkLaunch {
-        name = "voice-ui-jev-dev";
-        usage = "--envs-sha <40-hex> --apps-sha <40-hex> --port <1024-65535> [--host 127.0.0.1|0.0.0.0] | --formal --envs-sha <40-hex> --deploy-sha <40-hex> --deploy-provenance-sha256 <64-hex> --deploy-proof-sha256 <64-hex> --artifacts <absolute-dir> --port <1024-65535> [--host 127.0.0.1|0.0.0.0] [--post-limit <1-12>]";
-        say = "1";
+          sent[provider]++;
+          writeSync(2, "provider-send:" + provider + ":" + sent[provider] + "\n");
+          return native(input, { ...init, redirect: "error" });
+        };
+      '';
+      mkVoice = { typed ? false }: mkLaunch {
+        name = if typed then "voice-ui-typed-dev" else "voice-ui-jev-dev";
+        extraTypeLLM = typed;
+        usage = if typed then "--envs-sha <40-hex> --apps-sha <40-hex> --port <1024-65535> --jev-limit <0-300> --typellm-limit <0-300> [--host 127.0.0.1|0.0.0.0]" else "--envs-sha <40-hex> --apps-sha <40-hex> --port <1024-65535> [--host 127.0.0.1|0.0.0.0] | --formal --envs-sha <40-hex> --deploy-sha <40-hex> --deploy-provenance-sha256 <64-hex> --deploy-proof-sha256 <64-hex> --artifacts <absolute-dir> --port <1024-65535> [--host 127.0.0.1|0.0.0.0] [--post-limit <1-12>]";
+        say = if typed then "2" else "1";
         announce = "apps $apps_sha on $host:$port with PATH HOME LANG PORT HOST SSL_CERT_FILE JEV_API_KEY";
-        childEnv = ''PORT="$port" HOST="$host"'';
+        childEnv = ''PORT="$port" HOST="$host"'' + pkgs.lib.optionalString typed '' NODE_OPTIONS="--import=${providerBudget}" VOICE_UI_JEV_LIMIT="$jev_limit" VOICE_UI_TYPELLM_LIMIT="$typellm_limit"'';
         parse = ''
           apps_remote=${q appsRemote}
           formal=false
+          ${pkgs.lib.optionalString typed ''[ "''${1:-}" != --formal ] || usage''}
           if [ "''${1:-}" = --formal ]; then formal=true; shift; fi
-          envs_sha="" apps_sha="" port="" host=""
+          envs_sha="" apps_sha="" port="" host="" jev_limit="" typellm_limit=""
           deploy_sha="" deploy_provenance="" deploy_proof="" artifacts="" post_limit=""
           if [ "$formal" = true ]; then
             { [ "$#" -eq 12 ] || [ "$#" -eq 14 ] || [ "$#" -eq 16 ]; } || usage
           else
-            { [ "$#" -eq 6 ] || [ "$#" -eq 8 ]; } || usage
+            { [ "$#" -eq ${if typed then "10" else "6"} ] || [ "$#" -eq ${if typed then "12" else "8"} ]; } || usage
           fi
           while [ "$#" -gt 0 ]; do
             { [ "$formal" = false ] || [ -n "''${2:-}" ]; } || usage
@@ -249,6 +272,8 @@ rec {
               --post-limit) { [ "$formal" = true ] && [ -z "$post_limit" ]; } || usage; post_limit=$2 ;;
             --artifacts) { [ "$formal" = true ] && [ -z "$artifacts" ]; } || usage; artifacts=$2 ;;
               --port) [ -z "$port" ] || usage; port=$2 ;;
+              --jev-limit) { ${if typed then "true" else "false"} && [ -z "$jev_limit" ]; } || usage; jev_limit=$2 ;;
+              --typellm-limit) { ${if typed then "true" else "false"} && [ -z "$typellm_limit" ]; } || usage; typellm_limit=$2 ;;
               --host) { [ -z "$host" ] && [ -n "$2" ]; } || usage; host=$2 ;;
               *) usage ;;
             esac
@@ -262,6 +287,10 @@ rec {
             [[ $apps_sha =~ ^[0-9a-f]{40}$ ]] || usage
           fi
           { [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; } || usage
+          ${pkgs.lib.optionalString typed ''
+            [[ $jev_limit =~ ^(0|[1-9][0-9]{0,2})$ && $typellm_limit =~ ^(0|[1-9][0-9]{0,2})$ ]] || usage
+            { [ "$jev_limit" -le 300 ] && [ "$typellm_limit" -le 300 ]; } || usage
+          ''}
           [ -n "$host" ] || host=127.0.0.1
           case $host in 127.0.0.1 | 0.0.0.0) ;; *) usage ;; esac
         '';
@@ -375,6 +404,39 @@ rec {
             fi
         '';
       };
+    in
+    {
+      # Creates the target identity once: fixed path, safe parent, exclusive create, public recipient output only.
+      init = pkgs.writeShellApplication {
+        name = "jev-age-init";
+        text = ''
+          set +o xtrace
+          umask 077
+          identity=${q identity}
+          cu=${pkgs.coreutils}/bin
+          fail() {
+            echo "jev-age-init: RED: $1" >&2
+            exit 1
+          }
+          [ "$#" -eq 0 ] || fail "takes no arguments"
+          { [ ! -e "$identity" ] && [ ! -L "$identity" ]; } || fail "the target identity exists and is never overwritten"
+          dir=$("$cu/dirname" "$identity")
+          "$cu/mkdir" -p "$dir"
+          { [ -d "$dir" ] && [ ! -L "$dir" ]; } || fail "the identity directory is not a real directory"
+          [ "$("$cu/stat" -c %u "$dir")" = "$("$cu/id" -u)" ] || fail "the identity directory is not owned by this user"
+          [ $(( 8#$("$cu/stat" -c %a "$dir") & 8#022 )) -eq 0 ] || fail "the identity directory is writable by others"
+          tmp=$("$cu/mktemp" "$dir/.identity.XXXXXX")
+          trap '"$cu/rm" -f "$tmp"' EXIT
+          ${pkgs.age}/bin/age-keygen 2>/dev/null > "$tmp" || fail "age-keygen failed"
+          # A hard link is created atomically and never replaces an existing file.
+          "$cu/ln" -T "$tmp" "$identity" 2>/dev/null || fail "the target identity exists and is never overwritten"
+          ${pkgs.age}/bin/age-keygen -y "$identity"
+        '';
+      };
+      # Starts the exact apps dev server in the foreground with JEV_API_KEY as the only secret in its environment.
+      launch = mkVoice { };
+      # Two fixed capabilities, explicit per-process budget allocations, source-dev only.
+      typedLaunch = mkVoice { typed = true; };
       # Runs the exact ops Jev CLI once: the caller's stdin is its request, its single stdout line is the result, and
       # the launcher's own messages go to stderr. Only the fixed package output; no attribute, program or argument choice.
       ops = mkOps {
