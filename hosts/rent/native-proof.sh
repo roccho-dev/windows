@@ -275,6 +275,201 @@ selection "$t1"
 [ "$(state_snapshot)" = "$snapshot" ] || fail 'recreation changed auth/session/repository'
 test "$(observe)" = "$(observe_ro)" || fail 'recreation changed observed selection geometry'
 docker exec "$c" /bin/nix-env --profile /nix/var/nix/profiles/rent-dev --list-generations
+# P2/P3 SOURCE fixture: same actual Docker/Nix instance and native generations.
+# The receiver is never installed into B, launched by logon, or authorized LIVE.
+python3 - "$c" "$t0" "$t1" "$binding" <<'PY'
+import copy, importlib.util, json, re, subprocess, sys
+from pathlib import Path
+container,t0,t1,source_path=sys.argv[1:]
+binding=json.loads(Path(source_path).read_text(encoding="utf-8"))
+spec=importlib.util.spec_from_file_location("rent_receiver",Path("hosts/rent/tool-receiver.py"))
+assert spec and spec.loader
+receiver=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(receiver)
+q=binding["proposed_q"]
+rev="ci-"+q[7:23]
+subject=dict(target_ref=binding["target_ref"],host_ref=binding["host_ref"],
+             unit_ref=binding["unit_ref"],scope=binding["scope"],
+             actor_ref="ci-fixed-W",work_ref="ci-rent-source-SUT",
+             attempt_ref="ci-rent-source-1",route_ref="ci-only-route")
+def grant(step,**updates):
+    g=dict(kind="envs.syntheticStageGrant.v0",**subject,step=step,
+           permit=True,issuer_fixture="ci-independent-source-issuer")
+    g.update(updates)
+    return g
+def request(action,**updates):
+    r=dict(kind="envs.syntheticHostSourceRequest.v0",**subject,
+           action=action,proposed_q=q,
+           requested_store=None if action=="READ" else t0)
+    r.update(updates)
+    return r
+def bound(**updates):
+    b=dict(kind="windows.syntheticBoundSource.v0",binding=copy.deepcopy(binding),
+           desired=dict(kind="envs.syntheticDesired.v0",target_ref=binding["target_ref"],
+                        proposed_q=q,material=binding["material"],
+                        revision=rev,store_path=t0),
+           current_q=rev,previous_state="NONE",read_grant=grant("READ"),
+           quiet=True,single_writer=True,recovery=True,
+           fixture_issuer="ci-independent-source-issuer")
+    b.update(updates)
+    return b
+def docker(*args,input=None):
+    p=subprocess.run(["docker",*args],input=input,stdout=subprocess.PIPE,
+                     stderr=subprocess.PIPE,text=True)
+    if p.returncode:
+        raise RuntimeError("disposable Docker/Nix command failed: "+p.stderr[-700:])
+    return p.stdout.strip()
+class Actual:
+    kind="windows.syntheticDisposableNixTransport.v0"
+    fixture_only=True
+    def __init__(self):
+        self.reads=self.selects=self.records=self.rollbacks=0
+        self.fail_after_write=False
+        self.reader=Path("hosts/rent/read-selected.sh").read_text(encoding="utf-8")
+    def observe(self):
+        self.reads+=1
+        try:
+            raw=docker("exec","-i","-u","1000:1000",container,
+                       "/bin/bash","-s",input=self.reader)
+        except RuntimeError:
+            return self.wrap("UNKNOWN",None,None,False)
+        if raw=="selection=ABSENT proof=geometry-only":
+            return self.wrap("ABSENT",None,None,True)
+        matched=re.fullmatch(
+            r"selection=SELECTED generation=(rent-dev-[1-9][0-9]*-link) "
+            r"store=(/nix/store/[0-9a-z]{32}-[^/\s]+) proof=geometry-only",raw)
+        if not matched:
+            return self.wrap("UNKNOWN",None,None,False)
+        store=matched.group(2)
+        try:
+            docker("exec",container,"/bin/nix-store","--check-validity",store)
+            valid=True
+        except RuntimeError:
+            valid=False
+        return self.wrap("SELECTED",store,matched.group(1),valid)
+    def wrap(self,state,store,generation,valid):
+        ident=None
+        if state!="UNKNOWN":
+            ident=copy.deepcopy(binding["identity"])
+            ident["tool"]=("ci:rent-tool-T0" if store==t0 else
+                           "ci:rent-tool-T1" if store==t1 else "ci:Tool-ABSENT")
+        return dict(kind="windows.syntheticRentObservation.v0",
+                    **{k:binding[k] for k in
+                       ("target_ref","host_ref","unit_ref","scope")},
+                    state=state,store_path=store,generation=generation,
+                    identity=ident,fresh=state!="UNKNOWN",closure_valid=valid)
+    def quiet(self):
+        top=docker("top",container,"-eo","pid,args")
+        if not all(token in top for token in ("rent-start","nix-daemon","sshd")):
+            return False
+        return not any(re.search(r"/bin/"+exe+r"(?:\s|$)",top)
+                       for exe in ("codex","claude","python3","uv","hello"))
+    def validate_closure(self,store):
+        if store not in (t0,t1):
+            return False
+        try:
+            paths=docker("exec",container,"/bin/nix-store",
+                         "--query","--requisites",store).splitlines()
+            for path in paths:
+                docker("exec",container,"/bin/nix-store","--check-validity",path)
+            helper=docker("exec",container,"/bin/readlink","-e",
+                          store+"/bin/git-credential-github-roccho-dev")
+            core=docker("exec",container,"/bin/readlink","-e",
+                        "/bin/git-credential-github-roccho-dev")
+            return helper==core
+        except RuntimeError:
+            return False
+    def select(self,store):
+        self.selects+=1
+        docker("exec",container,"/bin/nix-env","--profile",
+               "/nix/var/nix/profiles/rent-dev","--set",store)
+        if self.fail_after_write:
+            raise RuntimeError("CI synthetic acknowledgement lost after real Nix write")
+    def record(self,receipt):
+        self.records+=1
+    def rollback(self,preimage):
+        assert preimage in (t0,t1)
+        self.rollbacks+=1
+        docker("exec",container,"/bin/nix-env","--profile",
+               "/nix/var/nix/profiles/rent-dev","--rollback")
+port=Actual()
+image=docker("inspect","-f","{{.Image}}",container)
+state=docker("exec",container,"/bin/bash","-euc",
+             "sha256sum /var/lib/rent/dev/codex/auth.json "
+             "/var/lib/rent/dev/claude/ci-session-marker /work/repos/proof-marker")
+assert port.observe()["store_path"]==t1
+def call(action,*,req_over=None,grant_over=None,bound_over=None,receipt=None):
+    step={"READ":"READ","CHANGE":"TOOL_CHANGE",
+          "RECORD":"RECORD","ROLLBACK":"ROLLBACK"}[action]
+    req=request(action,**(req_over or {}))
+    g=grant(step,**(grant_over or {}))
+    b=bound(**(bound_over or {}))
+    return receiver.receive_step(req,g,b,port,receipt=receipt)
+def check(ref,stage,**kwargs):
+    result=call(ref,**kwargs)
+    assert result["stage"]==stage,(ref,stage,result)
+    assert result["admission"]=="NOT_ADMITTED"
+    assert result["production_effect"]=="FORBIDDEN"
+    assert result["target_ready"] is False and result["merge_ready"] is False
+    return result
+start_reads=port.reads
+check("READ","REFUSED_PRE_EFFECT",grant_over={"permit":False},
+      bound_over={"desired":None,"current_q":None,"previous_state":"UNKNOWN"})
+assert port.reads==start_reads and port.selects==0
+got=check("READ","READ_OBSERVED",
+          bound_over={"desired":None,"current_q":None,"previous_state":"UNKNOWN"})
+assert got["observation"]["store_path"]==t1 and port.selects==0
+check("CHANGE","REFUSED_PRE_EFFECT",grant_over={"step":"RECORD"})
+check("CHANGE","REFUSED_PRE_EFFECT",req_over={"route_ref":"ci-other-route"})
+check("CHANGE","REFUSED_PRE_EFFECT",req_over={"requested_store":t1})
+assert port.selects==0 and port.records==0 and port.rollbacks==0
+issued=check("CHANGE","TOOL_CHANGE_READBACK_CANDIDATE")["issued_receipt"]
+assert issued and issued["selected"]==t0 and issued["preimage"]==t1
+assert port.selects==1 and port.observe()["store_path"]==t0
+check("CHANGE","REFUSED_PRE_EFFECT")  # same current D Tool, no second write
+assert port.selects==1
+check("RECORD","REFUSED_PRE_EFFECT",grant_over={"permit":False},
+      bound_over={"previous_state":"CONFIRMED","quiet":False,
+                  "single_writer":False,"recovery":False},receipt=issued)
+assert port.records==0
+check("RECORD","REFUSED_PRE_EFFECT",bound_over={"previous_state":"CONFIRMED"},
+      receipt=copy.deepcopy(issued))
+assert port.records==0
+check("RECORD","RECORD_ONLY_CANDIDATE",
+      bound_over={"previous_state":"CONFIRMED","quiet":False,
+                  "single_writer":False,"recovery":False},receipt=issued)
+assert port.records==1 and port.selects==1
+check("RECORD","REFUSED_PRE_EFFECT",
+      bound_over={"previous_state":"CONFIRMED"},receipt=issued)
+assert port.records==1
+check("ROLLBACK","REFUSED_PRE_EFFECT",grant_over={"permit":False},
+      bound_over={"previous_state":"CONFIRMED"},receipt=issued)
+assert port.rollbacks==0
+check("ROLLBACK","ROLLBACK_READBACK_REQUIRED",
+      bound_over={"previous_state":"CONFIRMED"},receipt=issued)
+assert port.rollbacks==1 and port.observe()["store_path"]==t1
+check("ROLLBACK","REFUSED_PRE_EFFECT",
+      bound_over={"previous_state":"CONFIRMED"},receipt=issued)
+assert port.rollbacks==1
+# Simulate a real Nix write followed by lost acknowledgement: UNKNOWN, never
+# retry an equivalent change in this disposable instance. CI cleanup is explicit.
+port.fail_after_write=True
+check("CHANGE","UNKNOWN_AFTER_SEND_NO_REPLAY",
+      req_over={"attempt_ref":"ci-rent-source-2"})
+assert port.selects==2 and port.observe()["store_path"]==t0
+check("CHANGE","REFUSED_PRE_EFFECT",
+      req_over={"attempt_ref":"ci-rent-source-2"})
+assert port.selects==2
+docker("exec",container,"/bin/nix-env","--profile",
+       "/nix/var/nix/profiles/rent-dev","--rollback") # CI teardown, NOT receiver retry
+assert port.observe()["store_path"]==t1
+assert docker("inspect","-f","{{.Image}}",container)==image
+assert docker("exec",container,"/bin/bash","-euc",
+              "sha256sum /var/lib/rent/dev/codex/auth.json "
+              "/var/lib/rent/dev/claude/ci-session-marker /work/repos/proof-marker")==state
+print("PASS: same real OCI/Nix receiver READ->CHANGE->RECORD-only->ROLLBACK; "
+      "pre-effect refusal zero, post-send UNKNOWN no replay, Base/state unchanged")
+PY
 # Negative O-only fixtures run with the synthetic OCI stopped; each damaged preimage is retained
 # and each read must refuse without mutation. Repair is part of disposable test, not observer code.
 docker stop -t 30 "$c" >/dev/null
