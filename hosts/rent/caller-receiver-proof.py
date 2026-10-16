@@ -83,6 +83,7 @@ def proof():
         sys.path[:0] = [str(src / "checks"), str(src / "adapters")]
         try:
             from host_tool_source_entry import source_step
+            import host_tool_source_entry as entry_source
             from host_tool_selection import read_jsonl
             from test_host_tool_functional_binding import real_relation_projector
             from test_host_tool_continuation import facts
@@ -253,7 +254,18 @@ def proof():
                 assert bad["stage"] == "REFUSED_SOURCE_OR_AUTHORITY"
                 inert(bad)
             assert (actual.selects, actual.records, actual.rollbacks) == original_counts
-            effect = call("CHANGE")
+            # Diagnostic only: preserve the exact SOURCE require() decision,
+            # print the finite refusal reason without adding any action/grant.
+            base_require = entry_source.require
+            def traced_require(accepted, why):
+                if not accepted:
+                    print("P3_CURRENT_P1_REFUSAL:", why, flush=True)
+                return base_require(accepted, why)
+            entry_source.require = traced_require
+            try:
+                effect = call("CHANGE")
+            finally:
+                entry_source.require = base_require
             assert effect["stage"] == "SYNTHETIC_READBACK_CANDIDATE_NOT_SUCCESS", effect
             issued = effect["issued_receipt"]
             assert issued is actual._receiver_issued["ci-p3-1"][0]
