@@ -639,7 +639,7 @@ jobs:
       - name: Parse native rent SOURCE fixture (no Host or Docker)
         run: |
           bash -n hosts/rent/native-proof.sh
-          python3 -m py_compile hosts/rent/tool-receiver.py hosts/rent/proposed-binding-proof.py
+          python3 -m py_compile hosts/rent/tool-receiver.py hosts/rent/proposed-binding-proof.py hosts/rent/caller-receiver-proof.py
       - uses: cachix/install-nix-action@v31
       - name: Build from locked Nix inputs
         env:
