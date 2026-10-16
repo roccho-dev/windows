@@ -329,6 +329,7 @@ class Actual:
         self.fail_after_write=False
         self.fail_before_write=False
         self.fail_record_ack=False
+        self.fail_rollback_before_write=False
         self.reader=Path("hosts/rent/read-selected.sh").read_text(encoding="utf-8")
     def expected_producer_store(self):
         # $t0 is the actual immutable F1 Nix-built Tool-only output,
@@ -404,6 +405,8 @@ class Actual:
     def rollback(self,preimage):
         assert preimage in (t0,t1)
         self.rollbacks+=1
+        if self.fail_rollback_before_write:
+            raise RuntimeError("CI-only rollback transport UNKNOWN before Nix write")
         docker("exec",container,"/bin/nix-env","--profile",
                "/nix/var/nix/profiles/rent-dev","--rollback")
 port=Actual()
@@ -521,12 +524,41 @@ assert port.records==2 and port.selects==4
 docker("exec",container,"/bin/nix-env","--profile",
        "/nix/var/nix/profiles/rent-dev","--rollback") # CI teardown only
 assert port.observe()["store_path"]==t1
+# R2: a genuine receipt for a new CHANGE is not a license to replay ROLLBACK
+# when the first rollback was invoked but its ACK disappeared BEFORE Nix wrote.
+# The SAME real Docker/Nix container stays T0 after the injected exception.
+issued5=check("CHANGE","TOOL_CHANGE_READBACK_CANDIDATE",
+              req_over={"attempt_ref":"ci-rent-source-5"})["issued_receipt"]
+assert issued5["preimage"]==t1 and issued5["selected"]==t0
+assert port.selects==5 and port.observe()["store_path"]==t0
+before_rollback=port.rollbacks
+port.fail_rollback_before_write=True
+check("ROLLBACK","UNKNOWN_AFTER_SEND_NO_REPLAY",
+      req_over={"attempt_ref":"ci-rent-source-5"},
+      bound_over={"previous_state":"CONFIRMED"},receipt=issued5)
+assert port.rollbacks==before_rollback+1 and port.observe()["store_path"]==t0
+port.fail_rollback_before_write=False
+check("ROLLBACK","REFUSED_PRE_EFFECT",
+      req_over={"attempt_ref":"ci-rent-source-5"},
+      bound_over={"previous_state":"CONFIRMED"},receipt=issued5)
+assert port.rollbacks==before_rollback+1 and port.observe()["store_path"]==t0
+# Independently permitted READ remains possible after UNKNOWN but does not
+# settle the old rollback outcome or permit an equivalent retry.
+read_after_unknown=check("READ","READ_OBSERVED",
+      req_over={"attempt_ref":"ci-rent-source-5"},
+      bound_over={"desired":None,"current_q":None,"previous_state":"UNKNOWN"})
+assert read_after_unknown["observation"]["store_path"]==t0
+assert port.rollbacks==before_rollback+1 and port.records==2 and port.selects==5
+docker("exec",container,"/bin/nix-env","--profile",
+       "/nix/var/nix/profiles/rent-dev","--rollback") # CI teardown only; not receiver recovery
+assert port.observe()["store_path"]==t1
 assert docker("inspect","-f","{{.Image}}",container)==image
 assert docker("exec",container,"/bin/bash","-euc",
               "sha256sum /var/lib/rent/dev/codex/auth.json "
               "/var/lib/rent/dev/claude/ci-session-marker /work/repos/proof-marker")==state
 print("PASS: same real OCI/Nix receiver READ->CHANGE->RECORD-only->ROLLBACK; "
-      "pre-effect refusal zero, post-send UNKNOWN no replay, Base/state unchanged")
+      "pre-effect refusal zero, post-send CHANGE/RECORD/ROLLBACK UNKNOWN no replay, "
+      "Base/state unchanged")
 PY
 # Negative O-only fixtures run with the synthetic OCI stopped; each damaged preimage is retained
 # and each read must refuse without mutation. Repair is part of disposable test, not observer code.
