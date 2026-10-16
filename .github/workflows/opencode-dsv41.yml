@@ -32,7 +32,7 @@ jobs:
         run: |
           set -euo pipefail
           executable="$PWD/oc-host-profile/bin/opencode"
-          test "$("$executable" --version)" = "2.0.30"
+          test "$("$executable" --version)" = "opencode v2.0.30"
           tmp=$(mktemp -d)
           mkdir -p "$tmp/home" "$tmp/config/opencode" "$tmp/data" "$tmp/cache" "$tmp/project"
           printf '%s\n' '{"update":"disable","warming":false}' > "$tmp/config/opencode/opencode.json"
