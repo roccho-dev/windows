@@ -277,7 +277,11 @@ def receive_step(request: dict[str, Any], scoped_grant: dict[str, Any] | None,
             demand(req["attempt_ref"] not in getattr(port, "_receiver_recorded", set()),
                    "duplicate RECEIPT/RECORD")
             sent = True
-            port.record(receipt)
+            accepted = port.record(receipt)
+            # After sending RECORD, an absent/ambiguous acknowledgement is
+            # UNKNOWN, never a falsely recorded or pre-effect refused step.
+            if accepted != "CI_ONLY_RECORD_NO_TARGET_LEDGER":
+                return result("UNKNOWN_AFTER_SEND_NO_REPLAY")
             if getattr(port, "_receiver_recorded", None) is None:
                 port._receiver_recorded = set()
             port._receiver_recorded.add(req["attempt_ref"])
