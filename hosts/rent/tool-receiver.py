@@ -83,9 +83,11 @@ def _preflight(request: Any, grant: Any, bound: Any, transport: Any):
     demand(b["kind"] == "windows.syntheticBoundSource.v0"
            and b["fixture_issuer"] == "ci-independent-source-issuer",
            "not an independently supplied SOURCE binding")
-    bind = b["binding"]
-    demand(type(bind) is dict
-           and bind.get("kind") == "envs.hostToolFunctionalBindingProposal.v0"
+    bind = exact(b["binding"], {"kind", "admission", "target_ref",
+              "host_ref", "parent_ref", "unit_ref", "scope", "selector",
+              "desired_output", "proposed_q", "material", "hosts",
+              "relations", "identity"}, "exact F1 shape")
+    demand(bind.get("kind") == "envs.hostToolFunctionalBindingProposal.v0"
            and bind.get("admission") == "NOT_ADMITTED"
            and all(req[k] == bind[k] for k in
                    ("target_ref", "host_ref", "unit_ref", "scope"))
@@ -103,7 +105,23 @@ def _preflight(request: Any, grant: Any, bound: Any, transport: Any):
     demand(bind.get("material") == {
         "repository": "roccho-dev/windows", "source_commit": module.PIN,
         "flake_output": module.OUTPUT,
-    }, "not pinned immutable windows Tool SOURCE")
+    } and bind.get("identity") == module.EXPECTED
+           and bind.get("unit_ref") == "ci-rent-oci-unit-1",
+           "not pinned immutable windows Tool SOURCE")
+    import json
+    canon = json.dumps({"target_ref": bind["target_ref"],
+                        "material": bind["material"]},
+                       sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    q = "sha256:" + module.hashlib.sha256(canon.encode("utf-8")).hexdigest()
+    demand(bind.get("proposed_q") == q and req["proposed_q"] == q,
+           "fake PROPOSED q or foreign fixed Tool")
+    rel = bind["relations"]
+    demand(type(rel) is list and len([
+        x for x in rel if type(x) is dict and x.get("kind") == "contains"
+        and x.get("parent") == bind["parent_ref"]
+        and x.get("child") == bind["host_ref"]
+        and x.get("scope") == bind["scope"]]) == 1,
+           "missing scoped Host containment relation")
     demand(type(transport) is not str
            and getattr(transport, "kind", None)
            == "windows.syntheticDisposableNixTransport.v0"
@@ -218,6 +236,10 @@ def receive_step(request: dict[str, Any], scoped_grant: dict[str, Any] | None,
                    "B/launch/config/state require a different plan")
             demand(obs["store_path"] != desired["store_path"],
                    "same Tool geometry does not prove NOOP")
+            # A duplicate equivalent attempt must be stopped BEFORE nix-env.
+            demand(req["attempt_ref"] not in
+                   getattr(port, "_receiver_issued", {}),
+                   "duplicate mutating attempt not allowed")
             demand(port.quiet() is True, "continuous CI quiet not proven")
             demand(port.validate_closure(desired["store_path"]) is True,
                    "exact SOURCE Tool closure not valid")
@@ -237,7 +259,7 @@ def receive_step(request: dict[str, Any], scoped_grant: dict[str, Any] | None,
             issue = {
                 "kind": "windows.syntheticRentReceipt.v0",
                 "attempt": req["attempt_ref"], "issuer": b["fixture_issuer"],
-                "revision": desired["revision"],
+                "revision": desired["revision"], "effect": "SYNTHETIC_ONLY",
                 "selected": desired["store_path"], "preimage": obs["store_path"],
                 "generation": new_o["generation"],
             }
