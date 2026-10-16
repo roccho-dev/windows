@@ -248,7 +248,7 @@ rec {
         usage = if typed then "--envs-sha <40-hex> --apps-sha <40-hex> --port <1024-65535> --jev-limit <0-300> --typellm-limit <0-300> [--host 127.0.0.1|0.0.0.0]" else "--envs-sha <40-hex> --apps-sha <40-hex> --port <1024-65535> [--host 127.0.0.1|0.0.0.0] | --formal --envs-sha <40-hex> --deploy-sha <40-hex> --deploy-provenance-sha256 <64-hex> --deploy-proof-sha256 <64-hex> --artifacts <absolute-dir> --port <1024-65535> [--host 127.0.0.1|0.0.0.0] [--post-limit <1-12>]";
         say = if typed then "2" else "1";
         announce = "apps $apps_sha on $host:$port with PATH HOME LANG PORT HOST SSL_CERT_FILE JEV_API_KEY";
-        childEnv = ''PORT="$port" HOST="$host"'' + pkgs.lib.optionalString typed '' NODE_OPTIONS="--import=${providerBudget}" VOICE_UI_JEV_LIMIT="$jev_limit" VOICE_UI_TYPELLM_LIMIT="$typellm_limit"'';
+        childEnv = ''PORT="$port" HOST="$host"'' + pkgs.lib.optionalString typed (" " + ''NODE_OPTIONS="--import=${providerBudget}" VOICE_UI_JEV_LIMIT="$jev_limit" VOICE_UI_TYPELLM_LIMIT="$typellm_limit"'');
         parse = ''
           apps_remote=${q appsRemote}
           formal=false
