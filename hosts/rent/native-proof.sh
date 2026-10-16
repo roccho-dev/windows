@@ -275,6 +275,291 @@ selection "$t1"
 [ "$(state_snapshot)" = "$snapshot" ] || fail 'recreation changed auth/session/repository'
 test "$(observe)" = "$(observe_ro)" || fail 'recreation changed observed selection geometry'
 docker exec "$c" /bin/nix-env --profile /nix/var/nix/profiles/rent-dev --list-generations
+# P2/P3 SOURCE fixture: same actual Docker/Nix instance and native generations.
+# The receiver is never installed into B, launched by logon, or authorized LIVE.
+python3 - "$c" "$t0" "$t1" "$binding" <<'PY'
+import copy, importlib.util, json, re, subprocess, sys
+from pathlib import Path
+container,t0,t1,source_path=sys.argv[1:]
+binding=json.loads(Path(source_path).read_text(encoding="utf-8"))
+spec=importlib.util.spec_from_file_location("rent_receiver",Path("hosts/rent/tool-receiver.py"))
+assert spec and spec.loader
+receiver=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(receiver)
+q=binding["proposed_q"]
+rev="ci-"+q[7:23]
+subject=dict(target_ref=binding["target_ref"],host_ref=binding["host_ref"],
+             unit_ref=binding["unit_ref"],scope=binding["scope"],
+             actor_ref="ci-fixed-W",work_ref="ci-rent-source-SUT",
+             attempt_ref="ci-rent-source-1",route_ref="ci-only-route")
+def grant(granted_step,**updates):
+    # Use a distinct positional variable so an intentionally invalid
+    # grant_over={"step":"RECORD"} reaches the receiver rather than raising.
+    g=dict(kind="envs.syntheticStageGrant.v0",**subject,step=granted_step,
+           permit=True,issuer_fixture="ci-independent-source-issuer")
+    g.update(updates)
+    return g
+def request(action,**updates):
+    r=dict(kind="envs.syntheticHostSourceRequest.v0",**subject,
+           action=action,proposed_q=q,
+           requested_store=None if action=="READ" else t0)
+    r.update(updates)
+    return r
+def bound(**updates):
+    b=dict(kind="windows.syntheticBoundSource.v0",binding=copy.deepcopy(binding),
+           desired=dict(kind="envs.syntheticDesired.v0",target_ref=binding["target_ref"],
+                        proposed_q=q,material=binding["material"],
+                        revision=rev,store_path=t0),
+           current_q=rev,previous_state="NONE",read_grant=grant("READ"),
+           quiet=True,single_writer=True,recovery=True,
+           fixture_issuer="ci-independent-source-issuer")
+    b.update(updates)
+    return b
+def docker(*args,input=None):
+    p=subprocess.run(["docker",*args],input=input,stdout=subprocess.PIPE,
+                     stderr=subprocess.PIPE,text=True)
+    if p.returncode:
+        raise RuntimeError("disposable Docker/Nix command failed: "+p.stderr[-700:])
+    return p.stdout.strip()
+class Actual:
+    kind="windows.syntheticDisposableNixTransport.v0"
+    fixture_only=True
+    def __init__(self):
+        self.reads=self.selects=self.records=self.rollbacks=0
+        self.fail_after_write=False
+        self.fail_before_write=False
+        self.fail_record_ack=False
+        self.fail_rollback_before_write=False
+        self.reader=Path("hosts/rent/read-selected.sh").read_text(encoding="utf-8")
+    def expected_producer_store(self):
+        # $t0 is the actual immutable F1 Nix-built Tool-only output,
+        # independent of caller-proposed store/desired/q.
+        return t0
+    def observe(self):
+        self.reads+=1
+        try:
+            raw=docker("exec","-i","-u","1000:1000",container,
+                       "/bin/bash","-s",input=self.reader)
+        except RuntimeError:
+            return self.wrap("UNKNOWN",None,None,False)
+        if raw=="selection=ABSENT proof=geometry-only":
+            return self.wrap("ABSENT",None,None,True)
+        matched=re.fullmatch(
+            r"selection=SELECTED generation=(rent-dev-[1-9][0-9]*-link) "
+            r"store=(/nix/store/[0-9a-z]{32}-[^/\s]+) proof=geometry-only",raw)
+        if not matched:
+            return self.wrap("UNKNOWN",None,None,False)
+        store=matched.group(2)
+        try:
+            docker("exec",container,"/bin/nix-store","--check-validity",store)
+            valid=True
+        except RuntimeError:
+            valid=False
+        return self.wrap("SELECTED",store,matched.group(1),valid)
+    def wrap(self,state,store,generation,valid):
+        ident=None
+        if state!="UNKNOWN":
+            ident=copy.deepcopy(binding["identity"])
+            ident["tool"]=("ci:rent-tool-T0" if store==t0 else
+                           "ci:rent-tool-T1" if store==t1 else "ci:Tool-ABSENT")
+        return dict(kind="windows.syntheticRentObservation.v0",
+                    **{k:binding[k] for k in
+                       ("target_ref","host_ref","unit_ref","scope")},
+                    state=state,store_path=store,generation=generation,
+                    identity=ident,fresh=state!="UNKNOWN",closure_valid=valid)
+    def quiet(self):
+        top=docker("top",container,"-eo","pid,args")
+        if not all(token in top for token in ("rent-start","nix-daemon","sshd")):
+            return False
+        return not any(re.search(r"/bin/"+exe+r"(?:\s|$)",top)
+                       for exe in ("codex","claude","python3","uv","hello"))
+    def validate_closure(self,store):
+        if store not in (t0,t1):
+            return False
+        try:
+            paths=docker("exec",container,"/bin/nix-store",
+                         "--query","--requisites",store).splitlines()
+            for path in paths:
+                docker("exec",container,"/bin/nix-store","--check-validity",path)
+            helper=docker("exec",container,"/bin/readlink","-e",
+                          store+"/bin/git-credential-github-roccho-dev")
+            core=docker("exec",container,"/bin/readlink","-e",
+                        "/bin/git-credential-github-roccho-dev")
+            return helper==core
+        except RuntimeError:
+            return False
+    def select(self,store):
+        self.selects+=1
+        if self.fail_before_write:
+            raise RuntimeError("CI synthetic write acknowledgement unknown before Nix")
+        docker("exec",container,"/bin/nix-env","--profile",
+               "/nix/var/nix/profiles/rent-dev","--set",store)
+        if self.fail_after_write:
+            raise RuntimeError("CI synthetic acknowledgement lost after real Nix write")
+    def record(self,receipt):
+        self.records+=1
+        if self.fail_record_ack:
+            raise RuntimeError("CI record stored but acknowledgement lost")
+        # This is a disposable transport ACK, not a Target receipt or ledger.
+        return "CI_ONLY_RECORD_NO_TARGET_LEDGER"
+    def rollback(self,preimage):
+        assert preimage in (t0,t1)
+        self.rollbacks+=1
+        if self.fail_rollback_before_write:
+            raise RuntimeError("CI-only rollback transport UNKNOWN before Nix write")
+        docker("exec",container,"/bin/nix-env","--profile",
+               "/nix/var/nix/profiles/rent-dev","--rollback")
+port=Actual()
+image=docker("inspect","-f","{{.Image}}",container)
+state=docker("exec",container,"/bin/bash","-euc",
+             "sha256sum /var/lib/rent/dev/codex/auth.json "
+             "/var/lib/rent/dev/claude/ci-session-marker /work/repos/proof-marker")
+assert port.observe()["store_path"]==t1
+def call(action,*,req_over=None,grant_over=None,bound_over=None,receipt=None):
+    step={"READ":"READ","CHANGE":"TOOL_CHANGE",
+          "RECORD":"RECORD","ROLLBACK":"ROLLBACK"}[action]
+    req=request(action,**(req_over or {}))
+    g=grant(step,**(grant_over or {}))
+    b=bound(**(bound_over or {}))
+    if req["attempt_ref"] != subject["attempt_ref"]:
+        # Explicit CI issuer grants a separate exact attempt. Do NOT rebind
+        # other mutated subject fields, such as an unapproved route.
+        g["attempt_ref"]=req["attempt_ref"]
+        b["read_grant"]["attempt_ref"]=req["attempt_ref"]
+    return receiver.receive_step(req,g,b,port,receipt=receipt)
+def check(ref,stage,**kwargs):
+    result=call(ref,**kwargs)
+    assert result["stage"]==stage,(ref,stage,result)
+    assert result["admission"]=="NOT_ADMITTED"
+    assert result["production_effect"]=="FORBIDDEN"
+    assert result["target_ready"] is False and result["merge_ready"] is False
+    return result
+start_reads=port.reads
+check("READ","REFUSED_PRE_EFFECT",grant_over={"permit":False},
+      bound_over={"desired":None,"current_q":None,"previous_state":"UNKNOWN"})
+assert port.reads==start_reads and port.selects==0
+got=check("READ","READ_OBSERVED",
+          bound_over={"desired":None,"current_q":None,"previous_state":"UNKNOWN"})
+assert got["observation"]["store_path"]==t1 and port.selects==0
+check("CHANGE","REFUSED_PRE_EFFECT",grant_over={"step":"RECORD"})
+check("CHANGE","REFUSED_PRE_EFFECT",req_over={"route_ref":"ci-other-route"})
+check("CHANGE","REFUSED_PRE_EFFECT",req_over={"requested_store":t1})
+# R B: q/material unchanged while both caller-owned desired and request
+# point at t1 (the other VALID closure). Independently built F1 says t0.
+bad_d=bound()["desired"]
+bad_d["store_path"]=t1
+check("CHANGE","REFUSED_PRE_EFFECT",req_over={"requested_store":t1},
+      bound_over={"desired":bad_d})
+assert port.selects==0 and port.records==0 and port.rollbacks==0
+issued=check("CHANGE","TOOL_CHANGE_READBACK_CANDIDATE")["issued_receipt"]
+assert issued and issued["selected"]==t0 and issued["preimage"]==t1
+assert port.selects==1 and port.observe()["store_path"]==t0
+check("CHANGE","REFUSED_PRE_EFFECT")  # same current D Tool, no second write
+assert port.selects==1
+check("RECORD","REFUSED_PRE_EFFECT",grant_over={"permit":False},
+      bound_over={"previous_state":"CONFIRMED","quiet":False,
+                  "single_writer":False,"recovery":False},receipt=issued)
+assert port.records==0
+check("RECORD","REFUSED_PRE_EFFECT",bound_over={"previous_state":"CONFIRMED"},
+      receipt=copy.deepcopy(issued))
+assert port.records==0
+check("RECORD","RECORD_ONLY_CANDIDATE",
+      bound_over={"previous_state":"CONFIRMED","quiet":False,
+                  "single_writer":False,"recovery":False},receipt=issued)
+assert port.records==1 and port.selects==1
+check("RECORD","REFUSED_PRE_EFFECT",
+      bound_over={"previous_state":"CONFIRMED"},receipt=issued)
+assert port.records==1
+check("ROLLBACK","REFUSED_PRE_EFFECT",grant_over={"permit":False},
+      bound_over={"previous_state":"CONFIRMED"},receipt=issued)
+assert port.rollbacks==0
+check("ROLLBACK","ROLLBACK_READBACK_REQUIRED",
+      bound_over={"previous_state":"CONFIRMED"},receipt=issued)
+assert port.rollbacks==1 and port.observe()["store_path"]==t1
+check("ROLLBACK","REFUSED_PRE_EFFECT",
+      bound_over={"previous_state":"CONFIRMED"},receipt=issued)
+assert port.rollbacks==1
+# R C: ROLLBACK must not erase the consumed-attempt tombstone. The same
+# attempt, now with old T1 selected and previous_state reset, may NOT select.
+check("CHANGE","REFUSED_PRE_EFFECT")
+assert port.selects==1 and port.observe()["store_path"]==t1
+# Simulate a real Nix write followed by lost acknowledgement: UNKNOWN, never
+# retry an equivalent change in this disposable instance. CI cleanup is explicit.
+port.fail_after_write=True
+check("CHANGE","UNKNOWN_AFTER_SEND_NO_REPLAY",
+      req_over={"attempt_ref":"ci-rent-source-2"})
+assert port.selects==2 and port.observe()["store_path"]==t0
+check("CHANGE","REFUSED_PRE_EFFECT",
+      req_over={"attempt_ref":"ci-rent-source-2"})
+assert port.selects==2
+docker("exec",container,"/bin/nix-env","--profile",
+       "/nix/var/nix/profiles/rent-dev","--rollback") # CI teardown, NOT receiver retry
+assert port.observe()["store_path"]==t1
+# R C: when an invoked select fails before an actual Nix write, the OLD O
+# remains visible but that same attempt must still never be replayed.
+port.fail_after_write=False
+port.fail_before_write=True
+check("CHANGE","UNKNOWN_AFTER_SEND_NO_REPLAY",
+      req_over={"attempt_ref":"ci-rent-source-3"})
+assert port.selects==3 and port.observe()["store_path"]==t1
+port.fail_before_write=False
+check("CHANGE","REFUSED_PRE_EFFECT",
+      req_over={"attempt_ref":"ci-rent-source-3"})
+assert port.selects==3 and port.observe()["store_path"]==t1
+# R A: RECORD ACK loss can follow a real CI-only record side effect. The
+# same attempt's second RECORD must not call transport.record again.
+issued4=check("CHANGE","TOOL_CHANGE_READBACK_CANDIDATE",
+              req_over={"attempt_ref":"ci-rent-source-4"})["issued_receipt"]
+assert issued4["selected"]==t0 and port.selects==4
+port.fail_record_ack=True
+check("RECORD","UNKNOWN_AFTER_SEND_NO_REPLAY",
+      req_over={"attempt_ref":"ci-rent-source-4"},
+      bound_over={"previous_state":"CONFIRMED"},receipt=issued4)
+assert port.records==2
+port.fail_record_ack=False
+check("RECORD","REFUSED_PRE_EFFECT",
+      req_over={"attempt_ref":"ci-rent-source-4"},
+      bound_over={"previous_state":"CONFIRMED"},receipt=issued4)
+assert port.records==2 and port.selects==4
+docker("exec",container,"/bin/nix-env","--profile",
+       "/nix/var/nix/profiles/rent-dev","--rollback") # CI teardown only
+assert port.observe()["store_path"]==t1
+# R2: a genuine receipt for a new CHANGE is not a license to replay ROLLBACK
+# when the first rollback was invoked but its ACK disappeared BEFORE Nix wrote.
+# The SAME real Docker/Nix container stays T0 after the injected exception.
+issued5=check("CHANGE","TOOL_CHANGE_READBACK_CANDIDATE",
+              req_over={"attempt_ref":"ci-rent-source-5"})["issued_receipt"]
+assert issued5["preimage"]==t1 and issued5["selected"]==t0
+assert port.selects==5 and port.observe()["store_path"]==t0
+before_rollback=port.rollbacks
+port.fail_rollback_before_write=True
+check("ROLLBACK","UNKNOWN_AFTER_SEND_NO_REPLAY",
+      req_over={"attempt_ref":"ci-rent-source-5"},
+      bound_over={"previous_state":"CONFIRMED"},receipt=issued5)
+assert port.rollbacks==before_rollback+1 and port.observe()["store_path"]==t0
+port.fail_rollback_before_write=False
+check("ROLLBACK","REFUSED_PRE_EFFECT",
+      req_over={"attempt_ref":"ci-rent-source-5"},
+      bound_over={"previous_state":"CONFIRMED"},receipt=issued5)
+assert port.rollbacks==before_rollback+1 and port.observe()["store_path"]==t0
+# Independently permitted READ remains possible after UNKNOWN but does not
+# settle the old rollback outcome or permit an equivalent retry.
+read_after_unknown=check("READ","READ_OBSERVED",
+      req_over={"attempt_ref":"ci-rent-source-5"},
+      bound_over={"desired":None,"current_q":None,"previous_state":"UNKNOWN"})
+assert read_after_unknown["observation"]["store_path"]==t0
+assert port.rollbacks==before_rollback+1 and port.records==2 and port.selects==5
+docker("exec",container,"/bin/nix-env","--profile",
+       "/nix/var/nix/profiles/rent-dev","--rollback") # CI teardown only; not receiver recovery
+assert port.observe()["store_path"]==t1
+assert docker("inspect","-f","{{.Image}}",container)==image
+assert docker("exec",container,"/bin/bash","-euc",
+              "sha256sum /var/lib/rent/dev/codex/auth.json "
+              "/var/lib/rent/dev/claude/ci-session-marker /work/repos/proof-marker")==state
+print("PASS: same real OCI/Nix receiver READ->CHANGE->RECORD-only->ROLLBACK; "
+      "pre-effect refusal zero, post-send CHANGE/RECORD/ROLLBACK UNKNOWN no replay, "
+      "Base/state unchanged")
+PY
 # Negative O-only fixtures run with the synthetic OCI stopped; each damaged preimage is retained
 # and each read must refuse without mutation. Repair is part of disposable test, not observer code.
 docker stop -t 30 "$c" >/dev/null
