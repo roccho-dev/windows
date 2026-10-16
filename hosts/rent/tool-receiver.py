@@ -128,7 +128,8 @@ def _preflight(request: Any, grant: Any, bound: Any, transport: Any):
            and getattr(transport, "fixture_only", None) is True
            and all(callable(getattr(transport, name, None))
                    for name in ("observe", "validate_closure", "quiet",
-                                "select", "record", "rollback")),
+                                "select", "record", "rollback",
+                                "expected_producer_store")),
            "missing independently injected disposable Nix transport")
     _grant(b["read_grant"], req, "READ")
     _grant(grant, req, STAGES[req["action"]])
@@ -167,7 +168,7 @@ def _observe(transport: Any, req: dict[str, Any]):
     return o
 
 
-def _current_d(req, b):
+def _current_d(req, b, port):
     d = exact(b["desired"], DESIRED_FIELDS, "synthetic D shape")
     bind = b["binding"]
     demand(d["kind"] == "envs.syntheticDesired.v0"
@@ -181,6 +182,13 @@ def _current_d(req, b):
            and type(d["store_path"]) is str
            and STORE.fullmatch(d["store_path"]) is not None,
            "missing exact current synthetic D/q selected store")
+    # This expected T0 is independently supplied by the disposable Nix
+    # producer transport, not by the request/desired object. q hashes
+    # immutable material, and cannot by itself prove an arbitrary store path.
+    expected = port.expected_producer_store()
+    demand(type(expected) is str and STORE.fullmatch(expected) is not None
+           and d["store_path"] == expected,
+           "synthetic D Tool differs from Nix-built pinned Producer closure")
     return d
 
 
@@ -218,7 +226,7 @@ def receive_step(request: dict[str, Any], scoped_grant: dict[str, Any] | None,
             obs = _observe(port, req)
             return result("READ_OBSERVED" if obs["state"] != "UNKNOWN"
                           else "READ_UNKNOWN", observation=obs)
-        desired = _current_d(req, b)
+        desired = _current_d(req, b, port)
         demand(b["previous_state"] in ("NONE", "CONFIRMED", "UNKNOWN"),
                "unknown previous effect shape")
         obs = _observe(port, req)
@@ -236,13 +244,20 @@ def receive_step(request: dict[str, Any], scoped_grant: dict[str, Any] | None,
                    "B/launch/config/state require a different plan")
             demand(obs["store_path"] != desired["store_path"],
                    "same Tool geometry does not prove NOOP")
-            # A duplicate equivalent attempt must be stopped BEFORE nix-env.
-            demand(req["attempt_ref"] not in
-                   getattr(port, "_receiver_issued", {}),
-                   "duplicate mutating attempt not allowed")
+            # A sent attempt is consumed BEFORE the irreversible Nix call.
+            # Do not erase it on rollback, and do not allow a blind retry when
+            # the write's acknowledgement disappears before readback.
+            attempted = getattr(port, "_receiver_change_started", None)
+            if attempted is None:
+                attempted = port._receiver_change_started = set()
+            demand(req["attempt_ref"] not in attempted
+                   and req["attempt_ref"] not in getattr(port, "_receiver_issued", {})
+                   and req["attempt_ref"] not in getattr(port, "_receiver_recorded", set()),
+                   "duplicate or consumed mutating attempt not allowed")
             demand(port.quiet() is True, "continuous CI quiet not proven")
             demand(port.validate_closure(desired["store_path"]) is True,
                    "exact SOURCE Tool closure not valid")
+            attempted.add(req["attempt_ref"])
             sent = True
             port.select(desired["store_path"])
             new_o = _observe(port, req)
@@ -274,8 +289,15 @@ def receive_step(request: dict[str, Any], scoped_grant: dict[str, Any] | None,
                "record or rollback requires settled prior effect")
         _valid_receipt(port, receipt, req, desired["revision"], obs)
         if action == "RECORD":
-            demand(req["attempt_ref"] not in getattr(port, "_receiver_recorded", set()),
-                   "duplicate RECEIPT/RECORD")
+            record_started = getattr(port, "_receiver_record_started", None)
+            if record_started is None:
+                record_started = port._receiver_record_started = set()
+            demand(req["attempt_ref"] not in record_started
+                   and req["attempt_ref"] not in getattr(port, "_receiver_recorded", set()),
+                   "duplicate or unresolved RECEIPT/RECORD")
+            # A transport may store RECORD before an ACK is delivered.
+            # Preserve this attempt even if the transport throws/returns UNKNOWN.
+            record_started.add(req["attempt_ref"])
             sent = True
             accepted = port.record(receipt)
             # After sending RECORD, an absent/ambiguous acknowledgement is
