@@ -316,6 +316,16 @@ def receive_step(request: dict[str, Any], scoped_grant: dict[str, Any] | None,
                and port.quiet() is True
                and port.validate_closure(receipt["preimage"]) is True,
                "missing rollback grant, quiet or genuine preimage")
+        # A rollback invocation may change Nix before its ACK arrives.
+        # Consume this exact attempt BEFORE transport; an UNKNOWN result may
+        # leave the original issued receipt/selected T intact, so receipt
+        # validation alone cannot prevent an equivalent blind retry.
+        rollback_started = getattr(port, "_receiver_rollback_started", None)
+        if rollback_started is None:
+            rollback_started = port._receiver_rollback_started = set()
+        demand(req["attempt_ref"] not in rollback_started,
+               "duplicate or unknown rollback attempt cannot be resent")
+        rollback_started.add(req["attempt_ref"])
         sent = True
         port.rollback(receipt["preimage"])
         after = _observe(port, req)
