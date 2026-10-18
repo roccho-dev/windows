@@ -65,6 +65,7 @@ jobs:
           echo "launcher_only=$launcher_only" >> "$GITHUB_OUTPUT"
           echo "own_tool_only=$own_tool_only" >> "$GITHUB_OUTPUT"
 
+  # Coordinated retirement candidate: keep every proof, but this caller never publishes new images or Releases.
   own:
     needs: scope
     if: needs.scope.outputs.launcher_only != 'true'
@@ -73,7 +74,7 @@ jobs:
       packages: write
     uses: ./.github/workflows/own-image.yml
     with:
-      publish: ${{ github.event_name == 'push' && github.ref == 'refs/heads/proposals' && needs.scope.outputs.own_tool_only != 'true' }}
+      publish: false
       tool_only: ${{ needs.scope.outputs.own_tool_only == 'true' }}
     secrets: inherit
 
@@ -85,7 +86,7 @@ jobs:
       packages: write
     uses: ./.github/workflows/rent-image.yml
     with:
-      publish: ${{ github.event_name == 'push' && github.ref == 'refs/heads/proposals' }}
+      publish: false
     secrets: inherit
 
   dev:
@@ -354,7 +355,7 @@ jobs:
   # tested and pushed (by registry digest), so a consumer binds both to the source and runs the image by digest.
   publish:
     needs: [scope, build, windows, rent]
-    if: needs.scope.outputs.launcher_only != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/proposals'
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
