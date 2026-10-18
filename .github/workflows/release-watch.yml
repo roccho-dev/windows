@@ -11,8 +11,7 @@ on:
       - infra/release-watch/watch.test.mjs
       - .github/workflows/release-watch.yml
       - flake.nix
-  schedule:
-    - cron: '0 21 * * 5'
+  # Coordinated retirement candidate: keep read-only verification, no automatic or manual proposal writes.
   workflow_dispatch:
 
 permissions:
@@ -66,7 +65,7 @@ jobs:
           cat release-proof.json >> "$GITHUB_STEP_SUMMARY"
 
   propose:
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/proposals'
+    if: ${{ false }}
     needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 30
